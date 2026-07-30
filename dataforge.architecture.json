@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Medical AI Data Foundation",
+    "subtitle": "统一数据生产 → 统一数据资产 → 统一知识消费",
+    "output": "dataforge-architecture.html",
+    "quality_profile": "standard"
+  },
+  "components": [
+    {
+      "id": "data_sources",
+      "type": "external",
+      "label": "Data Sources",
+      "sublabel": "PDF / DB / API / HIS / EMR",
+      "pos": [40, 300],
+      "size": [160, 68]
+    },
+    {
+      "id": "source_center",
+      "type": "cloud",
+      "label": "Source Center",
+      "sublabel": "来源 / 数据集 / 版本",
+      "pos": [260, 300],
+      "size": [160, 68]
+    },
+    {
+      "id": "data_factory",
+      "type": "backend",
+      "label": "Data Factory",
+      "sublabel": "Pipeline / Workflow",
+      "tag": "一期核心",
+      "pos": [480, 300],
+      "size": [160, 68]
+    },
+    {
+      "id": "asset_center",
+      "type": "database",
+      "label": "Asset Center",
+      "sublabel": "Document / FAQ / Chunk / Entity",
+      "pos": [700, 300],
+      "size": [180, 68]
+    },
+    {
+      "id": "knowledge_runtime",
+      "type": "backend",
+      "label": "Knowledge Runtime",
+      "sublabel": "Retrieval / Search / Citation",
+      "tag": "Phase 2",
+      "pos": [1010, 300],
+      "size": [180, 68]
+    },
+    {
+      "id": "ai_applications",
+      "type": "frontend",
+      "label": "AI Applications",
+      "sublabel": "FAQ / 导诊 / Agent / Workflow",
+      "tag": "Phase 3",
+      "pos": [1260, 300],
+      "size": [180, 68]
+    },
+    {
+      "id": "dataflow_engine",
+      "type": "messagebus",
+      "label": "Processing Engine",
+      "sublabel": "DataFlow（当前实现，可替换）",
+      "pos": [470, 500],
+      "size": [180, 68]
+    },
+    {
+      "id": "medical_operators",
+      "type": "backend",
+      "label": "Medical Operators",
+      "sublabel": "OCR / ICD / 实体识别 / 标准化",
+      "pos": [720, 500],
+      "size": [190, 68]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Phase 1 / Unified Data Production",
+      "wraps": [
+        "source_center",
+        "data_factory",
+        "asset_center",
+        "dataflow_engine",
+        "medical_operators"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "Phase 2–3 / Knowledge Consumption",
+      "wraps": ["knowledge_runtime", "ai_applications"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "sources-to-source-center",
+      "from": "data_sources",
+      "to": "source_center",
+      "label": "ingest",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "source-center-to-factory",
+      "from": "source_center",
+      "to": "data_factory",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "factory-to-assets",
+      "from": "data_factory",
+      "to": "asset_center",
+      "label": "publish",
+      "variant": "emphasis",
+      "route": "straight"
+    },
+    {
+      "id": "assets-to-runtime",
+      "from": "asset_center",
+      "to": "knowledge_runtime",
+      "label": "Phase 2",
+      "variant": "dashed",
+      "route": "straight"
+    },
+    {
+      "id": "runtime-to-apps",
+      "from": "knowledge_runtime",
+      "to": "ai_applications",
+      "label": "knowledge APIs",
+      "variant": "dashed",
+      "route": "straight",
+      "labelAt": [1225, 296]
+    },
+    {
+      "id": "factory-to-engine",
+      "from": "data_factory",
+      "to": "dataflow_engine",
+      "label": "engine adapter",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [565, 382]
+    },
+    {
+      "id": "engine-to-operators",
+      "from": "dataflow_engine",
+      "to": "medical_operators",
+      "label": "executes",
+      "route": "straight"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "一期范围",
+      "items": [
+        "统一接入、加工、资产沉淀、治理与发布",
+        "不改造现有业务，不建设统一 Runtime"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "架构原则",
+      "items": [
+        "面向数据资产，而不是面向具体业务",
+        "Processing Engine 保持抽象，DataFlow 只是当前实现"
+      ]
+    }
+  ]
+}

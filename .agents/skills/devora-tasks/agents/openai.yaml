@@ -1,0 +1,6 @@
+interface:
+  display_name: "Devora Tasks"
+  short_description: "Generate executable, dependency-aware tasks from the active spec and plan."
+  default_prompt: "Use $devora-tasks for this task."
+policy:
+  allow_implicit_invocation: true

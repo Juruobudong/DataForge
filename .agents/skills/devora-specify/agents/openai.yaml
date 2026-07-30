@@ -1,0 +1,6 @@
+interface:
+  display_name: "Devora Specify"
+  short_description: "Create a traceable, project-grounded feature specification from product materials and user intent."
+  default_prompt: "Use $devora-specify for this task."
+policy:
+  allow_implicit_invocation: true

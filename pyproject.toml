@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medical-dataforge"
+version = "0.1.0"
+description = "Medical AI data foundation built around OpenDCAI DataFlow"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "pypdf>=5.9,<7",
+  "python-docx>=1.2,<2"
+]
+
+[project.optional-dependencies]
+dataflow = [
+  "colorlog>=6.8",
+  "numpy<2",
+  "pandas>=2.2,<3",
+  "rich>=13",
+  "tqdm>=4.66"
+]
+web = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1"
+]
+studio = [
+  "loguru>=0.7,<1",
+  "pandas>=2.2,<3",
+  "pydantic-settings>=2.10,<3",
+  "pymysql>=1.1,<2",
+  "pyyaml>=6,<7",
+  "ray>=2.48,<3"
+]
+
+[project.scripts]
+dataforge = "dataforge.cli:main"
+dataforge-web = "dataforge.web:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
