@@ -1,0 +1,32 @@
+{
+  "schema_version": 2,
+  "devora_version": "0.4.0",
+  "owner": "core",
+  "integration": null,
+  "installed_at": "2026-07-28T01:34:14.877914+00:00",
+  "files": {
+    ".devora/init-options.json": "b966a45ac577154a4cf8c0b63715585f133d1a7d2194ebd1bff1a82c78a8306d",
+    ".devora/scripts/bash/check-prerequisites.sh": "5d3537cec65783c1951bffb4b3980ebfdafb62e25b42675dc68b19918c1826b5",
+    ".devora/scripts/bash/common.sh": "a73d37129fa7883ee27720dedbb5afa8dba1b26707ee3e4464a7f4f687404215",
+    ".devora/scripts/bash/create-new-feature.sh": "b0c05c172a552097deeefde420afd6c3a0e7f49d144be1bf5190ad1fc19713b0",
+    ".devora/scripts/bash/setup-plan.sh": "1028c0fef167ed67d8c4a186098e426181a623cd3b9c9d6af92c5afd20ecd9ed",
+    ".devora/scripts/bash/setup-review.sh": "b9fe0e86d26dd37ec24c7116d015b523d5d510da96b174d0e98afae0777203bb",
+    ".devora/scripts/bash/setup-tasks.sh": "99f0527831109ecac73a9e2933542eff218b2a38608166d858b2f05bc45d4c4b",
+    ".devora/scripts/python/check_prerequisites.py": "e6eb2789658d25009fdcf0539adb580074f1087944c9afb8250336faa575612a",
+    ".devora/scripts/python/common.py": "04bddb39915c2dc8926887000077a5f54a5efa940a21bdec4fd51384ecc6486a",
+    ".devora/scripts/python/create_new_feature.py": "083da0bf3d187e6778871878e9209cda42d7cb29aa789a43b9082779d3d7dd2d",
+    ".devora/scripts/python/setup_plan.py": "a480f2c04543190daf51d51e1f767f4a2ae1f993fa3078b3ef6ea900669c6e09",
+    ".devora/scripts/python/setup_review.py": "db90ae8e3ad10ad88c5a0c17e3eee06890a8657a9725459584ac770f87adbf46",
+    ".devora/scripts/python/setup_tasks.py": "7c27a8e3958b89d6d797d65c24c54ad5236599c6760bf90a0b6c5c5862003194",
+    ".devora/templates/analysis-template.md": "1e880165ea525fb49653eff6bd78b99b1681695ce0e5f36ecb84a31dd0725810",
+    ".devora/templates/constitution-template.md": "7794f51453c0704e01ab55e50029d65cce8c0eb539aa1aa3877560d1220d03a2",
+    ".devora/templates/intake-template.md": "c248b9ec5f0d5362b47cb31e2fd2203945ad34e139cd31b0527c41fe82383c4c",
+    ".devora/templates/plan-template.md": "d2a647859ea89239d7bcd062ed9eff125f87a1cad8e83b93a09041b28e684249",
+    ".devora/templates/project-context-template.md": "dbd3c6f8cdc127c6c7bc0035e3b6546c5a67604a27a15ce280644622a75c5a3d",
+    ".devora/templates/review-template.md": "ea5391d7ba9f16d7f166f1b0246e5592fcf3cc4fe8da71d27c080e32b99d1ef1",
+    ".devora/templates/spec-template.md": "3c7d0f3b46c7be530ec9cf19a0aa5cb045416d641089c74506d5aa55c559280a",
+    ".devora/templates/summary-template.md": "c3e81b9415e18f3240541d1af66d8c7d98989d5b446e89452555e962c142585b",
+    ".devora/templates/tasks-template.md": "e07a113a91bb75b5d78225819a7011983a0edf051f905e49b8231fe42301b043",
+    ".devora/templates/test-cases-template.md": "43b5c74859bda010e61e7bc398207db132ec827823da6d863ce32bc5328b0bd6"
+  }
+}

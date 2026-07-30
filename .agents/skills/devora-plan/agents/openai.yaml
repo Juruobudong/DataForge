@@ -1,0 +1,6 @@
+interface:
+  display_name: "Devora Plan"
+  short_description: "Build a technical implementation plan grounded in the active spec and the real project structure."
+  default_prompt: "Use $devora-plan for this task."
+policy:
+  allow_implicit_invocation: true

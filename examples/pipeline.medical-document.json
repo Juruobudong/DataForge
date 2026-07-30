@@ -1,0 +1,19 @@
+{
+  "id": "medical-document-v1",
+  "name": "Medical Document Standardization",
+  "version": 1,
+  "engine": "dataflow",
+  "definition": {
+    "kind": "medical_document",
+    "description": "Normalize, chunk, deduplicate, and publish medical document assets.",
+    "parameters": {
+      "chunk_size": 600,
+      "chunk_overlap": 80
+    },
+    "operators": [
+      "NormalizeMedicalTextOperator",
+      "ChunkMedicalTextOperator"
+    ],
+    "output_asset_type": "medical_chunk_collection"
+  }
+}

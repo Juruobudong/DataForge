@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "integration": "codex",
+  "feature_numbering": "sequential",
+  "artifact_language": "auto",
+  "script_type": "py"
+}

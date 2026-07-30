@@ -1,0 +1,11 @@
+.venv/
+.dataforge/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.DS_Store
+frontend/node_modules/
+third_party/dataflow_webui/frontend/node_modules/
+third_party/dataflow_webui/backend/data/
+third_party/dataflow_webui/backend/cache_local/

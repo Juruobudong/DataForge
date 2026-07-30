@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "devora_version": "0.4.0",
+  "owner": "codex",
+  "integration": "codex",
+  "installed_at": "2026-07-28T01:34:14.878609+00:00",
+  "files": {
+    ".agents/skills/devora-analyze/SKILL.md": "0f000cf8e68494c69cc3c9bed0e4961660b912ba2bbe2e7ed54d4fcc8c1b36aa",
+    ".agents/skills/devora-analyze/agents/openai.yaml": "fd8431ec866e6c74384b2026bcc59864fa240e4a7105bbf3def0af3204c65f20",
+    ".agents/skills/devora-clarify/SKILL.md": "62032c22e90da6842a1a7cba50bf5d40617a01b1728590486768dde2b9bcc8ab",
+    ".agents/skills/devora-clarify/agents/openai.yaml": "45f6e8702e633fa5fb54e390704264306757e7ddb4abc3c7875099bb51344f24",
+    ".agents/skills/devora-constitution/SKILL.md": "3ebb247682dc32bbabed28f47ba3a4710cd538539aacc0d978b925bc0743244f",
+    ".agents/skills/devora-constitution/agents/openai.yaml": "bb96b1f9de6840307f4486a9c71a0abc032c8e01a45bd47ddfa12d610d6879de",
+    ".agents/skills/devora-implement/SKILL.md": "2e53d737850cb5b75a6fd1b422f5a7febeb3629cf2ae0028fa7693b3d4fa0867",
+    ".agents/skills/devora-implement/agents/openai.yaml": "3a47d8e3adda706260e5f92ea1d41bd39ee3d4d59ab7b7c0943081b2c502dcda",
+    ".agents/skills/devora-plan/SKILL.md": "e396bb9dfef814e6e457b9bf2d9ef76845f81c138becdb4ae447449dcf51b1ac",
+    ".agents/skills/devora-plan/agents/openai.yaml": "852c1c6904df42b4660d3b7645b1e77ff950545df446759dfd84a472f582c653",
+    ".agents/skills/devora-project-context/SKILL.md": "3f892408ef5f9e669130fc9c70e429d731c509cc09482e19c95f0039d7674f27",
+    ".agents/skills/devora-project-context/agents/openai.yaml": "677fa4b6e2c5c9bd07561768978f56055dcbd8ccfd3e5504422aa2e495f38dc3",
+    ".agents/skills/devora-resolve/SKILL.md": "cb6df47e48da1cd09df47925cd17b258d03864a1f269ec33ab9d7bcb6fbe4f3d",
+    ".agents/skills/devora-resolve/agents/openai.yaml": "646197e72aec6f6030f78c09b8dde8bcbd702bb7a413e12d51f03ff950068502",
+    ".agents/skills/devora-review/SKILL.md": "1ca67810c3bde448a577df019b4201bf86f079c754aae5e738c118eb19444cd6",
+    ".agents/skills/devora-review/agents/openai.yaml": "bd9f343274fec9fb4c185dff1880562e474326eb98ab10299bf47c336eac3d2e",
+    ".agents/skills/devora-specify/SKILL.md": "6a71ae345d23efcbeb726a99a9b0491b19396d1dfb807f59ec6f670d7aa7b264",
+    ".agents/skills/devora-specify/agents/openai.yaml": "c16afc4024a2e39aab4faacca5be76524643a161bef6c36e858440bfabd04c56",
+    ".agents/skills/devora-tasks/SKILL.md": "ff20d5ad8fc0db9f975579607a081a2d27c7743533b87c49d41e72e504b8681a",
+    ".agents/skills/devora-tasks/agents/openai.yaml": "f870a40dcb937c040dbb2c38b5e72821d105062e422d25e7f738f10257c96b83"
+  }
+}

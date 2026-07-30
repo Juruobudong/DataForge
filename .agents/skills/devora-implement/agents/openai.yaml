@@ -1,0 +1,6 @@
+interface:
+  display_name: "Devora Implement"
+  short_description: "Implement the active feature by following its grounded plan and task list."
+  default_prompt: "Use $devora-implement for this task."
+policy:
+  allow_implicit_invocation: true

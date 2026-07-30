@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "DataForge 知识资产生产全流程",
+    "subtitle": "先确定知识格式，再选择兼容流程；验证通过后入库并保留逐条溯源",
+    "output": "dataforge-knowledge-flow.html",
+    "viewBox": [1080, 780],
+    "animation": "none",
+    "visual_preset": "classic",
+    "quality_profile": "standard",
+    "views": [
+      { "id": "production", "label": "一期生产主链路", "focus": ["source-files", "source-version", "type-catalog", "compatibility", "standard-pipeline", "parallel-job", "schema-gate", "knowledge-base"], "note": "从源文档版本开始，经过类型与流程兼容校验、并行加工和格式验证后写入知识库。" },
+      { "id": "governance", "label": "标准流程治理", "focus": ["dataflow-studio", "standard-pipeline", "type-catalog", "compatibility", "schema-gate"], "note": "流程先在 DataFlow 调试，并绑定固定知识格式；只有验证通过的版本才能用于生产。" },
+      { "id": "trace", "label": "记录级溯源", "focus": ["source-version", "parallel-job", "schema-gate", "knowledge-base", "knowledge-record"], "note": "每条知识记录保留源文档版本、运行任务、中间资产和原始位置。" },
+      { "id": "phase-two", "label": "二期集合交付", "focus": ["knowledge-base", "knowledge-collection", "applications"], "note": "同类知识库组成不可变集合版本，再将稳定标识交付给应用。" }
+    ]
+  },
+  "stages": [
+    { "label": "源文档" },
+    { "label": "规则与流程" },
+    { "label": "加工与验证" },
+    { "label": "知识资产" },
+    { "label": "二期交付" }
+  ],
+  "nodes": [
+    { "id": "source-files", "type": "frontend", "label": "源文档上传", "sublabel": "PDF / CSV / MD / DOCX / TXT", "stage": 0, "row": 0, "width": 150, "tag": "优先来源" },
+    { "id": "source-version", "type": "database", "label": "文件来源与版本", "sublabel": "原文件 + 校验码 + 不可变版本", "stage": 0, "row": 2, "width": 150, "tag": "可追溯输入" },
+    { "id": "type-catalog", "type": "database", "label": "知识库类型目录", "sublabel": "文本块 / 问答 / 三元组 / 多轮对话", "stage": 1, "row": 0, "width": 158, "tag": "固定结构" },
+    { "id": "standard-pipeline", "type": "backend", "label": "标准流程版本", "sublabel": "绑定目标类型与输出结构", "stage": 1, "row": 2, "width": 150, "tag": "已验证才发布" },
+    { "id": "dataflow-studio", "type": "cloud", "label": "DataFlow 调试台", "sublabel": "算子 / 流程 / 任务 / 算力", "stage": 1, "row": 4, "width": 150, "tag": "定义与样本调试" },
+    { "id": "compatibility", "type": "security", "label": "兼容性校验", "sublabel": "类型 + 结构版本 + 验证状态", "stage": 2, "row": 0, "width": 150, "tag": "生产入口保护" },
+    { "id": "parallel-job", "type": "messagebus", "label": "并行知识加工", "sublabel": "多文档并行 · 单文档顺序执行", "stage": 2, "row": 2, "width": 150, "tag": "并发上限 4" },
+    { "id": "schema-gate", "type": "security", "label": "逐条格式验证", "sublabel": "不合格则整库不入库", "stage": 2, "row": 4, "width": 150, "tag": "写入前校验" },
+    { "id": "knowledge-base", "type": "database", "label": "知识库资产", "sublabel": "编号 / 名称 / 类型 / 流程 / 来源", "stage": 3, "row": 1, "width": 150, "tag": "正式入库" },
+    { "id": "knowledge-record", "type": "database", "label": "知识记录与溯源", "sublabel": "标准内容 + 源版本 + 源位置", "stage": 3, "row": 3, "width": 150, "tag": "逐条关系" },
+    { "id": "knowledge-collection", "type": "cloud", "label": "同类知识集合", "sublabel": "不可变集合版本", "stage": 4, "row": 1, "width": 140, "tag": "二期" },
+    { "id": "applications", "type": "backend", "label": "应用消费", "sublabel": "绑定集合版本编号", "stage": 4, "row": 3, "width": 140, "tag": "二期" }
+  ],
+  "flows": [
+    { "id": "upload-version", "from": "source-files", "to": "source-version", "label": "原文件与版本元数据", "classification": "不可变", "variant": "emphasis", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [100, 214] },
+    { "id": "type-policy", "from": "type-catalog", "to": "compatibility", "label": "目标知识结构", "classification": "固定格式", "variant": "security", "route": "straight", "labelAt": [425, 110] },
+    { "id": "pipeline-policy", "from": "standard-pipeline", "to": "compatibility", "label": "流程输出声明", "classification": "版本绑定", "variant": "security", "fromSide": "top", "toSide": "bottom", "via": [[400, 330], [625, 330], [625, 214], [530, 214]], "labelAt": [565, 317] },
+    { "id": "studio-publish", "from": "dataflow-studio", "to": "standard-pipeline", "label": "样本验证后发布", "classification": "流程治理", "variant": "dashed", "fromSide": "right", "toSide": "bottom", "via": [[440, 613], [440, 440], [315, 440]], "labelAt": [440, 540] },
+    { "id": "input-job", "from": "source-version", "to": "parallel-job", "label": "选中的源版本", "classification": "批量输入", "variant": "emphasis", "fromSide": "right", "toSide": "left", "via": [[215, 450], [430, 450], [430, 385]], "labelAt": [322, 463] },
+    { "id": "compatible-run", "from": "compatibility", "to": "parallel-job", "label": "允许执行", "classification": "前后端双重校验", "variant": "emphasis", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [530, 272] },
+    { "id": "job-output", "from": "parallel-job", "to": "schema-gate", "label": "候选知识记录", "classification": "汇总输出", "variant": "emphasis", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [530, 500] },
+    { "id": "validated-assets", "from": "schema-gate", "to": "knowledge-base", "label": "全部合格记录", "classification": "事务入库", "variant": "emphasis", "fromSide": "right", "toSide": "left", "via": [[640, 613], [640, 271]], "labelAt": [640, 450] },
+    { "id": "record-membership", "from": "knowledge-base", "to": "knowledge-record", "label": "标准知识记录", "classification": "一对多", "variant": "default", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [745, 386] },
+    { "id": "record-source", "from": "source-version", "to": "knowledge-record", "label": "源版本与原始位置", "classification": "记录级溯源", "variant": "dashed", "route": "bottom-channel", "fromSide": "bottom", "toSide": "bottom", "channelY": 704 },
+    { "id": "collection-members", "from": "knowledge-base", "to": "knowledge-collection", "label": "同类型成员", "classification": "类型一致", "variant": "dashed", "route": "straight" },
+    { "id": "application-binding", "from": "knowledge-collection", "to": "applications", "label": "集合版本编号", "classification": "可复现交付", "variant": "dashed", "route": "straight", "fromSide": "bottom", "toSide": "top", "labelAt": [960, 386] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "一期主链路", "items": ["上传后先选择目标知识格式", "只允许兼容且已验证的标准流程", "多文档并行处理，逐条验证后整体入库"] },
+    { "dot": "emerald", "title": "数据关系", "items": ["知识库只有一种知识类型", "知识记录保留源版本、运行任务和源位置", "失败任务保留校验明细但不创建知识库"] },
+    { "dot": "orange", "title": "二期边界", "items": ["仅组合同类型知识库", "发布不可变集合版本编号", "应用绑定集合，不重新加工数据"] }
+  ]
+}
