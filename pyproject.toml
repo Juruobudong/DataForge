@@ -3,48 +3,54 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "medical-dataforge"
+name = "dataforge"
 version = "0.1.0"
-description = "Medical AI data foundation built around OpenDCAI DataFlow"
+description = "Document knowledge production platform"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+  "alembic>=1.16,<2",
+  "minio>=7.2,<8",
+  "httpx>=0.28,<1",
+  "llama-index-embeddings-openai-like>=0.3,<0.4",
+  "networkx>=3.6.1",
+  "openpyxl>=3.1,<4",
+  "openai>=1.99,<2",
   "pypdf>=5.9,<7",
-  "python-docx>=1.2,<2"
+  "pymilvus>=2.5,<3",
+  "PyMySQL>=1.1,<2",
+  "python-docx>=1.2,<2",
+  "pyyaml>=6,<7",
+  "SQLAlchemy>=2.0,<3",
 ]
 
 [project.optional-dependencies]
-dataflow = [
-  "colorlog>=6.8",
-  "numpy<2",
-  "pandas>=2.2,<3",
-  "rich>=13",
-  "tqdm>=4.66"
-]
 web = [
   "fastapi>=0.116,<1",
-  "httpx>=0.28,<1",
   "python-multipart>=0.0.20,<1",
-  "uvicorn[standard]>=0.35,<1"
+  "uvicorn[standard]>=0.35,<1",
 ]
-studio = [
-  "loguru>=0.7,<1",
-  "pandas>=2.2,<3",
-  "pydantic-settings>=2.10,<3",
-  "pymysql>=1.1,<2",
-  "pyyaml>=6,<7",
-  "ray>=2.48,<3"
+runner = [
+  "jsonschema>=4.24,<5",
+  "open-dataflow==1.0.10",
 ]
 
 [project.scripts]
 dataforge = "dataforge.cli:main"
-dataforge-web = "dataforge.web:main"
+dataforge-web = "dataforge.v7.web:main"
+dataforge-worker = "dataforge.v7.worker:main"
+dataforge-runner = "dataforge.v7.runner:main"
+dataforge-migrate = "dataforge.migration:main"
+dataforge-provision = "dataforge.v7.provisioning:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+packages = [
+  "dataforge",
+  "dataforge.v7",
+]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools.package-dir]
+dataforge = "src/dataforge"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

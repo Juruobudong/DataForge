@@ -1,0 +1,278 @@
+name: dataforge
+
+x-python-build-args: &python-build-args
+  PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+  UV_VERSION: ${UV_VERSION:-0.9.9}
+  PYPI_INDEX_URL: ${PYPI_INDEX_URL:-https://pypi.org/simple}
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "3"
+
+services:
+  dataforge-migrate:
+    image: dataforge-app:${DATAFORGE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+      args: *python-build-args
+    command: ["dataforge-migrate", "--upgrade-platform"]
+    environment:
+      DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    networks: [private]
+    logging: *default-logging
+
+  dataforge-provision:
+    image: dataforge-app:${DATAFORGE_IMAGE_TAG:-local}
+    pull_policy: never
+    command: ["dataforge-provision", "--reconcile"]
+    environment:
+      DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
+      DATAFORGE_MILVUS_TOKEN: ${DATAFORGE_MILVUS_TOKEN:-}
+    depends_on:
+      dataforge-migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    networks: [milvus-egress, private]
+    logging: *default-logging
+
+  frontend:
+    image: dataforge-frontend:${DATAFORGE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: deploy/frontend/Dockerfile
+      args:
+        NODE_VERSION: ${NODE_VERSION:-22}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+    ports:
+      - "18080:8080"
+    depends_on:
+      dataforge-api:
+        condition: service_started
+    restart: unless-stopped
+    networks: [edge, private]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+
+  dataforge-api:
+    image: dataforge-app:${DATAFORGE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+      args: *python-build-args
+    init: true
+    environment:
+      DATAFORGE_WEB_HOST: 0.0.0.0
+      DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_MINIO_ENDPOINT: minio:9000
+      DATAFORGE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-dataforge}
+      DATAFORGE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-dataforge-minio}
+      DATAFORGE_MINIO_BUCKET: dataforge
+      DATAFORGE_RUNNER_URL: http://dataforge-runner:8010
+      DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
+      DATAFORGE_ROUTING_DIR: /var/lib/dataforge/routing
+      DATAFORGE_ADMIN_PASSWORD_HASH_FILE: /run/secrets/dataforge_admin_password_hash
+      DATAFORGE_SESSION_SECRET_FILE: /run/secrets/dataforge_session_secret
+      DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
+      DATAFORGE_MILVUS_TOKEN: ${DATAFORGE_MILVUS_TOKEN:-}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-fake}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+    secrets:
+      - dataforge_admin_password_hash
+      - dataforge_session_secret
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      dataforge-migrate:
+        condition: service_completed_successfully
+      dataforge-runner:
+        condition: service_started
+    restart: unless-stopped
+    networks: [milvus-egress, private]
+    volumes:
+      - routing-snapshots:/var/lib/dataforge/routing
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 8G
+        reservations:
+          cpus: "1"
+          memory: 1G
+
+  dataforge-worker:
+    # 与 API 复用同一镜像，不再重复构建和安装依赖。
+    image: dataforge-app:${DATAFORGE_IMAGE_TAG:-local}
+    pull_policy: never
+    command: ["dataforge-worker"]
+    init: true
+    environment:
+      DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_RUNNER_URL: http://dataforge-runner:8010
+      DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
+      DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
+      DATAFORGE_MILVUS_TOKEN: ${DATAFORGE_MILVUS_TOKEN:-}
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-fake}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      dataforge-migrate:
+        condition: service_completed_successfully
+      dataforge-runner:
+        condition: service_started
+      dataforge-api:
+        condition: service_started
+    restart: unless-stopped
+    networks: [milvus-egress, private]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 8G
+        reservations:
+          cpus: "1"
+          memory: 1G
+
+  dataforge-runner:
+    image: dataforge-runner:${DATAFORGE_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runner
+      additional_contexts:
+        global_llm: ${GLOBAL_LLM_BUILD_CONTEXT:-/data/zoe-ai-proj/global_llm}
+      args:
+        <<: *python-build-args
+    command: ["dataforge-runner"]
+    init: true
+    environment:
+      DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_MINIO_ENDPOINT: minio:9000
+      DATAFORGE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-dataforge}
+      DATAFORGE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-dataforge-minio}
+      DATAFORGE_MINIO_BUCKET: dataforge
+      DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
+      LOCAL_LLM_API_KEY: ${LOCAL_LLM_API_KEY:-}
+      DATAFORGE_LLM_ORG_CODE: ${DATAFORGE_LLM_ORG_CODE:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      dataforge-migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [private]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  mysql:
+    image: mysql:8.0.39
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: dataforge
+      MYSQL_USER: dataforge
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-dataforge}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-dataforge-root}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -uroot -p"$${MYSQL_ROOT_PASSWORD}" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    networks: [private]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
+        reservations:
+          cpus: "1"
+          memory: 1G
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dataforge}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-dataforge-minio}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+    networks: [private]
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+secrets:
+  dataforge_admin_password_hash:
+    file: ./secrets/dataforge_admin_password_hash
+  dataforge_session_secret:
+    file: ./secrets/dataforge_session_secret
+
+volumes:
+  mysql-data: {}
+  minio-data: {}
+  routing-snapshots: {}
+
+networks:
+  edge: {}
+  milvus-egress:
+    external: true
+    name: ${DATAFORGE_MILVUS_NETWORK:-dataforge_milvus_egress}
+  private:
+    internal: true

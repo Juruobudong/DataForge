@@ -1,0 +1,9 @@
+[Unit]
+Description=Reconcile DataForge Milvus egress network and firewall rules
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/dataforge/milvus-egress.env
+ExecStart=/usr/bin/env bash -lc 'exec "$DATAFORGE_HOME/scripts/ensure-milvus-egress.sh" --env-file "$DATAFORGE_ENV_FILE"'

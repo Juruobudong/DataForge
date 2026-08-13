@@ -1,7 +1,7 @@
-"""Medical DataForge public package."""
+"""DataForge V7 public package."""
 
-from .application import DataForge
 from .config import Settings
+from .v7.models import Base
 
-__all__ = ["DataForge", "Settings"]
-__version__ = "0.1.0"
+__all__ = ["Base", "Settings"]
+__version__ = "7.0.0"

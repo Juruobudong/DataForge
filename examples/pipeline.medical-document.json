@@ -2,7 +2,7 @@
   "id": "medical-document-v1",
   "name": "Medical Document Standardization",
   "version": 1,
-  "engine": "dataflow",
+  "engine": "native",
   "definition": {
     "kind": "medical_document",
     "description": "Normalize, chunk, deduplicate, and publish medical document assets.",

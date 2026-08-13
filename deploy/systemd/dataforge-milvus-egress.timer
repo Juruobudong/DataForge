@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically restore DataForge Milvus egress network access
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=dataforge-milvus-egress.service
+
+[Install]
+WantedBy=timers.target

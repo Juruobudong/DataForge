@@ -1,0 +1,12 @@
+README-应用步骤.md
+Dockerfile
+compose.yaml
+pyproject.toml
+.dockerignore
+.env.docker.example
+deploy/frontend/Dockerfile
+deploy/frontend/nginx.conf
+docs/Docker构建优化说明.md
+scripts/regenerate-lock.sh
+scripts/build-and-up.sh
+scripts/diagnose-build.sh
