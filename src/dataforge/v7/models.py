@@ -337,8 +337,16 @@ class OperatorDefinition(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     code: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name_zh: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     category: Mapped[str] = mapped_column(String(64), nullable=False)
+    subcategory: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    scenarios: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    knowledge_types: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    recommended_predecessors: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    recommended_successors: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="published", nullable=False, index=True)
     exposure: Mapped[str] = mapped_column(String(32), default="canvas", nullable=False)
     risk_level: Mapped[str] = mapped_column(String(32), default="standard", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -357,6 +365,7 @@ class OperatorVersion(Timestamped, Base):
     input_example: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     output_example: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     parameter_schema: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    parameter_docs: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     runtime_requirements: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -417,6 +426,9 @@ class FlowSubgraphRevision(Timestamped, Base):
     flow_subgraph_id: Mapped[str] = mapped_column(ForeignKey("flow_subgraphs.id"), nullable=False, index=True)
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    input_contract: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    output_contract: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -433,9 +445,19 @@ class FlowExecutionSnapshot(Timestamped, Base):
 
 class FlowRun(Timestamped, Base):
     __tablename__ = "flow_runs"
+    __table_args__ = (UniqueConstraint("parent_flow_run_id", "idempotency_key", name="uq_derived_run_request"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
     execution_snapshot_id: Mapped[str] = mapped_column(ForeignKey("flow_execution_snapshots.id"), nullable=False, index=True)
+    parent_flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
+    run_mode: Mapped[str] = mapped_column(String(32), default="full", nullable=False, index=True)
+    start_node_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    parameter_overrides: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    sink_policy: Mapped[str] = mapped_column(String(32), default="commit", nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(255), default="system", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="running", nullable=False, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -446,6 +468,15 @@ class FlowNodeRun(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
     node_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    operator_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    operator_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resolved_parameters: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    logs_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    error_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="running", nullable=False)
     input_artifact_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     output_artifact_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
@@ -462,6 +493,54 @@ class Artifact(Timestamped, Base):
     uri: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     data_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    summary_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    record_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    content_format: Mapped[str] = mapped_column(String(32), default="json", nullable=False)
+    replayable: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
+
+class FlowNodeArtifactBinding(Timestamped, Base):
+    __tablename__ = "flow_node_artifact_bindings"
+    __table_args__ = (UniqueConstraint("flow_node_run_id", "direction", "port_name", "ordinal", name="uq_node_artifact_port"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_node_run_id: Mapped[str] = mapped_column(ForeignKey("flow_node_runs.id"), nullable=False, index=True)
+    artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    port_name: Mapped[str] = mapped_column(String(120), default="input", nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
+class FlowRunEvent(Base):
+    __tablename__ = "flow_run_events"
+    __table_args__ = (UniqueConstraint("flow_run_id", "sequence_no", name="uq_flow_run_event_sequence"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    level: Mapped[str] = mapped_column(String(16), default="info", nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    node_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class FlowRunSinkPreview(Timestamped, Base):
+    __tablename__ = "flow_run_sink_previews"
+    __table_args__ = (UniqueConstraint("flow_run_id", "output_key", name="uq_flow_run_sink_preview"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
+    output_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    knowledge_library_id: Mapped[str] = mapped_column(ForeignKey("knowledge_libraries.id"), nullable=False, index=True)
+    candidates_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    successful_chunks_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    diff_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    quality_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    base_state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    preview_checksum: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ArtifactLineage(Timestamped, Base):
@@ -491,6 +570,8 @@ class KnowledgeIndexProfile(Timestamped, Base):
     collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
     embedding_profile_id: Mapped[str] = mapped_column(ForeignKey("embedding_profiles.id"), nullable=False)
     fields_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    origin: Mapped[str] = mapped_column(String(32), default="manual", nullable=False, index=True)
+    owner_knowledge_type_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_types.id"), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
     current_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
@@ -549,6 +630,19 @@ class ManagedCollection(Timestamped, Base):
     observed_spec_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="planned", nullable=False, index=True)
     error_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class ManagedCollectionDeletionJob(Timestamped, Base):
+    """Explicit, retryable deletion of one verified DataForge-owned Collection."""
+    __tablename__ = "managed_collection_deletion_jobs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    managed_collection_id: Mapped[str] = mapped_column(ForeignKey("managed_collections.id"), nullable=False, index=True)
+    preflight_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class VectorSyncJob(Timestamped, Base):

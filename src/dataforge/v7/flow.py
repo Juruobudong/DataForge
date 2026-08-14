@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import Any
 
 from .catalog import catalog_by_code
+from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
 class FlowValidationError(ValueError):
@@ -28,11 +29,12 @@ def _type_matches(actual: str, expected: str) -> bool:
 
 
 class FlowCompiler:
-    def __init__(self, catalog: dict[str, dict[str, Any]] | None = None, subflows: dict[str, dict[str, Any]] | None = None, type_revisions: dict[str, dict[str, Any]] | None = None, *, allow_controlled: bool = False):
+    def __init__(self, catalog: dict[str, dict[str, Any]] | None = None, subflows: dict[str, dict[str, Any]] | None = None, type_revisions: dict[str, dict[str, Any]] | None = None, *, allow_controlled: bool = False, llm_serving_registry: LLMServingRegistry | None = None):
         self.catalog = catalog or catalog_by_code()
         self.subflows = subflows or {}
         self.type_revisions = type_revisions or {}
         self.allow_controlled = allow_controlled
+        self.llm_serving_registry = llm_serving_registry
 
     def _expand(self, definition: dict[str, Any], prefix: str = "", stack: tuple[str, ...] = ()) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         nodes = [deepcopy(value) for value in definition.get("nodes", [])]
@@ -47,6 +49,9 @@ class FlowCompiler:
             node_id = str(node["id"])
             if node.get("kind") != "subflow":
                 node["id"] = f"{prefix}{node_id}"
+                node["origin_path"] = [part for part in f"{prefix}{node_id}".split("::") if part]
+                if definition.get("_subgraph_code"):
+                    node["source_subgraph"] = {"code": definition["_subgraph_code"], "revision": definition.get("_subgraph_revision")}
                 result_nodes.append(node)
                 continue
             code = str(node.get("ref", ""))
@@ -156,9 +161,29 @@ class FlowCompiler:
                     raise FlowValidationError(f"{code} 只能作为 SourceFile 根节点")
             elif not source_types or cardinality == "one" and len(source_types) != 1 or any(not _type_matches(source_type, expected) for source_type in source_types):
                 raise FlowValidationError(f"节点 {node_id} 输入 Artifact Type 不兼容，需要 {expected}")
-            params = node.get("params") or {}
+            params = node.get("params")
+            if params is None:
+                params = {}
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
+            if code == "document-parser" and params:
+                raise FlowValidationError(
+                    f"节点 {node_id} 的 Document Parser 当前不接受参数；"
+                    "PDF 固定使用 MinerU backend=pipeline、parse_method=auto"
+                )
+            uses_llm = bool((item.get("runtime_requirements") or {}).get("uses_llm"))
+            if "llm_serving" in params and not uses_llm:
+                raise FlowValidationError(f"节点 {node_id} 不是 LLM 算子，不能配置 llm_serving")
+            if uses_llm:
+                registry = self.llm_serving_registry or get_llm_serving_registry()
+                serving_id = str(params.get("llm_serving") or registry.default_serving).strip()
+                try:
+                    registry.require(serving_id)
+                except ValueError as exc:
+                    raise FlowValidationError(f"节点 {node_id} 引用了未配置的 LLM Serving：{serving_id}") from exc
+                params["llm_serving"] = serving_id
+                dependencies.append({"kind": "llm_serving", "id": serving_id})
+            node["params"] = params
             output_spec = (item.get("output_ports") or {}).get("output") or {"artifact_type": item["output"]}
             output = str(output_spec.get("artifact_type", item["output"]))
             knowledge_type = str(params.get("knowledge_type", ""))

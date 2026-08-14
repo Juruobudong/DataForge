@@ -23,6 +23,7 @@ async function trace(item) { try { sources.value = await api.knowledgeItemSource
 async function checkDelete() { try { deletion.value = await api.knowledgeLibraryDeleteCheck(selected.value.id) } catch (e) { error.value = e.message } }
 async function remove() { try { if (!deletion.value?.deletable) return; if (!window.confirm('将异步清理该知识库的 V7 Partition，确认继续？')) return; deletion.value = await api.deleteKnowledgeLibrary(selected.value.id); deletionJobs.value = await api.deletionJobs(selected.value.id); await load() } catch (e) { error.value = e.message } }
 async function retryDeletion(job) { try { await api.retryDeletion(job.id); deletionJobs.value = await api.deletionJobs(selected.value.id) } catch (e) { error.value = e.message } }
+onMounted(load)
 </script>
 
 <template>

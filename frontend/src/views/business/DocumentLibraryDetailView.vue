@@ -6,10 +6,14 @@ import { api } from '../../api/platform'
 const route = useRoute(), router = useRouter(), libraryId = route.params.libraryId
 const library = ref(null), tree = ref({ children: [] }), listing = ref({ items: [], total: 0 }), selectedPath = ref(null)
 const keyword = ref(''), status = ref(''), fileType = ref(''), page = ref(1), selectedSources = ref([])
-const queued = ref([]), preview = ref(null), results = ref([]), detail = ref(null), error = ref(''), dragging = ref(false), duplicatePolicy = ref('skip'), bindings = ref([]), templates = ref([]), templateId = ref('')
+const queued = ref([]), preview = ref(null), results = ref([]), detail = ref(null), error = ref(''), dragging = ref(false), duplicatePolicy = ref('skip'), bindings = ref([]), templates = ref([]), templateIds = ref([]), bindingTemplates = ref(false)
 const directoryInput = ref(null), fileInput = ref(null), replaceInput = ref(null), replaceTarget = ref(null)
 const files = computed(() => listing.value.items || [])
 const hasActiveBinding = computed(() => bindings.value.some(item => item.status === 'active'))
+const availableTemplates = computed(() => {
+  const activeIds = new Set(bindings.value.filter(item => item.status === 'active').map(item => item.template.id))
+  return templates.value.filter(item => item.status === 'active' && item.revision_status === 'published' && !activeIds.has(item.id))
+})
 const allPageSourcesSelected = computed(() => files.value.length > 0 && files.value.every(source => selectedSources.value.includes(source.id)))
 const flatTree = computed(() => {
   const output = []
@@ -107,7 +111,11 @@ async function hardDelete() {
   try { const body = { source_ids: selectedSources.value }; const check = await api.documentDeletionPreflight(body); if (!check.deletable) throw new Error('存在运行任务，整批不能彻底删除。'); if (!confirm(`将彻底删除 ${check.source_count} 个文件，并影响 ${check.impact.knowledge_item_count} 个知识项、${check.impact.vector_record_count} 条向量。\n此操作不可撤销，确定继续吗？`)) return; await api.requestDocumentDeletion(body); selectedSources.value = []; await load() } catch (e) { error.value = e.message }
 }
 function toggleAllPageSources(event) { selectedSources.value = event.target.checked ? files.value.map(source => source.id) : [] }
-async function bindTemplate() { try { await api.bindDocumentTemplate(libraryId, templateId.value); templateId.value = ''; await load() } catch (e) { error.value = e.message } }
+async function bindTemplates() {
+  if (!templateIds.value.length || bindingTemplates.value) return
+  bindingTemplates.value = true; error.value = ''
+  try { await api.bindDocumentTemplates(libraryId, templateIds.value); templateIds.value = []; await load() } catch (e) { error.value = e.message } finally { bindingTemplates.value = false }
+}
 async function unbindTemplate(binding) { try { if (!confirm(`解绑 ${binding.template.name}？结果知识库不会删除。`)) return; await api.unbindDocumentTemplate(libraryId, binding.template.id); await load() } catch (e) { error.value = e.message } }
 async function processLibrary() { try { const result = await api.processDocumentLibrary(libraryId); results.value = result.jobs; await load() } catch (e) { error.value = e.message } }
 async function processSelectedSources() { try { const result = await api.processSelectedDocumentSources(libraryId, selectedSources.value); results.value = result.jobs; await load() } catch (e) { error.value = e.message } }
@@ -123,10 +131,34 @@ onMounted(load)
     <input ref="replaceInput" class="sr-only" type="file" accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt" @change="replaceFile">
     <div class="document-browser"><aside class="panel directory-tree"><b>目录</b><button :class="{ active: selectedPath === null }" @click="selectedPath=null; page=1; load()">▾ 全部文件</button><button v-for="node in flatTree" :key="node.path" :class="{ active: selectedPath === node.path }" :style="{ paddingLeft: `${12 + node.depth * 16}px` }" @click="selectedPath=node.path; page=1; load()">▸ {{ node.name }} <small>{{ node.file_count }}</small></button></aside>
       <div class="panel file-area" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop="onDrop"><div class="actions"><input v-model="keyword" placeholder="搜索文件" @keyup.enter="page=1; load()"><select v-model="status" @change="page=1; load()"><option value="">全部状态</option><option value="uploaded">已上传</option><option value="deleted">已删除</option></select><select v-model="fileType" @change="page=1; load()"><option value="">全部格式</option><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="xlsx">XLSX</option></select><button @click="load">筛选</button><span class="badge amber">已选当前页 {{ selectedSources.length }} 个</span><button class="primary" :disabled="!selectedSources.length || !hasActiveBinding" @click="processSelectedSources">处理选中文件</button><button class="danger" :disabled="!selectedSources.length" @click="hardDelete">彻底删除</button></div><div v-if="dragging" class="drop-zone">拖拽文件或文件夹到此处</div><div v-else-if="!files.length" class="drop-zone">拖拽文件或文件夹到此处，或使用顶部上传入口</div><table><thead><tr><th><input type="checkbox" :checked="allPageSourcesSelected" :disabled="!files.length" aria-label="全选当前页文件" @change="toggleAllPageSources"> 全选当前页</th><th>名称</th><th>类型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="source in files" :key="source.id"><td><input v-model="selectedSources" type="checkbox" :value="source.id"></td><td><b>{{ source.original_filename }}</b><small>{{ source.relative_path }}</small></td><td>{{ source.original_filename.split('.').pop()?.toUpperCase() }}</td><td><span class="badge" :class="source.status === 'deleted' ? 'red' : 'green'">{{ source.status }}</span></td><td>{{ source.updated_at }}</td><td><button @click="openDetail(source)">详情</button><button @click="chooseReplace(source)">替换</button></td></tr></tbody></table><p>共 {{ listing.total }} 个文件；全选仅作用于当前页。</p></div></div>
-    <section class="panel"><div class="panel-head"><div><h3>已配置知识模板</h3><p>首次绑定自动创建结果知识库；后续批量处理仅处理新增或替换版本。</p></div><button class="primary" :disabled="!hasActiveBinding" @click="processLibrary">批量处理待更新文件（本次上传）</button></div><form class="actions" @submit.prevent="bindTemplate"><select v-model="templateId" required><option value="">选择已发布模板</option><option v-for="item in templates.filter(item=>item.status==='active' && item.revision_status==='published')" :key="item.id" :value="item.id">{{ item.name }} · r{{ item.revision }}</option></select><button>绑定模板</button></form><table v-if="bindings.length"><thead><tr><th>模板 / 修订</th><th>结果知识库</th><th>待处理</th><th>最近任务</th><th></th></tr></thead><tbody><tr v-for="binding in bindings" :key="binding.id"><td>{{ binding.template.name }} · r{{ binding.template.revision }}<small>{{ binding.status }}</small></td><td><span v-for="output in binding.outputs" :key="output.knowledge_type">{{ output.knowledge_type }}：{{ output.knowledge_library.name }}<br></span></td><td>{{ binding.pending_file_count }}</td><td>{{ binding.latest_job?.status || '—' }}</td><td><button v-if="binding.status==='active'" class="danger" @click="unbindTemplate(binding)">解绑</button></td></tr></tbody></table><p v-else>尚未绑定知识模板。</p></section>
+    <section class="panel">
+      <div class="panel-head"><div><h3>已配置知识模板</h3><p>可一次选择多个已发布模板；整批成功后才会创建绑定和结果知识库。</p></div><button class="primary" :disabled="!hasActiveBinding" @click="processLibrary">批量处理待更新文件（本次上传）</button></div>
+      <form class="actions template-binding-form" @submit.prevent="bindTemplates">
+        <details class="template-multiselect">
+          <summary>{{ templateIds.length ? `已选择 ${templateIds.length} 个模板` : '选择已发布模板' }}</summary>
+          <div class="template-options">
+            <label v-for="item in availableTemplates" :key="item.id"><input v-model="templateIds" type="checkbox" :value="item.id"> <span>{{ item.name }} · r{{ item.revision }}</span></label>
+            <p v-if="!availableTemplates.length">没有可绑定的已发布模板。</p>
+          </div>
+        </details>
+        <button :disabled="!templateIds.length || bindingTemplates">{{ bindingTemplates ? '绑定中…' : '绑定所选模板' }}</button>
+      </form>
+      <table v-if="bindings.length"><thead><tr><th>模板 / 修订</th><th>结果知识库</th><th>待处理</th><th>最近任务</th><th></th></tr></thead><tbody><tr v-for="binding in bindings" :key="binding.id"><td>{{ binding.template.name }} · r{{ binding.template.revision }}<small>{{ binding.status }}</small></td><td><span v-for="output in binding.outputs" :key="output.knowledge_type">{{ output.knowledge_type }}：{{ output.knowledge_library.name }}<br></span></td><td>{{ binding.pending_file_count }}</td><td>{{ binding.latest_job?.status || '—' }}</td><td><button v-if="binding.status==='active'" class="danger" @click="unbindTemplate(binding)">解绑</button></td></tr></tbody></table><p v-else>尚未绑定知识模板。</p>
+    </section>
     <section v-if="queued.length" class="panel"><div class="panel-head"><h3>上传预检</h3><button class="primary" @click="upload">开始上传</button></div><p>准备上传 {{ uploadStats.count }} 个文件，{{ formatBytes(uploadStats.bytes) }}</p><p>{{ Object.entries(uploadStats.types).map(([type, count]) => `${type} ${count}`).join(' · ') }}</p><ul class="queued-file-list" aria-label="待上传文件"><li v-for="item in queuedFiles" :key="item.relative_path"><div><b>{{ item.file.name }}</b><small>{{ item.relative_path }} · {{ formatBytes(item.file.size) }}</small></div><span class="badge" :class="item.issue ? (item.issue === '同路径文件' ? 'amber' : 'red') : 'blue'">{{ item.issue || '准备上传' }}</span></li></ul><label v-if="preview?.duplicates?.length">同路径文件 {{ preview.duplicates.join('、') }}：<select v-model="duplicatePolicy"><option value="skip">跳过</option><option value="replace">替换原文件</option><option value="keep_both">保留两份（自动重命名）</option></select></label><p v-if="preview?.unsupported?.length" class="error">不支持：{{ preview.unsupported.map(item => item.relative_path).join('、') }}</p><p v-if="preview?.oversized?.length" class="error">超过 200 MiB：{{ preview.oversized.join('、') }}</p></section>
     <details v-if="results.length" class="panel" open><summary>本次上传结果</summary><ul><li v-for="item in results" :key="`${item.relative_path}-${item.status}`">{{ item.relative_path }}：{{ item.status }}{{ item.error ? `（${item.error}）` : '' }}</li></ul></details>
     <section v-if="detail" class="panel source-detail"><div class="panel-head"><h3>{{ detail.source.original_filename }}</h3><button @click="detail=null">关闭</button></div><p>原目录：{{ detail.source.directory_path || '根目录' }} · {{ formatBytes(detail.source.version?.size_bytes || 0) }}</p><p><a :href="api.sourceDownloadUrl(detail.source.id, detail.source.current_version_id)">下载原始文件</a></p><details open><summary>解析结果</summary><pre>{{ detail.document_ir?.text || '尚未生成解析结果' }}</pre></details><details><summary>SourceChunk（{{ detail.source_chunks.length }}）</summary><ol><li v-for="chunk in detail.source_chunks" :key="chunk.id">{{ chunk.content }}</li></ol></details><details><summary>生成知识（{{ detail.knowledge_results.length }}）</summary><ul><li v-for="item in detail.knowledge_results" :key="item.knowledge_item_id">{{ item.knowledge_library_name }}：{{ item.content }}</li></ul></details><details><summary>处理任务与日志</summary><pre>{{ JSON.stringify(detail.jobs, null, 2) }}</pre></details></section>
     <p v-if="error" class="error">{{ error }}</p>
   </section>
 </template>
+
+<style scoped>
+.template-binding-form { align-items: flex-start; }
+.template-multiselect { position: relative; min-width: min(360px, 100%); }
+.template-multiselect summary { min-height: 34px; padding: 8px 34px 8px 12px; border: 1px solid var(--border); border-radius: 8px; color: #405069; background: #fff; font-size: 10px; cursor: pointer; }
+.template-options { position: absolute; z-index: 8; display: grid; width: 100%; max-height: 260px; gap: 4px; overflow: auto; margin-top: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: #fff; box-shadow: var(--shadow); }
+.template-options label { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: 7px; color: #405069; font-size: 10px; cursor: pointer; }
+.template-options label:hover { background: var(--blue-soft); }
+.template-options p { margin: 8px; color: var(--muted); font-size: 10px; }
+@media (max-width: 640px) { .template-multiselect { width: 100%; min-width: 0; } }
+</style>

@@ -35,7 +35,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-install-project --extra web
 
 COPY src ./src
-COPY llm_local.yaml ./
+COPY llm_servings.yaml ./
 
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-editable --extra web
@@ -73,12 +73,6 @@ USER root
 
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     uv sync --frozen --no-editable --extra web --extra runner
-
-# global_llm is an authoritative shared package maintained outside this
-# repository.  Compose supplies it as a named BuildKit context only for the
-# Runner target, after uv has created the isolated application environment.
-COPY --from=global_llm / /tmp/global_llm
-RUN uv pip install --python /app/.venv/bin/python /tmp/global_llm
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

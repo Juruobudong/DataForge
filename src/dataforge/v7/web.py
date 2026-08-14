@@ -42,6 +42,10 @@ class SelectedDocumentSourcesRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
 
 
+class DocumentTemplateBatchBindingRequest(BaseModel):
+    knowledge_flow_template_ids: list[str] = Field(min_length=1)
+
+
 class DocumentDeletionRequest(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     document_library_ids: list[str] = Field(default_factory=list)
@@ -77,6 +81,30 @@ class TemplateSampleRequest(BaseModel):
     sample_id: Literal["guideline-md", "faq-csv", "case-txt"] = "guideline-md"
 
 
+class SubflowRevisionRequest(BaseModel):
+    description: str = ""
+    input_contract: dict = Field(default_factory=dict)
+    output_contract: dict = Field(default_factory=dict)
+    definition: dict
+
+
+class DerivedRunRequest(BaseModel):
+    mode: Literal["node_only", "from_node"]
+    node_id: str
+    parameter_overrides: dict = Field(default_factory=dict)
+    idempotency_key: str | None = None
+
+
+class CommitDerivedRunRequest(BaseModel):
+    preview_checksum: str
+    idempotency_key: str
+
+
+class PersistDerivedParametersRequest(BaseModel):
+    node_id: str
+    parameters: dict = Field(default_factory=dict)
+
+
 class PromptTemplateRequest(BaseModel):
     code: str
     name: str
@@ -106,14 +134,19 @@ class KnowledgeTypeRequest(BaseModel):
     identity_fields: list[str] = Field(min_length=1)
     source_policy: Literal["single", "multiple"]
     quality_profile_revision_id: str
-    index_profile_ids: list[str] = Field(min_length=1)
+    index_profile_ids: list[str] = Field(default_factory=list)
+    managed_collection_name: str = ""
+    reuse_managed_collection_id: str | None = None
 
 
 class IndexProfileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     code: str = ""
     knowledge_type: str
     collection_name: str = ""
-    collection_policy: Literal["external", "managed"] = "external"
+    collection_mode: Literal["create", "attach"] | None = None
+    collection_policy: Literal["external", "managed"] | None = None
+    reuse_managed_collection_id: str | None = None
     storage_schema: dict | None = None
     index_spec: dict = Field(default_factory=lambda: {"index_type": "AUTOINDEX"})
     embedding_code: str
@@ -234,6 +267,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/document-libraries/{library_id}/template-bindings", status_code=201)
     def bind_document_library_template(library_id: str, payload: dict):
         try: return store.bind_document_library_template(library_id, str(payload.get("knowledge_flow_template_id", "")))
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/document-libraries/{library_id}/template-bindings/batch", status_code=201)
+    def bind_document_library_templates(library_id: str, payload: DocumentTemplateBatchBindingRequest):
+        try: return {"bindings": store.bind_document_library_templates(library_id, payload.knowledge_flow_template_ids)}
         except ValueError as exc: raise _error(exc) from exc
 
     @app.delete("/api/document-libraries/{library_id}/template-bindings/{template_id}")
@@ -527,14 +565,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/developer/knowledge-types", status_code=201)
     def create_knowledge_type(payload: KnowledgeTypeRequest):
         try: return store.create_knowledge_type(payload.code, payload.name, payload.icon, payload.type_schema, payload.canonical_field,
-                                                payload.identity_fields, payload.source_policy, payload.quality_profile_revision_id,
-                                                payload.index_profile_ids)
+                                                 payload.identity_fields, payload.source_policy, payload.quality_profile_revision_id,
+                                                 payload.index_profile_ids, managed_collection_name=payload.managed_collection_name,
+                                                 reuse_managed_collection_id=payload.reuse_managed_collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-types/{type_id}/revisions", status_code=201)
     def revise_knowledge_type(type_id: str, payload: KnowledgeTypeRequest):
         try: return store.revise_knowledge_type(type_id, payload.type_schema, payload.canonical_field, payload.identity_fields,
-                                                payload.source_policy, payload.quality_profile_revision_id, payload.index_profile_ids)
+                                                payload.source_policy, payload.quality_profile_revision_id, payload.index_profile_ids,
+                                                managed_collection_name=payload.managed_collection_name,
+                                                reuse_managed_collection_id=payload.reuse_managed_collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-types/{type_id}/validate")
@@ -544,7 +585,20 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/developer/knowledge-types/{type_id}/publish")
     def publish_knowledge_type(type_id: str):
-        try: return store.publish_knowledge_type(type_id)
+        try:
+            from .provisioning import ManagedCollectionProvisioner
+            requirements = store.knowledge_type_publication_requirements(type_id)
+            service = VectorSyncService.from_environment(store)
+            for requirement in requirements:
+                if requirement["collection_policy"] == "managed":
+                    if not service.milvus:
+                        raise ValueError("未配置 DATAFORGE_MILVUS_URI，不能 Provision 受管 Collection")
+                    result = ManagedCollectionProvisioner(store, service.milvus).reconcile_one(requirement["managed_collection_id"])
+                    if result["status"] != "ready":
+                        raise ValueError(result.get("error") or "受管 Collection Provision 失败")
+                else:
+                    index_validator(requirement["collection_name"], requirement["fields"], requirement["dimension"])
+            return store.publish_knowledge_type(type_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/standard-pipelines")
@@ -552,8 +606,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         return [{"code": "common", "steps": ["Document Parse", "Document Clean", "Knowledge Chunk", "Production", "Knowledge Publish"]}]
 
     @app.get("/api/developer/operator-catalog")
-    def operator_catalog():
-        return store.list_operator_catalog()
+    def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",
+                         include_internal: bool = True):
+        return store.list_operator_catalog(include_internal=include_internal, query=q, category=category, knowledge_type=knowledge_type,
+                                           exposure=exposure, status=status)
+
+    @app.get("/api/developer/operator-catalog/facets")
+    def operator_catalog_facets(): return store.operator_catalog_facets()
+
+    @app.get("/api/developer/operator-catalog/{code}")
+    def operator_catalog_detail(code: str):
+        try: return store.operator_catalog_detail(code)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/developer/prompt-templates")
     def prompt_templates():
@@ -586,6 +650,33 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/flow-subgraphs")
     def flow_subgraphs():
         return store.list_subflows()
+
+    @app.get("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}")
+    def flow_subgraph_revision(subflow_id: str, revision: int):
+        try: return store.subflow_revision_detail(subflow_id, revision)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/copy", status_code=201)
+    def copy_flow_subgraph_revision(subflow_id: str, revision: int):
+        try: return store.copy_subflow_draft(subflow_id, revision)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.put("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}")
+    def update_flow_subgraph_revision(subflow_id: str, revision: int, payload: SubflowRevisionRequest):
+        try: return store.update_subflow_draft(subflow_id, revision, payload.definition, payload.description, payload.input_contract, payload.output_contract)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/validate")
+    def validate_flow_subgraph_revision(subflow_id: str, revision: int):
+        try:
+            value = store.subflow_revision_detail(subflow_id, revision); store._validate_subflow_definition(value["definition"])
+            return {"id": subflow_id, "revision": revision, "valid": True}
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/publish")
+    def publish_flow_subgraph_revision(subflow_id: str, revision: int):
+        try: return store.publish_subflow_draft(subflow_id, revision)
+        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/knowledge-flow-templates")
     def flow_templates():
@@ -637,9 +728,55 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def flow_runs():
         return store.list_flow_runs()
 
+    @app.get("/api/developer/flow-runs/capabilities")
+    def flow_run_capabilities():
+        return {"derived_runs_enabled": resolved.derived_runs_enabled,
+                "derived_run_commit_enabled": resolved.derived_run_commit_enabled,
+                "cancellation": "cooperative"}
+
     @app.get("/api/developer/flow-runs/{flow_run_id}")
     def flow_run(flow_run_id: str):
         try: return store.flow_run_detail(flow_run_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/developer/flow-runs/{flow_run_id}/derived-runs", status_code=202)
+    def create_derived_flow_run(flow_run_id: str, payload: DerivedRunRequest):
+        if not resolved.derived_runs_enabled: raise HTTPException(status_code=403, detail="派生 Run 功能未启用")
+        try: return store.create_derived_run(flow_run_id, payload.mode, payload.node_id, payload.parameter_overrides, payload.idempotency_key)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-runs/{flow_run_id}/cancel")
+    def cancel_derived_flow_run(flow_run_id: str):
+        if not resolved.derived_runs_enabled: raise HTTPException(status_code=403, detail="派生 Run 功能未启用")
+        try: return store.cancel_flow_run(flow_run_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-runs/{flow_run_id}/persist-parameters")
+    def persist_derived_parameters(flow_run_id: str, payload: PersistDerivedParametersRequest):
+        if not resolved.derived_runs_enabled: raise HTTPException(status_code=403, detail="派生 Run 功能未启用")
+        try: return store.persist_derived_parameters(flow_run_id, payload.node_id, payload.parameters)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-runs/{flow_run_id}/commit")
+    def commit_derived_flow_run(flow_run_id: str, payload: CommitDerivedRunRequest):
+        if not resolved.derived_run_commit_enabled: raise HTTPException(status_code=403, detail="派生 Run 正式提交功能未启用")
+        try: return store.commit_derived_run(flow_run_id, payload.preview_checksum, payload.idempotency_key)
+        except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/developer/flow-runs/{flow_run_id}/events")
+    def flow_run_events(flow_run_id: str, after: int = 0, limit: int = 200):
+        try: return store.flow_run_events(flow_run_id, after, limit)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/developer/artifacts/{artifact_id}")
+    def artifact_detail(artifact_id: str):
+        try: return store.artifact_detail(artifact_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/developer/artifacts/{artifact_id}/content")
+    def artifact_content(artifact_id: str, offset: int = 0, limit: int = 100):
+        try: return store.artifact_content(artifact_id, offset, limit)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/developer/vector-indexes")
@@ -657,20 +794,53 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return ManagedCollectionProvisioner(store, service.milvus).reconcile_one(collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
+    @app.get("/api/developer/managed-collections/{collection_id}/delete-check")
+    def managed_collection_delete_check(collection_id: str):
+        from .provisioning import ManagedCollectionDeletionService
+        try: return ManagedCollectionDeletionService.from_environment(store).preflight(collection_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/developer/managed-collections/{collection_id}", status_code=202)
+    def delete_managed_collection(collection_id: str):
+        from .provisioning import ManagedCollectionDeletionService
+        try: return ManagedCollectionDeletionService.from_environment(store).request_delete(collection_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/developer/managed-collections/{collection_id}/deletion-jobs")
+    def managed_collection_deletion_jobs(collection_id: str):
+        return store.list_managed_collection_deletion_jobs(collection_id)
+
+    @app.post("/api/developer/managed-collection-deletion-jobs/{job_id}/retry")
+    def retry_managed_collection_deletion(job_id: str):
+        try: return store.retry_managed_collection_deletion(job_id)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.post("/api/developer/index-profiles", status_code=201)
     def create_index_profile(payload: IndexProfileRequest):
-        try: return store.create_index_profile(payload.code, payload.knowledge_type, payload.collection_name, payload.embedding_code,
-                                               payload.embedding_model, payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
-                                               collection_policy=payload.collection_policy, storage_schema=payload.storage_schema,
-                                               index_spec=payload.index_spec)
+        policy = payload.collection_policy or ("managed" if payload.collection_mode == "create" else "external")
+        try:
+            if payload.collection_mode and payload.collection_policy \
+                    and policy != ("managed" if payload.collection_mode == "create" else "external"):
+                raise ValueError("collection_mode 与 collection_policy 冲突")
+            return store.create_index_profile(payload.code, payload.knowledge_type, payload.collection_name, payload.embedding_code,
+                                              payload.embedding_model, payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
+                                              collection_policy=policy, collection_mode=payload.collection_mode,
+                                              storage_schema=payload.storage_schema, index_spec=payload.index_spec,
+                                              reuse_managed_collection_id=payload.reuse_managed_collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/index-profiles/{profile_id}/revisions", status_code=201)
     def revise_index_profile(profile_id: str, payload: IndexProfileRequest):
-        try: return store.revise_index_profile(profile_id, payload.collection_name, payload.embedding_code, payload.embedding_model,
-                                               payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
-                                               collection_policy=payload.collection_policy, storage_schema=payload.storage_schema,
-                                               index_spec=payload.index_spec)
+        policy = payload.collection_policy or ("managed" if payload.collection_mode == "create" else "external")
+        try:
+            if payload.collection_mode and payload.collection_policy \
+                    and policy != ("managed" if payload.collection_mode == "create" else "external"):
+                raise ValueError("collection_mode 与 collection_policy 冲突")
+            return store.revise_index_profile(profile_id, payload.collection_name, payload.embedding_code, payload.embedding_model,
+                                              payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
+                                              collection_policy=policy, storage_schema=payload.storage_schema,
+                                              index_spec=payload.index_spec,
+                                              reuse_managed_collection_id=payload.reuse_managed_collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     def index_validator(collection_name: str, fields: dict, dimension: int) -> None:
@@ -686,7 +856,24 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/developer/index-profiles/{profile_id}/publish")
     def publish_index_profile(profile_id: str):
-        try: return store.publish_index_profile(profile_id, index_validator)
+        try:
+            from .provisioning import ManagedCollectionProvisioner
+            requirement = store.index_profile_publication_requirement(profile_id)
+            if requirement["collection_policy"] == "managed":
+                service = VectorSyncService.from_environment(store)
+                if not service.milvus:
+                    raise ValueError("未配置 DATAFORGE_MILVUS_URI，不能 Provision 受管 Collection")
+                result = ManagedCollectionProvisioner(store, service.milvus).reconcile_one(requirement["managed_collection_id"])
+                if result["status"] != "ready":
+                    raise ValueError(result.get("error") or "受管 Collection Provision 失败")
+            else:
+                index_validator(requirement["collection_name"], requirement["fields"], requirement["dimension"])
+            return store.publish_index_profile(profile_id, index_validator)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/index-profiles/{profile_id}/archive")
+    def archive_index_profile(profile_id: str):
+        try: return store.archive_index_profile(profile_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/knowledge-libraries/{library_id}/vector-sync-jobs", status_code=202)

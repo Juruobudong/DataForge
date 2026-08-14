@@ -9,25 +9,34 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
+from openai import APITimeoutError
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..config import Settings
+from .catalog import catalog_by_code
+from .llm_serving import DEFAULT_LLM_SERVING_ID, get_llm_serving_registry
 from .models import KnowledgeJob, Source, SourceVersion
 from .parser_runtime import content_list_pages, parse_with_mineru
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
 
 
+logger = logging.getLogger("dataforge.v7.runner")
+
+
 class RunRequest(BaseModel):
-    job_id: str
+    job_id: str | None = None
+    flow_run_id: str | None = None
 
 
 def _objects(settings: Settings):
@@ -271,51 +280,64 @@ def _source_key(source_id: str, output_type: str, anchor: str) -> str:
     return hashlib.sha256(f"{source_id}|{output_type}|{anchor}".encode("utf-8")).hexdigest()
 
 
-GLOBAL_LLM_MODEL = "qwen3_32b"
+def _initialize_llm_servings():
+    """Validate the DataForge-owned Serving registry without reading secrets."""
+    return get_llm_serving_registry()
 
 
-def _global_llm_config_path() -> Path:
-    configured = os.getenv("DATAFORGE_LLM_CONFIG_PATH")
-    if configured:
-        return Path(configured).resolve()
-    root = Path(os.getenv("DATAFORGE_ROOT") or Path(__file__).resolve().parents[3])
-    return root / "llm_local.yaml"
-
-
-def _initialize_global_llm():
-    """Load the Runner's authoritative global_llm configuration once."""
+def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> dict[str, Any]:
+    """Call one configured Model Serving and parse its structured response."""
+    registry = _initialize_llm_servings()
+    serving, client = registry.client(llm_serving)
+    extra_body: dict[str, Any] = {"app_id": "dataforge"}
+    if serving.disable_thinking:
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    started = time.monotonic()
     try:
-        from global_llm import chat, get_app_config, init_app
-    except ImportError as exc:
-        raise RuntimeError("Runner 未安装权威 global_llm 包") from exc
+        response = client.chat.completions.create(
+            model=serving.model_name,
+            messages=[
+                {"role": "system", "content": "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。"},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=serving.max_tokens,
+            extra_body=extra_body,
+        )
+    except APITimeoutError as exc:
+        elapsed = time.monotonic() - started
+        logger.error(
+            "LLM Serving request timed out. serving_id=%s prompt_chars=%s elapsed_seconds=%.3f error_type=%s",
+            serving.id, len(prompt), elapsed, type(exc).__name__,
+        )
+        raise TimeoutError(
+            f"上游 LLM Serving {serving.id} 请求超时（{serving.timeout_seconds:g} 秒，未自动重试）"
+        ) from exc
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        logger.error(
+            "LLM Serving request failed. serving_id=%s prompt_chars=%s elapsed_seconds=%.3f error_type=%s",
+            serving.id, len(prompt), elapsed, type(exc).__name__,
+        )
+        raise RuntimeError(f"上游 LLM Serving {serving.id} 调用失败（{type(exc).__name__}）") from exc
     try:
-        get_app_config()
-    except RuntimeError:
-        config_path = _global_llm_config_path()
-        if not config_path.is_file():
-            raise RuntimeError(f"Runner 缺少 global_llm 配置文件：{config_path}")
-        init_app(config_path)
-    return chat
-
-
-def _llm_json(prompt: str) -> dict[str, Any]:
-    """Call the shared global_llm package with DataForge's logical Qwen model."""
-    chat = _initialize_global_llm()
-    content = chat(
-        [
-            {"role": "system", "content": "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。"},
-            {"role": "user", "content": prompt},
-        ],
-        GLOBAL_LLM_MODEL,
-        os.getenv("DATAFORGE_LLM_ORG_CODE") or None,
-        response_format={"type": "json_object"},
+        content = response.choices[0].message.content if response.choices else ""
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("LLM 没有返回 JSON 内容")
+        parsed = json.loads(content)
+    except (AttributeError, IndexError, TypeError, ValueError) as exc:
+        logger.error(
+            "LLM Serving response invalid. serving_id=%s prompt_chars=%s elapsed_seconds=%.3f error_type=%s",
+            serving.id, len(prompt), time.monotonic() - started, type(exc).__name__,
+        )
+        if isinstance(exc, json.JSONDecodeError):
+            raise ValueError(f"LLM 返回的内容不是 JSON：{exc.msg}") from exc
+        raise
+    logger.info(
+        "LLM Serving request completed. serving_id=%s prompt_chars=%s elapsed_seconds=%.3f",
+        serving.id, len(prompt), time.monotonic() - started,
     )
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("LLM 没有返回 JSON 内容")
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"LLM 返回的内容不是 JSON：{exc.msg}") from exc
+    return parsed
 
 
 def _json_errors(data: dict[str, Any], schema: dict[str, Any]) -> list[str]:
@@ -357,14 +379,14 @@ def _item_errors(items: Any, schema: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _structured_candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], contract: dict[str, Any]) -> list[dict]:
+def _structured_candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], contract: dict[str, Any], *, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
     prompt = _chunk_prompt(output_type, contract, str(chunk["content"]))
-    response = _llm_json(prompt)
+    response = _llm_json(prompt, llm_serving=llm_serving)
     items = response.get("items") if isinstance(response, dict) else None
     errors = _item_errors(items, contract["schema"])
     if errors:
         repair = prompt + "\n\n上次输出校验失败，请只返回修复后的 JSON。错误：" + "；".join(errors)
-        response = _llm_json(repair)
+        response = _llm_json(repair, llm_serving=llm_serving)
         items = response.get("items") if isinstance(response, dict) else None
         errors = _item_errors(items, contract["schema"])
     if errors:
@@ -398,13 +420,13 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
     return result
 
 
-def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None) -> list[dict]:
+def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
     anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
     if output_type == "text":
         return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": source.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "source_chunk_id": chunk["source_chunk_id"], "source_anchor": f"{source.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
     if not contract:
         raise ValueError(f"不支持的知识类型或缺少已发布契约：{output_type}")
-    return _structured_candidates(source, version, output_type, chunk, contract)
+    return _structured_candidates(source, version, output_type, chunk, contract, llm_serving=llm_serving)
 
 
 def _incoming(definition: dict[str, Any]) -> dict[str, list[str]]:
@@ -440,7 +462,7 @@ def select_runtime_mode(record_count: int, environ: dict[str, str] | None = None
 
 
 def _documents_for_versions(objects, versions: list[SourceVersion], sources: dict[str, Source], flow_run_id: str,
-                            created_parser_keys: list[str]) -> list[dict[str, Any]]:
+                            created_parser_keys: list[str], *, force_ocr: bool = False) -> list[dict[str, Any]]:
     documents: list[dict[str, Any]] = []
     for version in versions:
         source = sources[version.source_id]
@@ -449,7 +471,7 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
         parser_artifacts: list[dict[str, Any]] = []
         page_segments: list[dict[str, Any]] = []
         if suffix == ".pdf":
-            parsed = parse_with_mineru(filename=source.original_filename, payload=payload)
+            parsed = parse_with_mineru(filename=source.original_filename, payload=payload, parse_method="ocr" if force_ocr else "auto")
             text = parsed.markdown
             page_segments = content_list_pages(parsed.content_list)
             encoded_middle = json.dumps(parsed.middle_json, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -527,6 +549,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         contract = type_contracts.get(output_key) or type_contracts.get(kind)
         if not contract and kind != "text":
             raise ValueError(f"知识类型 {kind} 缺少已发布契约")
+        llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
+        _initialize_llm_servings().require(llm_serving)
         outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
         result: list[dict[str, Any]] = []
         for chunk in values:
@@ -535,7 +559,10 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             outcome["targeted"].append(chunk)
             try:
-                candidates = _candidates(sources[chunk["source_id"]], versions[chunk["source_version_id"]], output_key, chunk, contract=contract)
+                candidates = _candidates(
+                    sources[chunk["source_id"]], versions[chunk["source_version_id"]], output_key, chunk,
+                    contract=contract, llm_serving=llm_serving,
+                )
                 outcome["successful"].append(chunk)
                 result.extend(candidates)
                 if store and job_id:
@@ -713,9 +740,87 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         raise
 
 
+def _reachable_nodes(definition: dict[str, Any], start_node_id: str, mode: str) -> set[str]:
+    if mode == "node_only": return {start_node_id}
+    outgoing: dict[str, list[str]] = {str(node["id"]): [] for node in definition.get("nodes", [])}
+    for edge in definition.get("edges", []): outgoing.setdefault(str(edge["source"]), []).append(str(edge["target"]))
+    result, queue = set(), [start_node_id]
+    while queue:
+        current = queue.pop(0)
+        if current in result: continue
+        result.add(current); queue.extend(outgoing.get(current, []))
+    return result
+
+
+def _candidate_chunks(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for value in values:
+        chunk_id = str(value.get("source_chunk_id") or "")
+        for version_id in value.get("source_version_ids") or []:
+            if chunk_id:
+                result[(str(version_id), chunk_id)] = {"source_version_id": str(version_id), "source_chunk_id": chunk_id,
+                                                        "chunk_index": int((value.get("anchor_json") or {}).get("chunk_index", 0))}
+    return list(result.values())
+
+
+def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, Any]:
+    context = store.derived_run_context(flow_run_id); definition = context["definition"]; incoming = _incoming(definition)
+    selected = _reachable_nodes(definition, context["start_node_id"], context["mode"])
+    by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
+    versions_list = context["versions"]; versions = {item.id: item for item in versions_list}; sources = context["sources"]
+    type_contracts = store.type_contracts_for_job(context["job_id"]); catalog = catalog_by_code(); parent_outputs = context["parent_outputs"]
+    outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
+    generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
+    try:
+        start_node = by_id[context["start_node_id"]]
+        override = dict((context["parameter_overrides"] or {}).get(context["start_node_id"]) or {})
+        root_documents = _documents_for_versions(objects, versions_list, sources, flow_run_id, created_parser_keys,
+                                                 force_ocr=bool(override.get("force_ocr"))) if start_node.get("ref") == "document-parser" else []
+        for node in definition.get("nodes", []):
+            node_id = str(node["id"])
+            if node_id not in selected: continue
+            if store.is_flow_run_cancelled(flow_run_id):
+                store.finish_flow_run(flow_run_id, "已协作停止", status="cancelled"); return {"id": flow_run_id, "status": "cancelled"}
+            source_nodes = incoming.get(node_id, []); input_values: list[dict[str, Any]] = []; input_ids: list[str] = []
+            for source_id in source_nodes:
+                source = {"values": outputs.get(source_id, []), "ids": artifact_ids.get(source_id, [])} if source_id in selected else parent_outputs.get(source_id, {"values": [], "ids": []})
+                input_values.extend(source["values"]); input_ids.extend(source["ids"])
+            failed_upstream = [source_id for source_id in source_nodes if source_id in selected and source_id in failed]
+            if failed_upstream:
+                message = "上游节点失败，已跳过：" + "、".join(failed_upstream); failed.add(node_id); outputs[node_id] = []
+                artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=message, status="skipped"); continue
+            if node.get("kind") == "knowledge_sink":
+                output_key = str(node.get("output_key") or node.get("knowledge_type")); library_id = context["sink_libraries"].get(output_key)
+                if not library_id:
+                    failed.add(node_id); artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error="Sink 缺少目标知识库"); continue
+                successful = generation.get(output_key, {}).get("successful") or _candidate_chunks(input_values)
+                preview = store.stage_sink_preview(flow_run_id, output_key, library_id, input_values, successful); previews.append(preview)
+                outputs[node_id] = [{"_artifact_type": f"knowledge_preview:{output_key}", **preview}]
+                artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, outputs[node_id], status="awaiting_commit"); continue
+            ref = str(node.get("ref")); params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}; params.pop("force_ocr", None)
+            try:
+                values = _run_operator(ref, params, input_values, root_documents=root_documents, sources=sources, versions=versions,
+                                       type_contracts=type_contracts, generation=generation)
+                outputs[node_id] = values; item = catalog.get(ref) or {}
+                recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
+                artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
+                                                               operator_version=int(item.get("version", 1)), resolved_parameters=params,
+                                                               metrics={"input_records": len(input_values), "output_records": len(values)})
+            except Exception as exc:
+                failed.add(node_id); outputs[node_id] = []
+                artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=str(exc), operator_code=ref,
+                                                               operator_version=int((catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params)
+        if previews:
+            store.finish_flow_run(flow_run_id, status="awaiting_commit"); return {"id": flow_run_id, "status": "awaiting_commit", "previews": previews}
+        status = "failed" if context["start_node_id"] in failed else "completed"
+        store.finish_flow_run(flow_run_id, "派生节点执行失败" if status == "failed" else None, status=status); return {"id": flow_run_id, "status": status}
+    except Exception as exc:
+        store.finish_flow_run(flow_run_id, str(exc), status="failed"); raise
+
+
 def create_app(settings: Settings | None = None, *, check_schema: bool = True) -> FastAPI:
     resolved = settings or Settings.load(); resolved.ensure_directories()
-    _initialize_global_llm()
+    _initialize_llm_servings()
     store = V7Store(resolved.platform_database_url)
     if check_schema: store.assert_schema_current()
     objects = _objects(resolved); app = FastAPI(title="DataForge V7 Runner", version="7.0.0")
@@ -727,7 +832,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/internal/jobs", status_code=202)
     def run(payload: RunRequest, authorization: str | None = Header(None)):
         verify(authorization)
-        try: return execute_job(store, objects, payload.job_id)
+        try:
+            if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
+            if payload.job_id: return execute_job(store, objects, payload.job_id)
+            raise ValueError("job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/internal/runtime")

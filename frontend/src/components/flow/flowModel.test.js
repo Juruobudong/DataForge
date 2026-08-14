@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, makeCanvasNode, removeElements, resolveNodeMetadata, serializeDefinition, validateFlow } from './flowModel.js'
+import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, hasEditableParameters, makeCanvasNode, removeElements, resolveNodeMetadata, serializeDefinition, validateFlow } from './flowModel.js'
 import { ref } from 'vue'
 import { useFlowHistory } from './composables/useFlowHistory.js'
 
@@ -26,6 +26,14 @@ test('multi-port catalog metadata is preserved and subflow ports resolve from en
   assert.equal(meta.inputs.input.artifact_type, 'source_file')
   assert.equal(meta.outputs.qa.artifact_type, 'candidate:qa')
   assert.deepEqual(meta.inputExample.input, [{ filename: 'guide.md' }])
+})
+
+test('Document Parser parameters are read-only while other operators remain editable', () => {
+  const parserCatalog = [{ code: 'document-parser', name: 'Document Parser', category: '文档', input_ports: { input: { artifact_type: 'source_file' } }, output_ports: { output: { artifact_type: 'document_ir' } } }]
+  const parser = makeCanvasNode({ id: 'parser', kind: 'operator', ref: 'document-parser', params: {} }, { x: 0, y: 0 }, parserCatalog)
+  assert.equal(hasEditableParameters(parser), false)
+  assert.equal(hasEditableParameters(node('source', 'source')), true)
+  assert.equal(hasEditableParameters(sink), false)
 })
 
 test('connection validation covers legal, illegal, duplicate and cardinality cases', () => {
@@ -62,6 +70,17 @@ test('DSL round trip preserves explicit ports and positions and loads legacy edg
   const serialized = serializeDefinition(graph.nodes, graph.edges)
   assert.equal(serialized.edges[0].target_port, 'input')
   assert.deepEqual(serialized.ui.positions.a, { x: 12, y: 34 })
+})
+
+test('runtime DAG reuses canvas nodes and overlays node and artifact edge state', () => {
+  const graph = deserializeRuntimeDag({
+    nodes: [{ id: 'a', kind: 'operator', ref: 'source', status: 'reused' }, { id: 'b', kind: 'operator', ref: 'split', status: 'failed' }],
+    edges: [{ source: 'a', target: 'b', artifact_type: 'chunk_set', status: 'completed' }],
+  }, catalog)
+  assert.equal(graph.nodes[0].data.meta.status, 'reused')
+  assert.equal(graph.nodes[1].data.meta.status, 'failed')
+  assert.equal(graph.edges[0].data.label, 'chunk_set')
+  assert.equal(graph.edges[0].data.status, 'completed')
 })
 
 test('cycle detection, validation locations, and cascading removal work', () => {

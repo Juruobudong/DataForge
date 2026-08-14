@@ -132,10 +132,10 @@
 
 ## Assumptions
 
-- `llm_local.yaml` 已正确配置时，问答与图谱可执行；运行时异常以单项任务失败反馈。
+- `llm_servings.yaml` 已登记默认 Serving `qwen3_32b` 时，问答与图谱可执行；Flow 参数保存 Serving ID，运行时异常以单项任务或失败分块反馈。
 - 用户已授权永久删除 DataFlow 派生产物，并明确要求保留源文档。
 - 多轮对话库只保留契约目录，未来是否提供模板或任务入口不在本期范围。
 
 ## Dependencies
 
-- FastAPI、Vue/Vite、SQLite、现有全局 LLM 网关；不再依赖 OpenDCAI DataFlow。
+- FastAPI、Vue/Vite、SQLite、DataForge Model Serving Registry 与 OpenAI-compatible 上游；不再依赖 OpenDCAI DataFlow 或共享 `global_llm` 包。

@@ -1,11 +1,13 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
+import { hasEditableParameters } from '../flowModel.js'
 const props = defineProps({ node: Object, issue: Object, sampleResult: Object })
 const emit = defineEmits(['apply-parameters'])
 const tab = ref('parameters'), text = ref('{}')
 const parseError = ref('')
 watch(() => props.node, node => { text.value = JSON.stringify(node?.data.definition.params || {}, null, 2); parseError.value = '' }, { immediate: true })
-const editable = computed(() => props.node?.data.meta.kind === 'operator')
+const documentParser = computed(() => props.node?.data.meta.code === 'document-parser')
+const editable = computed(() => hasEditableParameters(props.node))
 const nodeRun = computed(() => props.node ? props.sampleResult?.node_runs?.[props.node.id] || null : null)
 const format = value => JSON.stringify(value, null, 2)
 function apply() { try { const value = JSON.parse(text.value || '{}'); if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(); parseError.value = ''; emit('apply-parameters', value) } catch { parseError.value = '参数必须是有效的 JSON 对象' } }
@@ -16,7 +18,10 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
     <template v-if="node">
       <div class="node-summary"><span class="summary-icon">{{ node.data.meta.kind === 'subflow' ? '◈' : node.data.meta.kind === 'knowledge_sink' ? '✓' : '◇' }}</span><div><b>{{ node.data.meta.name }}</b><small>{{ node.data.meta.code }}</small></div></div>
       <nav><button :class="{ active: tab==='parameters' }" @click="tab='parameters'">参数</button><button :class="{ active: tab==='ports' }" @click="tab='ports'">输入输出</button><button :class="{ active: tab==='schema' }" @click="tab='schema'">Schema</button><button :class="{ active: tab==='result' }" @click="tab='result'">运行结果</button></nav>
-      <section v-if="tab==='parameters'" class="inspector-body"><label>节点参数 JSON<textarea v-model="text" rows="16" :disabled="!editable" spellcheck="false" /></label><p v-if="!editable" class="muted">该节点参数由已发布资产定义，只读。</p><p v-if="parseError" class="inline-error">{{ parseError }}</p><button v-if="editable" class="primary apply" @click="apply">应用参数</button></section>
+      <section v-if="tab==='parameters'" class="inspector-body">
+        <div v-if="documentParser" class="fixed-parser"><h4>PDF 自动解析</h4><dl><div><dt>Backend</dt><dd>pipeline</dd></div><div><dt>Parse method</dt><dd>auto</dd></div></dl><p class="muted">扫描件判断与 OCR 由 MinerU 内部处理，当前不开放节点参数。</p></div>
+        <template v-else><label>节点参数 JSON<textarea v-model="text" rows="16" :disabled="!editable" spellcheck="false" /></label><p v-if="!editable" class="muted">该节点参数由已发布资产定义，只读。</p><p v-if="parseError" class="inline-error">{{ parseError }}</p><button v-if="editable" class="primary apply" @click="apply">应用参数</button></template>
+      </section>
       <section v-else-if="tab==='ports'" class="inspector-body io-body">
         <h4>INPUT</h4>
         <div v-for="(spec, name) in node.data.meta.inputs" :key="name" class="port-block"><article><b>{{ name }}</b><small>{{ spec.artifact_type }} · {{ spec.cardinality }}</small></article><h5>典型示例</h5><pre>{{ format(node.data.meta.inputExample?.[name] || []) }}</pre><h5>本次样例预览</h5><template v-if="nodeRun?.inputs?.[name]"><pre>{{ format(nodeRun.inputs[name].items) }}</pre><small class="preview-meta">共 {{ nodeRun.inputs[name].total }} 条<span v-if="nodeRun.inputs[name].truncated"> · 已截断</span></small></template><p v-else class="muted">尚未运行样例，暂无节点输入预览。</p></div>
@@ -37,4 +42,5 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
 </style>
 <style scoped>
 .inspector-body h5{margin:9px 0 5px;color:#69778b;font-size:8px}.inspector-body pre{max-height:180px;overflow:auto;padding:8px;border:1px solid #edf0f4;border-radius:7px;background:#f8fafc;white-space:pre-wrap;word-break:break-word}.port-block+.port-block{margin-top:12px}.preview-meta{display:block;margin-top:4px;color:#7d8ba0;font-size:7px}.io-body details,.result-body details{margin-top:12px}.io-body summary,.result-body summary{cursor:pointer;color:#2f6fed;font-size:8px;font-weight:800}.io-body details pre,.result-body details pre{margin-top:6px}.run-status{display:inline-block;margin:0;padding:4px 7px;border-radius:999px;background:#eaf7f1;color:#1d8c65;font-size:8px;font-weight:850}.run-status.failed,.run-status.skipped{background:#fff0f0;color:#c94a4a}
+.fixed-parser{padding:12px;border:1px solid #d9e5ff;border-radius:9px;background:#f6f9ff}.fixed-parser h4{margin:0 0 10px;color:#2f6fed}.fixed-parser dl{margin:0}.fixed-parser dl div{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-top:1px solid #e5edfb}.fixed-parser dt{color:#69778b;font-size:8px}.fixed-parser dd{margin:0;color:#24364f;font:9px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:800}
 </style>

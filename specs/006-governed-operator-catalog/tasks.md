@@ -27,24 +27,27 @@
 - [X] T012 [DataForge] 在上传预检中逐项显示拖入文件及其预检状态。— Depends on: T011 — Implementation: DONE — Validation: PASSED（`npm run build` 通过）。— Validate: `npm run build`。
 - [X] T013 [DataForge] [FR-010] 配置 DataForge API/Worker 的专用 Milvus 网络、Milvus 临时接入/防火墙恢复脚本、systemd 定时单元和部署文档。— Depends on: T012 — Implementation: DONE — Validation: PASSED（`test_milvus_egress_deployment_contract` 静态契约）；Docker Compose/Bash 主机执行另列 T014。— Validate: Compose 静态渲染、Bash 语法和部署脚本静态测试。
 - [ ] T014 [Deployment] [FR-010] 在 Docker 主机验证 Milvus/Embedding 最小出站、向量同步、Partition 操作和 Milvus 重建恢复。— Depends on: T013 — Implementation: PENDING — Validation: PENDING — Validate: TC-009、TC-012 手动验收。
-- [X] T015 [DataForge] [FR-011] 增加 Graph triple/semantic 模式、两个模式修订、专属 Profile 与旧 Graph 冻结兼容。— Depends on: T013 — Implementation: DONE — Validation: PASSED — Validate: TC-013。
+- [X] T015 [DataForge] [FR-011] 增加 Graph triple/semantic 模式、两个模式修订与专属 Profile，同时保留旧 Graph 冻结兼容。— Depends on: T013 — Implementation: DONE — Validation: PASSED — Validate: TC-013。
 - [X] T016 [DataForge] [FR-012] 增加五个默认 Storage Contract、Managed Collection、规格哈希、归属 token 和幂等 Provisioner，并支持扩展 Profile 同规格复用/异规格新建。— Depends on: T015 — Implementation: DONE — Validation: PASSED（Fake/静态）— Validate: TC-014。
 - [X] T017 [DataForge] [FR-011] 打通模式化模板输出、双图谱生成/重试/Sink、物化向量字段与统一图谱查询。— Depends on: T015,T016 — Implementation: DONE — Validation: PASSED — Validate: TC-013。
 - [X] T018 [DataForge] [FR-013] 升级 Flow DSL v3 和模板 Vue Flow 编辑器，支持强类型分支/合流、撤销重做、校验与发布。— Depends on: T017 — Implementation: DONE — Validation: PASSED — Validate: TC-015、前端构建。
 - [X] T019 [DataForge] 更新 API、Compose Provisioner、调试台、知识类型页、Wiki 与验收文档。— Depends on: T015-T018 — Implementation: DONE — Validation: PASSED — Validate: 静态契约与构建。
-- [ ] T020 [Deployment] [FR-011/012] 在真实 Milvus 供应五个默认受管 Collection，重点验证两个新 Graph Collection 的 insert/load/search/release，并确认旧 `dataforge_graph_knowledge` 无变化。— Depends on: T016,T019 — Implementation: PENDING — Validation: PENDING — Validate: TC-016。
+- [ ] T020 [Deployment] [FR-011/012] 在真实 Milvus 供应五个默认受管 Collection，验证两个 Graph Collection 的 insert/load/search/release、调试台不访问旧 Collection，并确认外部遗留 `dataforge_graph_knowledge` 无变化。— Depends on: T016,T019,T026 — Implementation: PENDING — Validation: PENDING — Validate: TC-016。
 - [X] T021 [DataForge] [FR-013] 将知识流程模板升级为 PC 固定三栏专业 DAG 编辑器，提供自定义节点/边、Typed Handle、算子拖入、Inspector、MiniMap、自动布局、事务历史和结构化本地校验定位。— Depends on: T018 — Implementation: DONE — Validation: PASSED（Node 逻辑测试 8 passed、Vite build、1440×900/1920×1080 浏览器验收，Console 无错误）。— Validate: TC-017。
 - [X] T022 [DataForge] [FR-014] 实现 MinerU 3.4.4 Pipeline GPU 镜像、内部/回环网络、PDF Adapter、页级 SourceChunk、Middle JSON Artifact、生命周期、失败保真与分层超时。— Depends on: T004,T009 — Implementation: DONE — Validation: PASSED（Conda `sun` 相关 V7 回归 60 passed；Compose/Dockerfile 静态契约通过）。— Validate: TC-018。
-- [ ] T023 [Deployment] [FR-014] 在 NVIDIA Docker 主机完成 CUDA/模型、双路径 health、局域网拒绝、文本/扫描 PDF及 MinerU 停止恢复验收。— Depends on: T022 — Implementation: PENDING — Validation: PENDING — Validate: TC-019。
+- [ ] T023 [Deployment] [FR-014] 在 NVIDIA Docker 主机完成 CUDA/模型、双路径 health、局域网拒绝、文本/扫描/混合 PDF 及 MinerU 停止恢复验收。— Depends on: T022 — Implementation: PENDING — Validation: PENDING — Validate: TC-019。
 - [X] T024 [DataForge] [FR-015] 增加算子中文说明、版本化输入输出示例、兼容迁移、逐节点受控内存预览与 Inspector 展示。— Depends on: T021 — Implementation: DONE — Validation: PASSED（V7 回归 63 passed、前端逻辑测试 8 passed、Vite build）。— Validate: TC-020。
+- [ ] T025 [DataForge] [FR-016] 固化 Document Parser 路由边界、MinerU `pipeline + auto`、空参数发布契约与 Inspector 只读展示，并明确排除扫描件检测和 Image Parser。— Depends on: T022,T024 — Implementation: DONE — Validation: BLOCKED（Owner: 并行 `007-flow-development-workbench` 迁移；`20260814_02_flow_workbench.py` 在空 SQLite 库重复创建 `flow_node_artifact_bindings`，使 Catalog/PDF Runner 回归在进入 Parser 逻辑前失败。Parser 纯契约 12 passed，前端最新工作区 12 passed 且 Vite build 通过。Next: 修复该迁移的幂等创表后重跑 TC-021）。— Validate: TC-021。
+- [X] T026 [DataForge] [FR-011] 保留旧 `graph` Index Profile、旧 Graph 类型修订和冻结选择分支；容量报告按 code 跳过 legacy Collection并返回未监控原因，其他 external Profile 仍正常探测。— Depends on: T016 — Implementation: DONE — Validation: PASSED（定向回归 5 passed；当前-schema 临时空库集成检查通过；前端逻辑测试 12 passed且 Vite build 通过；扩展 pytest 被并行未提交迁移的重复建表阻断，见 summary）。— Validate: TC-013 及相关 V7 回归。
 
 ## 状态摘要
 
 | 指标 | 数量 |
 |------|------|
-| 实现完成或 N/A | 21 |
-| 验证通过 | 21 |
-| 完全完成 | 21 |
+| 实现完成或 N/A | 23 |
+| 验证通过 | 22 |
+| 完全完成 | 22 |
+| 验证阻断 | 1（T025，并行 Workbench 迁移） |
 | 外部部署待验收 | 3（T014、T020、T023） |
 
 ## 关键依赖

@@ -36,7 +36,7 @@
 
 - 在 `domain/flow` 定义 Artifact Type、节点、边、校验器、子图展开器与确定性拓扑编译器。
 - 在 `integrations/dataflow/` 定义 Catalog、Adapter 与 Runtime Profile；P0 逻辑节点映射白名单 DataFlow 实现，MinerU/Batch 仅作为隐藏能力。
-- Document Parser 根据类型路由 PDF、DOC/DOCX、MD/TXT、CSV 至 `DocumentIR`；OCR 依赖缺失时显式失败。
+- Document Parser 根据类型路由 PDF、DOC/DOCX、MD/TXT、CSV 至 `DocumentIR`；PDF 内部委派给固定 `pipeline + auto` 的 MinerU Parser，解析依赖缺失时显式失败。
 - 通过 `KnowledgeSink` 完成 Schema、Source Binding、Quality、Canonical、Diff 和独立 Sink 事务；Candidate 内部二次切分不改变 `SourceChunk`。
 - Runner Docker target 通过独立 extra 安装 `open-dataflow==1.0.10` 与 `jsonschema`；本地 Adapter 可在未安装重型依赖时使用安全 Fake，真实 Adapter 仅在 Runner 启用。
 
@@ -60,7 +60,7 @@
 |------|------|
 | 上游 Operator API 漂移 | Catalog 仅持有 DataForge Adapter Version；Runner pin 1.0.10。 |
 | 破坏性 V7 重建 | 精确枚举、确认参数、服务维护窗口、测试无 Collection/旧资源访问。 |
-| OCR/LLM 环境缺失 | 本地 Fake 验证接口；真实运行失败透明并列入部署验收。 |
+| MinerU/LLM 环境缺失 | 本地 Fake 验证接口；真实运行失败透明并列入部署验收。 |
 | 正式知识污染 | Sink 之前拒绝未发布依赖、无效 Schema、来源/质量失败。 |
 | 未受管 Milvus 容器重建 | systemd 每 5 分钟检测并恢复专用网络、固定地址、DNS 别名和防火墙规则；实际 Milvus Compose 后续纳管前维持此运维约束。 |
 
@@ -81,7 +81,7 @@ cd frontend; npm run build
 
 ## 2026-08-13 增量设计
 
-- Graph 保持顶层 `graph`，新增 `triple / semantic` 模式修订和两个专属受管 Collection；旧 Graph Collection 冻结兼容。
+- Graph 保持顶层 `graph`，新增 `triple / semantic` 模式修订和两个专属受管 Collection；旧 Graph 兼容随后由 2026-08-14 增量设计移除。
 - Index Profile 通过版本化 Storage Contract 与 `storage_spec_hash` 决定 Collection 复用，独立 Provisioner 负责幂等创建与归属校验。
 - Flow DSL 升级到 v3 显式端口与基数，前端开放受控拖拽、分支和合流，继续禁止任意代码节点。
 
@@ -89,7 +89,7 @@ cd frontend; npm run build
 
 - 新增独立 MinerU 3.4.4 GPU 镜像，只安装和下载 Pipeline Runtime/模型；Compose 固定 GPU 0、并发 1、窗口 16，并以回环端口向宿主机内部服务提供访问。
 - Runner 新增同步 MinerU Adapter，所有 PDF 固定提交 `pipeline + auto + ch`；Markdown 写入 DocumentIR，Content List 生成页级 SourceChunk，Middle JSON 使用确定性 MinIO 对象键及 `source_version_id` Artifact 登记。
-- 文件删除、V7 重建和对象写入补偿均只使用数据库登记键；OCR 失败由 Runner 一次性持久化，Worker 不覆盖原始错误。MinerU 与 Runner 默认超时分别为 1800/1860 秒。
+- 文件删除、V7 重建和对象写入补偿均只使用数据库登记键；MinerU PDF 解析失败由 Runner 一次性持久化，Worker 不覆盖原始错误。MinerU 与 Runner 默认超时分别为 1800/1860 秒。
 - 本地以 Adapter/Runner/生命周期/Compose 静态测试验收；CUDA、模型、真实文本/扫描 PDF、回环访问和局域网拒绝在部署服务器验收。
 
 ## 2026-08-14 算子说明与节点预览增量设计
@@ -97,3 +97,15 @@ cd frontend; npm run build
 - Operator Definition 保存简短中文功能说明，Operator Version 冻结端口化输入/输出 JSON 示例；Alembic 对已有 MySQL JSON 列采用可空新增、回填、再收紧非空的兼容升级。
 - 样例接口复用编译器的展开 DAG，但使用独立的确定性内存预览处理器；禁止调用生产 `_run_operator`、LLM、MinerU、对象存储和 Store 写入。
 - 响应按画布节点聚合端口数据，并保留展开节点与子图内部轨迹；每端口最多 3 条、字符串最多 500 字符。Inspector 仅消费当前节点数据。
+
+## 2026-08-14 旧 Graph Profile 兼容与容量跳过设计
+
+- 空库种子创建五个受管 Profile，并额外保留 external legacy `graph → dataforge_graph_knowledge` Profile；Graph revision 1 绑定 legacy Profile，revision 2 包含 Triple/Semantic 模式并绑定两个专属 Profile。
+- 新建 Graph 库按 `graph-{graph_mode}` 解析 Profile；已有库若冻结到 legacy `graph` 则继续使用原 Profile。容量报告按稳定 code 跳过 legacy Profile并返回明确原因，其他 external Profile 不受影响。
+- 不新增数据清理迁移；部署测试环境按标准空卷重建。外部遗留 Collection 不由 Provisioner 供应、不迁移也不删除；仅旧库真正同步时按 external 契约要求其存在。
+
+## 2026-08-14 Document Parser 边界增量设计
+
+- Canvas 继续只暴露稳定 `Document Parser`，MinerU Adapter 保持内部；不增加扫描件检测、公开 PDF Parser 或 Image Parser。
+- PDF 固定使用 MinerU 3.4.4 `backend=pipeline`、`parse_method=auto`；Flow 发布要求 `document-parser.params` 为空对象，Inspector 只读展示固定契约。
+- 原生 DOC/DOCX、MD/TXT、CSV/XLSX 路由、上传白名单、DocumentIR、Artifact 和快照保持不变；本次无数据库迁移，图片留待独立视觉模型 Parser。

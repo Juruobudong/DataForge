@@ -29,6 +29,8 @@ class ManagedCollectionProvisioner:
             item = session.get(ManagedCollection, collection_id, with_for_update=True)
             if not item:
                 raise ValueError("受管 Collection 不存在")
+            if item.status in {"deleting", "deleted"}:
+                raise ValueError("正在删除或已删除的 Collection 不能 Provision")
             revision = session.get(StorageContractRevision, item.storage_contract_revision_id)
             if not revision or revision.status != "published":
                 item.status, item.error_summary = "failed", "存储结构修订不存在或未发布"
@@ -66,7 +68,9 @@ class ManagedCollectionProvisioner:
 
     def reconcile(self) -> list[dict[str, Any]]:
         with self.store.sessions() as session:
-            ids = list(session.scalars(select(ManagedCollection.id).order_by(ManagedCollection.collection_name)))
+            ids = list(session.scalars(select(ManagedCollection.id).where(
+                ManagedCollection.status.not_in(("deleting", "deleted")),
+            ).order_by(ManagedCollection.collection_name)))
         return [self.reconcile_one(item_id) for item_id in ids]
 
     @staticmethod
@@ -78,6 +82,55 @@ class ManagedCollectionProvisioner:
             "observed_spec_hash": item.observed_spec_hash,
             "status": item.status, "error": item.error_summary,
         }
+
+
+class ManagedCollectionDeletionService:
+    """Preflight and execute explicit deletion of DataForge-owned Collections."""
+    def __init__(self, store: V7Store, milvus: V7Milvus | None):
+        self.store, self.milvus = store, milvus
+
+    @classmethod
+    def from_environment(cls, store: V7Store) -> "ManagedCollectionDeletionService":
+        uri = os.getenv("DATAFORGE_MILVUS_URI")
+        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
+
+    @staticmethod
+    def _description(item: ManagedCollection) -> str:
+        return ManagedCollectionProvisioner._description(item)
+
+    def preflight(self, collection_id: str) -> dict[str, Any]:
+        with self.store.sessions() as session:
+            item = session.get(ManagedCollection, collection_id)
+            if not item:
+                raise ValueError("受管 Collection 不存在")
+            expected = self._description(item)
+            collection_name = item.collection_name
+        if not self.milvus:
+            observed = {"error": "未配置 DATAFORGE_MILVUS_URI，不能验证 Collection 所有权"}
+        else:
+            try:
+                observed = self.milvus.inspect_managed_collection(collection_name, expected)
+            except Exception as exc:
+                observed = {"error": str(exc)}
+        return self.store.managed_collection_delete_check(collection_id, observed)
+
+    def request_delete(self, collection_id: str) -> dict[str, Any]:
+        return self.store.create_managed_collection_deletion(collection_id, self.preflight(collection_id))
+
+    def run(self, job_id: str) -> dict[str, Any]:
+        try:
+            context = self.store.managed_collection_deletion_context(job_id)
+            item = context["collection"]
+            if not self.milvus:
+                return self.store.finish_managed_collection_deletion(job_id, "未配置 DATAFORGE_MILVUS_URI，不能删除受管 Collection")
+            preflight = self.preflight(item.id)
+            if preflight["blockers"]:
+                messages = "；".join(blocker["message"] for blocker in preflight["blockers"])
+                return self.store.finish_managed_collection_deletion(job_id, f"删除执行前预检失败：{messages}")
+            self.milvus.drop_managed_collection(item.collection_name, self._description(item))
+            return self.store.finish_managed_collection_deletion(job_id)
+        except Exception as exc:
+            return self.store.finish_managed_collection_deletion(job_id, str(exc))
 
 
 def main() -> None:

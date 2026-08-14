@@ -199,8 +199,6 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runner
-      additional_contexts:
-        global_llm: ${GLOBAL_LLM_BUILD_CONTEXT:-/data/zoe-ai-proj/global_llm}
       args:
         <<: *python-build-args
     command: ["dataforge-runner"]
@@ -214,8 +212,8 @@ services:
       DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
       DATAFORGE_MINERU_URL: http://mineru-api:8000
       DATAFORGE_MINERU_TIMEOUT_SECONDS: ${DATAFORGE_MINERU_TIMEOUT_SECONDS:-1800}
+      DATAFORGE_LLM_SERVINGS_PATH: /app/llm_servings.yaml
       LOCAL_LLM_API_KEY: ${LOCAL_LLM_API_KEY:-}
-      DATAFORGE_LLM_ORG_CODE: ${DATAFORGE_LLM_ORG_CODE:-}
     depends_on:
       mysql:
         condition: service_healthy

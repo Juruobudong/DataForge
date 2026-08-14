@@ -78,8 +78,8 @@ class V7Milvus:
     def validate_collection(self, collection_name: str, fields: dict[str, Any], dimension: int) -> None:
         """Reject a missing or incompatible administrator-selected Collection.
 
-        DataForge never creates or drops the Collection itself.  It owns only
-        its ``kl_`` partitions after this validation succeeds.
+        This method is the validate-only path for an external Collection.
+        DataForge owns only its ``kl_`` partitions after validation succeeds.
         """
         client = self.client()
         if not client.has_collection(collection_name=collection_name):
@@ -167,11 +167,39 @@ class V7Milvus:
         self.client().release_partitions(collection_name=collection_name, partition_names=[partition_name])
 
     def drop_partition(self, collection_name: str, partition_name: str) -> None:
-        """Drop one verified V7 library partition; collections are never dropped."""
+        """Drop one verified V7 library partition without touching its Collection."""
         self._assert_v7_partition(partition_name)
         client = self.client()
         if client.has_partition(collection_name=collection_name, partition_name=partition_name):
             client.drop_partition(collection_name=collection_name, partition_name=partition_name)
+
+    def inspect_managed_collection(self, collection_name: str, expected_description: str) -> dict[str, Any]:
+        """Read the facts required by the fail-closed managed deletion preflight."""
+        client = self.client()
+        if not client.has_collection(collection_name=collection_name):
+            return {"exists": False, "ownership_valid": True, "partitions": [], "entity_count": 0}
+        current = client.describe_collection(collection_name=collection_name)
+        description = str(current.get("description", "")) if isinstance(current, dict) else ""
+        # Partition enumeration is part of the deletion safety proof.  Fail
+        # closed when Milvus cannot provide it instead of treating it as empty.
+        partitions = list(client.list_partitions(collection_name=collection_name))
+        capacity = self.capacity(collection_name)
+        return {"exists": True, "description": description,
+                "ownership_valid": description == expected_description,
+                "partitions": partitions, "entity_count": capacity.entity_count}
+
+    def drop_managed_collection(self, collection_name: str, expected_description: str) -> bool:
+        """Drop only a Collection whose immutable DataForge ownership marker still matches."""
+        observed = self.inspect_managed_collection(collection_name, expected_description)
+        if not observed["exists"]:
+            return False
+        if not observed["ownership_valid"]:
+            raise ValueError("Collection ownership marker 不匹配，拒绝删除")
+        external = [name for name in observed.get("partitions", []) if name != "_default" and not str(name).startswith("kl_")]
+        if external:
+            raise ValueError("Collection 存在非 DataForge Partition，拒绝删除")
+        self.client().drop_collection(collection_name=collection_name)
+        return True
 
     def search(self, collection_name: str, partition_name: str, vector: list[float], limit: int = 10) -> Any:
         self._assert_v7_partition(partition_name)
@@ -283,10 +311,17 @@ class VectorSyncService:
 
     def capacity_report(self) -> list[dict[str, Any]]:
         profiles = self.store.list_index_profiles()
-        names = sorted({item["collection_name"] for item in profiles if item["status"] == "active"})
+        active = [item for item in profiles if item["status"] == "active"]
+        skipped = [{
+            "collection_name": item["collection_name"],
+            "available": False,
+            "reason": "旧外部 Profile，不参与容量监控",
+        } for item in active if item["code"] == "graph"]
+        names = sorted({item["collection_name"] for item in active if item["code"] != "graph"})
         if not self.milvus:
-            return [{"collection_name": name, "available": False, "reason": "Milvus 未配置"} for name in names]
-        return [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names)]
+            return skipped + [{"collection_name": name, "available": False, "reason": "Milvus 未配置"} for name in names]
+        checked = [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names)]
+        return skipped + checked
 
 
 class VectorDeletionService:

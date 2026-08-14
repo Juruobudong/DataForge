@@ -16,6 +16,8 @@
 | SRC-006 | 用户批准的双图谱专属 Collection 与受控 DAG 方案 | 对话/产品方案 | 2026-08-13 | READ | Graph 模式、Storage Contract、Managed Collection、Flow DSL v3 与编辑画布。 |
 | SRC-007 | 用户批准的 PDF GPU OCR 实施计划 | 对话/产品方案 | 2026-08-13 | READ | MinerU 3.4.4 Pipeline GPU、回环宿主机访问、Artifact 生命周期、超时和部署验收。 |
 | SRC-008 | 用户批准的算子说明与节点输入输出示例计划 | 对话/产品方案 | 2026-08-14 | READ | 中文功能说明、版本化静态示例、逐节点受控内存预览与 Inspector 展示。 |
+| SRC-009 | 用户更新的旧 Graph Profile 兼容决定 | 对话/产品方案 | 2026-08-14 | READ | 保留旧 `graph` Index Profile、类型修订和冻结兼容；容量报告不探测其外部 Collection，不迁移、供应或删除旧 Milvus Collection。 |
+| SRC-010 | 用户批准的 Document Parser 与 MinerU 自动解析边界 | 对话/产品方案 | 2026-08-14 | READ | 不设置扫描件检测算子；PDF 固定 `pipeline + auto`；图片留待独立视觉模型 Parser。 |
 
 ## 产品意图
 
@@ -33,6 +35,8 @@
 - `milvus-standalone-new` 是同一 Docker 主机上的未受 DataForge 管理容器，当前在默认 `bridge`，宿主机 `19531` 映射到其容器 `19530`；DataForge 不可修改其 Compose。— SRC-005
 - Worker 的 `private` 网络为 `internal: true`，不能经宿主机映射端口访问 Milvus；API 也需要 Milvus 连接以校验和发布 Index Profile。— SRC-005
 - 所有 PDF 固定通过独立 MinerU 3.4.4 GPU 服务以 `pipeline + auto` 解析；宿主机内部调用仅绑定回环地址，首版不接 VLM、vLLM、Flash、Router、多 GPU或 OCR UI。— SRC-007
+- V7 测试部署继续从空 Compose 卷重建；旧 `dataforge_graph_knowledge` 仅由 legacy Profile 引用，容量诊断不探测，Provisioner 不供应，DataForge 也不迁移或删除。— SRC-009
+- 画布只暴露稳定 `Document Parser`，其作为格式路由器：PDF 委派内部 MinerU Parser，其他已支持文档使用原生 Parser；不暴露扫描件检测、PDF Parser 或 Image Parser。— SRC-010
 
 ## 冲突与缺口
 
@@ -47,7 +51,9 @@
 ## 已确认决定
 
 - 用户已经批准三类内置知识、独立 Runner、V7 空库重建、无兼容迁移和固定四页导航。— SRC-001
+- 用户最新确认保留旧 `graph` Index Profile 及其类型修订兼容层，但容量诊断必须跳过；新建 Graph 库继续使用 revision 2 的 `graph-triple` 或 `graph-semantic`。— SRC-009
+- 用户确认 Document Parser 当前无参数，PDF 固定 `backend=pipeline`、`parse_method=auto`；`txt/ocr` 不预留公开入口，图片解析以后作为独立能力设计。— SRC-010
 
 ## 可追溯性
 
-SRC-001 覆盖 FR-001～FR-008；SRC-002 覆盖 FR-002、FR-003、FR-005、FR-006；SRC-003 提供迁移、兼容与安全验证基线；SRC-004 覆盖 FR-009；SRC-005 覆盖 FR-010；SRC-006 覆盖 FR-011～FR-013；SRC-007 覆盖 FR-014；SRC-008 覆盖 FR-015。
+SRC-001 覆盖 FR-001～FR-008；SRC-002 覆盖 FR-002、FR-003、FR-005、FR-006；SRC-003 提供迁移、兼容与安全验证基线；SRC-004 覆盖 FR-009；SRC-005 覆盖 FR-010；SRC-006 与 SRC-009 覆盖 FR-011～FR-013；SRC-007 覆盖 FR-014；SRC-008 覆盖 FR-015；SRC-010 覆盖 FR-016。

@@ -43,7 +43,7 @@ def _response_error(response: httpx.Response) -> str:
     return response.text.strip()[:500] or f"HTTP {response.status_code}"
 
 
-def parse_with_mineru(*, filename: str, payload: bytes) -> MinerUParseResult:
+def parse_with_mineru(*, filename: str, payload: bytes, parse_method: str = "auto") -> MinerUParseResult:
     """Synchronously parse one PDF through the pinned self-hosted MinerU API."""
     base_url = os.getenv("DATAFORGE_MINERU_URL", "http://mineru-api:8000").rstrip("/")
     if not base_url:
@@ -57,7 +57,7 @@ def parse_with_mineru(*, filename: str, payload: bytes) -> MinerUParseResult:
 
     form = {
         "backend": "pipeline",
-        "parse_method": "auto",
+        "parse_method": parse_method,
         "lang_list": "ch",
         "formula_enable": "true",
         "table_enable": "true",
@@ -74,11 +74,11 @@ def parse_with_mineru(*, filename: str, payload: bytes) -> MinerUParseResult:
         with httpx.Client(timeout=timeout) as client:
             response = client.post(f"{base_url}/file_parse", files=files, data=form)
     except httpx.TimeoutException as exc:
-        raise ValueError(f"MinerU OCR 超时（{timeout:g} 秒）") from exc
+        raise ValueError(f"MinerU PDF 解析超时（{timeout:g} 秒）") from exc
     except httpx.RequestError as exc:
-        raise ValueError(f"MinerU OCR 服务不可达：{exc}") from exc
+        raise ValueError(f"MinerU PDF 解析服务不可达：{exc}") from exc
     if response.status_code < 200 or response.status_code >= 300:
-        raise ValueError(f"MinerU OCR 失败（HTTP {response.status_code}）：{_response_error(response)}")
+        raise ValueError(f"MinerU PDF 解析失败（HTTP {response.status_code}）：{_response_error(response)}")
     try:
         body = response.json()
     except ValueError as exc:

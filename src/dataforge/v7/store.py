@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import uuid
 from datetime import timedelta
@@ -15,11 +16,13 @@ from pathlib import PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Iterable
 
+
 from sqlalchemy import create_engine, delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from .catalog import CATALOG_SEEDS, builtin_flow_definition, catalog_by_code, subflow_seeds
+from .catalog import CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code, subflow_seeds
 from .flow import FlowCompiler, FlowValidationError
+from .llm_serving import get_llm_serving_registry
 from .migrations import assert_schema_current
 from .models import (
     AdminSession,
@@ -43,6 +46,7 @@ from .models import (
     StorageContract,
     StorageContractRevision,
     ManagedCollection,
+    ManagedCollectionDeletionJob,
     KnowledgeItem,
     KnowledgeItemSource,
     KnowledgeChunkGeneration,
@@ -63,6 +67,9 @@ from .models import (
     FlowNodeRun,
     Artifact,
     ArtifactLineage,
+    FlowNodeArtifactBinding,
+    FlowRunEvent,
+    FlowRunSinkPreview,
     Project,
     ProjectOrgRoute,
     ProjectOrgRouteLibrary,
@@ -280,7 +287,7 @@ class V7Store:
                     index_profile = KnowledgeIndexProfile(
                         id=f"index_{code}", code=code, knowledge_type=kind, collection_name=collection,
                         embedding_profile_id=profile_id,
-                        fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), status="active",
+                        fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), origin="builtin", status="active",
                     )
                     session.add(index_profile)
                     session.flush()
@@ -407,6 +414,11 @@ class V7Store:
                 definition = OperatorDefinition(id=f"op_{item['code'].replace('-', '_')}", code=item["code"], name=item["name"], description=item["description"], category=item["category"], exposure=item["exposure"], risk_level=item["risk_level"], enabled=item["exposure"] != "disabled")
                 session.add(definition); session.flush()
             definition.name, definition.description, definition.category = item["name"], item["description"], item["category"]
+            definition.display_name_zh, definition.subcategory = item["display_name_zh"], item["subcategory"]
+            definition.summary, definition.scenarios = item["summary"], item["scenarios"]
+            definition.knowledge_types = item["knowledge_types"]
+            definition.recommended_predecessors, definition.recommended_successors = item["recommended_predecessors"], item["recommended_successors"]
+            definition.lifecycle_status = item["lifecycle_status"]
             definition.exposure, definition.risk_level = item["exposure"], item["risk_level"]
             definition.enabled = item["exposure"] != "disabled"
             version_no = int(item.get("version", 1))
@@ -418,7 +430,10 @@ class V7Store:
             version.input_ports = item.get("input_ports") or {"input": {"artifact_type": item["input"], "cardinality": "one"}}
             version.output_ports = item.get("output_ports") or {"output": {"artifact_type": item["output"], "cardinality": "many"}}
             version.input_example, version.output_example = item["input_example"], item["output_example"]
-            version.parameter_schema, version.runtime_requirements = item["parameter_schema"], item["runtime_requirements"]
+            version.parameter_schema, version.parameter_docs, version.runtime_requirements = item["parameter_schema"], item["parameter_docs"], item["runtime_requirements"]
+            missing = self._operator_publication_errors(definition, version)
+            if missing:
+                raise RuntimeError(f"算子 {definition.code} 发布元数据不完整：{', '.join(missing)}")
             definition.latest_version = max(definition.latest_version or 0, version_no)
         for item in subflow_seeds():
             subflow = session.scalar(select(FlowSubgraph).where(FlowSubgraph.code == item["code"]))
@@ -426,7 +441,9 @@ class V7Store:
                 subflow = FlowSubgraph(id=f"subflow_{item['code'].replace('-', '_')}", code=item["code"], name=item["name"], status="active")
                 session.add(subflow); session.flush()
             if not session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow.id, FlowSubgraphRevision.revision_no == 1)):
-                session.add(FlowSubgraphRevision(id=new_id("subflowrev"), flow_subgraph_id=subflow.id, revision_no=1, definition_json=item["definition"], status="published", published_at=utc_now()))
+                definition_json = {**item["definition"], "_subgraph_code": item["code"], "_subgraph_revision": 1}
+                session.add(FlowSubgraphRevision(id=new_id("subflowrev"), flow_subgraph_id=subflow.id, revision_no=1, definition_json=definition_json,
+                                                description=item.get("description", ""), status="published", published_at=utc_now()))
 
     def _seed_storage_contracts(self, session: Session, embedding: EmbeddingProfile) -> None:
         for code, seed in STORAGE_CONTRACT_SEEDS.items():
@@ -457,6 +474,8 @@ class V7Store:
                 )
                 session.add(managed)
             profile = session.scalar(select(KnowledgeIndexProfile).where(KnowledgeIndexProfile.code == code))
+            if profile:
+                profile.origin = "builtin"
             profile_revision = session.get(KnowledgeIndexProfileRevision, profile.current_revision_id) if profile and profile.current_revision_id else None
             if profile_revision:
                 profile_revision.storage_contract_revision_id = revision.id
@@ -471,17 +490,28 @@ class V7Store:
             values = []
             for item in session.scalars(select(KnowledgeType).order_by(KnowledgeType.code)):
                 revision = session.get(KnowledgeTypeRevision, item.current_revision_id) if item.current_revision_id else None
-                bindings = [] if not revision else session.execute(
-                    select(KnowledgeIndexProfile.code, KnowledgeIndexProfile.collection_name, KnowledgeTypeIndexBinding.field_path)
-                    .join(KnowledgeTypeIndexBinding, KnowledgeTypeIndexBinding.index_profile_id == KnowledgeIndexProfile.id)
-                    .where(KnowledgeTypeIndexBinding.knowledge_type_revision_id == revision.id)
-                ).all()
+                bindings = [] if not revision else list(session.scalars(select(KnowledgeTypeIndexBinding).where(
+                    KnowledgeTypeIndexBinding.knowledge_type_revision_id == revision.id,
+                )))
+                profile_values = []
+                for binding in bindings:
+                    profile = session.get(KnowledgeIndexProfile, binding.index_profile_id)
+                    if not profile:
+                        continue
+                    profile_revision = session.get(KnowledgeIndexProfileRevision, binding.index_profile_revision_id)
+                    profile_values.append({
+                        "id": profile.id, "code": profile.code, "origin": profile.origin,
+                        "collection_name": profile_revision.collection_name if profile_revision else profile.collection_name,
+                        "collection_policy": profile_revision.collection_policy if profile_revision else "external",
+                        "profile_revision_id": binding.index_profile_revision_id,
+                        "field_path": binding.field_path, "role": binding.role,
+                    })
                 values.append({"id": item.id, "code": item.code, "name": item.name, "icon": item.icon, "kind": item.kind,
                                "status": item.status, "current_revision": None if not revision else {
                                    "id": revision.id, "revision": revision.revision_no, "schema": revision.schema_json,
                                    "canonical_field": revision.canonical_field, "identity_fields": revision.identity_fields,
                                    "source_policy": revision.source_policy, "quality_profile_revision_id": revision.quality_profile_revision_id,
-                               }, "index_profiles": [{"code": code, "collection_name": collection, "field_path": path} for code, collection, path in bindings]})
+                                }, "index_profiles": profile_values})
             return values
 
     @staticmethod
@@ -498,7 +528,8 @@ class V7Store:
 
     def create_knowledge_type(self, code: str, name: str, icon: str, schema: dict[str, Any], canonical_field: str,
                               identity_fields: list[str], source_policy: str, quality_profile_revision_id: str,
-                              index_profile_ids: list[str]) -> dict[str, Any]:
+                              index_profile_ids: list[str], *, managed_collection_name: str = "",
+                              reuse_managed_collection_id: str | None = None) -> dict[str, Any]:
         code, name = code.strip(), name.strip()
         if not code or not name:
             raise ValueError("知识类型编码和名称不能为空")
@@ -508,24 +539,138 @@ class V7Store:
         with self.sessions.begin() as session:
             if session.scalar(select(KnowledgeType).where(KnowledgeType.code == code)):
                 raise ValueError("知识类型编码已存在")
-            self._validate_type_revision_dependencies(session, quality_profile_revision_id, index_profile_ids)
+            self._validate_quality_revision(session, quality_profile_revision_id)
             item = KnowledgeType(id=new_id("type"), code=code, name=name, icon=(icon or "知")[:8], kind="extension", status="draft")
             session.add(item); session.flush()
-            revision = self._add_type_revision(session, item, schema, canonical_field, identity_fields, source_policy, quality_profile_revision_id, index_profile_ids)
+            auto_profile, auto_revision, managed = self._create_extension_auto_profile(
+                session, item, managed_collection_name, reuse_managed_collection_id,
+            )
+            manual_profiles = self._validate_additional_profiles(session, code, index_profile_ids, managed.collection_name)
+            profile_ids = [auto_profile.id, *[profile.id for profile in manual_profiles]]
+            revision = self._add_type_revision(
+                session, item, schema, canonical_field, identity_fields, source_policy,
+                quality_profile_revision_id, profile_ids,
+                profile_revision_ids={auto_profile.id: auto_revision.id},
+            )
             self.audit(session, "knowledge_type.created", "knowledge_type", item.id, {"revision": revision.revision_no})
-            return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "draft"}
+            return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "draft",
+                    "managed_profile_id": auto_profile.id, "managed_collection_id": managed.id,
+                    "managed_collection_name": managed.collection_name}
 
     def revise_knowledge_type(self, type_id: str, schema: dict[str, Any], canonical_field: str, identity_fields: list[str],
-                              source_policy: str, quality_profile_revision_id: str, index_profile_ids: list[str]) -> dict[str, Any]:
+                              source_policy: str, quality_profile_revision_id: str, index_profile_ids: list[str],
+                              *, managed_collection_name: str = "",
+                              reuse_managed_collection_id: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
             item = session.get(KnowledgeType, type_id)
             if not item:
                 raise ValueError("知识类型不存在")
             self._validate_type_contract(schema, canonical_field, identity_fields, source_policy, builtin_code=item.code if item.kind == "builtin" else None)
-            self._validate_type_revision_dependencies(session, quality_profile_revision_id, index_profile_ids)
-            revision = self._add_type_revision(session, item, schema, canonical_field, identity_fields, source_policy, quality_profile_revision_id, index_profile_ids)
+            self._validate_quality_revision(session, quality_profile_revision_id)
+            auto_profile = session.scalar(select(KnowledgeIndexProfile).where(
+                KnowledgeIndexProfile.owner_knowledge_type_id == item.id,
+                KnowledgeIndexProfile.origin == "extension_auto",
+            ))
+            profile_revision_ids: dict[str, str] = {}
+            if item.kind == "extension":
+                if not auto_profile:
+                    auto_profile, auto_revision, managed = self._create_extension_auto_profile(
+                        session, item, managed_collection_name, reuse_managed_collection_id,
+                    )
+                elif managed_collection_name or reuse_managed_collection_id:
+                    embedding = session.get(EmbeddingProfile, auto_profile.embedding_profile_id)
+                    assert embedding
+                    storage_revision, managed = self._managed_storage_contract(
+                        session, auto_profile.code, managed_collection_name, embedding,
+                        {"fields": [dict(field) for field in _COMMON_STORAGE_FIELDS]},
+                        DEFAULT_INDEX_FIELD_MAPPING, {"index_type": "AUTOINDEX"},
+                        reuse_managed_collection_id=reuse_managed_collection_id,
+                    )
+                    latest = session.scalar(select(func.max(KnowledgeIndexProfileRevision.revision_no)).where(
+                        KnowledgeIndexProfileRevision.knowledge_index_profile_id == auto_profile.id,
+                    )) or 0
+                    auto_revision = KnowledgeIndexProfileRevision(
+                        id=new_id("indexrev"), knowledge_index_profile_id=auto_profile.id, revision_no=latest + 1,
+                        collection_name=managed.collection_name, embedding_profile_id=embedding.id,
+                        fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), storage_contract_revision_id=storage_revision.id,
+                        collection_policy="managed",
+                    )
+                    session.add(auto_revision); session.flush()
+                else:
+                    auto_revision = session.scalar(select(KnowledgeIndexProfileRevision).where(
+                        KnowledgeIndexProfileRevision.knowledge_index_profile_id == auto_profile.id,
+                    ).order_by(KnowledgeIndexProfileRevision.revision_no.desc()))
+                    assert auto_revision
+                    managed = session.scalar(select(ManagedCollection).where(
+                        ManagedCollection.collection_name == auto_revision.collection_name,
+                    ))
+                    assert managed
+                profile_revision_ids[auto_profile.id] = auto_revision.id
+                manual_profiles = self._validate_additional_profiles(session, item.code, index_profile_ids, managed.collection_name)
+                profile_ids = [auto_profile.id, *[profile.id for profile in manual_profiles]]
+            else:
+                self._validate_type_revision_dependencies(session, quality_profile_revision_id, index_profile_ids)
+                profile_ids = index_profile_ids
+            revision = self._add_type_revision(
+                session, item, schema, canonical_field, identity_fields, source_policy,
+                quality_profile_revision_id, profile_ids, profile_revision_ids=profile_revision_ids,
+            )
             self.audit(session, "knowledge_type.revised", "knowledge_type", item.id, {"revision": revision.revision_no})
             return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "draft"}
+
+    def _create_extension_auto_profile(self, session: Session, item: KnowledgeType, collection_name: str,
+                                       reuse_managed_collection_id: str | None) -> tuple[KnowledgeIndexProfile, KnowledgeIndexProfileRevision, ManagedCollection]:
+        embedding = session.scalar(select(EmbeddingProfile).where(EmbeddingProfile.code == "bce_base_768_v1"))
+        if not embedding:
+            raise ValueError("默认 Embedding Profile 不存在")
+        profile_code = f"{item.code}-default"
+        normalized_type_code = re.sub(r"[^A-Za-z0-9_]", "_", item.code.replace("-", "_"))
+        resolved_collection_name = collection_name or f"dataforge_{normalized_type_code}_knowledge"
+        storage_revision, managed = self._managed_storage_contract(
+            session, profile_code, resolved_collection_name, embedding,
+            {"fields": [dict(field) for field in _COMMON_STORAGE_FIELDS]},
+            DEFAULT_INDEX_FIELD_MAPPING, {"index_type": "AUTOINDEX"},
+            reuse_managed_collection_id=reuse_managed_collection_id,
+        )
+        profile = KnowledgeIndexProfile(
+            id=new_id("index"), code=profile_code, knowledge_type=item.code,
+            collection_name=managed.collection_name, embedding_profile_id=embedding.id,
+            fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), origin="extension_auto",
+            owner_knowledge_type_id=item.id, status="draft",
+        )
+        session.add(profile); session.flush()
+        revision = KnowledgeIndexProfileRevision(
+            id=new_id("indexrev"), knowledge_index_profile_id=profile.id, revision_no=1,
+            collection_name=managed.collection_name, embedding_profile_id=embedding.id,
+            fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), storage_contract_revision_id=storage_revision.id,
+            collection_policy="managed",
+        )
+        session.add(revision); session.flush()
+        return profile, revision, managed
+
+    @staticmethod
+    def _validate_quality_revision(session: Session, quality_profile_revision_id: str) -> None:
+        quality = session.get(QualityProfileRevision, quality_profile_revision_id)
+        if not quality or quality.status != "published":
+            raise ValueError("必须绑定已发布的 Quality Profile 修订")
+
+    @staticmethod
+    def _validate_additional_profiles(session: Session, type_code: str, profile_ids: list[str],
+                                      auto_collection_name: str) -> list[KnowledgeIndexProfile]:
+        if not profile_ids:
+            return []
+        profiles = list(session.scalars(select(KnowledgeIndexProfile).where(
+            KnowledgeIndexProfile.id.in_(list(dict.fromkeys(profile_ids))),
+            KnowledgeIndexProfile.status == "active",
+        )))
+        if len(profiles) != len(set(profile_ids)):
+            raise ValueError("附加 Manual Profile 不存在或尚未发布")
+        if any(profile.origin != "manual" or profile.knowledge_type != type_code or not profile.current_revision_id for profile in profiles):
+            raise ValueError("附加 Profile 必须是同一 Knowledge Type 的已发布 Manual Profile")
+        collection_names = [auto_collection_name, *[profile.collection_name for profile in profiles]]
+        if len(collection_names) != len(set(collection_names)):
+            raise ValueError("同一 Type Revision 不能绑定两个指向同一 Collection 的 Profile")
+        return profiles
 
     def validate_knowledge_type(self, type_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -539,7 +684,27 @@ class V7Store:
             bindings = list(session.scalars(select(KnowledgeTypeIndexBinding).where(KnowledgeTypeIndexBinding.knowledge_type_revision_id == revision.id)))
             if not bindings:
                 raise ValueError("知识类型至少要绑定一个已发布 Index Profile")
-            self._validate_type_revision_dependencies(session, revision.quality_profile_revision_id or "", [item.index_profile_id for item in bindings])
+            self._validate_quality_revision(session, revision.quality_profile_revision_id or "")
+            collections: list[str] = []
+            for binding in bindings:
+                profile = session.get(KnowledgeIndexProfile, binding.index_profile_id)
+                profile_revision = session.get(KnowledgeIndexProfileRevision, binding.index_profile_revision_id) if binding.index_profile_revision_id else None
+                if not profile or not profile_revision or profile.knowledge_type != item.code:
+                    raise ValueError("Type Revision 绑定的 Profile 或修订无效")
+                if profile.origin == "extension_auto":
+                    if profile.owner_knowledge_type_id != item.id or profile_revision.collection_policy != "managed":
+                        raise ValueError("扩展 Type 的自动 Profile 所有权无效")
+                    managed = session.scalar(select(ManagedCollection).where(
+                        ManagedCollection.collection_name == profile_revision.collection_name,
+                        ManagedCollection.storage_contract_revision_id == profile_revision.storage_contract_revision_id,
+                    ))
+                    if not managed or managed.status != "ready" or managed.observed_spec_hash != managed.desired_spec_hash:
+                        raise ValueError("扩展 Type 的受管 Collection 尚未完成 Provision")
+                elif profile.status != "active" or profile_revision.status != "published":
+                    raise ValueError("附加 Profile 尚未发布")
+                collections.append(profile_revision.collection_name)
+            if len(collections) != len(set(collections)):
+                raise ValueError("同一 Type Revision 不能绑定两个指向同一 Collection 的 Profile")
             return {"id": item.id, "revision_id": revision.id, "valid": True}
 
     def publish_knowledge_type(self, type_id: str) -> dict[str, Any]:
@@ -548,13 +713,89 @@ class V7Store:
             item = session.get(KnowledgeType, type_id)
             revision = session.scalar(select(KnowledgeTypeRevision).where(KnowledgeTypeRevision.knowledge_type_id == type_id).order_by(KnowledgeTypeRevision.revision_no.desc()))
             assert item and revision
+            for binding in session.scalars(select(KnowledgeTypeIndexBinding).where(
+                KnowledgeTypeIndexBinding.knowledge_type_revision_id == revision.id,
+            )):
+                profile = session.get(KnowledgeIndexProfile, binding.index_profile_id)
+                profile_revision = session.get(KnowledgeIndexProfileRevision, binding.index_profile_revision_id) if binding.index_profile_revision_id else None
+                if profile and profile_revision and profile.origin == "extension_auto":
+                    profile_revision.status, profile_revision.published_at = "published", utc_now()
+                    profile.collection_name = profile_revision.collection_name
+                    profile.embedding_profile_id = profile_revision.embedding_profile_id
+                    profile.fields_json = profile_revision.fields_json
+                    profile.current_revision_id, profile.status = profile_revision.id, "active"
             revision.status, revision.published_at, item.current_revision_id, item.status = "published", utc_now(), revision.id, "active"
             self.audit(session, "knowledge_type.published", "knowledge_type", item.id, {"revision": revision.revision_no})
             return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
+    def knowledge_type_publication_requirements(self, type_id: str) -> list[dict[str, Any]]:
+        """Return live external validations and managed reconciliations needed before publish."""
+        with self.sessions() as session:
+            item = session.get(KnowledgeType, type_id)
+            if not item:
+                raise ValueError("知识类型不存在")
+            revision = session.scalar(select(KnowledgeTypeRevision).where(
+                KnowledgeTypeRevision.knowledge_type_id == type_id,
+            ).order_by(KnowledgeTypeRevision.revision_no.desc()))
+            if not revision:
+                raise ValueError("知识类型没有修订")
+            requirements = []
+            for binding in session.scalars(select(KnowledgeTypeIndexBinding).where(
+                KnowledgeTypeIndexBinding.knowledge_type_revision_id == revision.id,
+            )):
+                profile = session.get(KnowledgeIndexProfile, binding.index_profile_id)
+                profile_revision = session.get(KnowledgeIndexProfileRevision, binding.index_profile_revision_id) if binding.index_profile_revision_id else None
+                if not profile or not profile_revision:
+                    raise ValueError("Type Revision 绑定的 Profile 修订不存在")
+                embedding = session.get(EmbeddingProfile, profile_revision.embedding_profile_id)
+                if not embedding:
+                    raise ValueError("Embedding Profile 不存在")
+                requirement = {
+                    "profile_id": profile.id, "profile_revision_id": profile_revision.id,
+                    "collection_policy": profile_revision.collection_policy,
+                    "collection_name": profile_revision.collection_name,
+                    "fields": profile_revision.fields_json, "dimension": embedding.dimension,
+                }
+                if profile_revision.collection_policy == "managed":
+                    managed = session.scalar(select(ManagedCollection).where(
+                        ManagedCollection.collection_name == profile_revision.collection_name,
+                        ManagedCollection.storage_contract_revision_id == profile_revision.storage_contract_revision_id,
+                    ))
+                    if not managed or managed.status == "deleted":
+                        raise ValueError("受管 Collection 登记不存在或已删除")
+                    requirement["managed_collection_id"] = managed.id
+                requirements.append(requirement)
+            return requirements
+
+    def index_profile_publication_requirement(self, profile_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            profile = session.get(KnowledgeIndexProfile, profile_id)
+            if not profile:
+                raise ValueError("Index Profile 不存在")
+            revision = session.scalar(select(KnowledgeIndexProfileRevision).where(
+                KnowledgeIndexProfileRevision.knowledge_index_profile_id == profile_id,
+            ).order_by(KnowledgeIndexProfileRevision.revision_no.desc()))
+            if not revision:
+                raise ValueError("Index Profile 没有可发布修订")
+            embedding = session.get(EmbeddingProfile, revision.embedding_profile_id)
+            if not embedding:
+                raise ValueError("Embedding Profile 不存在")
+            result = {"profile_id": profile.id, "collection_policy": revision.collection_policy,
+                      "collection_name": revision.collection_name, "fields": revision.fields_json,
+                      "dimension": embedding.dimension}
+            if revision.collection_policy == "managed":
+                managed = session.scalar(select(ManagedCollection).where(
+                    ManagedCollection.collection_name == revision.collection_name,
+                    ManagedCollection.storage_contract_revision_id == revision.storage_contract_revision_id,
+                ))
+                if not managed or managed.status == "deleted":
+                    raise ValueError("受管 Collection 登记不存在或已删除")
+                result["managed_collection_id"] = managed.id
+            return result
+
     def _add_type_revision(self, session: Session, item: KnowledgeType, schema: dict[str, Any], canonical_field: str,
                            identity_fields: list[str], source_policy: str, quality_profile_revision_id: str,
-                           index_profile_ids: list[str]) -> KnowledgeTypeRevision:
+                           index_profile_ids: list[str], *, profile_revision_ids: dict[str, str] | None = None) -> KnowledgeTypeRevision:
         latest = session.scalar(select(func.max(KnowledgeTypeRevision.revision_no)).where(KnowledgeTypeRevision.knowledge_type_id == item.id)) or 0
         revision = KnowledgeTypeRevision(id=new_id("typerev"), knowledge_type_id=item.id, revision_no=latest + 1,
                                          schema_json=schema, canonical_field=canonical_field.strip(), identity_fields=list(identity_fields),
@@ -563,16 +804,23 @@ class V7Store:
         for profile_id in dict.fromkeys(index_profile_ids):
             profile = session.get(KnowledgeIndexProfile, profile_id)
             assert profile
+            bound_revision_id = (profile_revision_ids or {}).get(profile.id) or profile.current_revision_id
+            if not bound_revision_id:
+                latest_revision = session.scalar(select(KnowledgeIndexProfileRevision).where(
+                    KnowledgeIndexProfileRevision.knowledge_index_profile_id == profile.id,
+                ).order_by(KnowledgeIndexProfileRevision.revision_no.desc()))
+                bound_revision_id = latest_revision.id if latest_revision else None
+            if not bound_revision_id:
+                raise ValueError("Index Profile 没有可绑定的修订")
             session.add(KnowledgeTypeIndexBinding(id=new_id("typeindex"), knowledge_type_revision_id=revision.id,
-                                                  index_profile_id=profile.id, index_profile_revision_id=profile.current_revision_id,
-                                                  field_path=canonical_field.strip()))
+                                                  index_profile_id=profile.id, index_profile_revision_id=bound_revision_id,
+                                                  field_path=canonical_field.strip(),
+                                                  role="primary" if profile.origin == "extension_auto" else "secondary"))
         return revision
 
     @staticmethod
     def _validate_type_revision_dependencies(session: Session, quality_profile_revision_id: str, index_profile_ids: list[str]) -> None:
-        quality = session.get(QualityProfileRevision, quality_profile_revision_id)
-        if not quality or quality.status != "published":
-            raise ValueError("必须绑定已发布的 Quality Profile 修订")
+        V7Store._validate_quality_revision(session, quality_profile_revision_id)
         if not index_profile_ids:
             raise ValueError("必须绑定至少一个已发布 Index Profile")
         profiles = list(session.scalars(select(KnowledgeIndexProfile).where(KnowledgeIndexProfile.id.in_(index_profile_ids), KnowledgeIndexProfile.status == "active")))
@@ -583,12 +831,22 @@ class V7Store:
                              embedding_model: str, dimension: int, metric_type: str, endpoint_ref: str | None,
                              fields: dict[str, Any], *, collection_policy: str = "external",
                              storage_schema: dict[str, Any] | None = None,
-                             index_spec: dict[str, Any] | None = None) -> dict[str, Any]:
+                             index_spec: dict[str, Any] | None = None, collection_mode: str | None = None,
+                             reuse_managed_collection_id: str | None = None, origin: str = "manual",
+                             owner_knowledge_type_id: str | None = None) -> dict[str, Any]:
+        if collection_mode is not None:
+            if collection_mode not in {"create", "attach"}:
+                raise ValueError("Collection 模式必须为 create 或 attach")
+            collection_policy = "managed" if collection_mode == "create" else "external"
         code, collection_name, embedding_code = code.strip(), collection_name.strip(), embedding_code.strip()
         if not code or not embedding_code or collection_policy not in {"external", "managed"}:
             raise ValueError("Index Profile、Embedding 编码和 Collection 策略必须有效")
+        if origin not in {"builtin", "extension_auto", "manual"}:
+            raise ValueError("Index Profile 来源无效")
         if collection_policy == "external" and not collection_name:
             raise ValueError("外部 Index Profile 必须指定 Collection")
+        if collection_policy == "external" and reuse_managed_collection_id:
+            raise ValueError("external Profile 不能复用受管 Collection 登记")
         self._validate_index_mapping(fields)
         if dimension <= 0:
             raise ValueError("Embedding 维度必须为正整数")
@@ -603,23 +861,30 @@ class V7Store:
             elif (embedding.model, embedding.dimension, embedding.metric_type) != (embedding_model.strip() or embedding_code, dimension, metric_type):
                 raise ValueError("同一 Embedding 编码的模型、维度和度量类型必须保持稳定")
             storage_revision = None
+            managed = None
             if collection_policy == "managed":
-                storage_revision, collection_name = self._managed_storage_contract(
+                storage_revision, managed = self._managed_storage_contract(
                     session, code, collection_name, embedding, storage_schema, fields, index_spec,
+                    reuse_managed_collection_id=reuse_managed_collection_id,
                 )
+                collection_name = managed.collection_name
             item = KnowledgeIndexProfile(id=new_id("index"), code=code, knowledge_type=knowledge_type.strip(), collection_name=collection_name,
-                                         embedding_profile_id=embedding.id, fields_json=dict(fields), status="draft")
+                                         embedding_profile_id=embedding.id, fields_json=dict(fields), origin=origin,
+                                         owner_knowledge_type_id=owner_knowledge_type_id, status="draft")
             session.add(item); session.flush()
             revision = KnowledgeIndexProfileRevision(id=new_id("indexrev"), knowledge_index_profile_id=item.id, revision_no=1,
                                                     collection_name=collection_name, embedding_profile_id=embedding.id, fields_json=dict(fields),
                                                     storage_contract_revision_id=storage_revision.id if storage_revision else None,
                                                     collection_policy=collection_policy)
             session.add(revision); self.audit(session, "index_profile.created", "index_profile", item.id)
-            return {"id": item.id, "revision_id": revision.id, "revision": 1, "status": "draft"}
+            return {"id": item.id, "revision_id": revision.id, "revision": 1, "status": "draft",
+                    "origin": item.origin, "collection_policy": collection_policy,
+                    "collection_name": collection_name, "managed_collection_id": managed.id if managed else None}
 
     def _managed_storage_contract(self, session: Session, code: str, collection_name: str,
                                   embedding: EmbeddingProfile, schema: dict[str, Any] | None,
-                                  fields: dict[str, Any], index_spec: dict[str, Any] | None) -> tuple[StorageContractRevision, str]:
+                                  fields: dict[str, Any], index_spec: dict[str, Any] | None,
+                                  *, reuse_managed_collection_id: str | None = None) -> tuple[StorageContractRevision, ManagedCollection]:
         if not isinstance(schema, dict) or not isinstance(schema.get("fields"), list):
             raise ValueError("受管 Index Profile 必须提供完整 storage_schema.fields")
         physical_names = {str(item.get("name")) for item in schema["fields"] if isinstance(item, dict)}
@@ -628,35 +893,49 @@ class V7Store:
         index_json = index_spec or {"index_type": "AUTOINDEX"}
         spec_hash = storage_spec_hash(schema, embedding, index_json)
         revision = session.scalar(select(StorageContractRevision).where(StorageContractRevision.storage_spec_hash == spec_hash))
-        if revision:
-            managed = session.scalar(select(ManagedCollection).where(ManagedCollection.storage_contract_revision_id == revision.id))
-            if not managed:
-                raise ValueError("相同 Storage Contract 已存在但没有受管 Collection")
-            return revision, managed.collection_name
+        if not revision:
+            contract = session.scalar(select(StorageContract).where(StorageContract.code == code))
+            if not contract:
+                contract = StorageContract(id=new_id("storage"), code=code, name=f"{code} 存储结构")
+                session.add(contract); session.flush()
+            latest = session.scalar(select(func.max(StorageContractRevision.revision_no)).where(
+                StorageContractRevision.storage_contract_id == contract.id,
+            )) or 0
+            revision = StorageContractRevision(
+                id=new_id("storagerev"), storage_contract_id=contract.id, revision_no=latest + 1,
+                schema_json=schema, embedding_profile_id=embedding.id, vector_type="FLOAT_VECTOR",
+                dimension=embedding.dimension, metric_type=embedding.metric_type, index_json=index_json,
+                storage_spec_hash=spec_hash, status="published", published_at=utc_now(),
+            )
+            session.add(revision); session.flush(); contract.current_revision_id = revision.id
+        if reuse_managed_collection_id:
+            managed = session.get(ManagedCollection, reuse_managed_collection_id)
+            if not managed or managed.status != "ready":
+                raise ValueError("只能显式复用 ready 的受管 Collection")
+            if managed.desired_spec_hash != spec_hash or managed.storage_contract_revision_id != revision.id:
+                raise ValueError("所选受管 Collection 与 Storage Contract 不兼容")
+            if collection_name and collection_name != managed.collection_name:
+                raise ValueError("复用受管 Collection 时不能指定不同名称")
+            return revision, managed
         resolved_name = collection_name or f"dataforge_{code.replace('-', '_')}_knowledge"
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,254}", resolved_name):
+            raise ValueError("Collection 名必须以字母或下划线开头，且只包含字母、数字和下划线")
         collision = session.scalar(select(ManagedCollection).where(ManagedCollection.collection_name == resolved_name))
         if collision:
-            raise ValueError("同名受管 Collection 已绑定不兼容的 Storage Contract")
-        contract = StorageContract(id=new_id("storage"), code=code, name=f"{code} 存储结构")
-        session.add(contract); session.flush()
-        revision = StorageContractRevision(
-            id=new_id("storagerev"), storage_contract_id=contract.id, revision_no=1,
-            schema_json=schema, embedding_profile_id=embedding.id, vector_type="FLOAT_VECTOR",
-            dimension=embedding.dimension, metric_type=embedding.metric_type, index_json=index_json,
-            storage_spec_hash=spec_hash, status="published", published_at=utc_now(),
-        )
-        session.add(revision); session.flush(); contract.current_revision_id = revision.id
-        session.add(ManagedCollection(
+            raise ValueError("Collection 名已登记；如需复用请显式选择该受管 Collection")
+        managed = ManagedCollection(
             id=new_id("collection"), storage_contract_revision_id=revision.id,
             collection_name=resolved_name, provisioning_token=secrets.token_hex(24),
             desired_spec_hash=spec_hash, status="planned",
-        ))
-        return revision, resolved_name
+        )
+        session.add(managed); session.flush()
+        return revision, managed
 
     def revise_index_profile(self, profile_id: str, collection_name: str, embedding_code: str, embedding_model: str,
                              dimension: int, metric_type: str, endpoint_ref: str | None, fields: dict[str, Any],
                              *, collection_policy: str = "external", storage_schema: dict[str, Any] | None = None,
-                             index_spec: dict[str, Any] | None = None) -> dict[str, Any]:
+                             index_spec: dict[str, Any] | None = None,
+                             reuse_managed_collection_id: str | None = None) -> dict[str, Any]:
         self._validate_index_mapping(fields)
         if collection_policy not in {"external", "managed"}:
             raise ValueError("Collection 策略必须为 external 或 managed")
@@ -671,10 +950,13 @@ class V7Store:
             elif (embedding.model, embedding.dimension, embedding.metric_type) != (embedding_model.strip() or embedding_code.strip(), dimension, metric_type):
                 raise ValueError("同一 Embedding 编码的模型、维度和度量类型必须保持稳定")
             storage_revision = None
+            managed = None
             if collection_policy == "managed":
-                storage_revision, collection_name = self._managed_storage_contract(
+                storage_revision, managed = self._managed_storage_contract(
                     session, item.code, collection_name.strip(), embedding, storage_schema, fields, index_spec,
+                    reuse_managed_collection_id=reuse_managed_collection_id,
                 )
+                collection_name = managed.collection_name
             elif not collection_name.strip():
                 raise ValueError("外部 Index Profile 必须指定 Collection")
             latest = session.scalar(select(func.max(KnowledgeIndexProfileRevision.revision_no)).where(KnowledgeIndexProfileRevision.knowledge_index_profile_id == item.id)) or 0
@@ -683,7 +965,8 @@ class V7Store:
                                                     storage_contract_revision_id=storage_revision.id if storage_revision else None,
                                                     collection_policy=collection_policy)
             session.add(revision); self.audit(session, "index_profile.revised", "index_profile", item.id, {"revision": revision.revision_no})
-            return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "draft"}
+            return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "draft",
+                    "collection_name": collection_name.strip(), "managed_collection_id": managed.id if managed else None}
 
     @staticmethod
     def _validate_index_mapping(fields: dict[str, Any]) -> None:
@@ -730,7 +1013,8 @@ class V7Store:
             self.audit(session, "index_profile.published", "index_profile", item.id, {"revision": revision.revision_no})
             return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
-    def list_operator_catalog(self, *, include_internal: bool = False) -> list[dict[str, Any]]:
+    def list_operator_catalog(self, *, include_internal: bool = False, query: str = "", category: str = "",
+                              knowledge_type: str = "", exposure: str = "", status: str = "") -> list[dict[str, Any]]:
         with self.sessions() as session:
             rows = session.execute(
                 select(OperatorDefinition, OperatorVersion).join(OperatorVersion, OperatorVersion.operator_definition_id == OperatorDefinition.id)
@@ -742,13 +1026,70 @@ class V7Store:
                 if definition.code in seen or (definition.exposure == "internal" and not include_internal):
                     continue
                 seen.add(definition.code)
-                values.append({"id": definition.id, "code": definition.code, "name": definition.name, "description": definition.description, "category": definition.category,
+                value = {"id": definition.id, "code": definition.code, "name": definition.name, "display_name_zh": definition.display_name_zh,
+                               "summary": definition.summary, "description": definition.description, "category": definition.category, "subcategory": definition.subcategory,
                                "exposure": definition.exposure, "risk_level": definition.risk_level, "enabled": definition.enabled,
+                               "scenarios": definition.scenarios, "knowledge_types": definition.knowledge_types,
+                               "recommended_predecessors": definition.recommended_predecessors, "recommended_successors": definition.recommended_successors,
+                               "status": definition.lifecycle_status,
                                "version": version.version_no, "adapter_code": version.adapter_code,
                                "input_ports": version.input_ports, "output_ports": version.output_ports,
                                "input_example": version.input_example, "output_example": version.output_example,
-                               "parameter_schema": version.parameter_schema, "runtime_requirements": version.runtime_requirements})
+                               "parameter_schema": version.parameter_schema, "parameter_docs": version.parameter_docs}
+                searchable = " ".join((definition.code, definition.name, definition.display_name_zh, definition.summary,
+                                       definition.description, json.dumps(version.input_ports, ensure_ascii=False),
+                                       json.dumps(version.output_ports, ensure_ascii=False))).lower()
+                if query and query.lower() not in searchable: continue
+                if category and definition.category != category: continue
+                if knowledge_type and knowledge_type not in (definition.knowledge_types or []): continue
+                if exposure and definition.exposure != exposure: continue
+                if status and definition.lifecycle_status != status: continue
+                values.append(value)
             return values
+
+    def operator_catalog_facets(self) -> dict[str, Any]:
+        values = self.list_operator_catalog(include_internal=True)
+        return {
+            "total": len(values),
+            "categories": [{"name": name, "count": sum(item["category"] == name for item in values)} for name in OPERATOR_CATEGORIES],
+            "knowledge_types": sorted({kind for item in values for kind in item.get("knowledge_types", [])}),
+            "exposures": [{"value": value, "label": label, "count": sum(item["exposure"] == value for item in values)} for value, label in (
+                ("canvas", "可直接使用"), ("controlled", "受控使用"), ("internal", "系统内部"), ("disabled", "已禁用"))],
+            "statuses": sorted({item["status"] for item in values}),
+        }
+
+    def operator_catalog_detail(self, code: str) -> dict[str, Any]:
+        values = self.list_operator_catalog(include_internal=True)
+        value = next((item for item in values if item["code"] == code), None)
+        if not value: raise ValueError("算子不存在或没有已发布版本")
+        with self.sessions() as session:
+            templates = []
+            for item in session.scalars(select(KnowledgeFlowTemplate).where(KnowledgeFlowTemplate.status == "active")).all():
+                definition = item.definition_json or {}
+                if any(node.get("ref") == code for node in definition.get("nodes", [])):
+                    templates.append({"id": item.id, "code": item.code, "name": item.name})
+        return {**value, "templates": templates}
+
+    @staticmethod
+    def _operator_publication_errors(definition: OperatorDefinition, version: OperatorVersion) -> list[str]:
+        required = {
+            "中文名": definition.display_name_zh, "摘要": definition.summary, "详细说明": definition.description,
+            "适用场景": definition.scenarios, "适用知识类型": definition.knowledge_types,
+            "输入契约": version.input_ports, "输出契约": version.output_ports,
+            "参数说明": version.parameter_docs, "输入样例": version.input_example, "输出样例": version.output_example,
+        }
+        return [label for label, value in required.items() if value in (None, "", [], {})]
+
+    def publish_operator_version(self, code: str, version_no: int) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == code))
+            version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id,
+                                                                    OperatorVersion.version_no == version_no)) if definition else None
+            if not definition or not version: raise ValueError("算子版本不存在")
+            missing = self._operator_publication_errors(definition, version)
+            if missing: raise ValueError(f"算子发布元数据不完整：{', '.join(missing)}")
+            version.status, version.published_at = "published", utc_now()
+            return {"code": code, "version": version_no, "status": "published"}
 
     def list_prompt_templates(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -828,12 +1169,84 @@ class V7Store:
         with self.sessions() as session:
             values = []
             for item in session.scalars(select(FlowSubgraph).order_by(FlowSubgraph.code)):
-                revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == item.id).order_by(FlowSubgraphRevision.revision_no.desc()))
+                revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == item.id,
+                                                                             FlowSubgraphRevision.status == "published")
+                                          .order_by(FlowSubgraphRevision.revision_no.desc()))
+                definition = revision.definition_json if revision else None
                 values.append({"id": item.id, "code": item.code, "name": item.name, "status": item.status,
                                "revision": revision.revision_no if revision else None,
                                "revision_status": revision.status if revision else None,
-                               "definition": revision.definition_json if revision else None})
+                               "description": revision.description if revision else "",
+                               "input_contract": revision.input_contract if revision else {}, "output_contract": revision.output_contract if revision else {},
+                               "node_count": len((definition or {}).get("nodes", [])), "edge_count": len((definition or {}).get("edges", [])),
+                               "definition": definition})
             return values
+
+    def subflow_revision_detail(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
+        with self.sessions() as session:
+            item = session.get(FlowSubgraph, subflow_id)
+            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
+                                                                         FlowSubgraphRevision.revision_no == revision_no))
+            if not item or not revision: raise ValueError("子图修订不存在")
+            definition = revision.definition_json or {}
+            return {"id": item.id, "code": item.code, "name": item.name, "status": item.status,
+                    "revision_id": revision.id, "revision": revision.revision_no, "revision_status": revision.status,
+                    "description": revision.description, "input_contract": revision.input_contract, "output_contract": revision.output_contract,
+                    "node_count": len(definition.get("nodes", [])), "edge_count": len(definition.get("edges", [])), "definition": definition}
+
+    @staticmethod
+    def _validate_subflow_definition(definition: dict[str, Any]) -> None:
+        nodes = definition.get("nodes") or []; edges = definition.get("edges") or []
+        ids = [str(node.get("id", "")) for node in nodes]
+        if not ids or any(not value for value in ids) or len(ids) != len(set(ids)): raise ValueError("子图节点 id 必须存在且唯一")
+        if definition.get("entry_node") not in ids or definition.get("exit_node") not in ids: raise ValueError("子图 entry_node/exit_node 必须引用内部节点")
+        incoming = {value: 0 for value in ids}; outgoing = {value: [] for value in ids}
+        for raw in edges:
+            source = str(raw[0] if isinstance(raw, list) else raw.get("source", "")); target = str(raw[1] if isinstance(raw, list) else raw.get("target", ""))
+            if source not in incoming or target not in incoming: raise ValueError("子图连线引用了不存在的节点")
+            incoming[target] += 1; outgoing[source].append(target)
+        queue = [value for value in ids if incoming[value] == 0]; visited = []
+        while queue:
+            current = queue.pop(0); visited.append(current)
+            for target in outgoing[current]:
+                incoming[target] -= 1
+                if incoming[target] == 0: queue.append(target)
+        if len(visited) != len(ids): raise ValueError("子图必须是有向无环图")
+
+    def copy_subflow_draft(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            item = session.get(FlowSubgraph, subflow_id)
+            source = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
+                                                                       FlowSubgraphRevision.revision_no == revision_no))
+            if not item or not source: raise ValueError("子图修订不存在")
+            latest = session.scalar(select(func.max(FlowSubgraphRevision.revision_no)).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id)) or 0
+            revision = FlowSubgraphRevision(id=new_id("subflowrev"), flow_subgraph_id=subflow_id, revision_no=latest + 1,
+                                            definition_json=dict(source.definition_json), description=source.description,
+                                            input_contract=dict(source.input_contract), output_contract=dict(source.output_contract), status="draft")
+            session.add(revision); self.audit(session, "subgraph.draft_created", "flow_subgraph", subflow_id, {"revision": revision.revision_no})
+            return {"id": subflow_id, "revision": revision.revision_no, "status": "draft"}
+
+    def update_subflow_draft(self, subflow_id: str, revision_no: int, definition: dict[str, Any], description: str,
+                             input_contract: dict[str, Any], output_contract: dict[str, Any]) -> dict[str, Any]:
+        self._validate_subflow_definition(definition)
+        with self.sessions.begin() as session:
+            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
+                                                                         FlowSubgraphRevision.revision_no == revision_no))
+            if not revision or revision.status != "draft": raise ValueError("只能修改子图草稿")
+            item = session.get(FlowSubgraph, subflow_id); assert item
+            revision.definition_json = {**definition, "_subgraph_code": item.code, "_subgraph_revision": revision_no}
+            revision.description, revision.input_contract, revision.output_contract = description.strip(), input_contract, output_contract
+            return {"id": subflow_id, "revision": revision_no, "status": "draft"}
+
+    def publish_subflow_draft(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
+                                                                         FlowSubgraphRevision.revision_no == revision_no))
+            if not revision or revision.status != "draft": raise ValueError("只能发布子图草稿")
+            self._validate_subflow_definition(revision.definition_json)
+            revision.status, revision.published_at = "published", utc_now()
+            self.audit(session, "subgraph.published", "flow_subgraph", subflow_id, {"revision": revision_no})
+            return {"id": subflow_id, "revision": revision_no, "status": "published"}
 
     def execution_snapshot_detail(self, snapshot_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -847,6 +1260,7 @@ class V7Store:
     def list_flow_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.sessions() as session:
             return [{"id": item.id, "knowledge_job_id": item.knowledge_job_id, "execution_snapshot_id": item.execution_snapshot_id,
+                     "parent_flow_run_id": item.parent_flow_run_id, "run_mode": item.run_mode, "start_node_id": item.start_node_id,
                      "status": item.status, "error": item.error, "created_at": item.created_at.isoformat(),
                      "completed_at": item.completed_at.isoformat() if item.completed_at else None}
                     for item in session.scalars(select(FlowRun).order_by(FlowRun.created_at.desc()).limit(limit))]
@@ -1069,21 +1483,42 @@ class V7Store:
             document_library = session.get(DocumentLibrary, document_library_id)
             if not document_library or document_library.status != "active":
                 raise ValueError("文档库不存在或不可用")
-            template, _ = self._published_template_revision(session, template_id)
-            binding = session.scalar(select(DocumentLibraryTemplateBinding).where(
-                DocumentLibraryTemplateBinding.document_library_id == document_library.id,
-                DocumentLibraryTemplateBinding.knowledge_flow_template_id == template.id,
-            ))
-            if not binding:
-                binding = DocumentLibraryTemplateBinding(id=new_id("docbind"), document_library_id=document_library.id,
-                                                        knowledge_flow_template_id=template.id)
-                session.add(binding); session.flush()
-            binding.status = "active"
-            self._ensure_document_binding_outputs(session, document_library, template, binding)
-            self.audit(session, "document_library.template_bound", "document_library_template_binding", binding.id,
-                       {"template_id": template.id})
+            binding = self._bind_document_library_template(session, document_library, template_id)
             session.flush()
             return self._document_binding_payload(session, binding)
+
+    def bind_document_library_templates(self, document_library_id: str, template_ids: list[str]) -> list[dict[str, Any]]:
+        """Atomically attach several published templates to one document library."""
+        identifiers = list(dict.fromkeys(template_id for template_id in template_ids if template_id))
+        if not identifiers:
+            raise ValueError("至少选择一个知识模板")
+        with self.sessions.begin() as session:
+            document_library = session.get(DocumentLibrary, document_library_id)
+            if not document_library or document_library.status != "active":
+                raise ValueError("文档库不存在或不可用")
+            bindings = [
+                self._bind_document_library_template(session, document_library, template_id)
+                for template_id in identifiers
+            ]
+            session.flush()
+            return [self._document_binding_payload(session, binding) for binding in bindings]
+
+    def _bind_document_library_template(self, session: Session, document_library: DocumentLibrary,
+                                        template_id: str) -> DocumentLibraryTemplateBinding:
+        template, _ = self._published_template_revision(session, template_id)
+        binding = session.scalar(select(DocumentLibraryTemplateBinding).where(
+            DocumentLibraryTemplateBinding.document_library_id == document_library.id,
+            DocumentLibraryTemplateBinding.knowledge_flow_template_id == template.id,
+        ))
+        if not binding:
+            binding = DocumentLibraryTemplateBinding(id=new_id("docbind"), document_library_id=document_library.id,
+                                                    knowledge_flow_template_id=template.id)
+            session.add(binding); session.flush()
+        binding.status = "active"
+        self._ensure_document_binding_outputs(session, document_library, template, binding)
+        self.audit(session, "document_library.template_bound", "document_library_template_binding", binding.id,
+                   {"template_id": template.id})
+        return binding
 
     def unbind_document_library_template(self, document_library_id: str, template_id: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -1927,7 +2362,36 @@ class V7Store:
 
     @staticmethod
     def job_payload(job: KnowledgeJob) -> dict[str, Any]:
-        return {"id": job.id, "knowledge_flow_template_id": job.knowledge_flow_template_id, "knowledge_flow_template_revision_id": job.knowledge_flow_template_revision_id, "execution_snapshot_id": job.execution_snapshot_id, "document_library_template_binding_id": job.document_library_template_binding_id, "source_version_ids": job.source_version_ids, "sink_library_ids": job.sink_library_ids or job.output_library_ids, "output_library_ids": job.output_library_ids, "status": job.status, "stage": job.stage, "attempt_count": job.attempt_count, "error": job.error, "warning_count": 0, "failed_chunk_count": 0, "created_at": job.created_at.isoformat()}
+        return {"id": job.id, "knowledge_flow_template_id": job.knowledge_flow_template_id, "knowledge_flow_template_revision_id": job.knowledge_flow_template_revision_id, "execution_snapshot_id": job.execution_snapshot_id, "document_library_template_binding_id": job.document_library_template_binding_id, "source_version_ids": job.source_version_ids, "sink_library_ids": job.sink_library_ids or job.output_library_ids, "output_library_ids": job.output_library_ids, "status": job.status, "stage": job.stage, "attempt_count": job.attempt_count, "error": job.error, "warning_count": 0, "failed_chunk_count": 0, "progress": V7Store._job_progress(job, 0, 0), "created_at": job.created_at.isoformat()}
+
+    @staticmethod
+    def _job_progress(job: KnowledgeJob, total_nodes: int, completed_nodes: int) -> dict[str, int]:
+        total = max(int(total_nodes or 0), 0)
+        completed = min(max(int(completed_nodes or 0), 0), total) if total else 0
+        if job.status == "queued":
+            completed, percent = 0, 0
+        elif job.status in {"completed", "completed_with_warnings"}:
+            completed, percent = total, 100
+        elif total:
+            percent = completed * 100 // total
+        else:
+            percent = 0
+        return {"completed_nodes": completed, "total_nodes": total, "percent": percent}
+
+    def _job_progress_with_session(self, session: Session, job: KnowledgeJob) -> dict[str, int]:
+        snapshot = session.get(FlowExecutionSnapshot, job.execution_snapshot_id) if job.execution_snapshot_id else None
+        total = len((snapshot.compiled_definition_json or {}).get("nodes", [])) if snapshot else 0
+        if job.status in {"queued", "completed", "completed_with_warnings"}:
+            return self._job_progress(job, total, total if job.status != "queued" else 0)
+        run = session.scalar(select(FlowRun).where(
+            FlowRun.knowledge_job_id == job.id,
+            FlowRun.parent_flow_run_id.is_(None),
+            FlowRun.run_mode == "full",
+        ).order_by(FlowRun.created_at.desc(), FlowRun.id.desc()))
+        completed = 0 if not run else session.scalar(select(func.count(func.distinct(FlowNodeRun.node_id))).where(
+            FlowNodeRun.flow_run_id == run.id,
+        )) or 0
+        return self._job_progress(job, total, completed)
 
     @staticmethod
     def _generation_payload(row: KnowledgeChunkGeneration) -> dict[str, Any]:
@@ -1952,6 +2416,7 @@ class V7Store:
         )))
         payload["failed_chunk_count"] = len(failed)
         payload["warning_count"] = len(failed) if job.status == "completed_with_warnings" else 0
+        payload["progress"] = self._job_progress_with_session(session, job)
         return payload
 
     def template_definition_for_job(self, job_id: str) -> dict[str, Any]:
@@ -2008,7 +2473,43 @@ class V7Store:
 
     def list_knowledge_jobs(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            return [self._job_payload_with_generation_summary(session, item) for item in session.scalars(select(KnowledgeJob).order_by(KnowledgeJob.created_at.desc()))]
+            jobs = list(session.scalars(select(KnowledgeJob).order_by(KnowledgeJob.created_at.desc())))
+            if not jobs:
+                return []
+            job_ids = [job.id for job in jobs]
+            snapshot_ids = {job.execution_snapshot_id for job in jobs if job.execution_snapshot_id}
+            snapshots = {item.id: item for item in session.scalars(select(FlowExecutionSnapshot).where(
+                FlowExecutionSnapshot.id.in_(snapshot_ids),
+            ))} if snapshot_ids else {}
+            failed_counts = dict(session.execute(select(
+                KnowledgeChunkGeneration.knowledge_job_id, func.count(),
+            ).where(
+                KnowledgeChunkGeneration.knowledge_job_id.in_(job_ids),
+                KnowledgeChunkGeneration.status == "failed",
+            ).group_by(KnowledgeChunkGeneration.knowledge_job_id)).all())
+            latest_runs: dict[str, FlowRun] = {}
+            for run in session.scalars(select(FlowRun).where(
+                FlowRun.knowledge_job_id.in_(job_ids),
+                FlowRun.parent_flow_run_id.is_(None),
+                FlowRun.run_mode == "full",
+            ).order_by(FlowRun.created_at.desc(), FlowRun.id.desc())):
+                latest_runs.setdefault(run.knowledge_job_id, run)
+            run_ids = [run.id for run in latest_runs.values()]
+            node_counts = dict(session.execute(select(
+                FlowNodeRun.flow_run_id, func.count(func.distinct(FlowNodeRun.node_id)),
+            ).where(FlowNodeRun.flow_run_id.in_(run_ids)).group_by(FlowNodeRun.flow_run_id)).all()) if run_ids else {}
+            payloads = []
+            for job in jobs:
+                payload = self.job_payload(job)
+                failed = int(failed_counts.get(job.id, 0))
+                payload["failed_chunk_count"] = failed
+                payload["warning_count"] = failed if job.status == "completed_with_warnings" else 0
+                snapshot = snapshots.get(job.execution_snapshot_id)
+                total = len((snapshot.compiled_definition_json or {}).get("nodes", [])) if snapshot else 0
+                run = latest_runs.get(job.id)
+                payload["progress"] = self._job_progress(job, total, node_counts.get(run.id, 0) if run else 0)
+                payloads.append(payload)
+            return payloads
 
     def job_generation_results(self, job_id: str, *, failed_only: bool = False) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -2212,22 +2713,37 @@ class V7Store:
                 raise ValueError("知识任务缺少执行快照")
             run = FlowRun(id=new_id("flowrun"), knowledge_job_id=job.id, execution_snapshot_id=job.execution_snapshot_id)
             session.add(run)
+            session.flush(); self._append_run_event(session, run.id, "run.started", "Flow Run 已开始")
             self.audit(session, "flow_run.started", "flow_run", run.id, {"knowledge_job_id": job.id})
             return {"id": run.id, "execution_snapshot_id": run.execution_snapshot_id, "status": run.status}
 
-    def record_flow_node(self, flow_run_id: str, node_id: str, input_artifact_ids: list[str], outputs: list[dict[str, Any]], *, error: str | None = None) -> list[str]:
+    def record_flow_node(self, flow_run_id: str, node_id: str, input_artifact_ids: list[str], outputs: list[dict[str, Any]], *, error: str | None = None,
+                         operator_code: str | None = None, operator_version: int | None = None, resolved_parameters: dict[str, Any] | None = None,
+                         status: str | None = None, logs: list[dict[str, Any]] | None = None, metrics: dict[str, Any] | None = None) -> list[str]:
         """Persist execution-only artifacts and their lineage; never use them as formal provenance."""
         with self.sessions.begin() as session:
-            node_run = FlowNodeRun(id=new_id("noderun"), flow_run_id=flow_run_id, node_id=node_id,
-                                   status="failed" if error else "completed", input_artifact_ids=list(input_artifact_ids), error=error)
+            started = utc_now()
+            node_run = FlowNodeRun(id=new_id("noderun"), flow_run_id=flow_run_id, node_id=node_id, operator_code=operator_code,
+                                   operator_version=operator_version, resolved_parameters=resolved_parameters or {}, logs_json=logs or [], metrics_json=metrics or {},
+                                   error_json={"message": error} if error else {}, started_at=started, finished_at=started, duration_ms=0,
+                                   status=status or ("failed" if error else "completed"), input_artifact_ids=list(input_artifact_ids), error=error)
             session.add(node_run); session.flush()
+            for ordinal, artifact_id in enumerate(input_artifact_ids):
+                session.add(FlowNodeArtifactBinding(id=new_id("binding"), flow_node_run_id=node_run.id, artifact_id=artifact_id,
+                                                    direction="input", port_name="input", ordinal=ordinal,
+                                                    reused=bool(session.get(Artifact, artifact_id) and session.get(Artifact, artifact_id).flow_run_id != flow_run_id)))
             output_ids: list[str] = []
-            for value in outputs:
+            for ordinal, value in enumerate(outputs):
                 data = dict(value) if isinstance(value, dict) else {"value": value}
                 parser_artifacts = list(data.pop("_parser_artifacts", []))
+                type_code = str(data.pop("_artifact_type", "execution"))
+                encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 artifact = Artifact(id=new_id("artifact"), flow_run_id=flow_run_id, flow_node_run_id=node_run.id,
-                                    type_code=str(data.pop("_artifact_type", "execution")), data_json=data)
+                                    type_code=type_code, data_json=data, checksum=hashlib.sha256(encoded).hexdigest(),
+                                    summary_json={"keys": sorted(data)[:20], "bytes": len(encoded)}, record_count=1, replayable=True)
                 session.add(artifact); session.flush(); output_ids.append(artifact.id)
+                session.add(FlowNodeArtifactBinding(id=new_id("binding"), flow_node_run_id=node_run.id, artifact_id=artifact.id,
+                                                    direction="output", port_name="output", ordinal=ordinal))
                 for parent_id in input_artifact_ids:
                     session.add(ArtifactLineage(id=new_id("lineage"), parent_artifact_id=parent_id, child_artifact_id=artifact.id))
                 for parser_artifact in parser_artifacts:
@@ -2241,6 +2757,8 @@ class V7Store:
                     session.add(persisted); session.flush(); output_ids.append(persisted.id)
                     session.add(ArtifactLineage(id=new_id("lineage"), parent_artifact_id=artifact.id, child_artifact_id=persisted.id))
             node_run.output_artifact_ids = output_ids
+            self._append_run_event(session, flow_run_id, f"node.{node_run.status}", f"节点 {node_id} {node_run.status}", node_id=node_id,
+                                   payload={"input_count": len(input_artifact_ids), "output_count": len(output_ids)})
             return output_ids
 
     def finish_flow_run(self, flow_run_id: str, error: str | None = None, *, status: str | None = None) -> None:
@@ -2250,6 +2768,7 @@ class V7Store:
                 raise ValueError("Flow Run 不存在")
             final_status = status or ("failed" if error else "completed")
             run.status, run.error, run.completed_at = final_status, error, utc_now()
+            self._append_run_event(session, run.id, f"run.{final_status}", error or f"Flow Run {final_status}", level="error" if error else "info")
             self.audit(session, "flow_run.finished", "flow_run", run.id, {"status": final_status, "error": error} if error else {"status": final_status})
 
     def flow_run_detail(self, flow_run_id: str) -> dict[str, Any]:
@@ -2259,12 +2778,323 @@ class V7Store:
                 raise ValueError("Flow Run 不存在")
             nodes = session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == run.id).order_by(FlowNodeRun.created_at)).all()
             artifacts = session.scalars(select(Artifact).where(Artifact.flow_run_id == run.id).order_by(Artifact.created_at)).all()
+            previews = session.scalars(select(FlowRunSinkPreview).where(FlowRunSinkPreview.flow_run_id == run.id).order_by(FlowRunSinkPreview.created_at)).all()
+            snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id)
+            definition = snapshot.compiled_definition_json if snapshot else {"nodes": [], "edges": []}
+            latest = {node.node_id: node for node in nodes}
+            artifact_by_id = {item.id: item for item in artifacts}
+            selected_ids = {str(node["id"]) for node in definition.get("nodes", [])}
+            if run.parent_flow_run_id and run.start_node_id:
+                selected_ids = {run.start_node_id}
+                if run.run_mode == "from_node":
+                    outgoing: dict[str, list[str]] = {}
+                    for edge in definition.get("edges", []):
+                        source = str(edge[0] if isinstance(edge, list) else edge.get("source")); target = str(edge[1] if isinstance(edge, list) else edge.get("target"))
+                        outgoing.setdefault(source, []).append(target)
+                    queue = [run.start_node_id]
+                    while queue:
+                        current = queue.pop(0)
+                        for target in outgoing.get(current, []):
+                            if target not in selected_ids: selected_ids.add(target); queue.append(target)
+            reused_ids = set()
+            parent_latest: dict[str, FlowNodeRun] = {}
+            if run.parent_flow_run_id:
+                for edge in definition.get("edges", []):
+                    source = str(edge[0] if isinstance(edge, list) else edge.get("source")); target = str(edge[1] if isinstance(edge, list) else edge.get("target"))
+                    if target in selected_ids and source not in selected_ids: reused_ids.add(source)
+                parent_latest = {node.node_id: node for node in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == run.parent_flow_run_id)).all()}
+                reused_artifact_ids = [artifact_id for node_id in reused_ids for artifact_id in (parent_latest.get(node_id).output_artifact_ids if parent_latest.get(node_id) else [])]
+                if reused_artifact_ids:
+                    artifact_by_id.update({item.id: item for item in session.scalars(select(Artifact).where(Artifact.id.in_(reused_artifact_ids))).all()})
+            runtime_nodes = []
+            for definition_node in definition.get("nodes", []):
+                node = latest.get(str(definition_node["id"]))
+                runtime_nodes.append({"id": definition_node["id"], "kind": definition_node.get("kind"), "ref": definition_node.get("ref"),
+                                      "params": definition_node.get("params") or {}, "origin_path": definition_node.get("origin_path") or str(definition_node["id"]).split("::"),
+                                      "source_subgraph": definition_node.get("source_subgraph"), "status": node.status if node else "reused" if str(definition_node["id"]) in reused_ids else "skipped",
+                                      "node_run_id": node.id if node else None})
+            runtime_edges = []
+            for raw in definition.get("edges", []):
+                source = str(raw[0] if isinstance(raw, list) else raw.get("source")); target = str(raw[1] if isinstance(raw, list) else raw.get("target"))
+                source_run = latest.get(source) or (parent_latest.get(source) if source in reused_ids else None); edge_artifacts = [artifact_by_id[value] for value in (source_run.output_artifact_ids if source_run else []) if value in artifact_by_id]
+                edge = {"source": source, "target": target,
+                        "source_port": "output" if isinstance(raw, list) else raw.get("source_port", "output"),
+                        "target_port": "input" if isinstance(raw, list) else raw.get("target_port", "input"),
+                        "status": latest.get(source).status if latest.get(source) else "reused" if source in reused_ids else "skipped", "artifact_ids": [item.id for item in edge_artifacts],
+                        "artifact_type": ", ".join(sorted({item.type_code for item in edge_artifacts})),
+                        "record_count": sum(item.record_count or 0 for item in edge_artifacts)}
+                runtime_edges.append(edge)
             return {"id": run.id, "knowledge_job_id": run.knowledge_job_id, "execution_snapshot_id": run.execution_snapshot_id,
-                    "status": run.status, "error": run.error, "nodes": [
+                    "parent_flow_run_id": run.parent_flow_run_id, "run_mode": run.run_mode, "start_node_id": run.start_node_id,
+                    "parameter_overrides": run.parameter_overrides, "sink_policy": run.sink_policy,
+                     "status": run.status, "error": run.error, "runtime_dag": {"nodes": runtime_nodes, "edges": runtime_edges}, "nodes": [
                         {"id": node.id, "node_id": node.node_id, "status": node.status, "input_artifact_ids": node.input_artifact_ids,
-                         "output_artifact_ids": node.output_artifact_ids, "error": node.error} for node in nodes],
-                    "artifacts": [{"id": item.id, "node_run_id": item.flow_node_run_id, "type": item.type_code,
-                                   "data": item.data_json, "uri": item.uri} for item in artifacts]}
+                         "output_artifact_ids": node.output_artifact_ids, "operator_code": node.operator_code, "operator_version": node.operator_version,
+                         "resolved_parameters": node.resolved_parameters, "logs": node.logs_json, "metrics": node.metrics_json,
+                         "started_at": node.started_at.isoformat() if node.started_at else None, "finished_at": node.finished_at.isoformat() if node.finished_at else None,
+                         "duration_ms": node.duration_ms, "error": node.error, "error_detail": node.error_json} for node in nodes],
+                     "artifacts": [{"id": item.id, "node_run_id": item.flow_node_run_id, "type": item.type_code,
+                                    "summary": item.summary_json, "record_count": item.record_count, "replayable": item.replayable,
+                                    "uri": item.uri} for item in artifacts],
+                     "sink_previews": [{"id": item.id, "output_key": item.output_key, "status": item.status,
+                                         "diff": item.diff_json, "quality": item.quality_json,
+                                         "preview_checksum": item.preview_checksum} for item in previews]}
+
+    def _append_run_event(self, session: Session, flow_run_id: str, event_type: str, message: str, *, node_id: str | None = None,
+                          level: str = "info", payload: dict[str, Any] | None = None) -> FlowRunEvent:
+        sequence = session.scalar(select(func.max(FlowRunEvent.sequence_no)).where(FlowRunEvent.flow_run_id == flow_run_id)) or 0
+        event = FlowRunEvent(id=new_id("event"), flow_run_id=flow_run_id, sequence_no=sequence + 1, event_type=event_type,
+                             node_id=node_id, level=level, message=message, payload_json=payload or {})
+        session.add(event); return event
+
+    def flow_run_events(self, flow_run_id: str, after: int = 0, limit: int = 200) -> dict[str, Any]:
+        with self.sessions() as session:
+            if not session.get(FlowRun, flow_run_id): raise ValueError("Flow Run 不存在")
+            rows = session.scalars(select(FlowRunEvent).where(FlowRunEvent.flow_run_id == flow_run_id,
+                                                              FlowRunEvent.sequence_no > max(after, 0))
+                                   .order_by(FlowRunEvent.sequence_no).limit(min(max(limit, 1), 500))).all()
+            return {"items": [{"cursor": item.sequence_no, "level": item.level, "type": item.event_type, "node_id": item.node_id,
+                               "message": item.message, "payload": item.payload_json, "created_at": item.created_at.isoformat()} for item in rows],
+                    "next_cursor": rows[-1].sequence_no if rows else after}
+
+    def artifact_detail(self, artifact_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            item = session.get(Artifact, artifact_id)
+            if not item: raise ValueError("Artifact 不存在")
+            parents = list(session.scalars(select(ArtifactLineage.parent_artifact_id).where(ArtifactLineage.child_artifact_id == artifact_id)))
+            children = list(session.scalars(select(ArtifactLineage.child_artifact_id).where(ArtifactLineage.parent_artifact_id == artifact_id)))
+            return {"id": item.id, "flow_run_id": item.flow_run_id, "node_run_id": item.flow_node_run_id, "type": item.type_code,
+                    "summary": item.summary_json, "record_count": item.record_count, "content_format": item.content_format,
+                    "replayable": item.replayable, "checksum": item.checksum, "uri": item.uri,
+                    "lineage": {"parents": parents, "children": children}}
+
+    def artifact_content(self, artifact_id: str, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        with self.sessions() as session:
+            item = session.get(Artifact, artifact_id)
+            if not item: raise ValueError("Artifact 不存在")
+            raw = item.data_json
+            values = raw if isinstance(raw, list) else [raw]
+            start, size = max(offset, 0), min(max(limit, 1), 200)
+            return {"items": values[start:start + size], "offset": start, "limit": size, "total": len(values),
+                    "has_more": start + size < len(values)}
+
+    @staticmethod
+    def _incoming_nodes(definition: dict[str, Any]) -> dict[str, list[str]]:
+        values = {str(node["id"]): [] for node in definition.get("nodes", [])}
+        for edge in definition.get("edges", []): values.setdefault(str(edge["target"]), []).append(str(edge["source"]))
+        return values
+
+    @staticmethod
+    def _artifact_can_replay(item: Artifact | None) -> bool:
+        if not item or not item.replayable or not item.checksum:
+            return False
+        # URI-backed parser artifacts are verified by their storage checksum when read.
+        if item.uri:
+            return True
+        encoded = json.dumps(item.data_json, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest() == item.checksum
+
+    @staticmethod
+    def _validate_parameter_override(schema: dict[str, Any], value: dict[str, Any]) -> str | None:
+        properties = dict(schema.get("properties") or {})
+        unknown = set(value) - set(properties)
+        if schema.get("additionalProperties") is False and unknown:
+            return f"不允许参数 {sorted(unknown)[0]}"
+        for key in schema.get("required") or []:
+            if key not in value: return f"缺少必填参数 {key}"
+        python_types = {"string": str, "integer": int, "number": (int, float), "boolean": bool, "array": list, "object": dict}
+        for key, item in value.items():
+            spec = properties.get(key) or {}
+            expected = python_types.get(spec.get("type"))
+            if expected and not isinstance(item, expected): return f"参数 {key} 类型不符合 {spec['type']}"
+            if spec.get("enum") and item not in spec["enum"]: return f"参数 {key} 不在允许值范围内"
+            if key == "llm_serving":
+                try:
+                    get_llm_serving_registry().require(str(item))
+                except ValueError as exc:
+                    return str(exc)
+        return None
+
+    def create_derived_run(self, parent_run_id: str, mode: str, node_id: str, parameter_overrides: dict[str, Any], idempotency_key: str | None = None) -> dict[str, Any]:
+        if mode not in {"node_only", "from_node"}: raise ValueError("派生 Run mode 仅支持 node_only 或 from_node")
+        with self.sessions.begin() as session:
+            parent = session.get(FlowRun, parent_run_id)
+            if not parent or parent.status == "running": raise ValueError("父 Flow Run 不存在或仍在运行")
+            if idempotency_key:
+                existing = session.scalar(select(FlowRun).where(FlowRun.parent_flow_run_id == parent_run_id,
+                                                                 FlowRun.idempotency_key == idempotency_key))
+                if existing:
+                    return {"id": existing.id, "parent_flow_run_id": parent.id, "execution_snapshot_id": existing.execution_snapshot_id,
+                            "run_mode": existing.run_mode, "start_node_id": existing.start_node_id, "status": existing.status, "idempotent": True}
+            snapshot = session.get(FlowExecutionSnapshot, parent.execution_snapshot_id); assert snapshot
+            definition = snapshot.compiled_definition_json or {}; by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
+            node = by_id.get(node_id)
+            if not node or node.get("kind") != "operator": raise ValueError("只能对展开后的真实算子节点创建派生 Run")
+            overrides = dict(parameter_overrides or {})
+            unknown = set(overrides) - {node_id}
+            if unknown: raise ValueError("参数覆盖只能包含所选节点")
+            resolved = {**dict(node.get("params") or {}), **dict(overrides.get(node_id) or {})}
+            definition_row = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == node.get("ref")))
+            version_row = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition_row.id,
+                                                                        OperatorVersion.version_no == int(node.get("version") or definition_row.latest_version or 1))) if definition_row else None
+            if not definition_row or not definition_row.enabled or not version_row or version_row.status != "published": raise ValueError("算子版本已不可执行")
+            validated_parameters = {key: value for key, value in dict(overrides.get(node_id) or {}).items() if key != "force_ocr"}
+            validation_error = self._validate_parameter_override(version_row.parameter_schema or {"type": "object"}, validated_parameters)
+            if validation_error: raise ValueError(f"参数覆盖不符合 Operator Version Schema：{validation_error}")
+            if resolved.get("force_ocr") and node.get("ref") != "document-parser": raise ValueError("force_ocr 仅适用于 Document Parser")
+            if resolved.get("force_ocr"):
+                job = session.get(KnowledgeJob, parent.knowledge_job_id); assert job
+                sources = session.execute(select(Source.original_filename).join(SourceVersion, SourceVersion.source_id == Source.id)
+                                          .where(SourceVersion.id.in_(job.source_version_ids))).scalars().all()
+                if not sources or any(not name.lower().endswith(".pdf") for name in sources): raise ValueError("强制 OCR 仅适用于全部输入均为 PDF 的 Run")
+            incoming = self._incoming_nodes(definition)
+            parent_nodes = {item.node_id: item for item in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == parent.id)).all()}
+            selected_record = parent_nodes.get(node_id)
+            selected_inputs = [session.get(Artifact, value) for value in (selected_record.input_artifact_ids if selected_record else [])]
+            if selected_record and any(not self._artifact_can_replay(item) for item in selected_inputs):
+                raise ValueError(f"节点 {node_id} 缺少完整可重放 Artifact")
+            selected_ids = {node_id}
+            if mode == "from_node":
+                outgoing: dict[str, list[str]] = {}
+                for edge in definition.get("edges", []):
+                    source = str(edge[0] if isinstance(edge, list) else edge.get("source")); target = str(edge[1] if isinstance(edge, list) else edge.get("target"))
+                    outgoing.setdefault(source, []).append(target)
+                queue = [node_id]
+                while queue:
+                    current = queue.pop(0)
+                    for target in outgoing.get(current, []):
+                        if target not in selected_ids: selected_ids.add(target); queue.append(target)
+            boundary_nodes = {predecessor for selected_id in selected_ids for predecessor in incoming.get(selected_id, []) if predecessor not in selected_ids}
+            for predecessor in boundary_nodes:
+                record = parent_nodes.get(predecessor)
+                artifacts = [session.get(Artifact, value) for value in (record.output_artifact_ids if record else [])]
+                if not artifacts or any(not self._artifact_can_replay(item) for item in artifacts):
+                    raise ValueError(f"节点 {predecessor} 缺少完整可重放 Artifact")
+            run = FlowRun(id=new_id("flowrun"), knowledge_job_id=parent.knowledge_job_id, execution_snapshot_id=parent.execution_snapshot_id,
+                          parent_flow_run_id=parent.id, run_mode=mode, start_node_id=node_id, parameter_overrides=overrides,
+                          sink_policy="preview", requested_by="admin", idempotency_key=idempotency_key, status="queued")
+            session.add(run); session.flush(); self._append_run_event(session, run.id, "run.queued", "派生 Run 已进入队列", payload={"parent": parent.id, "mode": mode, "node": node_id})
+            self.audit(session, "flow_run.derived_created", "flow_run", run.id, {"parent": parent.id, "mode": mode, "node": node_id})
+            return {"id": run.id, "parent_flow_run_id": parent.id, "execution_snapshot_id": run.execution_snapshot_id, "run_mode": mode, "start_node_id": node_id, "status": "queued"}
+
+    def claim_derived_run(self, owner: str) -> FlowRun | None:
+        with self.sessions.begin() as session:
+            run = session.scalar(select(FlowRun).where(FlowRun.status == "queued", FlowRun.parent_flow_run_id.is_not(None))
+                                 .order_by(FlowRun.created_at).with_for_update(skip_locked=True).limit(1))
+            if not run: return None
+            run.status = "running"; self._append_run_event(session, run.id, "run.started", f"派生 Run 由 {owner} 开始执行")
+            return run
+
+    def persist_derived_parameters(self, flow_run_id: str, node_id: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            if not run or not run.parent_flow_run_id: raise ValueError("只能保存派生 Run 的参数覆盖")
+            snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id); job = session.get(KnowledgeJob, run.knowledge_job_id)
+            if not snapshot or not job: raise ValueError("派生 Run 缺少不可变快照或任务")
+            node = next((item for item in (snapshot.compiled_definition_json or {}).get("nodes", []) if str(item.get("id")) == node_id), None)
+            if not node or node.get("kind") != "operator": raise ValueError("只能保存真实算子节点参数")
+            if len(node.get("origin_path") or [node_id]) > 1 or "::" in node_id:
+                raise ValueError("子图内部节点不能直接写回父模板；请先复制所属子图为草稿")
+            definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == node.get("ref")))
+            version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id,
+                                                                    OperatorVersion.version_no == int(node.get("version") or definition.latest_version or 1))) if definition else None
+            if not version: raise ValueError("算子版本不存在")
+            validation_error = self._validate_parameter_override(version.parameter_schema or {"type": "object"}, parameters)
+            if validation_error: raise ValueError(f"参数不符合 Operator Version Schema：{validation_error}")
+            template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
+            if not template: raise ValueError("父模板不存在")
+            template_id, template_name, output_types = template.id, template.name, list(template.output_types)
+            template_definition = json.loads(json.dumps(template.definition_json or {}))
+        target = next((item for item in template_definition.get("nodes", []) if str(item.get("id")) == node_id), None)
+        if not target: raise ValueError("顶层节点已不在当前模板中")
+        target["params"] = dict(parameters)
+        result = self.update_flow_template(template_id, template_name, output_types, template_definition)
+        return {**result, "node_id": node_id, "message": "参数覆盖已保存为模板草稿"}
+
+    def derived_run_context(self, flow_run_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            if not run or not run.parent_flow_run_id: raise ValueError("派生 Flow Run 不存在")
+            parent = session.get(FlowRun, run.parent_flow_run_id); snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id)
+            job = session.get(KnowledgeJob, run.knowledge_job_id)
+            assert parent and snapshot and job
+            node_runs = {item.node_id: item for item in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == parent.id)).all()}
+            parent_outputs: dict[str, dict[str, Any]] = {}
+            for node_id, node_run in node_runs.items():
+                artifacts = [session.get(Artifact, value) for value in node_run.output_artifact_ids]
+                parent_outputs[node_id] = {"ids": [item.id for item in artifacts if item], "values": [dict(item.data_json) for item in artifacts if item]}
+            versions_list = session.scalars(select(SourceVersion).where(SourceVersion.id.in_(job.source_version_ids))).all()
+            sources = {source.id: source for source in session.scalars(select(Source).where(Source.id.in_([item.source_id for item in versions_list])))}
+            return {"id": run.id, "parent_id": parent.id, "mode": run.run_mode, "start_node_id": run.start_node_id,
+                    "parameter_overrides": run.parameter_overrides, "definition": snapshot.compiled_definition_json,
+                    "job_id": job.id, "sink_libraries": dict(job.sink_library_ids or job.output_library_ids),
+                    "versions": versions_list, "sources": sources, "parent_outputs": parent_outputs}
+
+    def is_flow_run_cancelled(self, flow_run_id: str) -> bool:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            return bool(run and run.cancellation_requested_at)
+
+    def cancel_flow_run(self, flow_run_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            run = session.get(FlowRun, flow_run_id)
+            if not run or not run.parent_flow_run_id: raise ValueError("派生 Flow Run 不存在")
+            if run.status not in {"queued", "running"}: return {"id": run.id, "status": run.status, "idempotent": True}
+            run.cancellation_requested_at = utc_now()
+            if run.status == "queued": run.status, run.completed_at = "cancelled", utc_now()
+            else: run.status = "cancelling"
+            self._append_run_event(session, run.id, "run.cancel_requested", "已请求协作式停止")
+            return {"id": run.id, "status": run.status}
+
+    def _library_state_hash(self, session: Session, library_id: str) -> str:
+        rows = session.execute(select(KnowledgeItem.source_knowledge_id, KnowledgeItem.content_hash, KnowledgeItem.status)
+                               .where(KnowledgeItem.knowledge_library_id == library_id).order_by(KnowledgeItem.source_knowledge_id)).all()
+        return hashlib.sha256(json.dumps([list(row) for row in rows], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def stage_sink_preview(self, flow_run_id: str, output_key: str, library_id: str, candidates: list[dict[str, Any]],
+                           successful_chunks: list[dict[str, Any]], quality: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            base_hash = self._library_state_hash(session, library_id)
+            current_ids = set(session.scalars(select(KnowledgeItem.source_knowledge_id).where(KnowledgeItem.knowledge_library_id == library_id,
+                                                                                               KnowledgeItem.status == "active")))
+            candidate_ids = {str(item.get("source_knowledge_id")) for item in candidates}
+            diff = {"ADD": len(candidate_ids - current_ids), "UPDATE": len(candidate_ids & current_ids), "INACTIVE": 0, "UNCHANGED": 0}
+            checksum = hashlib.sha256(json.dumps({"base": base_hash, "candidates": candidates, "chunks": successful_chunks}, ensure_ascii=False,
+                                                 sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            preview = FlowRunSinkPreview(id=new_id("preview"), flow_run_id=flow_run_id, output_key=output_key, knowledge_library_id=library_id,
+                                         candidates_json=candidates, successful_chunks_json=successful_chunks, diff_json=diff,
+                                         quality_json=quality or {"candidate_count": len(candidates), "status": "pass"},
+                                         base_state_hash=base_hash, preview_checksum=checksum)
+            session.add(preview); self._append_run_event(session, flow_run_id, "sink.preview_ready", f"{output_key} Diff 已暂存", payload={"diff": diff, "checksum": checksum})
+            return {"output_key": output_key, "diff": diff, "preview_checksum": checksum}
+
+    def commit_derived_run(self, flow_run_id: str, preview_checksum: str, idempotency_key: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            run = session.get(FlowRun, flow_run_id)
+            if not run or run.status not in {"awaiting_commit", "completed"}: raise ValueError("Flow Run 没有可提交的 Sink 预览")
+            previews = session.scalars(select(FlowRunSinkPreview).where(FlowRunSinkPreview.flow_run_id == flow_run_id)).all()
+            preview = next((item for item in previews if item.preview_checksum == preview_checksum), None)
+            if not preview: raise ValueError("预览 checksum 不匹配")
+            if preview.status == "committed":
+                if preview.idempotency_key == idempotency_key: return {"id": run.id, "status": run.status, "idempotent": True}
+                raise ValueError("该 Sink 预览已经提交")
+            if self._library_state_hash(session, preview.knowledge_library_id) != preview.base_state_hash:
+                raise RuntimeError("知识库当前态已变化，请重新生成 Sink 预览")
+            payload = {"id": preview.id, "output_key": preview.output_key, "knowledge_library_id": preview.knowledge_library_id,
+                       "candidates": list(preview.candidates_json), "chunks": list(preview.successful_chunks_json)}
+        job_id = self.flow_run_detail(flow_run_id)["knowledge_job_id"]
+        self.apply_knowledge_output(job_id, payload["output_key"], payload["candidates"], successful_chunks=payload["chunks"])
+        vector_jobs = {payload["knowledge_library_id"]: self.create_vector_sync_jobs(payload["knowledge_library_id"])}
+        with self.sessions.begin() as session:
+            run = session.get(FlowRun, flow_run_id); assert run
+            preview = session.get(FlowRunSinkPreview, payload["id"]); assert preview
+            preview.status, preview.idempotency_key, preview.committed_at = "committed", idempotency_key, utc_now()
+            remaining = session.scalar(select(func.count()).select_from(FlowRunSinkPreview).where(FlowRunSinkPreview.flow_run_id == flow_run_id,
+                                                                                                 FlowRunSinkPreview.status != "committed")) or 0
+            run.status = "awaiting_commit" if remaining else "completed"
+            if not remaining: run.committed_at, run.completed_at = utc_now(), utc_now()
+            self._append_run_event(session, run.id, "sink.committed", f"{payload['output_key']} 预览已提交并排队向量同步")
+            return {"id": run.id, "status": run.status, "output_key": payload["output_key"], "vector_sync_jobs": vector_jobs}
 
     def v7_rebuild_manifest(self) -> dict[str, Any]:
         """Return the exact V7-owned physical resources eligible for a rebuild.
@@ -2293,7 +3123,7 @@ class V7Store:
         """Delete V7 table rows only; schema and external resources are retained."""
         # Order is intentional for MySQL foreign keys.  Never issue DDL here.
         tables = (
-            ArtifactLineage, Artifact, FlowNodeRun, SourceChunk, DocumentIR, FlowRun, FlowExecutionSnapshot, KnowledgeChunkGeneration,
+            FlowRunSinkPreview, FlowRunEvent, FlowNodeArtifactBinding, ArtifactLineage, Artifact, FlowNodeRun, SourceChunk, DocumentIR, FlowRun, FlowExecutionSnapshot, KnowledgeChunkGeneration,
             VectorDeletionJob, VectorRecordState, VectorSyncJob, KnowledgeChange, KnowledgeItemSource, KnowledgeItem,
             ProjectOrgRouteLibrary, ProjectOrgRoute, ProjectRouteVersion, ProjectTask, Project,
             DocumentLibraryProcessingRecord, KnowledgeJob, KnowledgeLibraryDeletionJob, DocumentDeletionJob,
@@ -2820,9 +3650,13 @@ class V7Store:
                 revisions = session.scalars(select(KnowledgeIndexProfileRevision).where(
                     KnowledgeIndexProfileRevision.knowledge_index_profile_id == item.id,
                 ).order_by(KnowledgeIndexProfileRevision.revision_no.desc())).all()
+                managed = session.scalar(select(ManagedCollection).where(ManagedCollection.collection_name == item.collection_name))
                 values.append({"id": item.id, "code": item.code, "knowledge_type": item.knowledge_type,
                     "collection_name": item.collection_name, "embedding_profile_id": item.embedding_profile_id,
-                    "fields": item.fields_json, "status": item.status, "current_revision_id": item.current_revision_id,
+                    "fields": item.fields_json, "origin": item.origin,
+                    "owner_knowledge_type_id": item.owner_knowledge_type_id,
+                    "status": item.status, "current_revision_id": item.current_revision_id,
+                    "managed_collection_id": managed.id if managed else None,
                     "revisions": [{"id": revision.id, "revision": revision.revision_no, "status": revision.status,
                                    "collection_name": revision.collection_name, "fields": revision.fields_json,
                                    "embedding_profile_id": revision.embedding_profile_id,
@@ -2835,11 +3669,242 @@ class V7Store:
             rows = session.execute(select(ManagedCollection, StorageContractRevision, StorageContract).join(
                 StorageContractRevision, StorageContractRevision.id == ManagedCollection.storage_contract_revision_id,
             ).join(StorageContract, StorageContract.id == StorageContractRevision.storage_contract_id).order_by(ManagedCollection.collection_name)).all()
-            return [{"id": item.id, "collection_name": item.collection_name, "status": item.status,
-                     "error": item.error_summary, "desired_spec_hash": item.desired_spec_hash,
-                     "observed_spec_hash": item.observed_spec_hash, "storage_contract": {"code": contract.code,
-                     "name": contract.name, "revision": revision.revision_no, "dimension": revision.dimension,
-                     "metric_type": revision.metric_type}} for item, revision, contract in rows]
+            values = []
+            for item, revision, contract in rows:
+                references = self._managed_collection_reference_snapshot(session, item)
+                values.append({
+                    "id": item.id, "collection_name": item.collection_name, "status": item.status,
+                    "error": item.error_summary, "ownership": "dataforge",
+                    "ownership_verified": item.observed_spec_hash == item.desired_spec_hash and item.status in {"ready", "deleting"},
+                    "desired_spec_hash": item.desired_spec_hash, "observed_spec_hash": item.observed_spec_hash,
+                    "partition_names": [library["partition_name"] for library in references["knowledge_libraries"]],
+                    "storage_contract": {"code": contract.code, "name": contract.name,
+                                         "revision": revision.revision_no, "dimension": revision.dimension,
+                                         "metric_type": revision.metric_type},
+                    "references": references,
+                })
+            return values
+
+    @staticmethod
+    def _managed_collection_reference_snapshot(session: Session, item: ManagedCollection) -> dict[str, Any]:
+        revision_ids = list(session.scalars(select(KnowledgeIndexProfileRevision.id).where(
+            KnowledgeIndexProfileRevision.collection_name == item.collection_name,
+        )))
+        profile_ids = list(session.scalars(select(KnowledgeIndexProfile.id).where(
+            KnowledgeIndexProfile.current_revision_id.in_(revision_ids),
+            KnowledgeIndexProfile.status != "archived",
+        ))) if revision_ids else []
+        draft_profiles = list(session.scalars(select(KnowledgeIndexProfile.id).where(
+            KnowledgeIndexProfile.current_revision_id.is_(None),
+            KnowledgeIndexProfile.status != "archived",
+        )))
+        if revision_ids and draft_profiles:
+            draft_bound = list(session.scalars(select(KnowledgeIndexProfileRevision.knowledge_index_profile_id).where(
+                KnowledgeIndexProfileRevision.id.in_(revision_ids),
+                KnowledgeIndexProfileRevision.knowledge_index_profile_id.in_(draft_profiles),
+            )))
+            profile_ids = list(dict.fromkeys([*profile_ids, *draft_bound]))
+        profiles = list(session.scalars(select(KnowledgeIndexProfile).where(
+            KnowledgeIndexProfile.id.in_(profile_ids),
+        ))) if profile_ids else []
+        binding_rows = list(session.scalars(select(KnowledgeTypeIndexBinding).where(
+            KnowledgeTypeIndexBinding.index_profile_revision_id.in_(revision_ids),
+        ))) if revision_ids else []
+        binding_revision_ids = list({binding.knowledge_type_revision_id for binding in binding_rows})
+        current_types = list(session.scalars(select(KnowledgeType).where(
+            KnowledgeType.current_revision_id.in_(binding_revision_ids), KnowledgeType.status == "active",
+        ))) if binding_revision_ids else []
+        libraries = list(session.scalars(select(KnowledgeLibrary).where(
+            KnowledgeLibrary.knowledge_type_revision_id.in_(binding_revision_ids),
+            KnowledgeLibrary.status.in_(("active", "deleting")),
+        ))) if binding_revision_ids else []
+        library_ids = [library.id for library in libraries]
+        template_rows = session.execute(select(DocumentLibraryTemplateOutput, DocumentLibraryTemplateBinding).join(
+            DocumentLibraryTemplateBinding,
+            DocumentLibraryTemplateBinding.id == DocumentLibraryTemplateOutput.document_library_template_binding_id,
+        ).where(
+            DocumentLibraryTemplateOutput.knowledge_library_id.in_(library_ids),
+            DocumentLibraryTemplateBinding.status == "active",
+        )).all() if library_ids else []
+        route_rows = session.execute(select(ProjectOrgRouteLibrary, ProjectOrgRoute).join(
+            ProjectOrgRoute, ProjectOrgRoute.id == ProjectOrgRouteLibrary.project_org_route_id,
+        ).where(
+            ProjectOrgRouteLibrary.knowledge_library_id.in_(library_ids),
+            ProjectOrgRoute.status == "published",
+        )).all() if library_ids else []
+        sync_jobs = list(session.scalars(select(VectorSyncJob).where(
+            VectorSyncJob.index_profile_id.in_(profile_ids), VectorSyncJob.status.in_(("queued", "running")),
+        ))) if profile_ids else []
+        vector_deletion_jobs = list(session.scalars(select(VectorDeletionJob).where(
+            VectorDeletionJob.index_profile_id.in_(profile_ids), VectorDeletionJob.status.in_(("queued", "running")),
+        ))) if profile_ids else []
+        return {
+            "profile_ids": profile_ids,
+            "profiles": [{"id": value.id, "code": value.code, "origin": value.origin,
+                          "status": value.status} for value in profiles],
+            "type_ids": [value.id for value in current_types],
+            "type_revisions": [{"type_id": value.id, "code": value.code, "name": value.name,
+                                "revision_id": value.current_revision_id} for value in current_types],
+            "knowledge_libraries": [{"id": value.id, "name": value.name, "partition_name": value.partition_name} for value in libraries],
+            "template_bindings": [{"binding_id": binding.id, "template_id": binding.knowledge_flow_template_id,
+                                   "knowledge_library_id": output.knowledge_library_id}
+                                  for output, binding in template_rows],
+            "template_binding_count": len(template_rows),
+            "routes": [{"route_id": route.id, "project_task_id": route.project_task_id,
+                        "org_code": route.org_code, "knowledge_library_id": link.knowledge_library_id}
+                       for link, route in route_rows],
+            "route_count": len(route_rows),
+            "vector_jobs": [{"id": job.id, "kind": "sync", "status": job.status,
+                             "index_profile_id": job.index_profile_id} for job in sync_jobs] +
+                           [{"id": job.id, "kind": "delete", "status": job.status,
+                             "index_profile_id": job.index_profile_id} for job in vector_deletion_jobs],
+            "running_vector_job_count": len(sync_jobs) + len(vector_deletion_jobs),
+        }
+
+    def managed_collection_delete_check(self, collection_id: str, observed: dict[str, Any] | None = None) -> dict[str, Any]:
+        with self.sessions() as session:
+            item = session.get(ManagedCollection, collection_id)
+            if not item:
+                raise ValueError("受管 Collection 不存在")
+            references = self._managed_collection_reference_snapshot(session, item)
+            blockers: list[dict[str, Any]] = []
+            for key, message in (
+                ("profile_ids", "仍有当前或草稿 Profile 引用"),
+                ("type_ids", "仍有当前 Knowledge Type Revision 引用"),
+                ("knowledge_libraries", "仍有活动知识库及其 kl_ Partition 引用"),
+            ):
+                if references[key]:
+                    blockers.append({"code": key, "message": message, "count": len(references[key])})
+            for key, message in (
+                ("template_binding_count", "仍有文档模板结果绑定"),
+                ("route_count", "仍有已发布路由引用"),
+                ("running_vector_job_count", "仍有运行中的向量任务"),
+            ):
+                if references[key]:
+                    blockers.append({"code": key, "message": message, "count": references[key]})
+            observed = dict(observed or {})
+            if observed:
+                if observed.get("error"):
+                    blockers.append({"code": "milvus_unavailable", "message": str(observed["error"])})
+                elif observed.get("exists"):
+                    if not observed.get("ownership_valid"):
+                        blockers.append({"code": "ownership_mismatch", "message": "Collection ownership marker 或规格哈希不匹配"})
+                    external_partitions = [name for name in observed.get("partitions", []) if name not in {"_default"} and not str(name).startswith("kl_")]
+                    if external_partitions:
+                        blockers.append({"code": "external_partitions", "message": "存在非 DataForge Partition", "partitions": external_partitions})
+            elif item.status != "deleted":
+                blockers.append({"code": "milvus_unverified", "message": "尚未连接 Milvus 验证 Collection 所有权"})
+            return {
+                "id": item.id, "collection_name": item.collection_name, "status": item.status,
+                "desired_spec_hash": item.desired_spec_hash, "references": references,
+                "observed": observed, "blockers": blockers, "deletable": not blockers,
+                "warning": "删除受管 Collection 将永久删除其中全部向量数据，此操作不可恢复。",
+            }
+
+    def create_managed_collection_deletion(self, collection_id: str, preflight: dict[str, Any]) -> dict[str, Any]:
+        if preflight.get("id") != collection_id or preflight.get("blockers") or not preflight.get("deletable"):
+            raise ValueError("受管 Collection 删除预检未通过")
+        with self.sessions.begin() as session:
+            item = session.get(ManagedCollection, collection_id)
+            if not item or item.status not in {"ready", "delete_failed"}:
+                raise ValueError("仅 ready 或删除失败的受管 Collection 可申请删除")
+            existing = session.scalar(select(ManagedCollectionDeletionJob).where(
+                ManagedCollectionDeletionJob.managed_collection_id == collection_id,
+                ManagedCollectionDeletionJob.status.in_(("queued", "running")),
+            ))
+            if existing:
+                return {"id": existing.id, "managed_collection_id": collection_id, "status": existing.status}
+            job = ManagedCollectionDeletionJob(
+                id=new_id("mcdj"), managed_collection_id=collection_id,
+                preflight_json=preflight,
+            )
+            session.add(job); item.status = "deleting"
+            self.audit(session, "managed_collection.deletion_requested", "managed_collection", collection_id, {"job_id": job.id})
+            return {"id": job.id, "managed_collection_id": collection_id, "status": job.status}
+
+    def list_managed_collection_deletion_jobs(self, collection_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(ManagedCollectionDeletionJob).order_by(ManagedCollectionDeletionJob.created_at.desc())
+            if collection_id:
+                query = query.where(ManagedCollectionDeletionJob.managed_collection_id == collection_id)
+            return [{"id": job.id, "managed_collection_id": job.managed_collection_id,
+                     "status": job.status, "attempt_count": job.attempt_count,
+                     "error": job.error, "created_at": job.created_at.isoformat()} for job in session.scalars(query)]
+
+    def retry_managed_collection_deletion(self, job_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(ManagedCollectionDeletionJob, job_id)
+            if not job or job.status != "failed":
+                raise ValueError("仅可重试失败的受管 Collection 删除任务")
+            item = session.get(ManagedCollection, job.managed_collection_id)
+            if not item or item.status == "deleted":
+                raise ValueError("受管 Collection 已删除或登记不存在")
+            job.status, job.error, job.lease_owner, job.lease_expires_at = "queued", None, None, None
+            item.status, item.error_summary = "deleting", None
+            return {"id": job.id, "status": job.status}
+
+    def claim_managed_collection_deletion_job(self, owner: str) -> ManagedCollectionDeletionJob | None:
+        with self.sessions.begin() as session:
+            job = session.scalar(select(ManagedCollectionDeletionJob).where(
+                (ManagedCollectionDeletionJob.status == "queued") |
+                ((ManagedCollectionDeletionJob.status == "running") & (ManagedCollectionDeletionJob.lease_expires_at < utc_now())),
+            ).order_by(ManagedCollectionDeletionJob.created_at).with_for_update(skip_locked=True).limit(1))
+            if not job:
+                return None
+            job.status, job.attempt_count = "running", job.attempt_count + 1
+            job.lease_owner, job.lease_expires_at = owner, utc_now() + timedelta(minutes=5)
+            return job
+
+    def managed_collection_deletion_context(self, job_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            job = session.get(ManagedCollectionDeletionJob, job_id)
+            if not job:
+                raise ValueError("受管 Collection 删除任务不存在")
+            item = session.get(ManagedCollection, job.managed_collection_id)
+            revision = session.get(StorageContractRevision, item.storage_contract_revision_id) if item else None
+            if not item or not revision:
+                raise ValueError("受管 Collection 或 Storage Contract 不存在")
+            return {"job": job, "collection": item, "storage_contract_revision": revision}
+
+    def finish_managed_collection_deletion(self, job_id: str, error: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(ManagedCollectionDeletionJob, job_id)
+            if not job:
+                raise ValueError("受管 Collection 删除任务不存在")
+            item = session.get(ManagedCollection, job.managed_collection_id)
+            if not item:
+                raise ValueError("受管 Collection 不存在")
+            if error:
+                job.status, job.error, job.lease_owner, job.lease_expires_at = "failed", error, None, None
+                item.status, item.error_summary = "delete_failed", error
+                return {"id": job.id, "status": job.status, "error": error}
+            job.status, job.error, job.lease_owner, job.lease_expires_at = "completed", None, None, None
+            item.status, item.error_summary, item.observed_spec_hash = "deleted", None, None
+            self.audit(session, "managed_collection.deleted", "managed_collection", item.id, {"job_id": job.id})
+            return {"id": job.id, "status": job.status, "managed_collection_id": item.id}
+
+    def archive_index_profile(self, profile_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            profile = session.get(KnowledgeIndexProfile, profile_id)
+            if not profile:
+                raise ValueError("Index Profile 不存在")
+            if profile.origin == "builtin":
+                raise ValueError("内置 Index Profile 不可归档")
+            current_bindings = session.scalar(select(func.count()).select_from(KnowledgeTypeIndexBinding).join(
+                KnowledgeType, KnowledgeType.current_revision_id == KnowledgeTypeIndexBinding.knowledge_type_revision_id,
+            ).where(KnowledgeTypeIndexBinding.index_profile_id == profile_id, KnowledgeType.status == "active")) or 0
+            binding_revision_ids = list(session.scalars(select(KnowledgeTypeIndexBinding.knowledge_type_revision_id).where(
+                KnowledgeTypeIndexBinding.index_profile_id == profile_id,
+            )))
+            library_count = session.scalar(select(func.count()).select_from(KnowledgeLibrary).where(
+                KnowledgeLibrary.knowledge_type_revision_id.in_(binding_revision_ids),
+                KnowledgeLibrary.status.in_(("active", "deleting")),
+            )) if binding_revision_ids else 0
+            if current_bindings or library_count:
+                raise ValueError("Profile 仍被当前 Knowledge Type 或知识库引用，不能归档")
+            profile.status = "archived"
+            self.audit(session, "index_profile.archived", "index_profile", profile.id)
+            return {"id": profile.id, "status": profile.status}
 
     def create_project(self, name: str, legacy_name: str | None = None) -> dict[str, Any]:
         # The optional form avoids breaking old private callers; public API uses

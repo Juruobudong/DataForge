@@ -34,6 +34,8 @@ class Settings:
     runner_url: str | None = None
     runner_service_token: str | None = None
     runner_timeout_seconds: float = 1860.0
+    derived_runs_enabled: bool = False
+    derived_run_commit_enabled: bool = False
 
     @classmethod
     def load(
@@ -63,6 +65,8 @@ class Settings:
             runner_url=os.getenv("DATAFORGE_RUNNER_URL"),
             runner_service_token=_read_secret("DATAFORGE_RUNNER_SERVICE_TOKEN"),
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
+            derived_runs_enabled=os.getenv("DATAFORGE_DERIVED_RUNS_ENABLED", "0") == "1",
+            derived_run_commit_enabled=os.getenv("DATAFORGE_DERIVED_RUN_COMMIT_ENABLED", "0") == "1",
         )
 
     @property

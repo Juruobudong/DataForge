@@ -62,6 +62,10 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
   }
 }
 
+export function hasEditableParameters(node) {
+  return node?.data?.meta?.kind === 'operator' && node?.data?.meta?.code !== 'document-parser'
+}
+
 export function makeCanvasNode(definition, position, catalog = [], subflows = []) {
   const meta = resolveNodeMetadata(definition, catalog, subflows)
   return {
@@ -92,6 +96,21 @@ export function deserializeDefinition(value = {}, catalog = [], subflows = []) {
     }
   })
   return { nodes, edges, missingPositions }
+}
+
+export function deserializeRuntimeDag(value = {}, catalog = []) {
+  const graph = deserializeDefinition({ nodes: value.nodes || [], edges: value.edges || [], ui: value.ui || {} }, catalog)
+  const runtimeById = Object.fromEntries((value.nodes || []).map(node => [node.id, node]))
+  graph.nodes = graph.nodes.map(node => ({
+    ...node,
+    data: { ...node.data, definition: { ...node.data.definition, status: runtimeById[node.id]?.status || 'idle' }, meta: { ...node.data.meta, status: runtimeById[node.id]?.status || 'idle', runtime: runtimeById[node.id] } },
+  }))
+  graph.edges = graph.edges.map((edge, index) => {
+    const raw = (value.edges || [])[index] || {}
+    const type = raw.artifact_type || raw.type_code || ''
+    return { ...edge, data: { status: raw.status || 'idle', artifactIds: raw.artifact_ids || [], label: type ? `${type}${raw.record_count ? ` · ${raw.record_count}` : ''}` : '' } }
+  })
+  return graph
 }
 
 export function serializeDefinition(nodes, edges) {
