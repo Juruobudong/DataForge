@@ -12,7 +12,6 @@ import json
 import os
 import re
 import tempfile
-from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -22,24 +21,13 @@ from sqlalchemy import select
 
 from ..config import Settings
 from .models import KnowledgeJob, Source, SourceVersion
+from .parser_runtime import content_list_pages, parse_with_mineru
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
 
 
 class RunRequest(BaseModel):
     job_id: str
-
-
-DATAFLOW_VERSION = "1.0.10"
-
-
-def dataflow_runtime_status() -> dict[str, str | bool]:
-    """Report the Runner-only pinned runtime without exposing its classes."""
-    try:
-        installed = metadata.version("open-dataflow")
-    except metadata.PackageNotFoundError:
-        installed = None
-    return {"package": "open-dataflow", "required": DATAFLOW_VERSION, "installed": installed or "not-installed", "compatible": installed == DATAFLOW_VERSION}
 
 
 def _objects(settings: Settings):
@@ -65,13 +53,6 @@ def _extract_text(filename: str, payload: bytes) -> str:
                 if values:
                     lines.append(" | ".join(values))
         return "\n".join(lines)
-    if suffix == ".pdf":
-        from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(payload))
-        if reader.is_encrypted: reader.decrypt("")
-        value = "\n".join(page.extract_text() or "" for page in reader.pages)
-        if not value.strip(): raise ValueError("PDF 未提取到文本；扫描件 OCR 不在本期范围")
-        return value
     if suffix == ".docx":
         from docx import Document
         return "\n".join(paragraph.text for paragraph in Document(io.BytesIO(payload)).paragraphs if paragraph.text.strip())
@@ -98,16 +79,192 @@ SAMPLE_DOCUMENTS = {
 }
 
 
-def preview_template_definition(definition: dict, sample_id: str) -> dict:
-    """Run the fixed parsing/chunking path in memory for developer preview."""
+def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], index: int) -> dict[str, Any]:
+    content = str(value.get("content") or value.get("text") or value.get("canonical_content") or "示例知识")
+    source_chunk_id = str(value.get("source_chunk_id") or f"preview-chunk-{index + 1}")
+    common = {
+        "source_knowledge_id": f"preview-{ref}-{index + 1}", "source_chunk_id": source_chunk_id,
+        "source_version_ids": [str(value.get("source_version_id") or "preview-version")],
+        "source_anchor": f"{value.get('filename', '样例文档')}#chunk-{value.get('chunk_index', index)}",
+        "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
+        "evidence_text": content, "is_primary": True,
+    }
+    kind = "qa" if ref in {"qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
+    mode = str(params.get("graph_mode") or "")
+    if ref == "triple-builder" or kind == "graph" and mode != "semantic":
+        data = {"subject": "高血压", "predicate": "需要", "object": "规范随访"}
+        return {**common, "canonical_content": "高血压 需要 规范随访", "data_json": data}
+    if ref == "evidence-binder" or kind == "graph" and mode == "semantic":
+        data = {"source_entity": {"name": "高血压"}, "target_entity": {"name": "规范随访"},
+                "relation": {"description": "患者需要"}, "evidence": [content]}
+        return {**common, "canonical_content": "高血压 患者需要 规范随访", "data_json": data}
+    if kind == "qa":
+        data = {"question": "高血压患者需要什么？", "answer": "需要规范随访。"}
+        return {**common, "canonical_content": f"{data['question']} {data['answer']}", "data_json": data}
+    return {**common, "canonical_content": content, "data_json": {"content": content}}
+
+
+def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], root_documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Execute a deterministic, side-effect-free operator approximation for developer preview."""
+    if ref == "document-parser":
+        return [dict(value) for value in root_documents]
+    if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
+        result = []
+        for raw in values:
+            value = dict(raw); text = str(value.get("text", ""))
+            if ref == "null-filter" and not text.strip():
+                continue
+            if ref in {"text-cleaner", "whitespace-cleaner", "text-normalizer"}:
+                value["text"] = re.sub(r"\s+", " ", text).strip()
+            result.append(value)
+        return result
+    if ref == "semantic-chunker":
+        size = int(params.get("chunk_size", 800))
+        if not 100 <= size <= 4000:
+            raise ValueError("Semantic Chunker 的 chunk_size 必须是 100–4000")
+        result = []
+        for document in values:
+            for index, content in enumerate(_chunks(str(document.get("text", "")), size)):
+                result.append({"source_id": document.get("source_id", "preview-source"),
+                               "source_version_id": document.get("source_version_id", "preview-version"),
+                               "filename": document.get("filename", "样例文档"), "content": content,
+                               "chunk_index": index, "runtime_mode": "preview",
+                               "anchor": {**dict(document.get("anchor") or {}), "chunk_index": index}})
+        return result
+    if ref == "source-chunk-builder":
+        return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
+    if ref == "entity-extractor":
+        return [{**value, "entities": [{"name": "高血压", "type": "疾病"}, {"name": "规范随访", "type": "医疗行为"}]} for value in values]
+    if ref == "relation-extractor":
+        return [{**value, "relations": [{"source": "高血压", "relation": "需要", "target": "规范随访"}]} for value in values]
+    if ref == "entity-normalizer":
+        return [{**value, "entities": list(value.get("entities") or [])} for value in values]
+    if ref == "semantic-relation-builder":
+        return [{**value, "semantic_relations": [{"source_entity": "高血压", "relation": "患者需要", "target_entity": "规范随访"}]} for value in values]
+    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa", "triple-builder", "evidence-binder"}:
+        return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
+    if ref == "artifact-merge":
+        return [dict(value) for value in values]
+    if ref == "quality-evaluator":
+        return [{**value, "quality_score": float(value.get("quality_score", 1.0)), "quality_status": "pass"} for value in values]
+    if ref == "quality-filter":
+        return [{**value, "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= 0.8 else "review"}
+                for value in values if float(value.get("quality_score", 1.0)) >= 0.6]
+    if ref == "deduplicate":
+        unique: dict[str, dict[str, Any]] = {}
+        for value in values:
+            unique.setdefault(str(value.get("source_knowledge_id") or json.dumps(value, sort_keys=True, default=str)), dict(value))
+        return list(unique.values())
+    if ref in {"source-binding", "schema-validator", "knowledge-diff", "prompted-refiner"}:
+        return [dict(value) for value in values]
+    raise ValueError(f"算子不支持受控内存预览：{ref}")
+
+
+def _truncate_preview_value(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        return (value[:500], len(value) > 500)
+    if isinstance(value, list):
+        items, flags = zip(*(_truncate_preview_value(item) for item in value)) if value else ((), ())
+        return list(items), any(flags)
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}; truncated = False
+        for key, item in value.items():
+            result[key], changed = _truncate_preview_value(item); truncated = truncated or changed
+        return result, truncated
+    return value, False
+
+
+def _preview_port(values: list[dict[str, Any]]) -> dict[str, Any]:
+    items = []; content_truncated = False
+    for value in values[:3]:
+        item, changed = _truncate_preview_value(value)
+        items.append(item); content_truncated = content_truncated or changed
+    return {"items": items, "total": len(values), "truncated": len(values) > 3 or content_truncated}
+
+
+def _port_payload(values: list[dict[str, Any]], *, empty: bool = False) -> dict[str, Any]:
+    return {} if empty else {"input": _preview_port(values)}
+
+
+def _merge_preview_ports(ports: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for payload in ports:
+        for name, preview in payload.items():
+            current = merged.setdefault(name, {"items": [], "total": 0, "truncated": False})
+            current["total"] += int(preview.get("total", 0))
+            current["truncated"] = current["truncated"] or bool(preview.get("truncated"))
+            remaining = max(0, 3 - len(current["items"]))
+            current["items"].extend(list(preview.get("items") or [])[:remaining])
+            if current["total"] > len(current["items"]):
+                current["truncated"] = True
+    return merged
+
+
+def preview_template_definition(definition: dict, sample_id: str, *, compiled_definition: dict | None = None) -> dict:
+    """Preview a compiled DAG in memory without external calls or persistence."""
     if sample_id not in SAMPLE_DOCUMENTS:
         raise ValueError("不支持的内置样例")
     filename, text = SAMPLE_DOCUMENTS[sample_id]
-    parameters = dict((definition or {}).get("parameters") or {})
-    chunks = _chunks(text, int(parameters.get("chunk_size", 800)))
-    return {"sample_id": sample_id, "filename": filename, "stages": ["validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate"],
-            "parsed_text": text, "chunks": [{"index": index, "content": chunk} for index, chunk in enumerate(chunks)],
-            "outputs": {"text": len(chunks), "qa": 1 if chunks else 0, "graph": 1 if chunks else 0}, "persisted": False}
+    compiled = compiled_definition or definition
+    root_documents = [{"source_id": "preview-source", "source_version_id": "preview-version", "filename": filename,
+                       "text": text, "parser_strategy": "preview", "runtime_profile": "controlled_in_memory",
+                       "parser_adapter": "preview", "anchor": {"file": filename, "page": None, "section": None}}]
+    nodes = list(compiled.get("nodes") or [])
+    incoming = _incoming(compiled)
+    outputs: dict[str, list[dict[str, Any]]] = {}
+    failures: dict[str, str] = {}
+    expanded_runs: dict[str, dict[str, Any]] = {}
+    for node in nodes:
+        node_id = str(node["id"]); source_nodes = incoming.get(node_id, [])
+        values = [value for source_id in source_nodes for value in outputs.get(source_id, [])]
+        if node.get("kind") == "operator" and str(node.get("ref")) == "document-parser" and not source_nodes:
+            values = [dict(value) for value in root_documents]
+        failed_upstream = [source_id for source_id in source_nodes if source_id in failures]
+        if failed_upstream:
+            message = "上游节点失败，已跳过：" + "、".join(failed_upstream)
+            failures[node_id] = message; outputs[node_id] = []
+            expanded_runs[node_id] = {"status": "skipped", "inputs": _port_payload(values), "outputs": {}, "error": message}
+            continue
+        if node.get("kind") == "knowledge_sink":
+            outputs[node_id] = []
+            expanded_runs[node_id] = {"status": "success", "inputs": _port_payload(values), "outputs": {}, "error": None}
+            continue
+        try:
+            result = _preview_operator(str(node.get("ref")), dict(node.get("params") or {}), values, root_documents)
+            outputs[node_id] = result
+            expanded_runs[node_id] = {"status": "success", "inputs": _port_payload(values), "outputs": {"output": _preview_port(result)}, "error": None}
+        except Exception as exc:
+            failures[node_id] = str(exc); outputs[node_id] = []
+            expanded_runs[node_id] = {"status": "failed", "inputs": _port_payload(values), "outputs": {}, "error": str(exc)}
+
+    top_level_runs: dict[str, dict[str, Any]] = {}
+    compiled_edges = list(compiled.get("edges") or [])
+    for node in definition.get("nodes") or []:
+        node_id = str(node["id"])
+        if node.get("kind") != "subflow":
+            if node_id in expanded_runs:
+                top_level_runs[node_id] = expanded_runs[node_id]
+            continue
+        prefix = f"{node_id}::"
+        internal_ids = [str(item["id"]) for item in nodes if str(item["id"]).startswith(prefix)]
+        internal_set = set(internal_ids)
+        entries = [item for item in internal_ids if not any(edge["target"] == item and edge["source"] in internal_set for edge in compiled_edges)]
+        exits = [item for item in internal_ids if not any(edge["source"] == item and edge["target"] in internal_set for edge in compiled_edges)]
+        output_values = [value for item in exits for value in outputs.get(item, [])]
+        internal_trace = {item[len(prefix):]: expanded_runs[item] for item in internal_ids if item in expanded_runs}
+        statuses = {run["status"] for run in internal_trace.values()}
+        status = "failed" if "failed" in statuses else "skipped" if "skipped" in statuses else "success"
+        errors = [run["error"] for run in internal_trace.values() if run.get("error")]
+        top_level_runs[node_id] = {"status": status, "inputs": _merge_preview_ports([expanded_runs.get(item, {}).get("inputs", {}) for item in entries]),
+                                   "outputs": {"output": _preview_port(output_values)},
+                                   "error": "；".join(errors) or None, "internal_trace": internal_trace}
+    chunk_values = [value for node_id, values in outputs.items() if node_id.endswith("::chunk") for value in values]
+    sink_totals = {str(node.get("output_key") or node.get("knowledge_type")): expanded_runs.get(str(node["id"]), {}).get("inputs", {}).get("input", {}).get("total", 0)
+                   for node in nodes if node.get("kind") == "knowledge_sink"}
+    return {"sample_id": sample_id, "filename": filename, "preview_mode": "controlled_in_memory",
+            "status": "completed_with_errors" if failures else "completed", "node_runs": top_level_runs,
+            "expanded_node_runs": expanded_runs, "stages": [str(node["id"]) for node in nodes],
+            "parsed_text": text, "chunks": chunk_values, "outputs": sink_totals, "persisted": False}
 
 
 def _source_key(source_id: str, output_type: str, anchor: str) -> str:
@@ -267,11 +424,8 @@ def select_parser_adapter(filename: str, profile: str, environ: dict[str, str] |
         return "dataforge-structured-table-parser"
     if suffix in {".md", ".txt"}:
         return "dataforge-text-parser"
-    if suffix in {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif"}:
-        selected = profile
-        if selected == "auto":
-            selected = "api" if variables.get("MINERU_API_KEY") else "flash" if variables.get("DATAFORGE_MINERU_FLASH_ENABLED") == "1" else "local"
-        return f"mineru-{selected}-adapter"
+    if suffix == ".pdf":
+        return "mineru-pipeline-gpu"
     raise ValueError("Document Parser 不支持的文档类型")
 
 
@@ -285,17 +439,40 @@ def select_runtime_mode(record_count: int, environ: dict[str, str] | None = None
     return "batch" if record_count >= threshold else "single"
 
 
-def _documents_for_versions(objects, versions: list[SourceVersion], sources: dict[str, Source]) -> list[dict[str, Any]]:
+def _documents_for_versions(objects, versions: list[SourceVersion], sources: dict[str, Source], flow_run_id: str,
+                            created_parser_keys: list[str]) -> list[dict[str, Any]]:
     documents: list[dict[str, Any]] = []
-    profile = os.getenv("DATAFORGE_PARSER_PROFILE", "auto")
-    if profile not in {"auto", "api", "local", "flash"}:
-        raise ValueError("DATAFORGE_PARSER_PROFILE 仅支持 auto、api、local 或 flash")
     for version in versions:
         source = sources[version.source_id]
-        text = _extract_text(source.original_filename, objects.get_bytes(version.object_key))
+        payload = objects.get_bytes(version.object_key)
+        suffix = Path(source.original_filename).suffix.lower()
+        parser_artifacts: list[dict[str, Any]] = []
+        page_segments: list[dict[str, Any]] = []
+        if suffix == ".pdf":
+            parsed = parse_with_mineru(filename=source.original_filename, payload=payload)
+            text = parsed.markdown
+            page_segments = content_list_pages(parsed.content_list)
+            encoded_middle = json.dumps(parsed.middle_json, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            object_key = f"parser-artifacts/{version.id}/{flow_run_id}/mineru-middle.json"
+            stored = objects.put_bytes(object_key, encoded_middle, "application/json")
+            created_parser_keys.append(stored.key)
+            pdf_info = parsed.middle_json.get("pdf_info")
+            page_count = len(pdf_info) if isinstance(pdf_info, list) else len(page_segments)
+            parser_artifacts.append({
+                "type_code": "parser.middle-json", "uri": f"object:///{stored.key}", "checksum": stored.sha256,
+                "source_version_id": version.id,
+                "data": {"object_key": stored.key, "mineru_version": parsed.version, "backend": parsed.backend,
+                         "parse_method": parsed.parse_method, "lang_list": "ch", "formula_enable": True,
+                         "table_enable": True, "page_count": page_count, "size_bytes": stored.size_bytes},
+            })
+            profile = "pipeline:auto"
+        else:
+            text = _extract_text(source.original_filename, payload)
+            profile = "native"
         documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
                           "parser_adapter": select_parser_adapter(source.original_filename, profile),
+                          "page_segments": page_segments, "_parser_artifacts": parser_artifacts,
                           "anchor": {"file": source.original_filename, "page": None, "section": None}})
     return documents
 
@@ -324,10 +501,15 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
             raise ValueError("Semantic Chunker 的 chunk_size 必须是 100–4000")
         result = []; mode = select_runtime_mode(len(values))
         for document in values:
-            for index, chunk in enumerate(_chunks(str(document.get("text", "")), size)):
-                result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
-                               "filename": document["filename"], "content": chunk, "chunk_index": index,
-                               "runtime_mode": mode, "anchor": {**document.get("anchor", {}), "chunk_index": index}})
+            segments = document.get("page_segments") or [{"text": str(document.get("text", "")), "page": None, "page_index": None}]
+            index = 0
+            for segment in segments:
+                for chunk in _chunks(str(segment.get("text", "")), size):
+                    result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
+                                   "filename": document["filename"], "content": chunk, "chunk_index": index,
+                                   "runtime_mode": mode, "anchor": {**document.get("anchor", {}), "page": segment.get("page"),
+                                                                       "page_index": segment.get("page_index"), "chunk_index": index}})
+                    index += 1
         return result
     if ref == "source-chunk-builder":
         # This is the formal provenance boundary.  Any further internal LLM
@@ -408,11 +590,13 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
     node_errors: dict[str, str] = {}
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}
     current_source_chunks: list[dict[str, Any]] = []
+    created_parser_keys: list[str] = []
+    persisted_parser_keys: set[str] = set()
     try:
         definition = store.template_definition_for_job(job_id)
         type_contracts = store.type_contracts_for_job(job_id)
         incoming = _incoming(definition)
-        root_documents = _documents_for_versions(objects, versions_list, sources)
+        root_documents = _documents_for_versions(objects, versions_list, sources, flow_run["id"], created_parser_keys)
         sink_nodes: list[dict[str, Any]] = []
         for node in definition.get("nodes", []):
             if store.is_job_cancelled(job_id):
@@ -452,6 +636,9 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                 values = [{**value, "_artifact_type": artifact_type} for value in values]
                 outputs[node_id] = values
             artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, values)
+            if ref == "document-parser":
+                persisted_parser_keys.update(created_parser_keys)
+                outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]
         # All generation gates finish before any Knowledge Sink writes.  A
         # failed chunk stays out of a Sink's replacement range, so successful
         # neighbouring chunks can publish without erasing it.
@@ -514,6 +701,12 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         vector_jobs = {library_id: store.create_vector_sync_jobs(library_id) for library_id in sink_libraries.values()}
         return {"id": job_id, "status": "completed_with_warnings" if warnings else "completed", "flow_run_id": flow_run["id"], "changes": changes, "warnings": warnings, "vector_sync_jobs": vector_jobs}
     except Exception as exc:
+        for object_key in created_parser_keys:
+            if object_key not in persisted_parser_keys:
+                try:
+                    objects.delete_key(object_key)
+                except Exception:
+                    pass
         store.mark_source_versions_failed([item.id for item in versions_list], str(exc))
         store.finish_flow_run(flow_run["id"], str(exc))
         store.mark_job_failed(job_id, str(exc))
@@ -522,9 +715,6 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
 
 def create_app(settings: Settings | None = None, *, check_schema: bool = True) -> FastAPI:
     resolved = settings or Settings.load(); resolved.ensure_directories()
-    runtime = dataflow_runtime_status()
-    if not runtime["compatible"]:
-        raise RuntimeError(f"Runner 必须安装 open-dataflow=={DATAFLOW_VERSION}，当前为 {runtime['installed']}")
     _initialize_global_llm()
     store = V7Store(resolved.platform_database_url)
     if check_schema: store.assert_schema_current()

@@ -13,6 +13,8 @@
 | SRC-001 | 架构、数据重建、部署和交付边界 | FR-001、FR-004、FR-007、FR-008 |
 | SRC-002 | Catalog、Adapter、Prompt、Parser、质量与子图设计 | FR-002、FR-003、FR-005、FR-006 |
 | SRC-003 | 现有实现与安全边界 | 全部迁移与回归场景 |
+| SRC-007 | PDF GPU OCR、宿主机访问与部署边界 | FR-003、FR-007、FR-014 |
+| SRC-008 | 算子功能说明与节点输入输出示例 | FR-002、FR-008、FR-015 |
 
 ## 已验证的项目上下文
 
@@ -69,6 +71,8 @@
 - **FR-011**：顶层知识族保持 `text / qa / graph`，Graph 必须支持 `triple / semantic` 两种冻结模式并使用两个独立受管 Collection；旧 `dataforge_graph_knowledge` 不迁移、不删除且只供旧库使用。— SRC-006
 - **FR-012**：Collection 必须按版本化 Storage Contract 的规格哈希复用；供应过程必须可重试、校验归属并且不得自动删除 Collection。— SRC-006
 - **FR-013**：模板页必须提供白名单、强类型、无环、可分支合流的受控可拖拽 DAG；禁止任意代码、Shell 与运行时改图。— SRC-006
+- **FR-014**：所有 PDF 必须由独立 MinerU 3.4.4 GPU 服务以 `pipeline + auto + ch` 解析，持久化 Markdown、页级 SourceChunk 和已登记的 Middle JSON Artifact；Runner 经内部网络调用，宿主机内部服务仅可经回环端口调用。失败不自动重试、不写正式知识并保留 Runner 原始错误；首版禁止 VLM、vLLM、Flash、Router、多 GPU和 OCR UI。— SRC-007
+- **FR-015**：受控算子必须提供中文功能说明和版本化输入/输出 JSON 示例；模板样例运行必须按编译后的 DAG 返回逐节点受控内存预览，限制返回记录和字符串长度，不落库且不调用外部服务。Inspector 必须将典型示例与本次节点预览并列展示。— SRC-008
 
 ## 关键实体
 
@@ -96,4 +100,4 @@
 
 ## 依赖
 
-- Runner 镜像需要固定 `open-dataflow==1.0.10`；真实 MinerU、LLM、Milvus 和 Embedding 验收需要部署凭据。
+- Runner 镜像需要固定 `open-dataflow==1.0.10`；MinerU 镜像需要 PyTorch 2.6/CUDA 12.4、`mineru[pipeline]==3.4.4` 和 Pipeline 模型；真实 GPU、LLM、Milvus 和 Embedding 验收需要部署环境。

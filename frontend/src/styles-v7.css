@@ -325,6 +325,13 @@ pre {
   padding: 26px 28px 40px;
 }
 
+/* The flow editor is intentionally a PC-only fixed three-column workspace. */
+.content:has(.template-page) {
+  max-width: none;
+  padding-right: 18px;
+  padding-left: 18px;
+}
+
 .page-head {
   display: flex;
   align-items: flex-start;

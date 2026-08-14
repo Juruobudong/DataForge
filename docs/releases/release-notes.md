@@ -1,5 +1,11 @@
 # DataForge 更新记录
 
+## [2026-08-13] feature | PDF MinerU Pipeline GPU OCR
+
+- 所有 PDF 统一由独立 MinerU 3.4.4 GPU 服务以 `pipeline + auto + ch` 解析；Runner 通过内部 `parser` 网络调用，宿主机内部服务只可通过 `127.0.0.1:18000` 调用。
+- Markdown、页级 SourceChunk 与 Middle JSON Artifact 已纳入版本溯源、文件详情、精确删除、V7 重建和写入失败补偿；Worker 保留 Runner 已持久化的原始 OCR 错误。
+- 新增 PyTorch 2.6/CUDA 12.4 MinerU 镜像、GPU/并发/窗口/health 配置和 1800/1860 秒分层超时；首版不含 VLM、vLLM、Flash、Router、多 GPU或 OCR 前端配置。
+
 ## [2026-08-03] fix | 图谱结构化输出保守容错
 
 - 图谱抽取在一次模型修复后会保守剔除无法可靠归类的实体、关系或属性及其依赖项，保留严格校验通过的事实；没有可安全三元组时仍不发布知识库。

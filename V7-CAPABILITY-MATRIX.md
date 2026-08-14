@@ -1,6 +1,6 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-12
+更新日期：2026-08-13
 范围：仅 `dataforge.v7`、V7 前后端、V7 Alembic 与运行文档；不读取、不迁移或清理 V2、旧 Milvus/MinIO 资源，也不修改 `qa_agent`。
 
 ## 状态定义
@@ -46,6 +46,7 @@
 | Operator / Prompt / Quality / Subflow / Snapshot / Flow Run 接口 | `DONE` | Catalog 屏蔽内部 DataFlow 类名；任务固定 `execution_snapshot_id`，可读取节点和 Artifact 诊断。 |
 | Knowledge Sink Schema/来源/质量 Gate | `DONE` | `review` 与失败候选阻断该 Sink；多 Sink 独立事务写入。 |
 | Qwen 分块生成、失败保留与局部重试 | `DONE` | Runner 通过权威 `global_llm` 固定 `qwen3_32b`；每个类型×来源版本×SourceChunk 持久化最新结果，成功空结果撤销、失败保留、全部失败零写入。 |
+| PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、页级 SourceChunk 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU 验收归 C-01～C-04。 |
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | 使用 `EMBEDDING_*` 和 `OpenAILikeEmbedding`；发布的模型/维度仍约束运行，环境模型/维度仅初始化新默认 Profile。 |
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格哈希复用，旧 Graph Collection 冻结兼容。真实供应仍属部署验收。 |
@@ -59,8 +60,8 @@
 
 | 顺序 | 未完成能力 | 状态 | 完成条件 |
 | --- | --- | --- | --- |
-| C-01 | 准备真实 V7 运行环境 | `CONNECT` | 提供空或已升级的 MySQL `dataforge`、MinIO bucket、Milvus URI/token、`EMBEDDING_*`、`LOCAL_LLM_API_KEY`、服务器 `/data/zoe-ai-proj/global_llm` 和可写 RoutingSnapshot volume；同机独立 Milvus 还须安装 `dataforge-milvus-egress.timer`。 |
-| C-02 | 真实集成验收 | `CONNECT` | 执行 Compose config/Runner build/`import global_llm`、Alembic 升级、上传、分块 Qwen 任务/失败重试、真实向量同步、Partition load/search/release、容量阈值与安全删除；验证 API/Worker 经专用网络的 Milvus/Embedding 最小出站、Milvus 重建恢复，确认没有 Collection 删除。 |
+| C-01 | 准备真实 V7 运行环境 | `CONNECT` | 提供空或已升级的 MySQL `dataforge`、MinIO bucket、Milvus URI/token、`EMBEDDING_*`、`LOCAL_LLM_API_KEY`、服务器 `/data/zoe-ai-proj/global_llm`、可写 RoutingSnapshot volume及可用 NVIDIA GPU；前置构建 `dataforge-mineru:3.4.4`，同机独立 Milvus 还须安装 `dataforge-milvus-egress.timer`。 |
+| C-02 | 真实集成验收 | `CONNECT` | 执行 Compose config/Runner build/`import global_llm`、Alembic 升级、MinerU 双路径 health 与局域网拒绝、文本/扫描 PDF、分块 Qwen 任务/失败重试、真实向量同步、Partition load/search/release、容量阈值与安全删除；确认没有 Collection 删除。 |
 | C-03 | 三个目标项目接入 | `CONNECT` | 在 V7 中创建项目/任务/路由，使用新建 V7 知识库发布并核对各自 Snapshot；不迁移或读取 V2。 |
 | C-04 | 真实失败恢复验收 | `CONNECT` | 验证 Milvus/Embedding/runner 不可用、worker 租约恢复、删除任务重试及前端告警。无 Milvus 的本地删除失败/重试已自动化覆盖。 |
 | C-05 | 上线签字与验收记录 | `CONNECT` | 依照 `docs/releases/v7-acceptance.md` 留存 C-01～C-04 的证据、负责人和批准记录。 |
@@ -70,7 +71,7 @@
 ## 执行记录
 
 - 本矩阵创建时已完成本期唯一可本地完成的导航收口：开发区第四页为只读「DataFlow 调试台」，向量状态作为其诊断面板的一部分保留。
-- 2026-08-12：本地回归 40 passed，覆盖三类内置种子、自动编码/`code` 拒绝、扩展类型发布、Runner 启动 Qwen 初始化/多项结构化结果/一次修复、分块失败保留/空结果撤销/身份变更替换/版本缩减跨类型全成功清理与失败重试后清理、OpenAI-like Embedding 及 Profile 维度、文档库自动结果库与增量防重、来源删除处理和动态路由；真实 MinerU API/Local/Flash、Qwen、Milvus/Embedding 仍需 C-01～C-04 部署验收。
+- 2026-08-13：MinerU 3.4.4 Pipeline GPU OCR 仓库实现完成；相关 V7 回归 60 passed，覆盖 Adapter、文本/扫描 PDF Runner、Artifact 补偿与删除生命周期、失败保真和 Compose 静态契约。真实 CUDA/模型、文本/扫描 PDF、回环端口和服务恢复仍需 C-01～C-04 部署验收。
 - C-01 至 C-05 是本期的下一执行队列。每完成一项，应更新本文件状态、`wiki/`、Devora 测试用例和上线证据；不得将模拟或缺失依赖的结果写成真实部署验收。
 
 ## 依据

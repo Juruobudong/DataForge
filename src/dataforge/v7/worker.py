@@ -29,10 +29,13 @@ def run_once(settings: Settings | None = None, *, check_schema: bool = True) -> 
             store.mark_job_failed(job.id, "DATAFORGE_RUNNER_URL 未配置"); return 0
         headers = {"Authorization": f"Bearer {resolved.runner_service_token}"} if resolved.runner_service_token else {}
         try:
-            response = httpx.post(f"{resolved.runner_url.rstrip('/')}/internal/jobs", json={"job_id": job.id}, headers=headers, timeout=300)
+            response = httpx.post(f"{resolved.runner_url.rstrip('/')}/internal/jobs", json={"job_id": job.id}, headers=headers,
+                                  timeout=resolved.runner_timeout_seconds)
             response.raise_for_status(); return 1
         except httpx.HTTPError as exc:
-            store.mark_job_failed(job.id, f"Runner 投递失败：{exc}"); return 0
+            if store.get_job(job.id).status != "failed":
+                store.mark_job_failed(job.id, f"Runner 投递失败：{exc}")
+            return 0
     vector_job = store.claim_vector_sync_job(owner)
     if vector_job:
         result = VectorSyncService.from_environment(store).run(vector_job.id)

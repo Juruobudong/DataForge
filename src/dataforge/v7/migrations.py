@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260813_graph_storage_contracts"
+CURRENT_SCHEMA_REVISION = "20260814_operator_examples"
 
 
 def _config(database_url: str) -> Config:

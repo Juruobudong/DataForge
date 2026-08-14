@@ -625,7 +625,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def sample_run_flow_template(template_id: str, payload: TemplateSampleRequest):
         try:
             checked = store.validate_flow_template(template_id)
-            return {**preview_template_definition(checked["definition"], payload.sample_id), "template_id": template_id, "revision": checked["revision"]}
+            return {**preview_template_definition(checked["definition"], payload.sample_id, compiled_definition=checked["compiled_definition"]), "template_id": template_id, "revision": checked["revision"]}
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/execution-snapshots/{snapshot_id}")

@@ -404,11 +404,21 @@ class V7Store:
         for item in CATALOG_SEEDS:
             definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == item["code"]))
             if not definition:
-                definition = OperatorDefinition(id=f"op_{item['code'].replace('-', '_')}", code=item["code"], name=item["name"], category=item["category"], exposure=item["exposure"], risk_level=item["risk_level"], enabled=item["exposure"] != "disabled")
+                definition = OperatorDefinition(id=f"op_{item['code'].replace('-', '_')}", code=item["code"], name=item["name"], description=item["description"], category=item["category"], exposure=item["exposure"], risk_level=item["risk_level"], enabled=item["exposure"] != "disabled")
                 session.add(definition); session.flush()
+            definition.name, definition.description, definition.category = item["name"], item["description"], item["category"]
+            definition.exposure, definition.risk_level = item["exposure"], item["risk_level"]
+            definition.enabled = item["exposure"] != "disabled"
             version_no = int(item.get("version", 1))
-            if not session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id, OperatorVersion.version_no == version_no)):
-                session.add(OperatorVersion(id=new_id("oprev"), operator_definition_id=definition.id, version_no=version_no, adapter_code=item["adapter_code"], input_ports=item.get("input_ports") or {"input": {"artifact_type": item["input"], "cardinality": "one"}}, output_ports=item.get("output_ports") or {"output": {"artifact_type": item["output"], "cardinality": "many"}}, parameter_schema=item["parameter_schema"], runtime_requirements=item["runtime_requirements"], status="published", published_at=utc_now()))
+            version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id, OperatorVersion.version_no == version_no))
+            if not version:
+                version = OperatorVersion(id=new_id("oprev"), operator_definition_id=definition.id, version_no=version_no, status="published", published_at=utc_now())
+                session.add(version)
+            version.adapter_code = item["adapter_code"]
+            version.input_ports = item.get("input_ports") or {"input": {"artifact_type": item["input"], "cardinality": "one"}}
+            version.output_ports = item.get("output_ports") or {"output": {"artifact_type": item["output"], "cardinality": "many"}}
+            version.input_example, version.output_example = item["input_example"], item["output_example"]
+            version.parameter_schema, version.runtime_requirements = item["parameter_schema"], item["runtime_requirements"]
             definition.latest_version = max(definition.latest_version or 0, version_no)
         for item in subflow_seeds():
             subflow = session.scalar(select(FlowSubgraph).where(FlowSubgraph.code == item["code"]))
@@ -732,10 +742,11 @@ class V7Store:
                 if definition.code in seen or (definition.exposure == "internal" and not include_internal):
                     continue
                 seen.add(definition.code)
-                values.append({"id": definition.id, "code": definition.code, "name": definition.name, "category": definition.category,
+                values.append({"id": definition.id, "code": definition.code, "name": definition.name, "description": definition.description, "category": definition.category,
                                "exposure": definition.exposure, "risk_level": definition.risk_level, "enabled": definition.enabled,
                                "version": version.version_no, "adapter_code": version.adapter_code,
                                "input_ports": version.input_ports, "output_ports": version.output_ports,
+                               "input_example": version.input_example, "output_example": version.output_example,
                                "parameter_schema": version.parameter_schema, "runtime_requirements": version.runtime_requirements})
             return values
 
@@ -1226,13 +1237,20 @@ class V7Store:
                 raise ValueError("文件版本不存在")
             jobs = [job for job in session.scalars(select(KnowledgeJob).order_by(KnowledgeJob.created_at.desc())).all() if version and version.id in (job.source_version_ids or [])]
             runs = session.scalars(select(FlowRun).where(FlowRun.knowledge_job_id.in_([job.id for job in jobs] or [""])).order_by(FlowRun.created_at.desc())).all()
-            active_run = next((run for run in runs if run.id == flow_run_id), None) if flow_run_id else next((run for run in runs if run.status == "completed"), None)
+            active_run = next((run for run in runs if run.id == flow_run_id), None) if flow_run_id else next((run for run in runs if run.status in {"completed", "completed_with_warnings"}), None)
             ir = session.scalar(select(DocumentIR).where(DocumentIR.source_version_id == version.id, DocumentIR.flow_run_id == active_run.id)) if version and active_run else None
             chunks = session.scalars(select(SourceChunk).where(SourceChunk.source_version_id == version.id, SourceChunk.flow_run_id == active_run.id).order_by(SourceChunk.chunk_index)).all() if version and active_run else []
+            parser_artifacts = session.scalars(select(Artifact).where(
+                Artifact.source_version_id == version.id,
+                Artifact.type_code.like("parser.%"),
+            ).order_by(Artifact.created_at.desc())).all() if version else []
             evidence_rows = session.execute(select(KnowledgeItemSource, KnowledgeItem, KnowledgeLibrary).join(KnowledgeItem, KnowledgeItem.id == KnowledgeItemSource.knowledge_item_id).join(KnowledgeLibrary, KnowledgeLibrary.id == KnowledgeItem.knowledge_library_id).where(KnowledgeItemSource.source_version_id == version.id)).all() if version else []
             return {"source": self._source_payload(source, version), "versions": [self._source_payload(source, item)["version"] for item in versions],
                     "jobs": [self.job_payload(job) for job in jobs], "flow_runs": [{"id": run.id, "status": run.status, "error": run.error, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None} for run in runs],
                     "document_ir": None if not ir else {"id": ir.id, "text": ir.text, "parser_adapter": ir.parser_adapter, "parser_profile": ir.parser_profile, "anchor": ir.anchor_json, "status": ir.status, "error": ir.error},
+                    "parser_artifacts": [{"id": item.id, "type": item.type_code, "flow_run_id": item.flow_run_id,
+                                          "uri": item.uri, "checksum": item.checksum, "metadata": item.data_json,
+                                          "created_at": item.created_at.isoformat()} for item in parser_artifacts],
                     "source_chunks": [{"id": item.id, "source_chunk_id": item.source_chunk_id, "chunk_index": item.chunk_index, "content": item.content, "anchor": item.anchor_json} for item in chunks],
                     "knowledge_results": [{"knowledge_item_id": item.id, "knowledge_library_id": library.id, "knowledge_library_name": library.name, "content": item.canonical_content, "status": item.status, "anchor": link.anchor_json, "evidence_text": link.evidence_text} for link, item, library in evidence_rows]}
 
@@ -1311,12 +1329,18 @@ class V7Store:
             raise ValueError("删除被运行任务阻断")
         with self.sessions.begin() as session:
             versions = session.scalars(select(SourceVersion).where(SourceVersion.source_id.in_(check["source_ids"]))).all()
+            version_ids = [item.id for item in versions]
+            parser_keys = [
+                str(item.data_json.get("object_key")) for item in session.scalars(select(Artifact).where(
+                    Artifact.source_version_id.in_(version_ids), Artifact.type_code.like("parser.%"),
+                )) if item.data_json.get("object_key")
+            ] if version_ids else []
             self._remove_source_evidence(session, [item.id for item in versions], deletion_job_id=None)
             for source in session.scalars(select(Source).where(Source.id.in_(check["source_ids"]))):
                 source.status = "deleting"
             for library in session.scalars(select(DocumentLibrary).where(DocumentLibrary.id.in_(check["document_library_ids"]))):
                 library.status = "deleting"
-            job = DocumentDeletionJob(id=new_id("deldoc"), target_kind="sources" if source_ids else "libraries", source_ids=check["source_ids"], document_library_ids=check["document_library_ids"], object_keys=[item.object_key for item in versions], status="queued")
+            job = DocumentDeletionJob(id=new_id("deldoc"), target_kind="sources" if source_ids else "libraries", source_ids=check["source_ids"], document_library_ids=check["document_library_ids"], object_keys=[item.object_key for item in versions] + parser_keys, status="queued")
             session.add(job); self.audit(session, "document.deletion_queued", "document_deletion_job", job.id, {"source_count": len(check["source_ids"])})
             return {"id": job.id, "status": job.status, **check}
 
@@ -1392,6 +1416,12 @@ class V7Store:
                 job.status, job.error, job.lease_owner = "failed", error, None
                 return {"id": job.id, "status": job.status, "error": error}
             version_ids = list(session.scalars(select(SourceVersion.id).where(SourceVersion.source_id.in_(job.source_ids))))
+            artifact_ids = list(session.scalars(select(Artifact.id).where(Artifact.source_version_id.in_(version_ids)))) if version_ids else []
+            if artifact_ids:
+                session.execute(delete(ArtifactLineage).where(
+                    (ArtifactLineage.parent_artifact_id.in_(artifact_ids)) | (ArtifactLineage.child_artifact_id.in_(artifact_ids))
+                ))
+                session.execute(delete(Artifact).where(Artifact.id.in_(artifact_ids)))
             for model, column in ((SourceChunk, SourceChunk.source_version_id), (DocumentIR, DocumentIR.source_version_id), (DocumentLibraryProcessingRecord, DocumentLibraryProcessingRecord.source_version_id), (KnowledgeChunkGeneration, KnowledgeChunkGeneration.source_version_id), (KnowledgeItemSource, KnowledgeItemSource.source_version_id), (DocumentLibraryMember, DocumentLibraryMember.source_id), (SourceVersion, SourceVersion.source_id), (Source, Source.id)):
                 session.execute(delete(model).where(column.in_(job.source_ids if model in (DocumentLibraryMember, SourceVersion, Source) else version_ids)))
             if job.document_library_ids:
@@ -2194,11 +2224,22 @@ class V7Store:
             output_ids: list[str] = []
             for value in outputs:
                 data = dict(value) if isinstance(value, dict) else {"value": value}
+                parser_artifacts = list(data.pop("_parser_artifacts", []))
                 artifact = Artifact(id=new_id("artifact"), flow_run_id=flow_run_id, flow_node_run_id=node_run.id,
                                     type_code=str(data.pop("_artifact_type", "execution")), data_json=data)
                 session.add(artifact); session.flush(); output_ids.append(artifact.id)
                 for parent_id in input_artifact_ids:
                     session.add(ArtifactLineage(id=new_id("lineage"), parent_artifact_id=parent_id, child_artifact_id=artifact.id))
+                for parser_artifact in parser_artifacts:
+                    parser_data = dict(parser_artifact.get("data") or {})
+                    persisted = Artifact(
+                        id=new_id("artifact"), flow_run_id=flow_run_id, flow_node_run_id=node_run.id,
+                        source_version_id=str(parser_artifact["source_version_id"]),
+                        type_code=str(parser_artifact["type_code"]), uri=str(parser_artifact["uri"]),
+                        checksum=str(parser_artifact["checksum"]), data_json=parser_data,
+                    )
+                    session.add(persisted); session.flush(); output_ids.append(persisted.id)
+                    session.add(ArtifactLineage(id=new_id("lineage"), parent_artifact_id=artifact.id, child_artifact_id=persisted.id))
             node_run.output_artifact_ids = output_ids
             return output_ids
 
@@ -2233,6 +2274,10 @@ class V7Store:
         """
         with self.sessions() as session:
             keys = list(session.scalars(select(SourceVersion.object_key)))
+            keys.extend(
+                str(item.data_json.get("object_key")) for item in session.scalars(select(Artifact).where(Artifact.type_code.like("parser.%")))
+                if item.data_json.get("object_key")
+            )
             partitions = list(session.scalars(select(KnowledgeLibrary.partition_name)))
             # The Collection is administrator-owned.  Rebuild/deletion may only
             # operate on partitions that are referenced from V7 libraries.

@@ -24,9 +24,14 @@
 | TC-014 | FR-012 | unit/integration | Storage Contract 哈希、归属冲突、幂等供应 | 同规格复用；不兼容拒绝；失败可重试；没有 Collection 删除 | AUTO/Fake + MANUAL |
 | TC-015 | FR-013 | unit/frontend | Flow DSL v3 分支、many 合流、孤立/环/非法 Sink 与拖拽画布 | 合法 DAG 发布；非法图拒绝；前端构建通过 | AUTO/build |
 | TC-016 | FR-011/012 | deployment | 五个默认受管 Collection 实机供应，并对两个新 Graph Collection 执行 insert/load/search/release | 五个状态 ready；Triple/Semantic 各自可用，旧 Collection 无变化 | MANUAL |
+| TC-017 | FR-013 | frontend | PC 固定三栏专业 DAG 画布、Typed Handle、端口连接、方向边、Palette、Inspector、MiniMap、自动布局、历史与校验定位 | 1440/1920 桌面视口可完整编排；旧 DSL/坐标可往返；非法连接与旧修订误操作被阻止 | AUTO/build + MANUAL |
+| TC-018 | FR-014 | unit/integration/static | MinerU multipart、响应/错误/超时、文本/扫描 PDF Fake、Artifact 生命周期与 Compose 契约 | 参数/版本严格；Markdown、页级 SourceChunk 和 Artifact 正确；失败不写知识且原始错误不被覆盖；回环端口、GPU 0、并发 1、窗口 16正确且无禁用 Runtime | AUTO |
+| TC-019 | FR-014 | deployment | CUDA 12.4、MinerU 3.4.4 Pipeline 模型、Runner/宿主机 health、局域网拒绝、真实文本/扫描 PDF与停止恢复 | 双路径访问成功、局域网拒绝；两类 PDF 完整入库；停止时仅一条失败且恢复后人工重试成功 | MANUAL |
+| TC-020 | FR-015 | unit/HTTP/frontend | Catalog 说明/示例、幂等种子、MySQL 迁移、逐节点预览、分支失败、子图/Sink、截断和 Inspector 映射 | 新字段完整；预览无外部调用或持久化；节点数据与状态正确；前端测试和构建通过 | AUTO/build |
 
 ## 退出标准
 
 - 所有 AUTO 用例通过；后端回归与前端构建通过。
 - 静态审查确认无 `drop_collection`、无旧资源读取、无未受控 Prompt/Shell 节点。
 - TC-009 记录为部署验收，不得以本地 Fake 替代真实签字。
+- TC-019 必须在 NVIDIA Docker 主机留存证据，本地静态测试不能替代。

@@ -5,7 +5,7 @@
 **工件就绪度**：READY
 **交付就绪度**：DEPLOYMENT_ACCEPTANCE_PENDING
 **人工门禁**：APPROVED  
-**更新日期**：2026-08-13
+**更新日期**：2026-08-14
 
 ## 变更内容
 
@@ -29,20 +29,25 @@
 | 同机 Milvus 网络 | DECISION | USER | CONFIRMED | 保留 `private`，通过外部 `dataforge_milvus_egress` 临时接入独立 Milvus，固定别名/地址并以最小出站白名单保护。 |
 | 双图谱与存储 | DECISION | USER | CONFIRMED | 顶层保持 graph；Triple/Semantic 使用专属 Collection；Collection 按完整 Storage Contract 哈希归并，旧 Graph 冻结。 |
 | 流程画布 | DECISION | USER | CONFIRMED | Flow DSL v3 采用白名单、强类型端口、受控分支/合流与 Knowledge Sink 终点，不开放任意代码。 |
+| PDF GPU OCR | DECISION | USER | CONFIRMED | 所有 PDF 固定 MinerU 3.4.4 `pipeline + auto`；Runner 内网调用，宿主机内部服务仅回环调用，不接 VLM/vLLM/Flash/Router 或 OCR UI。 |
+| 算子说明与预览 | DECISION | USER | CONFIRMED | 算子展示中文功能说明；Inspector 同时显示版本化典型示例与不调用外部服务的逐节点受控内存预览。 |
 
 ## 主要风险
 
-- 真实 OCR/LLM/Milvus 环境未提供；本地以 Adapter Fake/Stub 验证，真实集成保持部署验收项。
+- 真实 MinerU GPU/CUDA、LLM/Milvus 环境未提供；本地以 Adapter Fake/静态契约验证，真实集成保持部署验收项。
 - V7 重建是破坏性操作；命令需精确清单和确认参数，测试证明不触碰旧资源或 Collection。
 - Milvus 由另一份 Compose 管理，容器重建会失去临时网络端点；`dataforge-milvus-egress.timer` 负责恢复。基础网络/白名单验证已通过，但容器重建恢复及新 Collection 实机供应仍待验收。
 
 ## 实施与验证
 
-- **实施**：T001-T013、T015-T019 已完成；新增双 Graph 模式、五个默认 Storage Contract/Managed Collection、幂等 Provisioner、模式化 Sink、Flow DSL v3 与 Vue Flow 编辑画布。
-- **验证**：Conda `sun` 下完整回归 49 passed（1 条第三方警告），前端生产构建通过；部署主机基础 Milvus/Embedding/防火墙验证通过。当前 Windows 工作区无 Docker CLI，实机 Provision、向量写入/search/release 与重建恢复仍待部署主机执行。
-- **完成统计**：18 项仓库实现完成；T014、T020 为外部部署验收门禁。
+- **实施**：T001-T013、T015-T019、T021-T022、T024 已完成；PDF 已收敛到 MinerU 3.4.4 Pipeline GPU，算子 Catalog 与节点 Inspector 已补齐说明、静态示例和逐节点受控预览。
+- **画布增量**：T021 已完成；知识流程模板现为 PC 固定三栏专业 DAG 编辑器，包含 Typed Handle、自定义方向边、Palette、Inspector、MiniMap、LR 自动布局、事务历史和结构化问题定位，未改后端 DSL 或数据库。
+- **验证**：Conda `sun` 下本次相关 V7 回归 60 passed（1 条第三方警告）；MinerU Adapter、文本/扫描 PDF Runner、Artifact 补偿与删除生命周期、Worker 错误保真和 Compose 静态契约通过。全仓为 78 passed、1 skipped、1 个既有 `/studio/` 占位文案断言失败；当前 Windows 工作区不运行 Docker，真实 GPU/CUDA/模型、文本/扫描 PDF、回环访问与服务恢复仍待部署主机执行。
+- **本次画布验证**：Node 前端逻辑测试 8 passed，Vite 生产构建通过；1440×900 与 1920×1080 真实浏览器验收通过。先前并行变更出现的 3 个后端失败已修复并纳入本次 60 passed 回归。
+- **本次算子预览验证**：V7 回归 63 passed、前端逻辑测试 8 passed、Vite 生产构建通过；预览路径不调用 LLM、MinerU、对象存储或 Store 写入。
+- **完成统计**：21 项仓库实现完成；T014、T020、T023 为外部部署验收门禁。
 - **评审**：自动化验证完成后待审；真实部署验收完成前不进入最终交付评审。
 
 ## 下一步
 
-在 Docker 主机重新构建/启动当前代码，运行 `dataforge-provision --reconcile`，验证五个默认受管 Collection 与新 Triple/Semantic 向量链路，再完成 Milvus 重建恢复验收。
+在 NVIDIA Docker 主机先构建并验证 MinerU 3.4.4 Pipeline 镜像，按 `docs/releases/v7-acceptance.md` 完成 PDF OCR 实机验收；随后运行 `dataforge-provision --reconcile`，验证五个默认受管 Collection、向量链路与 Milvus 重建恢复。

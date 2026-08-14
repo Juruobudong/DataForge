@@ -33,16 +33,20 @@
 - [X] T018 [DataForge] [FR-013] 升级 Flow DSL v3 和模板 Vue Flow 编辑器，支持强类型分支/合流、撤销重做、校验与发布。— Depends on: T017 — Implementation: DONE — Validation: PASSED — Validate: TC-015、前端构建。
 - [X] T019 [DataForge] 更新 API、Compose Provisioner、调试台、知识类型页、Wiki 与验收文档。— Depends on: T015-T018 — Implementation: DONE — Validation: PASSED — Validate: 静态契约与构建。
 - [ ] T020 [Deployment] [FR-011/012] 在真实 Milvus 供应五个默认受管 Collection，重点验证两个新 Graph Collection 的 insert/load/search/release，并确认旧 `dataforge_graph_knowledge` 无变化。— Depends on: T016,T019 — Implementation: PENDING — Validation: PENDING — Validate: TC-016。
+- [X] T021 [DataForge] [FR-013] 将知识流程模板升级为 PC 固定三栏专业 DAG 编辑器，提供自定义节点/边、Typed Handle、算子拖入、Inspector、MiniMap、自动布局、事务历史和结构化本地校验定位。— Depends on: T018 — Implementation: DONE — Validation: PASSED（Node 逻辑测试 8 passed、Vite build、1440×900/1920×1080 浏览器验收，Console 无错误）。— Validate: TC-017。
+- [X] T022 [DataForge] [FR-014] 实现 MinerU 3.4.4 Pipeline GPU 镜像、内部/回环网络、PDF Adapter、页级 SourceChunk、Middle JSON Artifact、生命周期、失败保真与分层超时。— Depends on: T004,T009 — Implementation: DONE — Validation: PASSED（Conda `sun` 相关 V7 回归 60 passed；Compose/Dockerfile 静态契约通过）。— Validate: TC-018。
+- [ ] T023 [Deployment] [FR-014] 在 NVIDIA Docker 主机完成 CUDA/模型、双路径 health、局域网拒绝、文本/扫描 PDF及 MinerU 停止恢复验收。— Depends on: T022 — Implementation: PENDING — Validation: PENDING — Validate: TC-019。
+- [X] T024 [DataForge] [FR-015] 增加算子中文说明、版本化输入输出示例、兼容迁移、逐节点受控内存预览与 Inspector 展示。— Depends on: T021 — Implementation: DONE — Validation: PASSED（V7 回归 63 passed、前端逻辑测试 8 passed、Vite build）。— Validate: TC-020。
 
 ## 状态摘要
 
 | 指标 | 数量 |
 |------|------|
-| 实现完成或 N/A | 18 |
-| 验证通过 | 18 |
-| 完全完成 | 18 |
-| 外部部署待验收 | 2（T014、T020） |
+| 实现完成或 N/A | 21 |
+| 验证通过 | 21 |
+| 完全完成 | 21 |
+| 外部部署待验收 | 3（T014、T020、T023） |
 
 ## 关键依赖
 
-T001 → T002/T003 → T004 → T005/T006 → T007 → T008 → T009 → T010 → T011 → T012 → T013 → T014。
+T001 → T002/T003 → T004 → T005/T006 → T007 → T008 → T009 → T010 → T011 → T012 → T013 → T014；T004/T009 → T022 → T023。

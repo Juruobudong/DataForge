@@ -14,6 +14,8 @@
 | SRC-004 | 用户确认的文档库当前页选中文件处理 | 对话/产品方案 | 2026-08-12 | READ | 当前页全选、按全部有效模板定向处理待更新版本、保留整库处理入口。 |
 | SRC-005 | 用户确认的本机 Milvus 隔离直连方案与服务器网络盘点 | 对话/部署证据 | 2026-08-12 | READ | 专用外部 Docker 网络、Milvus 容器临时接入、API/Worker 最小出站与 systemd 恢复。 |
 | SRC-006 | 用户批准的双图谱专属 Collection 与受控 DAG 方案 | 对话/产品方案 | 2026-08-13 | READ | Graph 模式、Storage Contract、Managed Collection、Flow DSL v3 与编辑画布。 |
+| SRC-007 | 用户批准的 PDF GPU OCR 实施计划 | 对话/产品方案 | 2026-08-13 | READ | MinerU 3.4.4 Pipeline GPU、回环宿主机访问、Artifact 生命周期、超时和部署验收。 |
+| SRC-008 | 用户批准的算子说明与节点输入输出示例计划 | 对话/产品方案 | 2026-08-14 | READ | 中文功能说明、版本化静态示例、逐节点受控内存预览与 Inspector 展示。 |
 
 ## 产品意图
 
@@ -30,11 +32,12 @@
 - V7 当前实现仅支持固定三类知识和线性模板，开发区侧栏固定为四页。— SRC-003
 - `milvus-standalone-new` 是同一 Docker 主机上的未受 DataForge 管理容器，当前在默认 `bridge`，宿主机 `19531` 映射到其容器 `19530`；DataForge 不可修改其 Compose。— SRC-005
 - Worker 的 `private` 网络为 `internal: true`，不能经宿主机映射端口访问 Milvus；API 也需要 Milvus 连接以校验和发布 Index Profile。— SRC-005
+- 所有 PDF 固定通过独立 MinerU 3.4.4 GPU 服务以 `pipeline + auto` 解析；宿主机内部调用仅绑定回环地址，首版不接 VLM、vLLM、Flash、Router、多 GPU或 OCR UI。— SRC-007
 
 ## 冲突与缺口
 
 - 旧 V7 规格明确禁止任意 DAG 和新增知识类型；本特性取代该限制，但继续禁止任意代码、Shell、DataFlow WebUI 与非白名单算子。
-- 真实 MinerU、LLM、Milvus 和 Embedding 凭据不在本地工作区；真实集成验收需部署环境。
+- 真实 MinerU GPU/CUDA、LLM、Milvus 和 Embedding 环境不在本地工作区；真实集成验收需部署环境。
 
 ## 推断
 
@@ -47,4 +50,4 @@
 
 ## 可追溯性
 
-SRC-001 覆盖 FR-001～FR-008；SRC-002 覆盖 FR-002、FR-003、FR-005、FR-006；SRC-003 提供迁移、兼容与安全验证基线；SRC-004 覆盖 FR-009；SRC-005 覆盖 FR-010。
+SRC-001 覆盖 FR-001～FR-008；SRC-002 覆盖 FR-002、FR-003、FR-005、FR-006；SRC-003 提供迁移、兼容与安全验证基线；SRC-004 覆盖 FR-009；SRC-005 覆盖 FR-010；SRC-006 覆盖 FR-011～FR-013；SRC-007 覆盖 FR-014；SRC-008 覆盖 FR-015。

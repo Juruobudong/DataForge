@@ -9,20 +9,87 @@ from __future__ import annotations
 from typing import Any
 
 
+OPERATOR_DESCRIPTIONS: dict[str, str] = {
+    "document-parser": "将源文件解析为统一文档结构",
+    "document-ir-normalizer": "统一文档结构与基础元数据",
+    "null-filter": "过滤缺少有效正文的文档",
+    "language-filter": "按允许语言筛选文档内容",
+    "text-cleaner": "清理文本噪声与异常内容",
+    "whitespace-cleaner": "合并多余空白与换行",
+    "text-normalizer": "规范字符、标点与文本格式",
+    "semantic-chunker": "按语义边界将文档切分为文本块",
+    "source-chunk-builder": "生成可追溯的正式来源文本块",
+    "deduplicate": "移除重复的候选知识",
+    "prompt-generator": "按受控提示生成结构化知识",
+    "qa-generator": "从来源文本块生成问答知识",
+    "graph-extractor": "从来源文本块提取图谱知识",
+    "entity-extractor": "识别文本中的实体候选",
+    "relation-extractor": "识别实体之间的关系候选",
+    "triple-builder": "构造主谓宾三元组知识",
+    "entity-normalizer": "合并并规范同义实体",
+    "semantic-relation-builder": "构造带语义描述的实体关系",
+    "evidence-binder": "为语义关系绑定来源证据",
+    "artifact-merge": "合并多个上游候选结果",
+    "structured-knowledge-generator": "按知识类型契约生成结构化知识",
+    "quality-evaluator": "评估候选知识的质量分数",
+    "quality-filter": "按质量门槛筛选候选知识",
+    "source-binding": "为候选知识绑定来源与锚点",
+    "schema-validator": "校验候选知识是否符合 Schema",
+    "knowledge-diff": "计算候选知识与当前版本的差异",
+    "mineru-pipeline-gpu-adapter": "通过 MinerU GPU 服务解析 PDF",
+    "kbc-cleaner-batch": "批量执行文本清理",
+    "kbc-chunker-batch": "批量执行语义切片",
+    "prompted-refiner": "使用受控提示修订候选知识",
+    "multihop-qa": "生成需要多步推理的问答知识",
+    "pii-compliance": "识别并处理个人敏感信息",
+    "kcenter-greedy": "按覆盖度选择代表性样本",
+    "reference-remover": "移除文档中的参考文献部分",
+}
+
+
+def _artifact_example(artifact_type: str) -> dict[str, Any]:
+    if artifact_type == "source_file":
+        return {"filename": "临床指南.md", "content_type": "text/markdown"}
+    if artifact_type == "document_ir":
+        return {"filename": "临床指南.md", "text": "高血压患者应规范随访。", "anchor": {"page": 1}}
+    if artifact_type in {"chunk_set", "source_chunk_set"}:
+        value = {"content": "高血压患者应规范随访。", "chunk_index": 0, "anchor": {"page": 1}}
+        if artifact_type == "source_chunk_set":
+            value["source_chunk_id"] = "chunk-example-001"
+        return value
+    if artifact_type == "entity_candidate_set":
+        return {"entities": [{"name": "高血压", "type": "疾病"}], "source_chunk_id": "chunk-example-001"}
+    if artifact_type == "relation_candidate_set":
+        return {"source": "高血压", "relation": "需要", "target": "规范随访", "source_chunk_id": "chunk-example-001"}
+    if artifact_type == "semantic_relation_set":
+        return {"source_entity": "高血压", "relation": "患者需要规范随访", "target_entity": "规范随访"}
+    if artifact_type.startswith("candidate:qa"):
+        return {"question": "高血压患者需要什么？", "answer": "需要规范随访。", "source_chunk_id": "chunk-example-001"}
+    if artifact_type.startswith("candidate:graph:semantic"):
+        return {"source_entity": {"name": "高血压"}, "relation": {"description": "需要"}, "target_entity": {"name": "规范随访"}, "evidence": ["高血压患者应规范随访。"]}
+    if artifact_type.startswith("candidate:graph"):
+        return {"subject": "高血压", "predicate": "需要", "object": "规范随访", "source_chunk_id": "chunk-example-001"}
+    if artifact_type.startswith("candidate:"):
+        return {"canonical_content": "高血压患者应规范随访。", "source_chunk_id": "chunk-example-001"}
+    return {"value": "示例数据"}
+
+
 def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one") -> dict[str, Any]:
     return {
-        "code": code, "name": name, "category": category, "input": source,
+        "code": code, "name": name, "description": OPERATOR_DESCRIPTIONS[code], "category": category, "input": source,
         "output": target, "adapter_code": adapter, "exposure": exposure,
-        "risk_level": risk, "upstream": upstream or [], "version": 2,
+        "risk_level": risk, "upstream": upstream or [], "version": 3,
         "input_ports": {"input": {"artifact_type": source, "cardinality": input_cardinality}},
         "output_ports": {"output": {"artifact_type": target, "cardinality": "many"}},
+        "input_example": {"input": [_artifact_example(source)]},
+        "output_example": {"output": [_artifact_example(target)]},
         "parameter_schema": {"type": "object", "additionalProperties": False},
-        "runtime_requirements": {"package": "open-dataflow", "version": "1.0.10", "upstream": upstream or []},
+        "runtime_requirements": {"executor": "dataforge-adapter", "upstream": upstream or []},
     }
 
 
 CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
-    _entry("document-parser", "Document Parser", "文档", "source_file", "document_ir", "document_parser", upstream=["FileOrURLToMarkdownConverterAPI", "FileOrURLToMarkdownConverterLocal", "FileOrURLToMarkdownConverterFlash"]),
+    _entry("document-parser", "Document Parser", "文档", "source_file", "document_ir", "document_parser", upstream=["DataForgeNativeParser", "MinerUPipelineHTTPAdapter"]),
     _entry("document-ir-normalizer", "Document IR Normalizer", "文档", "document_ir", "document_ir", "document_ir_normalizer"),
     _entry("null-filter", "Null Filter", "清洗", "document_ir", "document_ir", "content_null_filter", upstream=["ContentNullFilter"]),
     _entry("language-filter", "Language Filter", "清洗", "document_ir", "document_ir", "language_filter", upstream=["LanguageFilter"]),
@@ -48,9 +115,7 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("source-binding", "Source Binding", "治理", "candidate:*", "candidate:*", "source_binding"),
     _entry("schema-validator", "Schema Validator", "治理", "candidate:*", "candidate:*", "schema_validator"),
     _entry("knowledge-diff", "Knowledge Diff", "治理", "candidate:*", "candidate:*", "knowledge_diff"),
-    _entry("mineru-api-adapter", "MinerU API Adapter", "Runtime", "source_file", "document_ir", "mineru_api", exposure="internal", upstream=["FileOrURLToMarkdownConverterAPI"]),
-    _entry("mineru-local-adapter", "MinerU Local Adapter", "Runtime", "source_file", "document_ir", "mineru_local", exposure="internal", upstream=["FileOrURLToMarkdownConverterLocal"]),
-    _entry("mineru-flash-adapter", "MinerU Flash Adapter", "Runtime", "source_file", "document_ir", "mineru_flash", exposure="internal", upstream=["FileOrURLToMarkdownConverterFlash"]),
+    _entry("mineru-pipeline-gpu-adapter", "MinerU Pipeline GPU Adapter", "Runtime", "source_file", "document_ir", "mineru_pipeline_gpu", exposure="internal", upstream=["MinerUPipelineHTTPAdapter"]),
     _entry("kbc-cleaner-batch", "KBC Cleaner Batch", "Runtime", "document_ir", "document_ir", "kbc_cleaner_batch", exposure="internal", upstream=["KBCTextCleanerBatch"]),
     _entry("kbc-chunker-batch", "KBC Chunker Batch", "Runtime", "document_ir", "chunk_set", "kbc_chunker_batch", exposure="internal", upstream=["KBCChunkGeneratorBatch"]),
     _entry("prompted-refiner", "Knowledge Refiner", "质量", "candidate:*", "candidate:*", "prompted_refiner", exposure="controlled", risk="advanced", upstream=["PromptedRefiner"]),

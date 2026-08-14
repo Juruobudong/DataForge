@@ -64,8 +64,8 @@ CMD ["dataforge-web"]
 
 # -----------------------------------------------------------------------------
 # V7 Runner 镜像目标。
-# Runner 独立安装受固定版本约束的 DataFlow 执行依赖；API/Worker 不安装
-# 重型 Runtime，也不部署 DataFlow WebUI、MCP 或 Agent。
+# Runner 仅补装结构化输出 Schema Validator；算子执行由本仓库的
+# DataForge Adapter 完成，不部署 DataFlow WebUI、MCP 或 Agent。
 # -----------------------------------------------------------------------------
 FROM app-common AS runner
 

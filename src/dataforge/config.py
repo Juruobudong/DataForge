@@ -23,6 +23,7 @@ def _read_secret(name: str) -> str | None:
 class Settings:
     project_root: Path
     state_dir: Path
+    dataflow_path: Path | None = None
     admin_password_hash: str | None = None
     session_secret: str | None = None
     database_url: str | None = None
@@ -32,17 +33,26 @@ class Settings:
     minio_bucket: str = "dataforge"
     runner_url: str | None = None
     runner_service_token: str | None = None
+    runner_timeout_seconds: float = 1860.0
 
     @classmethod
     def load(
         cls,
         project_root: str | Path | None = None,
+        dataflow_path: str | Path | None = None,
     ) -> "Settings":
         root = Path(project_root or os.getenv("DATAFORGE_ROOT") or Path.cwd()).resolve()
         state = Path(os.getenv("DATAFORGE_STATE_DIR") or root / ".dataforge").resolve()
+        configured_dataflow = dataflow_path or os.getenv("DATAFORGE_DATAFLOW_PATH")
+        if configured_dataflow:
+            resolved_dataflow: Path | None = Path(configured_dataflow).resolve()
+        else:
+            conventional = root.parent / "DataFlow"
+            resolved_dataflow = conventional.resolve() if conventional.exists() else None
         return cls(
             project_root=root,
             state_dir=state,
+            dataflow_path=resolved_dataflow,
             admin_password_hash=_read_secret("DATAFORGE_ADMIN_PASSWORD_HASH"),
             session_secret=_read_secret("DATAFORGE_SESSION_SECRET"),
             database_url=os.getenv("DATAFORGE_DATABASE_URL"),
@@ -52,6 +62,7 @@ class Settings:
             minio_bucket=os.getenv("DATAFORGE_MINIO_BUCKET", "dataforge"),
             runner_url=os.getenv("DATAFORGE_RUNNER_URL"),
             runner_service_token=_read_secret("DATAFORGE_RUNNER_SERVICE_TOKEN"),
+            runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
         )
 
     @property
@@ -68,6 +79,20 @@ class Settings:
         configured = os.getenv("DATAFORGE_ROUTING_DIR")
         return Path(configured).resolve() if configured else self.state_dir / "routing"
 
+    @property
+    def database_path(self) -> Path:
+        return self.state_dir / "metadata.sqlite3"
+
+    @property
+    def blobs_dir(self) -> Path:
+        return self.state_dir / "blobs"
+
+    @property
+    def runs_dir(self) -> Path:
+        return self.state_dir / "runs"
+
     def ensure_directories(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.blobs_dir.mkdir(parents=True, exist_ok=True)
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.routing_dir.mkdir(parents=True, exist_ok=True)

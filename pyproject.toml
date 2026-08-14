@@ -32,7 +32,6 @@ web = [
 ]
 runner = [
   "jsonschema>=4.24,<5",
-  "open-dataflow==1.0.10",
 ]
 
 [project.scripts]

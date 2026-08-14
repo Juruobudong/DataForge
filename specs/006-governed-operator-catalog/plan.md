@@ -84,3 +84,16 @@ cd frontend; npm run build
 - Graph 保持顶层 `graph`，新增 `triple / semantic` 模式修订和两个专属受管 Collection；旧 Graph Collection 冻结兼容。
 - Index Profile 通过版本化 Storage Contract 与 `storage_spec_hash` 决定 Collection 复用，独立 Provisioner 负责幂等创建与归属校验。
 - Flow DSL 升级到 v3 显式端口与基数，前端开放受控拖拽、分支和合流，继续禁止任意代码节点。
+
+## 2026-08-13 PDF GPU OCR 增量设计
+
+- 新增独立 MinerU 3.4.4 GPU 镜像，只安装和下载 Pipeline Runtime/模型；Compose 固定 GPU 0、并发 1、窗口 16，并以回环端口向宿主机内部服务提供访问。
+- Runner 新增同步 MinerU Adapter，所有 PDF 固定提交 `pipeline + auto + ch`；Markdown 写入 DocumentIR，Content List 生成页级 SourceChunk，Middle JSON 使用确定性 MinIO 对象键及 `source_version_id` Artifact 登记。
+- 文件删除、V7 重建和对象写入补偿均只使用数据库登记键；OCR 失败由 Runner 一次性持久化，Worker 不覆盖原始错误。MinerU 与 Runner 默认超时分别为 1800/1860 秒。
+- 本地以 Adapter/Runner/生命周期/Compose 静态测试验收；CUDA、模型、真实文本/扫描 PDF、回环访问和局域网拒绝在部署服务器验收。
+
+## 2026-08-14 算子说明与节点预览增量设计
+
+- Operator Definition 保存简短中文功能说明，Operator Version 冻结端口化输入/输出 JSON 示例；Alembic 对已有 MySQL JSON 列采用可空新增、回填、再收紧非空的兼容升级。
+- 样例接口复用编译器的展开 DAG，但使用独立的确定性内存预览处理器；禁止调用生产 `_run_operator`、LLM、MinerU、对象存储和 Store 写入。
+- 响应按画布节点聚合端口数据，并保留展开节点与子图内部轨迹；每端口最多 3 条、字符串最多 500 字符。Inspector 仅消费当前节点数据。

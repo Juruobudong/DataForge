@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
+from sqlalchemy import select
 
 from dataforge.v7.catalog import builtin_flow_definition, catalog_by_code
 from dataforge.v7.flow import FlowCompiler, FlowValidationError
-from dataforge.v7.runner import execute_job, select_parser_adapter, select_runtime_mode
+from dataforge.v7.runner import execute_job, preview_template_definition, select_parser_adapter, select_runtime_mode
 from dataforge.v7 import runner
+from dataforge.v7 import parser_runtime
+from dataforge.v7 import worker
+from dataforge.v7.documents import DocumentDeletionService
+from dataforge.v7.models import Artifact
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import DEFAULT_INDEX_FIELD_MAPPING, V7Store
 from dataforge.v7.web import create_app
@@ -33,9 +41,26 @@ def _source(store: V7Store, objects: LocalObjectStore, code: str, text: str) -> 
 
 def test_catalog_is_logical_allowlist_and_disabled_operator_is_rejected(tmp_path):
     store = _store(tmp_path)
-    codes = {item["code"] for item in store.list_operator_catalog()}
+    listed = store.list_operator_catalog()
+    codes = {item["code"] for item in listed}
     assert {"document-parser", "text-cleaner", "semantic-chunker", "source-chunk-builder", "knowledge-diff"} <= codes
-    assert "mineru-api-adapter" not in codes
+    assert not {"mineru-pipeline-gpu-adapter", "mineru-api-adapter", "mineru-local-adapter", "mineru-flash-adapter"} & codes
+    seeds = {item["code"] for item in __import__("dataforge.v7.catalog", fromlist=["CATALOG_SEEDS"]).CATALOG_SEEDS}
+    assert "mineru-pipeline-gpu-adapter" in seeds
+    assert not {"mineru-api-adapter", "mineru-local-adapter", "mineru-flash-adapter"} & seeds
+    assert all(item["description"].strip() and item["input_example"] and item["output_example"] for item in listed)
+    semantic = next(item for item in listed if item["code"] == "semantic-chunker")
+    assert semantic["description"] == "按语义边界将文档切分为文本块"
+    assert semantic["input_example"]["input"] and semantic["output_example"]["output"]
+    with store.sessions.begin() as session:
+        from dataforge.v7.models import OperatorDefinition, OperatorVersion
+        definition = session.get(OperatorDefinition, semantic["id"])
+        version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == semantic["id"]))
+        definition.description = "旧说明"; version.input_example = {}; version.output_example = {}
+    store.seed()
+    refreshed = next(item for item in store.list_operator_catalog() if item["code"] == "semantic-chunker")
+    assert refreshed["description"] == semantic["description"]
+    assert refreshed["input_example"] == semantic["input_example"] and refreshed["output_example"] == semantic["output_example"]
     catalog = catalog_by_code()
     compiler = FlowCompiler(catalog=catalog, type_revisions={"text": {"id": "typerev_text_1"}})
     with pytest.raises(FlowValidationError, match="allowlist"):
@@ -43,13 +68,285 @@ def test_catalog_is_logical_allowlist_and_disabled_operator_is_rejected(tmp_path
             {"id": "bad", "kind": "operator", "ref": "kcenter-greedy", "params": {"knowledge_type": "text"}},
             {"id": "sink", "kind": "knowledge_sink", "knowledge_type": "text"},
         ], "edges": [["bad", "sink"]]})
-    assert select_parser_adapter("report.pdf", "api") == "mineru-api-adapter"
-    assert select_parser_adapter("report.pdf", "local") == "mineru-local-adapter"
-    assert select_parser_adapter("report.pdf", "flash") == "mineru-flash-adapter"
+    assert select_parser_adapter("report.pdf", "auto") == "mineru-pipeline-gpu"
     assert select_parser_adapter("report.docx", "auto") == "dataforge-word-parser"
     assert select_parser_adapter("table.csv", "auto") == "dataforge-structured-table-parser"
     assert select_runtime_mode(4, {"DATAFORGE_BATCH_THRESHOLD": "4"}) == "batch"
     assert select_runtime_mode(3, {"DATAFORGE_BATCH_THRESHOLD": "4"}) == "single"
+
+
+def test_controlled_preview_exposes_top_level_subflows_sinks_and_isolates_branch_failures(monkeypatch):
+    definition = builtin_flow_definition(["text", "qa"])
+    compiled = FlowCompiler(
+        catalog=catalog_by_code(),
+        subflows={item["code"]: item["definition"] for item in __import__("dataforge.v7.catalog", fromlist=["subflow_seeds"]).subflow_seeds()},
+        type_revisions={"text": {"id": "text"}, "qa": {"id": "qa"}},
+    ).compile(definition)["compiled_definition"]
+    calls = []
+    monkeypatch.setattr(runner, "_initialize_global_llm", lambda: calls.append("llm"))
+    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: calls.append("mineru"))
+
+    preview = preview_template_definition(definition, "guideline-md", compiled_definition=compiled)
+
+    assert preview["preview_mode"] == "controlled_in_memory"
+    assert preview["persisted"] is False and preview["status"] == "completed"
+    assert calls == []
+    assert set(definition_node["id"] for definition_node in definition["nodes"]) <= set(preview["node_runs"])
+    assert preview["node_runs"]["parse"]["internal_trace"]
+    assert preview["node_runs"]["sink-text"]["inputs"]["input"]["total"] >= 1
+    assert preview["node_runs"]["sink-text"]["outputs"] == {}
+
+    invalid_compiled = json.loads(json.dumps(compiled))
+    chunk_node = next(item for item in invalid_compiled["nodes"] if item["id"] == "chunk::chunk")
+    chunk_node["params"] = {"chunk_size": 50}
+    failed = preview_template_definition(definition, "guideline-md", compiled_definition=invalid_compiled)
+    assert failed["status"] == "completed_with_errors"
+    assert any(item["status"] in {"failed", "skipped"} for item in failed["expanded_node_runs"].values())
+    assert failed["expanded_node_runs"]["generate-text"]["status"] == "skipped"
+
+
+def test_preview_truncates_records_and_long_strings():
+    payload = runner._preview_port([{"content": "x" * 600}, {"content": "b"}, {"content": "c"}, {"content": "d"}])
+    assert payload["total"] == 4 and payload["truncated"] is True
+    assert len(payload["items"]) == 3 and len(payload["items"][0]["content"]) == 500
+
+
+class FakeMinerUClient:
+    response: httpx.Response | None = None
+    error: Exception | None = None
+    seen: dict = {}
+
+    def __init__(self, *, timeout): self.timeout = timeout
+    def __enter__(self): return self
+    def __exit__(self, *_): return None
+
+    def post(self, url, *, files, data):
+        type(self).seen = {"url": url, "files": files, "data": data, "timeout": self.timeout}
+        if type(self).error:
+            raise type(self).error
+        assert type(self).response is not None
+        return type(self).response
+
+
+def _mineru_response(status: int, payload) -> httpx.Response:
+    request = httpx.Request("POST", "http://mineru-api:8000/file_parse")
+    return httpx.Response(status, request=request, json=payload)
+
+
+def _valid_mineru_payload(**result_overrides):
+    result = {"md_content": "# 标题\n正文", "middle_json": json.dumps({"pdf_info": [{"page_idx": 0}]}),
+              "content_list": json.dumps([{"page_idx": 0, "text": "正文"}])}
+    result.update(result_overrides)
+    return {"version": "3.4.4", "backend": "pipeline", "results": {"scan": result}}
+
+
+@pytest.fixture
+def fake_mineru_client(monkeypatch):
+    FakeMinerUClient.response = None; FakeMinerUClient.error = None; FakeMinerUClient.seen = {}
+    monkeypatch.setattr(parser_runtime.httpx, "Client", FakeMinerUClient)
+    monkeypatch.setenv("DATAFORGE_MINERU_URL", "http://mineru-api:8000/")
+    monkeypatch.setenv("DATAFORGE_MINERU_TIMEOUT_SECONDS", "1800")
+
+
+def test_mineru_adapter_sends_pinned_pipeline_contract(fake_mineru_client):
+    FakeMinerUClient.response = _mineru_response(200, _valid_mineru_payload())
+    parsed = parser_runtime.parse_with_mineru(filename="scan.pdf", payload=b"pdf")
+    assert parsed.version == "3.4.4" and parsed.markdown.startswith("# 标题")
+    assert FakeMinerUClient.seen == {
+        "url": "http://mineru-api:8000/file_parse",
+        "files": {"files": ("scan.pdf", b"pdf", "application/pdf")},
+        "data": {
+            "backend": "pipeline", "parse_method": "auto", "lang_list": "ch", "formula_enable": "true",
+            "table_enable": "true", "return_md": "true", "return_middle_json": "true",
+            "return_model_output": "false", "return_content_list": "true", "return_images": "false",
+            "response_format_zip": "false", "return_original_file": "false",
+        },
+        "timeout": 1800,
+    }
+
+
+@pytest.mark.parametrize(("payload", "message"), [
+    (_valid_mineru_payload(md_content="  "), "Markdown"),
+    (_valid_mineru_payload(middle_json="{"), "Middle JSON"),
+    ({"version": "3.4.5", "backend": "pipeline", "results": {"scan": {}}}, "版本必须为 3.4.4"),
+    ({"version": "3.4.4", "backend": "vlm-engine", "results": {"scan": {}}}, "pipeline"),
+])
+def test_mineru_adapter_rejects_invalid_contract(fake_mineru_client, payload, message):
+    FakeMinerUClient.response = _mineru_response(200, payload)
+    with pytest.raises(ValueError, match=message):
+        parser_runtime.parse_with_mineru(filename="scan.pdf", payload=b"pdf")
+
+
+def test_mineru_adapter_reports_http_and_transport_failures(fake_mineru_client):
+    FakeMinerUClient.response = _mineru_response(409, {"error": "pipeline failed"})
+    with pytest.raises(ValueError, match="pipeline failed"):
+        parser_runtime.parse_with_mineru(filename="scan.pdf", payload=b"pdf")
+    FakeMinerUClient.error = httpx.ConnectError("refused", request=httpx.Request("POST", "http://mineru-api:8000"))
+    with pytest.raises(ValueError, match="服务不可达"):
+        parser_runtime.parse_with_mineru(filename="scan.pdf", payload=b"pdf")
+    FakeMinerUClient.error = httpx.ReadTimeout("slow", request=httpx.Request("POST", "http://mineru-api:8000"))
+    with pytest.raises(ValueError, match="1800 秒"):
+        parser_runtime.parse_with_mineru(filename="scan.pdf", payload=b"pdf")
+
+
+def test_mineru_content_list_is_grouped_by_one_based_page_anchor():
+    pages = parser_runtime.content_list_pages([
+        {"page_idx": 1, "text": "第二页 A"}, {"page_idx": 0, "text": "第一页"},
+        {"page_idx": 1, "text": "第二页 B"}, {"text": "无页码"},
+    ])
+    assert pages == [
+        {"page_index": 0, "page": 1, "text": "第一页"},
+        {"page_index": 1, "page": 2, "text": "第二页 A\n\n第二页 B"},
+    ]
+
+
+def test_worker_preserves_runner_persisted_ocr_failure(monkeypatch):
+    failed = []; job = SimpleNamespace(id="job-ocr", status="running")
+
+    class FakeStore:
+        def __init__(self, _): pass
+        def assert_schema_current(self): pass
+        def claim_job(self, _): return job
+        def get_job(self, _): return SimpleNamespace(status="failed", error="MinerU OCR 服务不可达")
+        def mark_job_failed(self, job_id, error): failed.append((job_id, error))
+
+    monkeypatch.setattr(worker, "V7Store", FakeStore)
+    monkeypatch.setattr(worker.httpx, "post", lambda *_, **__: (_ for _ in ()).throw(
+        worker.httpx.HTTPStatusError("422", request=worker.httpx.Request("POST", "http://runner/internal/jobs"),
+                                    response=worker.httpx.Response(422))))
+    settings = SimpleNamespace(platform_database_url="sqlite:///worker.sqlite3", runner_url="http://runner",
+                               runner_service_token="token", runner_timeout_seconds=1860)
+    assert worker.run_once(settings) == 0 and failed == []
+
+
+def test_mineru_pipeline_gpu_deployment_contract():
+    root = Path(__file__).parents[1]
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (root / "deploy" / "mineru" / "Dockerfile").read_text(encoding="utf-8")
+    assert "image: ${DATAFORGE_MINERU_IMAGE:-dataforge-mineru:3.4.4}" in compose
+    assert '127.0.0.1:${DATAFORGE_MINERU_HOST_PORT:-18000}:8000' in compose
+    assert 'MINERU_API_MAX_CONCURRENT_REQUESTS: "1"' in compose
+    assert 'MINERU_PROCESSING_WINDOW_SIZE: "16"' in compose
+    assert 'device_ids: ["${DATAFORGE_MINERU_GPU_DEVICE:-0}"]' in compose
+    assert "DATAFORGE_MINERU_URL: http://mineru-api:8000" in compose
+    assert "DATAFORGE_RUNNER_TIMEOUT_SECONDS: ${DATAFORGE_RUNNER_TIMEOUT_SECONDS:-1860}" in compose
+    assert "networks: [private, parser]" in compose and "parser:\n    internal: true" in compose
+    assert "mineru[pipeline]==3.4.4" in dockerfile and "pytorch:2.6.0-cuda12.4-cudnn9-runtime" in dockerfile
+    assert "libglib2.0-0" in dockerfile and "import cv2" in dockerfile
+    assert "ARG MINERU_MODEL_SOURCE=modelscope" in dockerfile
+    assert 'mineru-models-download -s "${MINERU_MODEL_SOURCE}" -m pipeline' in dockerfile
+    assert "find_spec('vllm') is None" in dockerfile and "find_spec('sglang') is None" in dockerfile
+    assert all(term not in compose.lower() for term in ("vllm", "flash", "mineru-router", "vlm"))
+
+
+def test_parser_artifact_is_deleted_and_listed_for_v7_rebuild(tmp_path):
+    store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
+    documents = store.create_document_library("Artifact 生命周期")
+    stored = objects.put_bytes("sources/lifecycle.txt", b"lifecycle", "text/plain")
+    source = store.create_source(library_id=documents["id"], name="生命周期", filename="lifecycle.txt",
+                                 object_key=stored.key, sha256=stored.sha256, size_bytes=stored.size_bytes,
+                                 mime_type="text/plain")
+    knowledge = store.create_knowledge_library("artifact-text", "产物文本", "text")
+    job = store.create_knowledge_job([source["version"]["id"]], {"text": knowledge["id"]}, "flow_standard-text")
+    run = store.start_flow_run(job["id"])
+    middle = objects.put_bytes("parser-artifacts/middle.json", b"{}", "application/json")
+    with store.sessions.begin() as session:
+        session.add(Artifact(id="artifact_middle", flow_run_id=run["id"], source_version_id=source["version"]["id"],
+                             type_code="parser.middle-json", uri="object:///parser-artifacts/middle.json",
+                             data_json={"object_key": middle.key}, checksum=middle.sha256))
+    store.finish_flow_run(run["id"]); store.mark_job_failed(job["id"], "lifecycle fixture")
+    assert middle.key in store.v7_rebuild_manifest()["object_keys"]
+    store.request_document_deletion(source_ids=[source["id"]]); claimed = store.claim_document_deletion_job("test")
+    assert middle.key in claimed.object_keys
+    assert DocumentDeletionService(store, objects).run(claimed)["status"] == "completed"
+    assert not (tmp_path / "objects" / middle.key).exists()
+    with store.sessions() as session:
+        assert session.get(Artifact, "artifact_middle") is None
+
+
+@pytest.mark.parametrize("pdf_kind", ["text", "scan"])
+def test_pdf_runner_uses_mineru_and_persists_page_anchors_and_middle_json(tmp_path, monkeypatch, pdf_kind):
+    from dataforge.v7.models import Artifact
+    from dataforge.v7.parser_runtime import MinerUParseResult
+
+    store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
+    documents = store.create_document_library("扫描资料")
+    filename = f"{pdf_kind}.pdf"
+    stored = objects.put_bytes(f"sources/{filename}", f"%PDF-1.7 fake {pdf_kind} content".encode(), "application/pdf")
+    source = store.create_source(library_id=documents["id"], name=pdf_kind, filename=filename, object_key=stored.key,
+                                 sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="application/pdf")
+    library = store.create_knowledge_library("ocr-text", "OCR 文本", "text")
+    job = store.create_knowledge_job([source["version"]["id"]], {"text": library["id"]}, "flow_standard-text")
+    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: MinerUParseResult(
+        markdown="# 扫描标题\n第一页内容\n\n第二页内容",
+        middle_json={"pdf_info": [{"page_idx": 0}, {"page_idx": 1}]},
+        content_list=[{"page_idx": 0, "type": "text", "text": "第一页内容"},
+                      {"page_idx": 1, "type": "text", "text": "第二页内容"}],
+        version="3.4.4",
+    ))
+
+    result = execute_job(store, objects, job["id"])
+
+    assert result["status"] == "completed"
+    detail = store.source_detail(source["id"])
+    assert detail["document_ir"]["parser_adapter"] == "mineru-pipeline-gpu"
+    assert detail["document_ir"]["parser_profile"] == "pipeline:auto"
+    assert [chunk["anchor"]["page"] for chunk in detail["source_chunks"]] == [1, 2]
+    assert len(detail["parser_artifacts"]) == 1
+    artifact = detail["parser_artifacts"][0]
+    assert artifact["type"] == "parser.middle-json" and artifact["metadata"]["mineru_version"] == "3.4.4"
+    with store.sessions() as session:
+        persisted = session.get(Artifact, artifact["id"])
+        assert persisted.source_version_id == source["version"]["id"]
+    key = artifact["metadata"]["object_key"]
+    assert b'"pdf_info"' in objects.get_bytes(key)
+    assert store.list_knowledge_items(library["id"])
+
+
+def test_pdf_middle_object_is_compensated_when_artifact_persistence_fails(tmp_path, monkeypatch):
+    from dataforge.v7.parser_runtime import MinerUParseResult
+
+    store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
+    documents = store.create_document_library("补偿资料")
+    stored = objects.put_bytes("sources/compensate.pdf", b"%PDF-1.7", "application/pdf")
+    source = store.create_source(library_id=documents["id"], name="补偿", filename="compensate.pdf", object_key=stored.key,
+                                 sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="application/pdf")
+    library = store.create_knowledge_library("ocr-compensate", "OCR 补偿", "text")
+    job = store.create_knowledge_job([source["version"]["id"]], {"text": library["id"]}, "flow_standard-text")
+    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: MinerUParseResult(
+        markdown="补偿测试", middle_json={"pdf_info": [{"page_idx": 0}]},
+        content_list=[{"page_idx": 0, "text": "补偿测试"}], version="3.4.4",
+    ))
+    original = store.record_flow_node
+
+    def fail_parser_artifact(flow_run_id, node_id, input_artifact_ids, outputs):
+        if any(item.get("_parser_artifacts") for item in outputs):
+            raise RuntimeError("artifact database failure")
+        return original(flow_run_id, node_id, input_artifact_ids, outputs)
+
+    monkeypatch.setattr(store, "record_flow_node", fail_parser_artifact)
+    with pytest.raises(RuntimeError, match="artifact database failure"):
+        execute_job(store, objects, job["id"])
+    assert not list((tmp_path / "objects" / "parser-artifacts").rglob("mineru-middle.json"))
+
+
+def test_pdf_parser_failure_marks_job_and_source_once(tmp_path, monkeypatch):
+    store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
+    documents = store.create_document_library("失败扫描资料")
+    stored = objects.put_bytes("sources/fail.pdf", b"%PDF-1.7 broken", "application/pdf")
+    source = store.create_source(library_id=documents["id"], name="失败扫描件", filename="fail.pdf", object_key=stored.key,
+                                 sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="application/pdf")
+    library = store.create_knowledge_library("ocr-fail", "OCR 失败", "text")
+    job = store.create_knowledge_job([source["version"]["id"]], {"text": library["id"]}, "flow_standard-text")
+    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: (_ for _ in ()).throw(ValueError("MinerU OCR 服务不可达")))
+
+    with pytest.raises(ValueError, match="MinerU OCR 服务不可达"):
+        execute_job(store, objects, job["id"])
+
+    assert store.get_job(job["id"]).status == "failed"
+    assert store.source_versions(source["id"])[0]["extraction_status"] == "failed"
+    assert [item["action"] for item in store.job_logs(job["id"])].count("knowledge_job.failed") == 1
+    assert store.list_knowledge_items(library["id"]) == []
 
 
 def test_published_flow_snapshot_executes_expanded_dag_and_records_lineage(tmp_path):
@@ -236,7 +533,6 @@ def test_qwen_generation_is_initialized_once_and_returns_all_valid_items(monkeyp
 
 def test_runner_app_initializes_global_llm_on_startup(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr(runner, "dataflow_runtime_status", lambda: {"compatible": True})
     monkeypatch.setattr(runner, "_initialize_global_llm", lambda: calls.append("initialized"))
     settings = Settings(project_root=tmp_path, state_dir=tmp_path / "state", database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
     app = runner.create_app(settings, check_schema=False)
@@ -479,3 +775,36 @@ def test_mysql_upgrade_backfills_sink_json_without_a_server_default(monkeypatch)
     assert isinstance(alter_kwargs["existing_type"], migration.sa.JSON)
     assert alter_kwargs["existing_nullable"] is True
     assert alter_kwargs["nullable"] is False
+
+
+def test_operator_examples_migration_backfills_mysql_json_without_defaults(monkeypatch):
+    migration_path = Path(__file__).parents[1] / "src" / "dataforge" / "v7" / "alembic" / "versions" / "20260814_01_operator_examples.py"
+    spec = importlib.util.spec_from_file_location("operator_examples_migration", migration_path)
+    assert spec and spec.loader
+    migration = importlib.util.module_from_spec(spec); spec.loader.exec_module(migration)
+
+    class Inspector:
+        def get_columns(self, table):
+            return [{"name": "id"}]
+
+    bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": "mysql"})()})()
+    added, executed, altered = [], [], []
+    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
+    monkeypatch.setattr(migration.sa, "inspect", lambda _: Inspector())
+    monkeypatch.setattr(migration.op, "add_column", lambda table, column: added.append((table, column)))
+    monkeypatch.setattr(migration.op, "execute", lambda statement: executed.append(str(statement)))
+    monkeypatch.setattr(migration.op, "alter_column", lambda *args, **kwargs: altered.append((args, kwargs)))
+
+    migration.upgrade()
+
+    assert [(table, column.name, column.nullable) for table, column in added] == [
+        ("operator_definitions", "description", True),
+        ("operator_versions", "input_example", True),
+        ("operator_versions", "output_example", True),
+    ]
+    assert executed == [
+        "UPDATE operator_definitions SET description = '' WHERE description IS NULL",
+        "UPDATE operator_versions SET input_example = JSON_OBJECT() WHERE input_example IS NULL",
+        "UPDATE operator_versions SET output_example = JSON_OBJECT() WHERE output_example IS NULL",
+    ]
+    assert len(altered) == 3 and all(kwargs["nullable"] is False for _, kwargs in altered)
