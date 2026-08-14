@@ -36,6 +36,7 @@ export const api = {
   knowledgeItems: libraryId => request(`/api/knowledge-libraries/${libraryId}/items`),
   qaPairs: libraryId => request(`/api/knowledge-libraries/${libraryId}/qa-pairs`),
   graph: libraryId => request(`/api/knowledge-libraries/${libraryId}/graph`),
+  graphOverview: libraryId => request(`/api/knowledge-libraries/${libraryId}/graph/overview`),
   changes: libraryId => request(`/api/knowledge-libraries/${libraryId}/changes`),
   vectorStatus: libraryId => request(`/api/knowledge-libraries/${libraryId}/vector-status`),
   knowledgeItemSources: itemId => request(`/api/knowledge-items/${itemId}/sources`),

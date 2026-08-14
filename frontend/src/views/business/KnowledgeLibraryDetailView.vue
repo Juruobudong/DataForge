@@ -1,0 +1,40 @@
+<script setup>
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { api } from '../../api/platform'
+import GraphBrowser from '../../components/GraphBrowser.vue'
+
+const route = useRoute(), router = useRouter()
+const library = ref(null), items = ref([]), changes = ref([]), vector = ref(null), sources = ref([]), deletion = ref(null), deletionJobs = ref([]), tab = ref('content'), error = ref(''), loading = ref(false)
+const libraryId = computed(() => String(route.params.libraryId || ''))
+const isGraph = computed(() => library.value?.knowledge_type === 'graph')
+
+async function load() {
+  loading.value = true; error.value = ''; library.value = null
+  try {
+    const libraries = await api.knowledgeLibraries()
+    library.value = libraries.find(item => item.id === libraryId.value) || null
+    if (!library.value) throw new Error('知识库不存在或已不可用')
+    ;[items.value, changes.value, vector.value, deletionJobs.value] = await Promise.all([
+      library.value.knowledge_type === 'qa' ? api.qaPairs(library.value.id) : api.knowledgeItems(library.value.id),
+      api.changes(library.value.id), api.vectorStatus(library.value.id), api.deletionJobs(library.value.id),
+    ])
+    tab.value = 'content'; deletion.value = null; sources.value = []
+  } catch (err) { error.value = err.message } finally { loading.value = false }
+}
+async function trace(item) { try { sources.value = await api.knowledgeItemSources(item.id); tab.value = 'sources' } catch (err) { error.value = err.message } }
+async function checkDelete() { try { deletion.value = await api.knowledgeLibraryDeleteCheck(library.value.id) } catch (err) { error.value = err.message } }
+async function remove() { try { if (!deletion.value?.deletable || !window.confirm('将异步清理该知识库的 V7 Partition，确认继续？')) return; await api.deleteKnowledgeLibrary(library.value.id); await load() } catch (err) { error.value = err.message } }
+async function retryDeletion(job) { try { await api.retryDeletion(job.id); deletionJobs.value = await api.deletionJobs(library.value.id) } catch (err) { error.value = err.message } }
+function shortId(value) { return value?.length > 18 ? `${value.slice(0, 18)}…` : value }
+watch(libraryId, load, { immediate: true })
+</script>
+
+<template>
+  <section class="knowledge-detail"><button class="back-link" @click="router.push('/business/knowledge')">← 返回知识库</button><p v-if="error" class="error">{{ error }}</p><p v-else-if="loading" class="loading">正在加载知识库…</p><template v-else-if="library"><div class="detail-head"><div><span class="detail-type">{{ library.graph_mode === 'triple' ? '△ 三元组图谱' : library.graph_mode === 'semantic' ? '⬡ 语义图谱' : library.knowledge_type }}</span><h2>{{ library.name }}</h2><button class="technical-id" :title="library.id" @click="navigator.clipboard?.writeText(library.id)">{{ shortId(library.code || library.id) }} · 点击复制完整 ID</button></div><div class="page-actions"><span v-if="library.status === 'deleting'" class="badge amber">正在删除</span><button v-else class="danger" @click="checkDelete">删除检查</button></div></div><div class="detail-metrics"><span><b>{{ (library.knowledge_item_count || 0).toLocaleString() }}</b> 条知识</span><span v-if="library.status === 'deleting'" class="badge amber">等待 V7 Partition 清理完成</span><span v-else :class="['badge', library.vector_ready ? 'green' : 'amber']">向量 {{ library.vector_ready ? '就绪' : '未就绪' }}</span><span>最近更新 {{ new Date(library.updated_at).toLocaleString() }}</span></div><nav class="tabs"><button :class="{ active: tab === 'content' }" @click="tab = 'content'">知识内容</button><button :class="{ active: tab === 'diff' }" @click="tab = 'diff'">Knowledge Diff</button><button :class="{ active: tab === 'vector' }" @click="tab = 'vector'">向量状态</button><button :class="{ active: tab === 'sources' }" @click="tab = 'sources'">来源追踪</button><button v-if="isGraph" :class="{ active: tab === 'graph' }" @click="tab = 'graph'">图谱浏览器</button></nav><div v-if="tab === 'content'" class="table-wrap"><table><thead><tr><th>内容</th><th>来源</th><th>状态</th><th></th></tr></thead><tbody><tr v-for="item in items" :key="item.id"><td v-if="library.knowledge_type === 'qa'"><b>Q:</b> {{ item.data.question }}<br><b>A:</b> {{ item.data.answer }}</td><td v-else>{{ item.canonical_content }}</td><td>{{ item.source_count || item.source_version_ids?.length || 0 }}</td><td>{{ item.status }}</td><td><button @click="trace(item)">查看来源</button></td></tr><tr v-if="!items.length"><td colspan="4" class="empty-cell">暂无知识内容。</td></tr></tbody></table></div><div v-else-if="tab === 'diff'" class="change-list"><article v-for="change in changes" :key="change.id"><b>{{ change.change_type }}</b><p>{{ change.before?.content || change.before_hash || '—' }} → {{ change.after?.content || change.after_hash || '—' }}</p></article><p v-if="!changes.length" class="empty-group">暂无变更记录。</p></div><div v-else-if="tab === 'vector'" class="panel"><p>Vector Ready：<b>{{ vector?.ready ? '已就绪' : '未就绪' }}</b></p><pre>{{ JSON.stringify(vector?.record_states || {}, null, 2) }}</pre></div><div v-else-if="tab === 'sources'" class="source-list"><article v-for="source in sources" :key="source.id"><b>{{ source.source.original_filename || source.source.name }}</b><small>{{ source.anchor.label || source.anchor.file || '来源锚点' }}</small><p>{{ source.evidence_text }}</p></article><p v-if="!sources.length" class="empty-group">从知识内容中选择“查看来源”后会在这里显示 Evidence。</p></div><GraphBrowser v-else-if="tab === 'graph'" :library-id="library.id" /><section v-if="deletion" class="deletion-panel"><h3>删除检查</h3><p>{{ deletion.deletable ? '当前知识库可删除。' : '当前知识库仍被引用，暂不能删除。' }}</p><pre>{{ JSON.stringify(deletion, null, 2) }}</pre><button v-if="deletion.deletable" class="danger" @click="remove">确认异步删除</button></section><section v-if="deletionJobs.length" class="deletion-panel"><h3>删除任务</h3><div v-for="job in deletionJobs" :key="job.id" class="deletion-job"><span>{{ job.status }}</span><small>{{ job.error || job.id }}</small><button v-if="job.status === 'failed'" @click="retryDeletion(job)">重试</button></div></section></template>
+  </section>
+</template>
+
+<style scoped>
+.back-link{margin-bottom:18px;border:0;color:var(--blue);background:transparent;padding:0;font-size:14px}.detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.detail-head h2{margin:6px 0 0;font-size:26px}.detail-type{color:var(--blue);font-size:14px;font-weight:800}.technical-id{min-height:0;margin-top:8px;padding:0;border:0;color:var(--muted);background:transparent;font-size:12px;font-weight:600}.detail-metrics{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:18px 0;color:var(--muted);font-size:14px}.detail-metrics b{color:var(--text);font-size:18px}.change-list,.source-list{display:grid;gap:10px}.change-list article,.source-list article,.deletion-panel{padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.change-list p,.source-list p{margin:8px 0 0;line-height:1.65}.source-list b,.source-list small{display:block}.source-list small{margin-top:5px;color:var(--muted);font-size:13px}.deletion-panel{margin-top:18px}.deletion-panel h3{margin:0;font-size:16px}.deletion-panel pre{max-height:240px;margin:12px 0}.deletion-job{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}.deletion-job small{overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.empty-cell,.loading{color:var(--muted);text-align:center}@media(max-width:900px){.detail-head{display:grid}.detail-metrics{align-items:flex-start}}
+</style>

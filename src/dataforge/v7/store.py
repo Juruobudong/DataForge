@@ -95,7 +95,6 @@ V7_TEMPLATE_SEEDS = (
     ("standard-qa", "标准问答知识流程", ["qa"]),
     ("standard-graph-triple", "标准三元组图谱流程", ["graph:triple"]),
     ("standard-graph-semantic", "标准语义图谱流程", ["graph:semantic"]),
-    ("standard-graph", "标准图谱知识流程（兼容）", ["graph"]),
     ("standard-multi", "标准多产出知识流程", ["text", "qa", "graph"]),
 )
 LINEAR_TEMPLATE_STEPS = ("validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate")  # legacy API input only
@@ -273,6 +272,29 @@ class V7Store:
                         id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
                         definition_json=template.definition_json, status="published", published_at=utc_now(),
                     ))
+            # ``graph`` has long normalized to ``graph:triple``.  Move active
+            # document bindings to the canonical template before archiving the
+            # redundant row, while keeping historical revisions and jobs.
+            compatibility_template = session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.code == "standard-graph",
+            ))
+            if compatibility_template:
+                triple_template = session.scalar(select(KnowledgeFlowTemplate).where(
+                    KnowledgeFlowTemplate.code == "standard-graph-triple",
+                ))
+                for binding in session.scalars(select(DocumentLibraryTemplateBinding).where(
+                    DocumentLibraryTemplateBinding.knowledge_flow_template_id == compatibility_template.id,
+                    DocumentLibraryTemplateBinding.status == "active",
+                )):
+                    replacement = session.scalar(select(DocumentLibraryTemplateBinding).where(
+                        DocumentLibraryTemplateBinding.document_library_id == binding.document_library_id,
+                        DocumentLibraryTemplateBinding.knowledge_flow_template_id == triple_template.id,
+                    ))
+                    if replacement:
+                        replacement.status, binding.status = "active", "removed"
+                    else:
+                        binding.knowledge_flow_template_id = triple_template.id
+                compatibility_template.status, compatibility_template.is_default = "archived", False
             profile_id = profile.id
             index_seeds = (
                 ("text", "text", "dataforge_text_knowledge"),
@@ -1533,15 +1555,33 @@ class V7Store:
             return {"id": binding.id, "status": binding.status}
 
     def _ensure_document_binding_outputs(self, session: Session, document_library: DocumentLibrary,
-                                         template: KnowledgeFlowTemplate, binding: DocumentLibraryTemplateBinding) -> None:
+                                         template: KnowledgeFlowTemplate, binding: DocumentLibraryTemplateBinding,
+                                         *, recreate_deleted: bool = False) -> None:
+        """Create missing result libraries and optionally replace completed deletions.
+
+        A deleted automatic result library remains attached to its binding for
+        auditability.  Listing the binding must not resurrect it; only an
+        explicit new document-processing request may create its replacement.
+        """
         existing = {item.output_key: item for item in session.scalars(select(DocumentLibraryTemplateOutput).where(
             DocumentLibraryTemplateOutput.document_library_template_binding_id == binding.id,
         ))}
+        if recreate_deleted:
+            deleting = [item for item in existing.values() if (library := session.get(
+                KnowledgeLibrary, item.knowledge_library_id,
+            )) and library.status == "deleting"]
+            if deleting:
+                raise ValueError("自动结果知识库正在清理，请先等待清理完成或重试删除任务")
         for raw_output in template.output_types:
             output_key = normalise_output_key(raw_output)
             knowledge_type, graph_mode = output_contract(output_key)
-            if output_key in existing:
-                continue
+            output = existing.get(output_key)
+            if output:
+                library = session.get(KnowledgeLibrary, output.knowledge_library_id)
+                if library and library.status != "deleted":
+                    continue
+                if not recreate_deleted:
+                    continue
             type_row = session.scalar(select(KnowledgeType).where(KnowledgeType.code == knowledge_type, KnowledgeType.status == "active"))
             revision = session.get(KnowledgeTypeRevision, type_row.current_revision_id) if type_row and type_row.current_revision_id else None
             if not revision or revision.status != "published":
@@ -1564,9 +1604,12 @@ class V7Store:
                 partition_name="")
             library.partition_name = f"kl_{library.id}"
             session.add(library); session.flush()
-            session.add(DocumentLibraryTemplateOutput(id=new_id("docout"), document_library_template_binding_id=binding.id,
-                                                      knowledge_type=knowledge_type, output_key=output_key,
-                                                      graph_mode=graph_mode, knowledge_library_id=library.id))
+            if output:
+                output.knowledge_library_id = library.id
+            else:
+                session.add(DocumentLibraryTemplateOutput(id=new_id("docout"), document_library_template_binding_id=binding.id,
+                                                          knowledge_type=knowledge_type, output_key=output_key,
+                                                          graph_mode=graph_mode, knowledge_library_id=library.id))
 
     def _binding_pending_versions(self, session: Session, binding: DocumentLibraryTemplateBinding,
                                   revision: KnowledgeFlowTemplateRevision) -> list[str]:
@@ -1603,7 +1646,9 @@ class V7Store:
         ).order_by(KnowledgeJob.created_at.desc()))
         return {"id": binding.id, "status": binding.status, "template": {"id": template.id, "code": template.code,
                 "name": template.name, "revision": revision.revision_no, "revision_id": revision.id},
-                "outputs": [{"knowledge_type": item.knowledge_type, "knowledge_library": self._knowledge_library_payload(library)} for item, library in outputs],
+                "outputs": [{"knowledge_type": item.knowledge_type, "output_key": item.output_key, "state": library.status,
+                             **({"knowledge_library": self._knowledge_library_payload(library)} if library.status != "deleted" else {})}
+                            for item, library in outputs],
                 "pending_file_count": len(self._binding_pending_versions(session, binding, revision)),
                 "latest_job": self.job_payload(latest_job) if latest_job else None}
 
@@ -1613,6 +1658,7 @@ class V7Store:
                 raise ValueError("文档库不存在")
             return [self._document_binding_payload(session, item) for item in session.scalars(select(DocumentLibraryTemplateBinding).where(
                 DocumentLibraryTemplateBinding.document_library_id == document_library_id,
+                DocumentLibraryTemplateBinding.status == "active",
             ).order_by(DocumentLibraryTemplateBinding.created_at.desc()))]
 
     def process_document_library(self, document_library_id: str) -> list[dict[str, Any]]:
@@ -1647,7 +1693,7 @@ class V7Store:
                 DocumentLibraryTemplateBinding.status == "active",
             )):
                 template, revision = self._published_template_revision(session, binding.knowledge_flow_template_id)
-                self._ensure_document_binding_outputs(session, document_library, template, binding)
+                self._ensure_document_binding_outputs(session, document_library, template, binding, recreate_deleted=True)
                 versions = self._binding_pending_versions(session, binding, revision)
                 if selected_versions is not None:
                     versions = [version_id for version_id in versions if version_id in selected_versions]
@@ -1890,12 +1936,15 @@ class V7Store:
             return {"id": job.id, "status": job.status}
 
     @staticmethod
-    def _knowledge_library_payload(item: KnowledgeLibrary, ready: bool | None = None) -> dict[str, Any]:
+    def _knowledge_library_payload(item: KnowledgeLibrary, ready: bool | None = None,
+                                   knowledge_item_count: int | None = None) -> dict[str, Any]:
         result = {"id": item.id, "code": item.code, "name": item.name, "knowledge_type": item.knowledge_type,
                   "graph_mode": item.graph_mode, "display_type": ({"triple": "三元组图谱", "semantic": "语义图谱（LightRAG 模式）"}.get(item.graph_mode) if item.knowledge_type == "graph" else None),
                   "knowledge_type_revision_id": item.knowledge_type_revision_id, "description": item.description, "embedding_profile_id": item.embedding_profile_id, "index_profile_id": item.index_profile_id, "partition_name": item.partition_name, "status": item.status, "updated_at": item.updated_at.isoformat()}
         if ready is not None:
             result["vector_ready"] = ready
+        if knowledge_item_count is not None:
+            result["knowledge_item_count"] = int(knowledge_item_count)
         return result
 
     def create_knowledge_library(self, name: str, knowledge_type: str, description: str = "", graph_mode: str | None = None, *, code: str | None = None) -> dict[str, Any]:
@@ -2008,10 +2057,24 @@ class V7Store:
 
     def list_knowledge_libraries(self, knowledge_type: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            query = select(KnowledgeLibrary).order_by(KnowledgeLibrary.updated_at.desc())
+            query = select(KnowledgeLibrary).where(
+                KnowledgeLibrary.status.in_(("active", "deleting")),
+            ).order_by(KnowledgeLibrary.updated_at.desc())
             if knowledge_type:
                 query = query.where(KnowledgeLibrary.knowledge_type == knowledge_type)
-            return [self._knowledge_library_payload(item, self._library_ready(session, item)) for item in session.scalars(query)]
+            libraries = list(session.scalars(query))
+            if not libraries:
+                return []
+            library_ids = [item.id for item in libraries]
+            item_counts = dict(session.execute(select(
+                KnowledgeItem.knowledge_library_id, func.count(KnowledgeItem.id),
+            ).where(
+                KnowledgeItem.knowledge_library_id.in_(library_ids),
+                KnowledgeItem.status == "active",
+            ).group_by(KnowledgeItem.knowledge_library_id)).all())
+            return [self._knowledge_library_payload(
+                item, self._library_ready(session, item), item_counts.get(item.id, 0),
+            ) for item in libraries]
 
     def get_knowledge_library(self, library_id: str) -> KnowledgeLibrary:
         with self.sessions() as session:
@@ -2230,7 +2293,9 @@ class V7Store:
     def list_flow_templates(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
             values = []
-            for item in session.scalars(select(KnowledgeFlowTemplate).order_by(KnowledgeFlowTemplate.code)):
+            for item in session.scalars(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.status != "archived",
+            ).order_by(KnowledgeFlowTemplate.code)):
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                     KnowledgeFlowTemplateRevision.knowledge_flow_template_id == item.id,
                 ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
@@ -2477,6 +2542,19 @@ class V7Store:
             if not jobs:
                 return []
             job_ids = [job.id for job in jobs]
+            template_ids = {job.knowledge_flow_template_id for job in jobs}
+            templates = {item.id: item for item in session.scalars(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.id.in_(template_ids),
+            ))}
+            sink_ids = list(dict.fromkeys(
+                str(library_id)
+                for job in jobs
+                for library_id in (job.sink_library_ids or job.output_library_ids or {}).values()
+                if library_id
+            ))
+            sink_libraries = {item.id: item for item in session.scalars(select(KnowledgeLibrary).where(
+                KnowledgeLibrary.id.in_(sink_ids),
+            ))} if sink_ids else {}
             snapshot_ids = {job.execution_snapshot_id for job in jobs if job.execution_snapshot_id}
             snapshots = {item.id: item for item in session.scalars(select(FlowExecutionSnapshot).where(
                 FlowExecutionSnapshot.id.in_(snapshot_ids),
@@ -2501,6 +2579,26 @@ class V7Store:
             payloads = []
             for job in jobs:
                 payload = self.job_payload(job)
+                template = templates.get(job.knowledge_flow_template_id)
+                payload["template"] = (
+                    {"id": template.id, "code": template.code, "name": template.name}
+                    if template else None
+                )
+                ordered_sink_ids = list(dict.fromkeys(
+                    str(library_id)
+                    for library_id in (job.sink_library_ids or job.output_library_ids or {}).values()
+                    if library_id
+                ))
+                payload["sink_libraries"] = [
+                    {
+                        "id": library.id,
+                        "name": library.name,
+                        "knowledge_type": library.knowledge_type,
+                        "graph_mode": library.graph_mode,
+                    }
+                    for library_id in ordered_sink_ids
+                    if (library := sink_libraries.get(library_id))
+                ]
                 failed = int(failed_counts.get(job.id, 0))
                 payload["failed_chunk_count"] = failed
                 payload["warning_count"] = failed if job.status == "completed_with_warnings" else 0
@@ -2643,6 +2741,17 @@ class V7Store:
                 invalid = [job.id for job in values if job.status not in {"failed", "cancelled", "completed_with_warnings"}]
                 if invalid:
                     raise ValueError("仅可重试 failed、cancelled 或 completed_with_warnings 任务")
+                blocked = []
+                for job in values:
+                    if not job.document_library_template_binding_id:
+                        continue
+                    library_ids = set((job.sink_library_ids or job.output_library_ids or {}).values())
+                    if any(library is None or library.status != "active" for library in (
+                        session.get(KnowledgeLibrary, library_id) for library_id in library_ids
+                    )):
+                        blocked.append(job.id)
+                if blocked:
+                    raise ValueError("自动结果知识库正在清理或已清理，请返回文档库重新发起处理")
                 for job in values:
                     job.status, job.stage, job.error, job.lease_owner, job.lease_expires_at = "queued", "queued", None, None, None
                     scope = [self._generation_payload(row) for row in session.scalars(select(KnowledgeChunkGeneration).where(
@@ -2672,10 +2781,62 @@ class V7Store:
             ).order_by(AuditEvent.created_at.desc())
             return [{"id": event.id, "action": event.action, "payload": event.payload_json, "created_at": event.created_at.isoformat()} for event in session.scalars(query)]
 
+    def _queue_empty_failed_auto_output_cleanup(self, session: Session, job: KnowledgeJob) -> list[str]:
+        """Queue deletion only for never-populated automatic result libraries."""
+        if not job.document_library_template_binding_id:
+            return []
+        library_ids = set((job.sink_library_ids or job.output_library_ids or {}).values())
+        if not library_ids:
+            return []
+        outputs = session.scalars(select(DocumentLibraryTemplateOutput).where(
+            DocumentLibraryTemplateOutput.document_library_template_binding_id == job.document_library_template_binding_id,
+            DocumentLibraryTemplateOutput.knowledge_library_id.in_(library_ids),
+        )).all()
+        blocked: list[str] = []
+        for output in outputs:
+            library = session.get(KnowledgeLibrary, output.knowledge_library_id)
+            if not library or library.status != "active":
+                continue
+            has_history = bool(session.scalar(select(func.count()).select_from(KnowledgeItem).where(
+                KnowledgeItem.knowledge_library_id == library.id,
+            )))
+            if has_history:
+                self.audit(session, "knowledge_library.auto_cleanup_skipped", "knowledge_library", library.id, {
+                    "knowledge_job_id": job.id, "reason": "existing_knowledge_history",
+                })
+                continue
+            has_route = bool(session.scalar(select(func.count()).select_from(ProjectOrgRouteLibrary).where(
+                ProjectOrgRouteLibrary.knowledge_library_id == library.id,
+            )))
+            if has_route:
+                blocked.append(library.name)
+                self.audit(session, "knowledge_library.auto_cleanup_blocked", "knowledge_library", library.id, {
+                    "knowledge_job_id": job.id, "reason": "project_route_reference",
+                })
+                continue
+            existing = session.scalar(select(KnowledgeLibraryDeletionJob).where(
+                KnowledgeLibraryDeletionJob.knowledge_library_id == library.id,
+                KnowledgeLibraryDeletionJob.status.in_(("queued", "running", "failed")),
+            ).order_by(KnowledgeLibraryDeletionJob.created_at.desc()))
+            if existing:
+                continue
+            library.status = "deleting"
+            deletion_job = KnowledgeLibraryDeletionJob(id=new_id("kldel"), knowledge_library_id=library.id)
+            session.add(deletion_job)
+            self.audit(session, "knowledge_library.auto_cleanup_queued", "knowledge_library", library.id, {
+                "knowledge_job_id": job.id, "deletion_job_id": deletion_job.id,
+            })
+        return blocked
+
     def mark_job_failed(self, job_id: str, error: str) -> None:
         with self.sessions.begin() as session:
             job = session.get(KnowledgeJob, job_id)
-            job.status, job.stage, job.error, job.lease_owner = "failed", "failed", error, None
+            if not job:
+                raise ValueError("知识任务不存在")
+            blocked = self._queue_empty_failed_auto_output_cleanup(session, job)
+            if blocked:
+                error = f"{error}；自动结果知识库仍被项目路由引用，请先解除路由后再清理：{'、'.join(blocked)}"
+            job.status, job.stage, job.error, job.lease_owner, job.lease_expires_at = "failed", "failed", error, None, None
             self.audit(session, "knowledge_job.failed", "knowledge_job", job_id, {"error": error})
 
     def complete_job(self, job_id: str, *, warnings: list[dict[str, Any]] | None = None) -> None:
@@ -3473,6 +3634,40 @@ class V7Store:
             needle = query.casefold().strip()
             values = [node for node in nodes.values() if not needle or needle in node["name"].casefold()]
             return sorted(values, key=lambda item: item["name"])[:max(1, min(limit, 100))]
+
+    def graph_overview(self, library_id: str, *, node_limit: int = 80, edge_limit: int = 160) -> dict[str, Any]:
+        """Return a bounded, stable overview biased toward connected entities."""
+        with self.sessions() as session:
+            library = session.get(KnowledgeLibrary, library_id)
+            nodes, edges = self._graph_projection(session, library_id)
+            degrees = {node_id: 0 for node_id in nodes}
+            for edge in edges.values():
+                degrees[edge["source"]] = degrees.get(edge["source"], 0) + 1
+                degrees[edge["target"]] = degrees.get(edge["target"], 0) + 1
+            selected_node_ids = {
+                item["id"] for item in sorted(
+                    nodes.values(),
+                    key=lambda item: (-degrees.get(item["id"], 0), item["name"].casefold(), item["id"]),
+                )[:max(1, min(node_limit, 80))]
+            }
+            selected_edges = [
+                edge for edge in edges.values()
+                if edge["source"] in selected_node_ids and edge["target"] in selected_node_ids
+            ]
+            selected_edges.sort(key=lambda edge: (
+                -(degrees.get(edge["source"], 0) + degrees.get(edge["target"], 0)),
+                edge["predicate"].casefold(), edge["id"],
+            ))
+            return {
+                "graph_mode": library.graph_mode or "triple",
+                "entity_count": len(nodes),
+                "relation_count": len(edges),
+                "nodes": [nodes[node_id] for node_id in sorted(
+                    selected_node_ids,
+                    key=lambda node_id: (-degrees.get(node_id, 0), nodes[node_id]["name"].casefold(), node_id),
+                )],
+                "edges": selected_edges[:max(1, min(edge_limit, 160))],
+            }
 
     def graph_neighbors(self, library_id: str, entity_id: str, depth: int = 1) -> dict[str, Any]:
         if depth not in {1, 2}:

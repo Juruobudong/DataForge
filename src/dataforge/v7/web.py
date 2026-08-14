@@ -520,6 +520,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.graph_entity_search(library_id, q, limit)
         except ValueError as exc: raise _error(exc) from exc
 
+    @app.get("/api/knowledge-libraries/{library_id}/graph/overview")
+    def graph_overview(library_id: str):
+        try: return store.graph_overview(library_id)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/knowledge-libraries/{library_id}/graph/entities/{entity_id}")
     def graph_entity_detail(library_id: str, entity_id: str):
         try: return store.graph_entity_detail(library_id, entity_id)

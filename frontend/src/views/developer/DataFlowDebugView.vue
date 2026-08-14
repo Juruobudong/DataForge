@@ -101,3 +101,27 @@ onBeforeUnmount(() => window.clearInterval(timer))
 <style scoped>
 .environment{margin-bottom:12px;padding:10px 14px;border:1px solid #dce3ed;border-radius:10px;background:#fff}.environment summary{cursor:pointer;color:#536177;font-weight:700}.env-grid{display:flex;flex-wrap:wrap;gap:7px;padding-top:10px}.workbench{display:grid;grid-template-columns:220px minmax(620px,1fr) 330px;grid-template-rows:minmax(680px,1fr) 190px;gap:12px}.left-pane,.dag-pane,.right-pane,.console{min-width:0;border:1px solid #dbe3ef;border-radius:12px;background:#fff}.left-pane{overflow:auto;padding:12px}.left-pane h3{margin:8px 0;font-size:12px}.compact-card{display:flex;flex-direction:column;padding:9px;border-bottom:1px solid #edf0f4}.compact-card small,.run-card small,.dag-toolbar small{display:block;margin-top:4px;color:#7a8799}.run-card{display:flex;width:100%;flex-wrap:wrap;justify-content:space-between;margin:5px 0;padding:10px;border:1px solid #e0e6ee;background:#fff;text-align:left}.run-card small{width:100%;overflow:hidden;text-overflow:ellipsis}.run-card.active{border-color:#2f6fed;background:#edf4ff}.dag-pane{overflow:hidden}.dag-toolbar{display:flex;align-items:center;justify-content:space-between;padding:11px 13px;border-bottom:1px solid #edf0f4}.actions{display:flex;gap:6px}.right-pane{display:grid;grid-template-rows:minmax(280px,1fr) auto auto;gap:10px;padding:0 0 10px;overflow:auto}.override,.preview{margin:0 10px;padding:11px;border:1px solid #e0e6ee;border-radius:9px}.override label{display:block;margin-bottom:6px;font-weight:700}.override textarea{box-sizing:border-box;width:100%;font:11px monospace}.override small,.preview small{display:block;margin-top:6px;color:#748196}.preview pre{max-height:140px;overflow:auto;background:#f6f8fb;font-size:10px}.console{grid-column:1/-1;overflow:hidden;background:#182231;color:#d9e2ee}.console header{display:flex;justify-content:space-between;padding:9px 12px;border-bottom:1px solid #344155}.console-lines{height:145px;overflow:auto;padding:6px 12px;font:11px monospace}.console-lines p{display:grid;grid-template-columns:170px 150px 130px 1fr;gap:10px;margin:4px 0}.console-lines time,.console-lines span{color:#8fa2ba}.console-lines .error{color:#ff9f9f}.empty{display:grid;height:590px;place-items:center;color:#7c899a}@media(max-width:1100px){.workbench{grid-template-columns:1fr;grid-template-rows:auto}.left-pane,.dag-pane,.right-pane,.console{grid-column:1}.left-pane{max-height:260px}.right-pane{min-height:500px}}
 </style>
+<style scoped>
+.workbench { grid-template-columns: 240px minmax(620px, 1fr) 350px; gap: 16px; }
+.left-pane { padding: 14px; }
+.left-pane h3 { font-size: var(--font-card); }
+.compact-card { padding: 11px; }
+.compact-card small,.run-card small,.dag-toolbar small,.override small,.preview small { font-size: var(--font-technical); }
+.run-card { padding: 11px; font-size: var(--font-assist); }
+.dag-toolbar { padding: 13px 15px; }
+.override,.preview { padding: 13px; }
+.override textarea,.console-lines { font: var(--font-technical) ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.preview pre { font-size: var(--font-technical); }
+.console header { padding: 11px 14px; }
+.console-lines { padding: 8px 14px; }
+@media (min-width: 901px) and (max-width: 1440px) {
+  .workbench { grid-template-columns: 220px minmax(520px, 1fr) 320px; gap: 12px; }
+}
+@media (max-width: 900px) {
+  .workbench { grid-template-columns: 1fr; grid-template-rows: auto; }
+  .left-pane,.dag-pane,.right-pane,.console { grid-column: 1; }
+  .left-pane { max-height: 260px; }
+  .right-pane { min-height: 500px; }
+  .console-lines p { grid-template-columns: 1fr; }
+}
+</style>

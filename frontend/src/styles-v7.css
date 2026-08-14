@@ -21,6 +21,13 @@
   --shadow: 0 8px 30px rgba(30, 51, 82, .06);
   --radius: 14px;
   --heading-gap: 20px;
+  --font-title: 26px;
+  --font-section: 20px;
+  --font-card: 16px;
+  --font-body: 15px;
+  --font-table: 14px;
+  --font-assist: 13px;
+  --font-technical: 12px;
 }
 
 * { box-sizing: border-box; }
@@ -29,7 +36,7 @@ html,
 body,
 #app { min-width: 320px; min-height: 100vh; }
 
-body { margin: 0; background: var(--bg); }
+body { margin: 0; background: var(--bg); font-size: var(--font-body); }
 
 button,
 input,
@@ -37,13 +44,13 @@ select,
 textarea { font: inherit; }
 
 button {
-  min-height: 34px;
+  min-height: 38px;
   padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   color: #405069;
   background: #fff;
-  font-size: 10px;
+  font-size: 14px;
   font-weight: 750;
   cursor: pointer;
 }
@@ -83,13 +90,13 @@ summary:focus-visible {
 input:not([type="checkbox"]),
 select,
 textarea {
-  min-height: 34px;
+  min-height: 40px;
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 8px;
   color: #405069;
   background: #fff;
-  font-size: 10px;
+  font-size: var(--font-body);
 }
 
 input:not([type="checkbox"]):focus,
@@ -118,26 +125,27 @@ form.stack label {
   display: grid;
   gap: 6px;
   color: #566379;
-  font-size: 10px;
+  font-size: var(--font-assist);
   font-weight: 700;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 10px;
+  font-size: var(--font-table);
 }
 
 th {
-  padding: 10px;
+  padding: 14px 12px;
   color: var(--muted);
   background: #f5f7f9;
-  font-size: 9px;
+  font-size: var(--font-assist);
   text-align: left;
 }
 
 td {
-  padding: 11px 10px;
+  min-height: 56px;
+  padding: 14px 12px;
   border-bottom: 1px solid #edf0f4;
   color: #4c596c;
   vertical-align: middle;
@@ -146,7 +154,7 @@ td {
 td b,
 td small { display: block; }
 
-td small { margin-top: 4px; color: #8591a1; font-size: 9px; line-height: 1.5; }
+td small { margin-top: 4px; color: #8591a1; font-size: var(--font-technical); line-height: 1.5; }
 
 pre {
   max-width: 100%;
@@ -155,7 +163,7 @@ pre {
   border: 1px solid var(--border);
   border-radius: 9px;
   background: var(--panel-muted);
-  font: 10px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -198,13 +206,13 @@ pre {
   font-weight: 900;
 }
 
-.brand h1 { margin: 0; color: #fff; font-size: 15px; }
+.brand h1 { margin: 0; color: #fff; font-size: 17px; }
 
 .brand small {
   display: block;
   margin-top: 3px;
   color: #8ea0b8;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .workspace-switch {
@@ -219,13 +227,13 @@ pre {
 }
 
 .workspace-switch button {
-  min-height: 34px;
+  min-height: 38px;
   padding: 8px 4px;
   border: 0;
   border-radius: 7px;
   color: #90a0b6;
   background: transparent;
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 750;
 }
 
@@ -235,7 +243,7 @@ pre {
   margin: 0;
   padding: 10px 10px 7px;
   color: #64748b;
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 800;
   letter-spacing: .12em;
 }
@@ -279,12 +287,12 @@ pre {
 .nav-item b,
 .nav-item small { display: block; }
 
-.nav-item b { font-size: 11px; }
+.nav-item b { font-size: 14px; }
 
 .nav-item small {
   margin-top: 2px;
   color: #7f90a7;
-  font-size: 8px;
+  font-size: 12px;
 }
 
 .topbar {
@@ -304,7 +312,7 @@ pre {
 
 .crumb {
   color: #6f7c90;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 700;
 }
 
@@ -316,14 +324,11 @@ pre {
   border: 1px solid var(--border);
   border-radius: 9px;
   background: #fff;
-  font-size: 10px;
+  font-size: 14px;
   font-weight: 800;
 }
 
-.content {
-  max-width: 1500px;
-  padding: 26px 28px 40px;
-}
+.content { width: 100%; min-width: 0; max-width: none; padding: clamp(20px, 1.5vw, 32px) clamp(20px, 1.8vw, 36px) 40px; }
 
 /* The flow editor is intentionally a PC-only fixed three-column workspace. */
 .content:has(.template-page) {
@@ -342,14 +347,14 @@ pre {
 
 .page-head h2 {
   margin: 0 !important;
-  font-size: 23px;
+  font-size: var(--font-title);
   letter-spacing: -.02em;
 }
 
 .page-head p {
   margin: 6px 0 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--font-assist);
   line-height: 1.7;
 }
 
@@ -380,15 +385,15 @@ pre {
   box-shadow: var(--shadow);
 }
 
-.metric { padding: 15px 16px; }
+.metric { padding: 18px; }
 
-.metric b { display: block; margin-bottom: 5px; font-size: 20px; }
+.metric b { display: block; margin-bottom: 5px; font-size: 22px; }
 
-.metric span { font-size: 9px; color: var(--muted); }
+.metric span { font-size: var(--font-assist); color: var(--muted); }
 
-.card { padding: 17px; }
+.card { padding: 20px; }
 
-.panel { padding: 18px; }
+.panel { padding: 20px; }
 
 .panel-head {
   display: flex;
@@ -398,10 +403,10 @@ pre {
 }
 
 .panel h3,
-.card h3 { margin: 0; font-size: 13px; }
+.card h3 { margin: 0; font-size: var(--font-card); }
 
 .panel-head p,
-.panel p { font-size: 10px; line-height: 1.7; color: #657187; }
+.panel p { font-size: var(--font-assist); line-height: 1.7; color: #657187; }
 
 .grid2 {
   display: grid;
@@ -411,14 +416,15 @@ pre {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
   margin: 0 0 16px;
 }
 
 .cards > * {
   min-width: 0;
-  padding: 15px;
+  min-height: 150px;
+  padding: 18px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--panel);
@@ -435,7 +441,7 @@ pre {
 .cards b,
 .cards small { display: block; }
 
-.cards small { margin-top: 5px; color: var(--muted); font-size: 9px; }
+.cards small { margin-top: 5px; color: var(--muted); font-size: var(--font-assist); }
 
 .clickable { cursor: pointer; }
 
@@ -457,11 +463,11 @@ pre {
 
 .directory-tree { display: grid; gap: 4px; padding: 12px; }
 
-.directory-tree > b { padding: 5px 8px 9px; font-size: 11px; }
+.directory-tree > b { padding: 5px 8px 9px; font-size: var(--font-assist); }
 
 .directory-tree button {
   display: flex;
-  min-height: 30px;
+  min-height: 38px;
   align-items: center;
   justify-content: space-between;
   border-color: transparent;
@@ -484,7 +490,7 @@ pre {
   border-radius: 10px;
   color: #71809a;
   background: #f8fbff;
-  font-size: 11px;
+  font-size: var(--font-assist);
 }
 
 .queued-file-list {
@@ -512,15 +518,15 @@ pre {
 .queued-file-list b,
 .queued-file-list small { display: block; }
 
-.queued-file-list b { overflow-wrap: anywhere; font-size: 10px; }
+.queued-file-list b { overflow-wrap: anywhere; font-size: var(--font-body); }
 
-.queued-file-list small { margin-top: 3px; color: var(--muted); font-size: 8px; overflow-wrap: anywhere; }
+.queued-file-list small { margin-top: 3px; color: var(--muted); font-size: var(--font-technical); overflow-wrap: anywhere; }
 
 .source-detail { margin-top: 18px; }
 
 .source-detail details { margin-top: 10px; }
 
-.source-detail summary { cursor: pointer; font-size: 11px; font-weight: 800; }
+.source-detail summary { cursor: pointer; font-size: var(--font-assist); font-weight: 800; }
 
 .tabs {
   display: flex;
@@ -530,11 +536,11 @@ pre {
 }
 
 .tabs button {
-  min-height: 34px;
+  min-height: 38px;
   padding: 0 12px;
   color: #69778b;
   background: #fff;
-  font-size: 9px;
+  font-size: 14px;
 }
 
 .tabs button.active {
@@ -559,22 +565,22 @@ pre {
   background: #fff;
 }
 
-.node b { display: block; font-size: 9px; }
+.node b { display: block; font-size: var(--font-assist); }
 
-.node small { font-size: 7.5px; color: var(--muted); }
+.node small { font-size: var(--font-technical); color: var(--muted); }
 
 .arrow { color: #9ca8b8; font-weight: 900; }
 
 .badge {
   display: inline-flex;
-  min-height: 24px;
+  min-height: 26px;
   align-items: center;
   padding: 0 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
   color: #657187;
   background: #f8fafc;
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 850;
 }
 
@@ -626,17 +632,20 @@ pre {
   border-radius: 9px;
   color: var(--red);
   background: var(--red-soft);
-  font-size: 10px;
+  font-size: var(--font-assist);
   line-height: 1.6;
 }
 
-@media (max-width: 1100px) {
+ .table-wrap { width: 100%; min-width: 0; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); }
+.table-wrap > table { min-width: 760px; }
+
+@media (max-width: 1440px) {
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .project-layout { grid-template-columns: 1fr; }
   .document-browser { grid-template-columns: 1fr; }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 900px) {
   .sidebar {
     position: static;
     width: 100%;
@@ -671,3 +680,54 @@ pre {
   .grid2,
   .cards { grid-template-columns: 1fr; }
 }
+
+/* Flow 组件沿用 V7 字号层级；画布内的技术标签仍可在高分屏清晰辨识。 */
+.flow-canvas .canvas-chip { font-size: var(--font-technical) !important; }
+.flow-canvas .artifact-edge-label { padding: 4px 7px !important; font-size: var(--font-technical) !important; }
+.flow-canvas .flow-node header b,
+.flow-canvas .subflow-node header b,
+.flow-canvas .sink-node header b { font-size: var(--font-assist) !important; }
+.flow-canvas .flow-node header small,
+.flow-canvas .subflow-node header small,
+.flow-canvas .sink-node header small,
+.flow-canvas .subflow-node em,
+.flow-canvas .sink-node em,
+.flow-canvas .flow-node footer,
+.flow-canvas .subflow-node footer,
+.flow-canvas .sink-node footer,
+.flow-canvas .port-name,
+.flow-canvas .typed-port small { font-size: var(--font-technical) !important; }
+.operator-palette .palette-title h3,
+.node-inspector .inspector-title h3,
+.runtime-inspector h3 { font-size: var(--font-card) !important; }
+.operator-palette .palette-title small,
+.operator-palette .palette-scroll h4,
+.operator-palette .palette-scroll b,
+.operator-palette .palette-scroll small,
+.operator-palette .hint,
+.node-inspector .inspector-title small,
+.node-inspector .status,
+.node-inspector .node-summary b,
+.node-inspector .node-summary small,
+.node-inspector nav button,
+.node-inspector .inspector-body label,
+.node-inspector .muted,
+.node-inspector .inline-error,
+.node-inspector .inspector-body h4,
+.node-inspector .inspector-body h5,
+.node-inspector .inspector-body article b,
+.node-inspector .inspector-body article small,
+.node-inspector .inspector-body pre,
+.node-inspector .issue,
+.node-inspector .empty b,
+.node-inspector .empty p,
+.node-inspector .preview-meta,
+.node-inspector .io-body summary,
+.node-inspector .result-body summary,
+.node-inspector .run-status,
+.node-inspector .fixed-parser dt,
+.node-inspector .fixed-parser dd,
+.runtime-inspector nav button,
+.runtime-inspector .body pre,
+.runtime-inspector .artifact-link,
+.runtime-inspector header small { font-size: var(--font-technical) !important; }
