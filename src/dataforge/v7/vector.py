@@ -167,11 +167,21 @@ class V7Milvus:
         self.client().release_partitions(collection_name=collection_name, partition_names=[partition_name])
 
     def drop_partition(self, collection_name: str, partition_name: str) -> None:
-        """Drop one verified V7 library partition without touching its Collection."""
+        """Drop one verified V7 library partition without touching its Collection.
+
+        Milvus rejects dropping a partition that is currently loaded, so release it
+        first. Releasing an already-released partition is a no-op; if the release
+        itself fails we still attempt the drop so the underlying error surfaces.
+        """
         self._assert_v7_partition(partition_name)
         client = self.client()
-        if client.has_partition(collection_name=collection_name, partition_name=partition_name):
-            client.drop_partition(collection_name=collection_name, partition_name=partition_name)
+        if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
+            return
+        try:
+            client.release_partitions(collection_name=collection_name, partition_names=[partition_name])
+        except Exception:
+            pass
+        client.drop_partition(collection_name=collection_name, partition_name=partition_name)
 
     def inspect_managed_collection(self, collection_name: str, expected_description: str) -> dict[str, Any]:
         """Read the facts required by the fail-closed managed deletion preflight."""

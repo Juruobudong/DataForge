@@ -191,6 +191,9 @@ class KnowledgeLibrary(Timestamped, Base):
     index_profile_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     partition_name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    graph_schema_snapshot_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    graph_schema_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_template_revision_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_flow_template_revisions.id"), nullable=True)
 
 
 class KnowledgeItem(Timestamped, Base):

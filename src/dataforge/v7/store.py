@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .catalog import CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code, subflow_seeds
 from .flow import FlowCompiler, FlowValidationError
+from .graph_literal import detect_literal
+from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
 from .llm_serving import get_llm_serving_registry
 from .migrations import assert_schema_current
 from .models import (
@@ -410,13 +412,16 @@ class V7Store:
                     ),
                     "semantic": (
                         {"type": "object", "required": ["source_entity", "target_entity", "relation", "evidence"], "properties": {
-                            "source_entity": {"type": "object", "required": ["name"]},
-                            "target_entity": {"type": "object", "required": ["name"]},
-                            "relation": {"type": "object", "required": ["description"]},
+                            "source_entity": {"type": "object", "required": ["name", "type", "description"],
+                                              "properties": {"name": {"type": "string"}, "type": {"type": "string"}, "description": {"type": "string"}, "type_label": {"type": "string"}, "aliases": {"type": "array"}}},
+                            "target_entity": {"type": "object", "required": ["name", "type", "description"],
+                                              "properties": {"name": {"type": "string"}, "type": {"type": "string"}, "description": {"type": "string"}, "type_label": {"type": "string"}, "aliases": {"type": "array"}}},
+                            "relation": {"type": "object", "required": ["type", "description"],
+                                         "properties": {"type": {"type": "string"}, "type_label": {"type": "string"}, "description": {"type": "string"}, "keywords": {"type": "array"}, "weight": {"type": "number"}}},
                             "evidence": {"type": "array"},
                         }},
                         ["source_entity.name", "relation.description", "target_entity.name"],
-                        ["source_entity.name", "relation.description", "target_entity.name"],
+                        ["source_entity.name", "relation.type", "target_entity.name"],
                     ),
                 }
                 for mode, (mode_schema, canonical_fields, identity_fields) in mode_contracts.items():
@@ -1939,8 +1944,10 @@ class V7Store:
     def _knowledge_library_payload(item: KnowledgeLibrary, ready: bool | None = None,
                                    knowledge_item_count: int | None = None) -> dict[str, Any]:
         result = {"id": item.id, "code": item.code, "name": item.name, "knowledge_type": item.knowledge_type,
-                  "graph_mode": item.graph_mode, "display_type": ({"triple": "三元组图谱", "semantic": "语义图谱（LightRAG 模式）"}.get(item.graph_mode) if item.knowledge_type == "graph" else None),
-                  "knowledge_type_revision_id": item.knowledge_type_revision_id, "description": item.description, "embedding_profile_id": item.embedding_profile_id, "index_profile_id": item.index_profile_id, "partition_name": item.partition_name, "status": item.status, "updated_at": item.updated_at.isoformat()}
+                  "graph_mode": item.graph_mode, "display_type": ({"triple": "三元组图谱", "semantic": "语义图谱"}.get(item.graph_mode) if item.knowledge_type == "graph" else None),
+                  "knowledge_type_revision_id": item.knowledge_type_revision_id, "description": item.description, "embedding_profile_id": item.embedding_profile_id, "index_profile_id": item.index_profile_id, "partition_name": item.partition_name, "status": item.status, "updated_at": item.updated_at.isoformat(),
+                  "graph_schema_hash": getattr(item, "graph_schema_hash", None), "source_template_revision_id": getattr(item, "source_template_revision_id", None),
+                  "graph_schema_snapshot": getattr(item, "graph_schema_snapshot_json", None)}
         if ready is not None:
             result["vector_ready"] = ready
         if knowledge_item_count is not None:
@@ -2255,6 +2262,9 @@ class V7Store:
                 quality_id = params.get("quality_profile_revision_id")
                 if not quality_id or not session.scalar(select(QualityProfileRevision.id).where(QualityProfileRevision.id == quality_id, QualityProfileRevision.status == "published")):
                     raise ValueError("质量节点只能引用已发布 Quality Profile Revision")
+        if "graph" in {output_contract(value)[0] for value in output_types}:
+            config = normalize_graph_config(normalized.get("graph_config"))
+            normalized["graph_config"] = config.to_dict()
         return {"definition": normalized, **compiled}
 
     @staticmethod
@@ -2525,6 +2535,15 @@ class V7Store:
                 prompt = session.get(PromptTemplateRevision, prompt_revision_id) if prompt_revision_id else None
                 if prompt and prompt.status == "published":
                     prompt_body = prompt.body
+                graph_config: dict[str, Any] | None = None
+                graph_schema_hash: str | None = None
+                if library.knowledge_type == "graph":
+                    try:
+                        config = normalize_graph_config((definition or {}).get("graph_config"))
+                        graph_config = config.to_dict()
+                        graph_schema_hash = schema_hash(config)
+                    except ValueError:
+                        graph_config = normalize_graph_config(None).to_dict()
                 values[output_type] = {
                     "schema": mode_revision.schema_json if mode_revision else revision.schema_json,
                     "canonical_field": revision.canonical_field,
@@ -2532,7 +2551,9 @@ class V7Store:
                     "identity_fields": mode_revision.identity_fields if mode_revision else revision.identity_fields,
                     "source_policy": mode_revision.source_policy if mode_revision else revision.source_policy,
                     "knowledge_type": library.knowledge_type, "graph_mode": library.graph_mode,
-                    "prompt": prompt_body,
+                    "prompt": prompt_body, "library_id": library.id,
+                    "graph_config": graph_config, "graph_schema_hash": graph_schema_hash,
+                    "template_revision_id": job.knowledge_flow_template_revision_id,
                 }
             return values
 
@@ -3364,6 +3385,14 @@ class V7Store:
                 ).order_by(KnowledgeTypeModeRevision.revision_no.desc()))
                 if not mode_revision:
                     raise ValueError("目标图谱知识库没有已发布模式契约")
+            if knowledge_type == "graph" and library.graph_schema_snapshot_json is None:
+                template_rev = session.get(KnowledgeFlowTemplateRevision, job.knowledge_flow_template_revision_id) if job.knowledge_flow_template_revision_id else None
+                template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
+                definition = template_rev.definition_json if template_rev else (template.definition_json if template else {})
+                config = normalize_graph_config((definition or {}).get("graph_config"))
+                library.graph_schema_snapshot_json = config.to_dict()
+                library.graph_schema_hash = schema_hash(config)
+                library.source_template_revision_id = job.knowledge_flow_template_revision_id
             source_versions = {v.id: v for v in session.scalars(select(SourceVersion).where(SourceVersion.id.in_(job.source_version_ids)))}
             if not source_versions:
                 raise ValueError("任务来源版本不存在")
@@ -3599,47 +3628,94 @@ class V7Store:
     def _graph_identity(library_id: str, *parts: str) -> str:
         return hashlib.sha256("|".join((library_id, *parts)).encode("utf-8")).hexdigest()[:32]
 
-    def _graph_projection(self, session: Session, library_id: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    @staticmethod
+    def _add_graph_node(nodes: dict[str, dict[str, Any]], node_id: str, name: str, type_code: Any, type_label: Any, description: Any, aliases: Any) -> None:
+        node = nodes.get(node_id)
+        label = type_label or type_code or "未分类"
+        if node is None:
+            nodes[node_id] = {"id": node_id, "name": name, "type_code": type_code, "type": label,
+                              "type_label": type_label, "description": description, "aliases": list(aliases or [])}
+            return
+        if not node.get("description") and description:
+            node["description"] = description
+        if not node.get("type_label") and type_label:
+            node["type"] = label; node["type_label"] = type_label
+        node["aliases"] = sorted(set(node.get("aliases") or []) | set(aliases or []))
+
+    def _graph_projection(self, session: Session, library_id: str) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         library = session.get(KnowledgeLibrary, library_id)
         if not library or library.knowledge_type != "graph":
             raise ValueError("图谱知识库不存在或类型不匹配")
         nodes: dict[str, dict[str, Any]] = {}
         edges: dict[str, dict[str, Any]] = {}
+        facts: dict[str, dict[str, Any]] = {}
         for item in session.scalars(select(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library_id, KnowledgeItem.status == "active")):
             data = item.data_json or {}
             if library.graph_mode == "semantic":
                 source, target, relation = (data.get(key) or {} for key in ("source_entity", "target_entity", "relation"))
-                subject, obj = str(source.get("name", "")).strip(), str(target.get("name", "")).strip()
-                predicate = str(relation.get("description", "")).strip()
+                source_name, target_name = str(source.get("name", "")).strip(), str(target.get("name", "")).strip()
+                if not source_name or not target_name:
+                    continue
+                source_id = str(source.get("entity_id") or self._graph_identity(library_id, "entity", str(source.get("type") or ""), source_name.casefold()))
+                target_id = str(target.get("entity_id") or self._graph_identity(library_id, "entity", str(target.get("type") or ""), target_name.casefold()))
+                relation_id = str(relation.get("relation_id") or self._graph_identity(library_id, "relation", source_id, str(relation.get("type") or ""), target_id))
+                self._add_graph_node(nodes, source_id, source_name, source.get("type"), source.get("type_label"), source.get("description"), source.get("aliases"))
+                self._add_graph_node(nodes, target_id, target_name, target.get("type"), target.get("type_label"), target.get("description"), target.get("aliases"))
+                edge = edges.setdefault(relation_id, {
+                    "id": relation_id, "source": source_id, "target": target_id,
+                    "predicate": relation.get("type_label") or relation.get("type") or relation.get("description") or "",
+                    "relation_type": relation.get("type"), "relation_type_label": relation.get("type_label"),
+                    "description": relation.get("description"), "keywords": relation.get("keywords") or [], "weight": relation.get("weight"),
+                    "graph_mode": "semantic", "knowledge_item_ids": []})
+                edge["knowledge_item_ids"].append(item.id)
             else:
-                source, target, relation = {}, {}, {}
                 subject, predicate, obj = (str(data.get(key, "")).strip() for key in ("subject", "predicate", "object"))
-            if not subject or not predicate or not obj:
-                continue
-            source_id = self._graph_identity(library_id, "entity", subject.casefold())
-            target_id = self._graph_identity(library_id, "entity", obj.casefold())
-            relation_id = self._graph_identity(library_id, "relation", subject.casefold(), predicate.casefold(), obj.casefold())
-            nodes.setdefault(source_id, {"id": source_id, "name": subject, "type": source.get("type") or data.get("subject_type") or "未分类", "description": source.get("description")})
-            nodes.setdefault(target_id, {"id": target_id, "name": obj, "type": target.get("type") or data.get("object_type") or "未分类", "description": target.get("description")})
-            edge = edges.setdefault(relation_id, {"id": relation_id, "source": source_id, "target": target_id,
-                "predicate": predicate, "description": predicate if library.graph_mode == "semantic" else None,
-                "keywords": relation.get("keywords") or [], "weight": relation.get("weight"),
-                "graph_mode": library.graph_mode or "triple", "knowledge_item_ids": []})
-            edge["knowledge_item_ids"].append(item.id)
-        return nodes, edges
+                if not subject or not predicate or not obj:
+                    continue
+                subject_id = self._graph_identity(library_id, "entity", str(data.get("subject_type") or ""), subject.casefold())
+                self._add_graph_node(nodes, subject_id, subject, data.get("subject_type"), data.get("subject_type_label"), None, None)
+                literal = (data.get("data") or {}).get("object_kind") == "literal"
+                if literal:
+                    fact_id = self._graph_identity(library_id, "fact", subject.casefold(), predicate.casefold(), str((data.get("data") or {}).get("literal_normalized_value") or obj))
+                    fact = facts.setdefault(fact_id, {
+                        "id": fact_id, "subject_entity_id": subject_id, "subject": subject,
+                        "predicate": predicate, "predicate_code": data.get("predicate_code"),
+                        "object": obj, "object_kind": "literal",
+                        "literal_datatype": (data.get("data") or {}).get("literal_datatype"),
+                        "literal_unit": (data.get("data") or {}).get("literal_unit"),
+                        "literal_raw_value": (data.get("data") or {}).get("literal_raw_value") or obj,
+                        "literal_normalized_value": (data.get("data") or {}).get("literal_normalized_value"),
+                        "knowledge_item_ids": []})
+                    fact["knowledge_item_ids"].append(item.id)
+                else:
+                    obj_id = self._graph_identity(library_id, "entity", str(data.get("object_type") or ""), obj.casefold())
+                    self._add_graph_node(nodes, obj_id, obj, data.get("object_type"), data.get("object_type_label"), None, None)
+                    relation_id = self._graph_identity(library_id, "relation", subject.casefold(), predicate.casefold(), obj.casefold())
+                    edge = edges.setdefault(relation_id, {
+                        "id": relation_id, "source": subject_id, "target": obj_id,
+                        "predicate": predicate, "relation_type": data.get("predicate_code"), "relation_type_label": None,
+                        "description": None, "keywords": [], "weight": None,
+                        "graph_mode": "triple", "knowledge_item_ids": []})
+                    edge["knowledge_item_ids"].append(item.id)
+        return nodes, edges, facts
 
     def graph_entity_search(self, library_id: str, query: str, limit: int = 20) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            nodes, _ = self._graph_projection(session, library_id)
+            nodes, _, _ = self._graph_projection(session, library_id)
             needle = query.casefold().strip()
-            values = [node for node in nodes.values() if not needle or needle in node["name"].casefold()]
+            def matches(node: dict[str, Any]) -> bool:
+                if not needle:
+                    return True
+                haystack = [node["name"], node.get("description") or "", *((node.get("aliases") or []))]
+                return any(needle in str(part).casefold() for part in haystack)
+            values = [node for node in nodes.values() if matches(node)]
             return sorted(values, key=lambda item: item["name"])[:max(1, min(limit, 100))]
 
     def graph_overview(self, library_id: str, *, node_limit: int = 80, edge_limit: int = 160) -> dict[str, Any]:
         """Return a bounded, stable overview biased toward connected entities."""
         with self.sessions() as session:
             library = session.get(KnowledgeLibrary, library_id)
-            nodes, edges = self._graph_projection(session, library_id)
+            nodes, edges, facts = self._graph_projection(session, library_id)
             degrees = {node_id: 0 for node_id in nodes}
             for edge in edges.values():
                 degrees[edge["source"]] = degrees.get(edge["source"], 0) + 1
@@ -3660,20 +3736,25 @@ class V7Store:
             ))
             return {
                 "graph_mode": library.graph_mode or "triple",
-                "entity_count": len(nodes),
-                "relation_count": len(edges),
+                "stats": {
+                    "entity_count": len(nodes),
+                    "relation_count": len(edges),
+                    "literal_fact_count": len(facts),
+                    "entity_type_count": len({node.get("type_code") for node in nodes.values()}),
+                },
                 "nodes": [nodes[node_id] for node_id in sorted(
                     selected_node_ids,
                     key=lambda node_id: (-degrees.get(node_id, 0), nodes[node_id]["name"].casefold(), node_id),
                 )],
                 "edges": selected_edges[:max(1, min(edge_limit, 160))],
+                "facts": list(facts.values()),
             }
 
     def graph_neighbors(self, library_id: str, entity_id: str, depth: int = 1) -> dict[str, Any]:
         if depth not in {1, 2}:
             raise ValueError("图谱邻居深度只支持 1 或 2")
         with self.sessions() as session:
-            nodes, edges = self._graph_projection(session, library_id)
+            nodes, edges, facts = self._graph_projection(session, library_id)
             if entity_id not in nodes:
                 raise ValueError("图谱实体不存在")
             selected, frontier = {entity_id}, {entity_id}
@@ -3687,20 +3768,24 @@ class V7Store:
                 selected.update(next_frontier)
                 if len(selected) >= 100:
                     break
+            local_facts = [fact for fact in facts.values() if fact["subject_entity_id"] in selected]
             return {"center_id": entity_id, "depth": depth, "nodes": [nodes[node_id] for node_id in sorted(selected)[:100]],
-                    "edges": [edges[edge_id] for edge_id in sorted(selected_edges)[:200]]}
+                    "edges": [edges[edge_id] for edge_id in sorted(selected_edges)[:200]], "facts": local_facts}
 
     def graph_entity_detail(self, library_id: str, entity_id: str) -> dict[str, Any]:
         with self.sessions() as session:
-            nodes, edges = self._graph_projection(session, library_id)
+            nodes, edges, facts = self._graph_projection(session, library_id)
             if entity_id not in nodes:
                 raise ValueError("图谱实体不存在")
             related = [edge for edge in edges.values() if entity_id in (edge["source"], edge["target"])]
-            return {**nodes[entity_id], "relation_count": len(related), "relation_ids": [edge["id"] for edge in related]}
+            entity_facts = [fact for fact in facts.values() if fact["subject_entity_id"] == entity_id]
+            evidence_count = sum(len(edge["knowledge_item_ids"]) for edge in related)
+            return {**nodes[entity_id], "relation_count": len(related), "relation_ids": [edge["id"] for edge in related],
+                    "facts": entity_facts, "evidence_count": evidence_count}
 
     def graph_relation_evidence(self, library_id: str, relation_id: str) -> dict[str, Any]:
         with self.sessions() as session:
-            _, edges = self._graph_projection(session, library_id)
+            _, edges, _ = self._graph_projection(session, library_id)
             relation = edges.get(relation_id)
             if not relation:
                 raise ValueError("图谱关系不存在")

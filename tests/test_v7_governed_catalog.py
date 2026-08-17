@@ -7,16 +7,19 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import yaml
+from openai import APITimeoutError
 from sqlalchemy import select
 
-from dataforge.v7.catalog import builtin_flow_definition, catalog_by_code
+from dataforge.v7.catalog import builtin_flow_definition, catalog_by_code, subflow_seeds
 from dataforge.v7.flow import FlowCompiler, FlowValidationError
 from dataforge.v7.runner import execute_job, preview_template_definition, select_parser_adapter, select_runtime_mode
 from dataforge.v7 import runner
+from dataforge.v7 import llm_serving as llm_serving_module
 from dataforge.v7 import parser_runtime
 from dataforge.v7 import worker
 from dataforge.v7.documents import DocumentDeletionService
-from dataforge.v7.models import Artifact
+from dataforge.v7.models import Artifact, AuditEvent, FlowRun, ManagedCollection
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import DEFAULT_INDEX_FIELD_MAPPING, V7Store
 from dataforge.v7.web import create_app
@@ -39,12 +42,50 @@ def _source(store: V7Store, objects: LocalObjectStore, code: str, text: str) -> 
                                sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="text/plain")
 
 
+def _write_llm_servings(path: Path, *, default: str = "qwen3_32b", include_default: bool = True) -> Path:
+    servings = {
+        "qwen3_32b": {
+            "type": "openai-compatible-chat",
+            "model_name": "Qwen3-32B",
+            "base_url": "https://llm.example.test/v1",
+            "api_key_env": "LOCAL_LLM_API_KEY",
+            "default_api_key": "EMPTY",
+            "timeout_seconds": 300,
+            "max_retries": 0,
+            "max_tokens": 16384,
+            "disable_thinking": True,
+        },
+    } if include_default else {
+        "another_serving": {
+            "type": "openai-compatible-chat",
+            "model_name": "AnotherModel",
+            "base_url": "https://another.example.test/v1",
+            "api_key_env": "ANOTHER_API_KEY",
+            "default_api_key": "EMPTY",
+            "timeout_seconds": 60,
+            "max_retries": 0,
+            "max_tokens": 1024,
+            "disable_thinking": True,
+        },
+    }
+    path.write_text(yaml.safe_dump({"default_serving": default, "servings": servings}), encoding="utf-8")
+    return path
+
+
+def _mark_managed_collection_ready(store: V7Store, collection_id: str) -> None:
+    with store.sessions.begin() as session:
+        collection = session.get(ManagedCollection, collection_id)
+        collection.status = "ready"
+        collection.observed_spec_hash = collection.desired_spec_hash
+
+
 def test_catalog_is_logical_allowlist_and_disabled_operator_is_rejected(tmp_path):
     store = _store(tmp_path)
     listed = store.list_operator_catalog()
     codes = {item["code"] for item in listed}
     assert {"document-parser", "text-cleaner", "semantic-chunker", "source-chunk-builder", "knowledge-diff"} <= codes
     assert not {"mineru-pipeline-gpu-adapter", "mineru-api-adapter", "mineru-local-adapter", "mineru-flash-adapter"} & codes
+    assert not {"ocr-detector", "pdf-parser", "image-parser"} & codes
     seeds = {item["code"] for item in __import__("dataforge.v7.catalog", fromlist=["CATALOG_SEEDS"]).CATALOG_SEEDS}
     assert "mineru-pipeline-gpu-adapter" in seeds
     assert not {"mineru-api-adapter", "mineru-local-adapter", "mineru-flash-adapter"} & seeds
@@ -70,9 +111,52 @@ def test_catalog_is_logical_allowlist_and_disabled_operator_is_rejected(tmp_path
         ], "edges": [["bad", "sink"]]})
     assert select_parser_adapter("report.pdf", "auto") == "mineru-pipeline-gpu"
     assert select_parser_adapter("report.docx", "auto") == "dataforge-word-parser"
+    assert select_parser_adapter("report.doc", "auto") == "dataforge-word-parser"
     assert select_parser_adapter("table.csv", "auto") == "dataforge-structured-table-parser"
+    assert select_parser_adapter("table.xlsx", "auto") == "dataforge-structured-table-parser"
+    assert select_parser_adapter("notes.md", "auto") == "dataforge-text-parser"
+    assert select_parser_adapter("notes.txt", "auto") == "dataforge-text-parser"
     assert select_runtime_mode(4, {"DATAFORGE_BATCH_THRESHOLD": "4"}) == "batch"
     assert select_runtime_mode(3, {"DATAFORGE_BATCH_THRESHOLD": "4"}) == "single"
+
+
+@pytest.mark.parametrize("params", [
+    {"parse_method": "txt"},
+    {"parse_method": "ocr"},
+    {"backend": "pipeline"},
+    {"unexpected": True},
+])
+def test_document_parser_rejects_all_public_parameters(params):
+    catalog = catalog_by_code()
+    compiler = FlowCompiler(catalog=catalog, type_revisions={"text": {"id": "typerev_text_1"}})
+    definition = builtin_flow_definition(["text"])
+    subflows = {item["code"]: item["definition"] for item in subflow_seeds()}
+    compiler.subflows = subflows
+    parser = next(node for node in subflows["document-parse"]["nodes"] if node["ref"] == "document-parser")
+    parser["params"] = params
+
+    with pytest.raises(FlowValidationError, match="Document Parser.*不接受参数.*parse_method=auto"):
+        compiler.compile(definition)
+
+
+def test_document_parser_accepts_empty_parameters():
+    catalog = catalog_by_code()
+    subflows = {item["code"]: item["definition"] for item in subflow_seeds()}
+    parser = next(node for node in subflows["document-parse"]["nodes"] if node["ref"] == "document-parser")
+    parser["params"] = {}
+
+    compiled = FlowCompiler(catalog=catalog, subflows=subflows, type_revisions={"text": {"id": "typerev_text_1"}}).compile(builtin_flow_definition(["text"]))
+
+    assert any(node["ref"] == "document-parser" and node["params"] == {} for node in compiled["compiled_definition"]["nodes"])
+
+
+def test_document_parser_rejects_non_object_parameters():
+    subflows = {item["code"]: item["definition"] for item in subflow_seeds()}
+    parser = next(node for node in subflows["document-parse"]["nodes"] if node["ref"] == "document-parser")
+    parser["params"] = []
+
+    with pytest.raises(FlowValidationError, match="参数必须是对象"):
+        FlowCompiler(catalog=catalog_by_code(), subflows=subflows, type_revisions={"text": {"id": "typerev_text_1"}}).compile(builtin_flow_definition(["text"]))
 
 
 def test_controlled_preview_exposes_top_level_subflows_sinks_and_isolates_branch_failures(monkeypatch):
@@ -83,7 +167,7 @@ def test_controlled_preview_exposes_top_level_subflows_sinks_and_isolates_branch
         type_revisions={"text": {"id": "text"}, "qa": {"id": "qa"}},
     ).compile(definition)["compiled_definition"]
     calls = []
-    monkeypatch.setattr(runner, "_initialize_global_llm", lambda: calls.append("llm"))
+    monkeypatch.setattr(runner, "_initialize_llm_servings", lambda: calls.append("llm"))
     monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: calls.append("mineru"))
 
     preview = preview_template_definition(definition, "guideline-md", compiled_definition=compiled)
@@ -207,7 +291,7 @@ def test_worker_preserves_runner_persisted_ocr_failure(monkeypatch):
         def __init__(self, _): pass
         def assert_schema_current(self): pass
         def claim_job(self, _): return job
-        def get_job(self, _): return SimpleNamespace(status="failed", error="MinerU OCR 服务不可达")
+        def get_job(self, _): return SimpleNamespace(status="failed", error="MinerU PDF 解析服务不可达")
         def mark_job_failed(self, job_id, error): failed.append((job_id, error))
 
     monkeypatch.setattr(worker, "V7Store", FakeStore)
@@ -264,7 +348,7 @@ def test_parser_artifact_is_deleted_and_listed_for_v7_rebuild(tmp_path):
         assert session.get(Artifact, "artifact_middle") is None
 
 
-@pytest.mark.parametrize("pdf_kind", ["text", "scan"])
+@pytest.mark.parametrize("pdf_kind", ["text", "scan", "mixed"])
 def test_pdf_runner_uses_mineru_and_persists_page_anchors_and_middle_json(tmp_path, monkeypatch, pdf_kind):
     from dataforge.v7.models import Artifact
     from dataforge.v7.parser_runtime import MinerUParseResult
@@ -336,11 +420,11 @@ def test_pdf_parser_failure_marks_job_and_source_once(tmp_path, monkeypatch):
     stored = objects.put_bytes("sources/fail.pdf", b"%PDF-1.7 broken", "application/pdf")
     source = store.create_source(library_id=documents["id"], name="失败扫描件", filename="fail.pdf", object_key=stored.key,
                                  sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="application/pdf")
-    library = store.create_knowledge_library("ocr-fail", "OCR 失败", "text")
+    library = store.create_knowledge_library("pdf-parse-fail", "PDF 解析失败", "text")
     job = store.create_knowledge_job([source["version"]["id"]], {"text": library["id"]}, "flow_standard-text")
-    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: (_ for _ in ()).throw(ValueError("MinerU OCR 服务不可达")))
+    monkeypatch.setattr(runner, "parse_with_mineru", lambda **_: (_ for _ in ()).throw(ValueError("MinerU PDF 解析服务不可达")))
 
-    with pytest.raises(ValueError, match="MinerU OCR 服务不可达"):
+    with pytest.raises(ValueError, match="MinerU PDF 解析服务不可达"):
         execute_job(store, objects, job["id"])
 
     assert store.get_job(job["id"]).status == "failed"
@@ -376,10 +460,10 @@ def test_unpublished_prompt_is_rejected_and_only_three_builtin_types_are_seeded(
 def test_custom_type_is_draft_until_governance_dependencies_are_published(tmp_path):
     store = _store(tmp_path)
     quality = store.list_quality_profiles()[0]["revisions"][0]["id"]
-    index = store.list_index_profiles()[0]["id"]
     created = store.create_knowledge_type("policy", "政策条款", "策", {"type": "object", "required": ["title"]},
-                                          "title", ["title"], "single", quality, [index])
+                                          "title", ["title"], "single", quality, [])
     assert created["status"] == "draft"
+    _mark_managed_collection_ready(store, created["managed_collection_id"])
     assert store.publish_knowledge_type(created["id"])["status"] == "published"
 
 
@@ -406,6 +490,67 @@ def test_document_template_binding_creates_stable_result_library_and_tracks_incr
     jobs = store.process_document_library(document["id"])
     assert len(jobs) == 1 and jobs[0]["document_library_template_binding_id"] == binding["id"]
     assert store.process_document_library(document["id"]) == []
+
+
+def test_document_template_batch_binding_is_atomic_and_http_deduplicates_ids(tmp_path):
+    store = _store(tmp_path)
+    document = store.create_document_library("批量模板资料")
+    libraries_before = {item["id"] for item in store.list_knowledge_libraries()}
+    with store.sessions() as session:
+        audit_count_before = len(list(session.scalars(select(AuditEvent))))
+
+    with pytest.raises(ValueError, match="模板不存在"):
+        store.bind_document_library_templates(document["id"], ["flow_standard-text", "missing-template"])
+    assert store.list_document_library_template_bindings(document["id"]) == []
+    assert {item["id"] for item in store.list_knowledge_libraries()} == libraries_before
+    with store.sessions() as session:
+        assert len(list(session.scalars(select(AuditEvent)))) == audit_count_before
+
+    settings = Settings(project_root=tmp_path, state_dir=tmp_path / "state", database_url=str(store.engine.url))
+    client = TestClient(create_app(settings))
+    response = client.post(f"/api/document-libraries/{document['id']}/template-bindings/batch", json={
+        "knowledge_flow_template_ids": ["flow_standard-text", "flow_standard-qa", "flow_standard-text"],
+    })
+    assert response.status_code == 201
+    assert [item["template"]["id"] for item in response.json()["bindings"]] == ["flow_standard-text", "flow_standard-qa"]
+    assert client.post(f"/api/document-libraries/{document['id']}/template-bindings/batch", json={
+        "knowledge_flow_template_ids": [],
+    }).status_code == 422
+
+
+def test_knowledge_job_progress_uses_latest_full_run_nodes_and_resets_on_retry(tmp_path):
+    store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
+    source = _source(store, objects, "job-progress", "用于节点进度测试的资料")
+    library = store.create_knowledge_library("节点进度知识库", "text")
+    job = store.create_knowledge_job([source["version"]["id"]], {"text": library["id"]}, "flow_standard-text")
+    node_ids = [item["id"] for item in store.template_definition_for_job(job["id"])["nodes"]]
+
+    queued = next(item for item in store.list_knowledge_jobs() if item["id"] == job["id"])
+    assert queued["progress"] == {"completed_nodes": 0, "total_nodes": len(node_ids), "percent": 0}
+    store.claim_job("progress-worker")
+    full_run = store.start_flow_run(job["id"])
+    store.record_flow_node(full_run["id"], node_ids[0], [], [])
+
+    with store.sessions.begin() as session:
+        derived = FlowRun(id="flowrun_progress_derived", knowledge_job_id=job["id"],
+                          execution_snapshot_id=job["execution_snapshot_id"], parent_flow_run_id=full_run["id"],
+                          run_mode="node_only", start_node_id=node_ids[-1], status="completed")
+        session.add(derived)
+    store.record_flow_node("flowrun_progress_derived", node_ids[-1], [], [])
+
+    running = next(item for item in store.list_knowledge_jobs() if item["id"] == job["id"])
+    assert running["progress"] == {
+        "completed_nodes": 1,
+        "total_nodes": len(node_ids),
+        "percent": 100 // len(node_ids),
+    }
+    store.manage_jobs([job["id"]], "cancel")
+    assert next(item for item in store.list_knowledge_jobs() if item["id"] == job["id"])["progress"] == running["progress"]
+    retried = store.manage_jobs([job["id"]], "retry")[0]
+    assert retried["progress"] == {"completed_nodes": 0, "total_nodes": len(node_ids), "percent": 0}
+    store.complete_job(job["id"])
+    completed = next(item for item in store.list_knowledge_jobs() if item["id"] == job["id"])
+    assert completed["progress"] == {"completed_nodes": len(node_ids), "total_nodes": len(node_ids), "percent": 100}
 
 
 def test_selected_document_sources_only_queue_pending_current_versions_for_each_binding(tmp_path):
@@ -450,9 +595,9 @@ def test_selected_document_sources_only_queue_pending_current_versions_for_each_
 def test_dynamic_routing_snapshot_uses_published_profile_mapping_and_multi_source_delete_keeps_graph(tmp_path):
     store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
     quality = store.list_quality_profiles()[0]["revisions"][0]["id"]
-    index = store.list_index_profiles()[0]["id"]
     extension = store.create_knowledge_type("multi-note", "多来源备注", "多", {"type": "object", "required": ["title"]},
-                                            "title", ["title"], "multiple", quality, [index])
+                                            "title", ["title"], "multiple", quality, [])
+    _mark_managed_collection_ready(store, extension["managed_collection_id"])
     store.publish_knowledge_type(extension["id"])
     library = store.create_knowledge_library("动态路由", "multi-note")
     project = store.create_project("动态路由项目")
@@ -479,48 +624,114 @@ def test_structured_generator_repairs_once_then_refuses_invalid_output(monkeypat
     contract = {"schema": {"type": "object", "required": ["title"]}, "prompt": "生成", "canonical_field": "title", "identity_fields": ["title"]}
     chunk = {"content": "内容", "chunk_index": 0, "source_chunk_id": "chunk-0"}
     replies = iter([{"items": [{"wrong": "x"}]}, {"items": [{"title": "fixed"}]}])
-    monkeypatch.setattr(runner, "_llm_json", lambda _: next(replies))
-    assert runner._structured_candidates(source, version, "custom", chunk, contract)[0]["canonical_content"] == "fixed"
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"wrong": "x"}]})
+    serving_calls = []
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **kwargs: serving_calls.append(kwargs["llm_serving"]) or next(replies))
+    assert runner._structured_candidates(source, version, "custom", chunk, contract, llm_serving="qwen3_32b")[0]["canonical_content"] == "fixed"
+    assert serving_calls == ["qwen3_32b", "qwen3_32b"]
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"wrong": "x"}]})
     with pytest.raises(ValueError, match="一次修复"):
         runner._structured_candidates(source, version, "custom", chunk, contract)
 
 
-def test_qwen_generation_is_initialized_once_and_returns_all_valid_items(monkeypatch, tmp_path):
+def test_llm_serving_registry_and_flow_contract_do_not_expose_connection_details(tmp_path):
+    config = _write_llm_servings(tmp_path / "llm_servings.yaml")
+    registry = llm_serving_module.get_llm_serving_registry(config)
+    assert registry.default_serving == "qwen3_32b"
+    assert registry.require().model_name == "Qwen3-32B"
+    with pytest.raises(ValueError, match="未配置"):
+        registry.require("missing_serving")
+
+    catalog = catalog_by_code()
+    qa = catalog["qa-generator"]
+    serialized = json.dumps({"schema": qa["parameter_schema"], "docs": qa["parameter_docs"]}, ensure_ascii=False)
+    assert qa["parameter_schema"]["properties"]["llm_serving"]["default"] == "qwen3_32b"
+    assert "aimedia.health.dev.zoenet.cn" not in serialized
+    assert "LOCAL_LLM_API_KEY" not in serialized
+    assert "Qwen3-32B" not in serialized
+
+    definition = builtin_flow_definition(["qa"])
+    generator = next(node for node in definition["nodes"] if node["id"] == "generate-qa")
+    generator["params"].pop("llm_serving")
+    compiled = FlowCompiler(
+        catalog=catalog,
+        subflows={item["code"]: item["definition"] for item in subflow_seeds()},
+        type_revisions={"qa": {"id": "qa"}},
+        llm_serving_registry=registry,
+    ).compile(definition)
+    compiled_generator = next(node for node in compiled["compiled_definition"]["nodes"] if node["id"] == "generate-qa")
+    assert compiled_generator["params"]["llm_serving"] == "qwen3_32b"
+    assert {("llm_serving", "qwen3_32b")} <= {(item["kind"], item.get("id")) for item in compiled["dependencies"]}
+
+    generator["params"]["llm_serving"] = "missing_serving"
+    with pytest.raises(FlowValidationError, match="未配置的 LLM Serving"):
+        FlowCompiler(
+            catalog=catalog,
+            subflows={item["code"]: item["definition"] for item in subflow_seeds()},
+            type_revisions={"qa": {"id": "qa"}},
+            llm_serving_registry=registry,
+        ).compile(definition)
+    schema = qa["parameter_schema"]
+    assert "未配置" in str(V7Store._validate_parameter_override(schema, {"llm_serving": "missing_serving"}))
+
+
+def test_llm_serving_registry_rejects_invalid_default_and_missing_fields(tmp_path):
+    missing_default = _write_llm_servings(tmp_path / "missing-default.yaml", include_default=False)
+    with pytest.raises(ValueError, match="默认 LLM Serving 未配置"):
+        llm_serving_module.get_llm_serving_registry(missing_default)
+    missing_field = tmp_path / "missing-field.yaml"
+    missing_field.write_text("default_serving: qwen3_32b\nservings:\n  qwen3_32b:\n    type: openai-compatible-chat\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="缺少配置 model_name"):
+        llm_serving_module.get_llm_serving_registry(missing_field)
+
+
+def test_model_serving_container_contract_has_no_global_llm_context():
+    root = Path(__file__).parents[1]
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    serving_config = (root / "llm_servings.yaml").read_text(encoding="utf-8")
+    assert "DATAFORGE_LLM_SERVINGS_PATH: /app/llm_servings.yaml" in compose
+    assert "COPY llm_servings.yaml ./" in dockerfile
+    assert "global_llm" not in compose and "global_llm" not in dockerfile
+    assert "llm_local.yaml" not in compose and "llm_local.yaml" not in dockerfile
+    configured = yaml.safe_load(serving_config)
+    assert configured["default_serving"] == "qwen3_32b"
+    assert configured["servings"]["qwen3_32b"]["base_url"] == "http://172.16.34.34:8198/v1"
+
+
+def test_qwen_serving_direct_client_is_cached_bounded_and_returns_all_valid_items(monkeypatch, tmp_path):
     calls = []
 
-    class SharedGlobalLlm:
-        @staticmethod
-        def get_app_config():
-            if not calls:
-                raise RuntimeError("not initialized")
-            return {"ready": True}
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            calls.append(("client", kwargs))
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
         @staticmethod
-        def init_app(path):
-            calls.append(("init", Path(path)))
+        def create(**kwargs):
+            calls.append(("chat", kwargs))
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"items": []}'))])
 
-        @staticmethod
-        def chat(messages, logical_model, org_code, **kwargs):
-            calls.append(("chat", messages, logical_model, org_code, kwargs))
-            return '{"items": []}'
-
-    monkeypatch.setitem(__import__("sys").modules, "global_llm", SharedGlobalLlm)
-    config = tmp_path / "llm_local.yaml"
-    config.write_text("app_id: dataforge\n", encoding="utf-8")
-    monkeypatch.setenv("DATAFORGE_LLM_CONFIG_PATH", str(config))
-    monkeypatch.setenv("DATAFORGE_LLM_ORG_CODE", "org-1")
+    config = _write_llm_servings(tmp_path / "llm_servings.yaml")
+    monkeypatch.setenv("DATAFORGE_LLM_SERVINGS_PATH", str(config))
+    monkeypatch.setenv("LOCAL_LLM_API_KEY", "test-key")
+    monkeypatch.setattr(llm_serving_module, "OpenAI", FakeOpenAI)
     assert runner._llm_json("test") == {"items": []}
-    assert calls[0] == ("init", config)
-    _, _, model, org_code, kwargs = calls[1]
-    assert model == "qwen3_32b" and org_code == "org-1"
-    assert kwargs["response_format"] == {"type": "json_object"}
+    assert runner._llm_json("test again") == {"items": []}
+    client_calls = [item for item in calls if item[0] == "client"]
+    assert len(client_calls) == 1
+    assert client_calls[0][1] == {
+        "base_url": "https://llm.example.test/v1", "api_key": "test-key", "timeout": 300.0, "max_retries": 0,
+    }
+    request = [item[1] for item in calls if item[0] == "chat"][0]
+    assert request["model"] == "Qwen3-32B" and request["max_tokens"] == 16384
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["extra_body"] == {"app_id": "dataforge", "chat_template_kwargs": {"enable_thinking": False}}
 
     source = type("Source", (), {"id": "source", "original_filename": "sample.txt"})()
     version = type("Version", (), {"id": "version"})()
     contract = {"schema": {"type": "object", "required": ["question", "answer"]},
                 "canonical_field": "answer", "identity_fields": ["question"]}
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [
         {"question": "问题 1", "answer": "答案 1"}, {"question": "问题 2", "answer": "答案 2"},
         {"question": "问题 3", "answer": "答案 3"},
     ]})
@@ -531,12 +742,48 @@ def test_qwen_generation_is_initialized_once_and_returns_all_valid_items(monkeyp
     assert "question 和 answer" in runner._chunk_prompt("qa", {**contract, "prompt": "自定义提示"}, "当前分块")
 
 
-def test_runner_app_initializes_global_llm_on_startup(monkeypatch, tmp_path):
+def test_runner_app_initializes_llm_serving_registry_on_startup(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr(runner, "_initialize_global_llm", lambda: calls.append("initialized"))
+    monkeypatch.setattr(runner, "_initialize_llm_servings", lambda: calls.append("initialized"))
     settings = Settings(project_root=tmp_path, state_dir=tmp_path / "state", database_url=f"sqlite:///{tmp_path / 'runner.sqlite3'}")
     app = runner.create_app(settings, check_schema=False)
     assert app.title == "DataForge V7 Runner" and calls == ["initialized"]
+
+
+def test_llm_timeout_is_mapped_without_sdk_retry(monkeypatch, tmp_path):
+    class TimeoutOpenAI:
+        def __init__(self, **kwargs):
+            assert kwargs["max_retries"] == 0 and kwargs["timeout"] == 300.0
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        @staticmethod
+        def create(**_):
+            raise APITimeoutError(request=httpx.Request("POST", "https://llm.example.test/v1/chat/completions"))
+
+    config = _write_llm_servings(tmp_path / "timeout-servings.yaml")
+    monkeypatch.setenv("DATAFORGE_LLM_SERVINGS_PATH", str(config))
+    monkeypatch.setattr(llm_serving_module, "OpenAI", TimeoutOpenAI)
+    with pytest.raises(TimeoutError, match="300 秒，未自动重试"):
+        runner._llm_json("timeout")
+
+
+def test_llm_failure_does_not_log_or_return_connection_details(monkeypatch, tmp_path, caplog):
+    class FailingOpenAI:
+        def __init__(self, **_):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        @staticmethod
+        def create(**_):
+            raise RuntimeError("https://secret.example.test/v1 api-key=do-not-log")
+
+    config = _write_llm_servings(tmp_path / "failing-servings.yaml")
+    monkeypatch.setenv("DATAFORGE_LLM_SERVINGS_PATH", str(config))
+    monkeypatch.setattr(llm_serving_module, "OpenAI", FailingOpenAI)
+    with pytest.raises(RuntimeError, match=r"qwen3_32b 调用失败（RuntimeError）") as captured:
+        runner._llm_json("sensitive prompt body")
+    assert "secret.example.test" not in str(captured.value)
+    assert "do-not-log" not in caplog.text
+    assert "sensitive prompt body" not in caplog.text
 
 
 def test_chunk_failures_are_retryable_without_replacing_successful_chunks(tmp_path, monkeypatch):
@@ -545,7 +792,7 @@ def test_chunk_failures_are_retryable_without_replacing_successful_chunks(tmp_pa
     library = store.create_knowledge_library("分块问答", "qa")
     job = store.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
 
-    def first_attempt(prompt):
+    def first_attempt(prompt, **_):
         if "FAIL" in prompt:
             raise ValueError("temporary qwen failure")
         return {"items": [{"question": "第一块", "answer": "第一块答案"}]}
@@ -562,7 +809,7 @@ def test_chunk_failures_are_retryable_without_replacing_successful_chunks(tmp_pa
     assert listed["status"] == "completed_with_warnings" and listed["warning_count"] == listed["failed_chunk_count"] == 1
     retried = client.post("/api/knowledge-jobs/batch-actions", json={"job_ids": [job["id"]], "action": "retry"})
     assert retried.status_code == 200 and retried.json()[0]["status"] == "queued"
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"question": "第二块", "answer": "第二块答案"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"question": "第二块", "answer": "第二块答案"}]})
     result = execute_job(store, objects, job["id"])
     assert result["status"] == "completed"
     assert store.job_generation_results(job["id"], failed_only=True) == []
@@ -571,15 +818,20 @@ def test_chunk_failures_are_retryable_without_replacing_successful_chunks(tmp_pa
 
 def test_all_failed_qwen_chunks_leave_no_knowledge_and_api_exposes_details(tmp_path, monkeypatch):
     store = _store(tmp_path); objects = LocalObjectStore(tmp_path / "objects")
-    source = _source(store, objects, "all-failed", "仅用于失败验证的资料")
+    source = _source(store, objects, "all-failed", "A" * 2000)
     library = store.create_knowledge_library("失败问答", "qa")
     job = store.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: (_ for _ in ()).throw(ValueError("qwen unavailable")))
+    timeout_message = "上游 LLM Serving qwen3_32b 请求超时（300 秒，未自动重试）"
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: (_ for _ in ()).throw(TimeoutError(timeout_message)))
     assert execute_job(store, objects, job["id"])["status"] == "failed"
     assert store.list_knowledge_items(library["id"]) == []
     settings = Settings(project_root=tmp_path, state_dir=tmp_path / "state", database_url=str(store.engine.url))
     response = TestClient(create_app(settings)).get(f"/api/knowledge-jobs/{job['id']}/chunk-generations?failed_only=true")
-    assert response.status_code == 200 and response.json()[0]["error"] == "qwen unavailable"
+    assert response.status_code == 200
+    failures = response.json()
+    assert len(failures) == 3
+    assert {item["error"] for item in failures} == {timeout_message}
+    assert {item["attempt_count"] for item in failures} == {1}
 
 
 def test_successful_empty_chunk_withdraws_its_previous_knowledge(tmp_path, monkeypatch):
@@ -587,7 +839,7 @@ def test_successful_empty_chunk_withdraws_its_previous_knowledge(tmp_path, monke
     source = _source(store, objects, "empty-result", "可先生成后撤销的资料")
     library = store.create_knowledge_library("空结果问答", "qa")
     first_job = store.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"question": "旧问题", "answer": "旧答案"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"question": "旧问题", "answer": "旧答案"}]})
     assert execute_job(store, objects, first_job["id"])["status"] == "completed"
     assert [item["status"] for item in store.list_knowledge_items(library["id"])] == ["active"]
 
@@ -595,7 +847,7 @@ def test_successful_empty_chunk_withdraws_its_previous_knowledge(tmp_path, monke
     replacement = store.replace_source(source_id=source["id"], filename="empty-result.txt", object_key=replacement_payload.key,
                                        sha256=replacement_payload.sha256, size_bytes=replacement_payload.size_bytes, mime_type="text/plain")
     second_job = store.create_knowledge_job([replacement["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": []})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": []})
     assert execute_job(store, objects, second_job["id"])["status"] == "completed"
     assert [item["status"] for item in store.list_knowledge_items(library["id"])] == ["inactive"]
 
@@ -605,14 +857,14 @@ def test_successful_chunk_replaces_old_knowledge_when_output_identity_changes(tm
     source = _source(store, objects, "identity-change", "同一分块更新资料")
     library = store.create_knowledge_library("身份变更问答", "qa")
     first_job = store.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"question": "旧问题", "answer": "旧答案"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"question": "旧问题", "answer": "旧答案"}]})
     assert execute_job(store, objects, first_job["id"])["status"] == "completed"
 
     replacement_payload = objects.put_bytes("sources/identity-change-v2.txt", "同一分块更新资料".encode("utf-8"), "text/plain")
     replacement = store.replace_source(source_id=source["id"], filename="identity-change.txt", object_key=replacement_payload.key,
                                        sha256=replacement_payload.sha256, size_bytes=replacement_payload.size_bytes, mime_type="text/plain")
     second_job = store.create_knowledge_job([replacement["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"question": "新问题", "answer": "新答案"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"question": "新问题", "answer": "新答案"}]})
     assert execute_job(store, objects, second_job["id"])["status"] == "completed"
     assert {item["data"]["question"] for item in store.list_knowledge_items(library["id"]) if item["status"] == "active"} == {"新问题"}
 
@@ -622,7 +874,7 @@ def test_version_chunk_reduction_cleans_absent_chunks_only_after_all_success(tmp
     source = _source(store, objects, "reduced", "A" * 800 + "B" * 800)
     library = store.create_knowledge_library("缩减问答", "qa")
     first_job = store.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda prompt: {"items": [{
+    monkeypatch.setattr(runner, "_llm_json", lambda prompt, **_: {"items": [{
         "question": "第一块" if "A" * 20 in prompt else "第二块", "answer": "答案",
     }]})
     assert execute_job(store, objects, first_job["id"])["status"] == "completed"
@@ -632,7 +884,7 @@ def test_version_chunk_reduction_cleans_absent_chunks_only_after_all_success(tmp
     replacement = store.replace_source(source_id=source["id"], filename="reduced.txt", object_key=reduced.key,
                                        sha256=reduced.sha256, size_bytes=reduced.size_bytes, mime_type="text/plain")
     second_job = store.create_knowledge_job([replacement["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"question": "第一块", "answer": "新答案"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"question": "第一块", "answer": "新答案"}]})
     assert execute_job(store, objects, second_job["id"])["status"] == "completed"
     active = [item for item in store.list_knowledge_items(library["id"]) if item["status"] == "active"]
     assert len(active) == 1 and active[0]["data"]["answer"] == "新答案"
@@ -646,7 +898,7 @@ def test_multitype_failure_skips_absent_chunk_cleanup_for_the_source_version(tmp
     graph = store.create_knowledge_library("多类型缩减图谱", "graph")
     outputs = {"text": text["id"], "qa": qa["id"], "graph": graph["id"]}
     first_job = store.create_knowledge_job([source["version"]["id"]], outputs, "flow_standard-multi")
-    monkeypatch.setattr(runner, "_llm_json", lambda prompt: {"items": [
+    monkeypatch.setattr(runner, "_llm_json", lambda prompt, **_: {"items": [
         {"question": "问题 A" if "A" * 20 in prompt else "问题 B", "answer": "答案"}
         if "question 和 answer" in prompt else
         {"subject": "实体 A" if "A" * 20 in prompt else "实体 B", "predicate": "关联", "object": "目标"}
@@ -659,7 +911,7 @@ def test_multitype_failure_skips_absent_chunk_cleanup_for_the_source_version(tmp
                                        sha256=reduced.sha256, size_bytes=reduced.size_bytes, mime_type="text/plain")
     second_job = store.create_knowledge_job([replacement["version"]["id"]], outputs, "flow_standard-multi")
 
-    def partial_failure(prompt):
+    def partial_failure(prompt, **_):
         if "subject、predicate、object" in prompt:
             raise ValueError("graph qwen failure")
         return {"items": [{"question": "问题 A", "answer": "新答案"}]}
@@ -678,7 +930,7 @@ def test_failed_only_retry_can_complete_cross_type_chunk_cleanup(tmp_path, monke
     graph = store.create_knowledge_library("重试清理图谱", "graph")
     outputs = {"text": text["id"], "qa": qa["id"], "graph": graph["id"]}
     job = store.create_knowledge_job([source["version"]["id"]], outputs, "flow_standard-multi")
-    monkeypatch.setattr(runner, "_llm_json", lambda prompt: {"items": [
+    monkeypatch.setattr(runner, "_llm_json", lambda prompt, **_: {"items": [
         {"question": "问题 A" if "A" * 20 in prompt else "问题 B", "answer": "答案"}
         if "question 和 answer" in prompt else
         {"subject": "实体 A" if "A" * 20 in prompt else "实体 B", "predicate": "关联", "object": "目标"}
@@ -691,7 +943,7 @@ def test_failed_only_retry_can_complete_cross_type_chunk_cleanup(tmp_path, monke
         version.object_key = objects.put_bytes("sources/retry-cleanup-reduced.txt", ("A" * 800).encode("utf-8"), "text/plain").key
 
 
-    def fail_graph(prompt):
+    def fail_graph(prompt, **_):
         if "subject、predicate、object" in prompt:
             raise ValueError("graph temporary failure")
         return {"items": [{"question": "问题 A", "answer": "新答案"}]}
@@ -704,7 +956,7 @@ def test_failed_only_retry_can_complete_cross_type_chunk_cleanup(tmp_path, monke
         persisted.status, persisted.stage = "queued", "queued"
     assert execute_job(store, objects, job["id"])["status"] == "completed_with_warnings"
     store.manage_jobs([job["id"]], "retry")
-    monkeypatch.setattr(runner, "_llm_json", lambda _: {"items": [{"subject": "实体 A", "predicate": "关联", "object": "目标"}]})
+    monkeypatch.setattr(runner, "_llm_json", lambda _, **__: {"items": [{"subject": "实体 A", "predicate": "关联", "object": "目标"}]})
     assert execute_job(store, objects, job["id"])["status"] == "completed"
     assert {item["data"]["question"] for item in store.list_knowledge_items(qa["id"]) if item["status"] == "active"} == {"问题 A"}
 

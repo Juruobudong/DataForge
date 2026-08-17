@@ -1,0 +1,109 @@
+--progress is a global compose flag, better use `docker compose --progress xx build ...#0 building with "default" instance using docker driver
+
+#1 [dataforge-runner internal] load build definition from Dockerfile
+#1 transferring dockerfile: 3.16kB done
+#1 DONE 0.0s
+
+#2 [dataforge-runner internal] load .dockerignore
+#2 transferring context: 492B done
+#2 DONE 0.0s
+
+#3 [dataforge-runner] resolve image config for docker.io/docker/dockerfile:1.7
+#3 DONE 0.1s
+
+#4 [dataforge-runner] docker-image://docker.io/docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+#4 CACHED
+
+#5 [dataforge-runner context global_llm] load .dockerignore
+#5 transferring global_llm: 2B done
+#5 DONE 0.0s
+
+#6 [dataforge-runner internal] load metadata for docker.io/library/python:3.12-slim
+#6 DONE 0.1s
+
+#7 [dataforge-runner python-base 1/3] FROM docker.io/library/python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36
+#7 resolve docker.io/library/python:3.12-slim@sha256:229a2c5bfa27522db7815ea81f9bed70af17ccb9de9fc7ad142b1877b5830d36 0.0s done
+#7 DONE 0.0s
+
+#8 [dataforge-runner context global_llm] load from client
+#8 transferring global_llm: 1.33kB done
+#8 DONE 0.0s
+
+#9 [dataforge-runner internal] load build context
+#9 transferring context: 8.57kB 0.0s done
+#9 DONE 0.0s
+
+#10 [dataforge-runner python-base 2/3] WORKDIR /app
+#10 CACHED
+
+#11 [dataforge-runner app-common 2/6] RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked     uv sync --frozen --no-install-project --extra web
+#11 CACHED
+
+#12 [dataforge-runner app-common 5/6] RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked     uv sync --frozen --no-editable --extra web
+#12 CACHED
+
+#13 [dataforge-runner python-base 3/3] RUN --mount=type=cache,target=/root/.cache/pip     python -m pip install "uv==0.9.9"
+#13 CACHED
+
+#14 [dataforge-runner app-common 3/6] COPY src ./src
+#14 CACHED
+
+#15 [dataforge-runner app-common 4/6] COPY llm_local.yaml ./
+#15 CACHED
+
+#16 [dataforge-runner app-common 1/6] COPY pyproject.toml uv.lock README.md alembic.ini ./
+#16 CACHED
+
+#17 [dataforge-runner app-common 6/6] RUN groupadd --system --gid 10001 dataforge     && useradd --system --uid 10001 --gid dataforge --home /app dataforge     && mkdir -p /var/lib/dataforge     && chown -R dataforge:dataforge /app /var/lib/dataforge
+#17 CACHED
+
+#18 [dataforge-runner runner 1/4] RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked     uv sync --frozen --no-editable --extra web --extra runner
+#18 0.856 Downloading nvidia-cuda-cupti (10.2MiB)
+#18 0.858 Downloading nvidia-curand (56.8MiB)
+#18 0.889 Downloading nvidia-cusparselt-cu13 (162.3MiB)
+#18 0.889 Downloading nvidia-cuda-nvrtc (86.0MiB)
+#18 0.889 Downloading nvidia-nvshmem-cu13 (57.6MiB)
+#18 0.894 Downloading nvidia-cusolver (191.6MiB)
+#18 0.894 Downloading nvidia-nvjitlink (38.9MiB)
+#18 0.894 Downloading nvidia-cudnn-cu13 (349.2MiB)
+#18 0.895 Downloading pymupdf (24.6MiB)
+#18 0.895 Downloading transformers (11.2MiB)
+#18 0.895 Downloading nvidia-cublas (403.5MiB)
+#18 0.896 Downloading scipy (33.6MiB)
+#18 0.896 Downloading babel (9.7MiB)
+#18 1.067 Downloading nvidia-cusparse (139.2MiB)
+#18 1.067 Downloading nvidia-nccl-cu13 (196.4MiB)
+#18 1.068 Downloading blis (10.8MiB)
+#18 1.068 Downloading nvidia-cufft (204.2MiB)
+#18 1.069 Downloading pyarrow (40.3MiB)
+#18 1.069 Downloading spacy (31.2MiB)
+#18 1.070 Downloading llvmlite (57.1MiB)
+#18 1.070 Downloading gradio (29.3MiB)
+#18 1.070 Downloading triton (188.6MiB)
+#18 1.071 Downloading torch (502.2MiB)
+#18 1.071 Downloading google-api-python-client (14.9MiB)
+#18 1518.8   × Failed to download `llvmlite==0.48.0`
+#18 1518.8   ├─▶ Failed to extract archive:
+#18 1518.8   │   llvmlite-0.48.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+#18 1518.8   ├─▶ I/O operation failed during extraction
+#18 1518.8   ╰─▶ Failed to download distribution due to network timeout. Try increasing
+#18 1518.8       UV_HTTP_TIMEOUT (current value: 30s).
+#18 1518.8   help: `llvmlite` (v0.48.0) was included because `dataforge[runner]`
+#18 1518.8         (v0.1.0) depends on `open-dataflow` (v1.0.10) which depends on
+#18 1518.8         `librosa` (v0.11.0) which depends on `numba` (v0.66.0) which depends
+#18 1518.8         on `llvmlite`
+#18 ERROR: process "/bin/sh -c uv sync --frozen --no-editable --extra web --extra runner" did not complete successfully: exit code: 1
+------
+ > [dataforge-runner runner 1/4] RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked     uv sync --frozen --no-editable --extra web --extra runner:
+1518.8   × Failed to download `llvmlite==0.48.0`
+1518.8   ├─▶ Failed to extract archive:
+1518.8   │   llvmlite-0.48.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+1518.8   ├─▶ I/O operation failed during extraction
+1518.8   ╰─▶ Failed to download distribution due to network timeout. Try increasing
+1518.8       UV_HTTP_TIMEOUT (current value: 30s).
+1518.8   help: `llvmlite` (v0.48.0) was included because `dataforge[runner]`
+1518.8         (v0.1.0) depends on `open-dataflow` (v1.0.10) which depends on
+1518.8         `librosa` (v0.11.0) which depends on `numba` (v0.66.0) which depends
+1518.8         on `llvmlite`
+------
+failed to solve: process "/bin/sh -c uv sync --frozen --no-editable --extra web --extra runner" did not complete successfully: exit code: 1
