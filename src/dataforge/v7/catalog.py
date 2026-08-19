@@ -21,6 +21,8 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "text-normalizer": "规范字符、标点与文本格式",
     "semantic-chunker": "按语义边界将文档切分为文本块",
     "source-chunk-builder": "生成可追溯的正式来源文本块",
+    "faq-table-row-builder": "将单机构 FAQ 表格逐行规范为来源切片",
+    "faq-record-mapper": "将规范 FAQ 行确定性映射为专用知识",
     "deduplicate": "移除重复的候选知识",
     "prompt-generator": "按受控提示生成结构化知识",
     "qa-generator": "从来源文本块生成问答知识",
@@ -67,7 +69,8 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "schema-validator": "结构校验器", "knowledge-diff": "知识差异计算器", "mineru-pipeline-gpu-adapter": "MinerU GPU 解析适配器",
     "kbc-cleaner-batch": "批量文本清洗器", "kbc-chunker-batch": "批量语义切片器", "prompted-refiner": "知识修订器",
     "multihop-qa": "多跳问答生成器", "pii-compliance": "敏感信息合规器", "kcenter-greedy": "代表样本选择器",
-    "reference-remover": "参考文献移除器",
+    "reference-remover": "参考文献移除器", "faq-table-row-builder": "FAQ 表格行构建器",
+    "faq-record-mapper": "FAQ 知识映射器",
 }
 
 
@@ -83,6 +86,7 @@ def _catalog_category(code: str, previous: str) -> tuple[str, str]:
 
 def _knowledge_types(source: str, target: str) -> list[str]:
     contract = f"{source}|{target}"
+    if "qa-agent-faq" in contract: return ["qa-agent-faq"]
     if "qa" in contract: return ["qa"]
     if any(value in contract for value in ("graph", "entity", "relation")): return ["graph"]
     return ["text", "qa", "graph"]
@@ -164,6 +168,8 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("text-normalizer", "Text Normalizer", "清洗", "document_ir", "document_ir", "text_normalizer", upstream=["TextNormalizationRefiner"]),
     _entry("semantic-chunker", "Semantic Chunker", "切片", "document_ir", "chunk_set", "semantic_chunker", upstream=["KBCChunkGenerator"]),
     _entry("source-chunk-builder", "Source Chunk Builder", "治理", "chunk_set", "source_chunk_set", "source_chunk_builder"),
+    _entry("faq-table-row-builder", "FAQ Table Row Builder", "清洗", "document_ir", "chunk_set", "faq_table_row_builder"),
+    _entry("faq-record-mapper", "FAQ Record Mapper", "知识生成", "source_chunk_set", "candidate:qa-agent-faq", "faq_record_mapper"),
     _entry("deduplicate", "Candidate Deduplicate", "清洗", "candidate:*", "candidate:*", "candidate_deduplicate", upstream=["MinHashDeduplicateFilter", "SemDeduplicateFilter"]),
     _entry("prompt-generator", "Prompt Generator", "知识生成", "source_chunk_set", "candidate:*", "prompt_generator", risk="advanced", upstream=["PromptedGenerator", "ChunkedPromptedGenerator"], uses_llm=True),
     _entry("qa-generator", "QA Generator", "知识生成", "source_chunk_set", "candidate:qa", "qa_generator", upstream=["Text2QAGenerator"], uses_llm=True),

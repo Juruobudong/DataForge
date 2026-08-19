@@ -17,7 +17,8 @@ const items = computed(() => developer.value ? [
   { label: '文档管理', caption: '文档库与原始资料', icon: '▣', to: '/business/documents' },
   { label: '处理任务', caption: '运行、日志与重试', icon: '⇄', to: '/business/jobs' },
   { label: '知识库', caption: '文 / 问 / 图', icon: '◆', to: '/business/knowledge' },
-  { label: '项目知识授权', caption: '机构与知识库授权', icon: '✓', to: '/business/authorization' },
+  { label: '项目发布', caption: 'Deployment 与知识授权', icon: '✓', to: '/business/authorization' },
+  { label: '知识库迁移', caption: '离线 Seed 与知识更新', icon: '⇲', to: '/business/migrations' },
 ])
 const current = computed(() => items.value.find(item => item.to === route.path)?.label || items.value[0].label)
 function switchTo(name) {

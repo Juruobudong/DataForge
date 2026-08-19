@@ -8,8 +8,8 @@ from typing import Any
 
 from sqlalchemy import select
 
-from .models import ManagedCollection, StorageContractRevision
-from .store import V7Store
+from .models import KnowledgeIndexProfileRevision, ManagedCollection, StorageContractRevision
+from .store import V7Store, new_id
 from .vector import ManagedCollectionIncompatible, V7Milvus
 
 
@@ -72,6 +72,31 @@ class ManagedCollectionProvisioner:
                 ManagedCollection.status.not_in(("deleting", "deleted")),
             ).order_by(ManagedCollection.collection_name)))
         return [self.reconcile_one(item_id) for item_id in ids]
+
+    def ensure_collection_for_profile(self, profile_revision_id: str) -> dict[str, Any]:
+        """Create or verify the locally owned Collection frozen by a Profile Revision."""
+        with self.store.sessions.begin() as session:
+            profile = session.get(KnowledgeIndexProfileRevision, profile_revision_id)
+            if not profile or profile.status != "published" or not profile.storage_contract_revision_id:
+                raise ValueError("Profile Revision 没有可供应的已发布 Storage Contract")
+            contract = session.get(StorageContractRevision, profile.storage_contract_revision_id)
+            if not contract or contract.status != "published":
+                raise ValueError("Storage Contract Revision 不存在或未发布")
+            item = session.scalar(select(ManagedCollection).where(
+                ManagedCollection.collection_name == profile.collection_name
+            ))
+            if item and (item.storage_contract_revision_id != contract.id or item.desired_spec_hash != contract.storage_spec_hash):
+                raise ManagedCollectionIncompatible("同名 Collection 的 Storage Contract 不兼容")
+            if not item:
+                item = ManagedCollection(id=new_id("mc"), storage_contract_revision_id=contract.id,
+                    collection_name=profile.collection_name, provisioning_token=new_id("provision"),
+                    desired_spec_hash=contract.storage_spec_hash, status="planned")
+                session.add(item); session.flush()
+            item_id = item.id
+        result = self.reconcile_one(item_id)
+        if result["status"] != "ready":
+            raise ManagedCollectionIncompatible(result.get("error") or "Collection 供应失败")
+        return result
 
     @staticmethod
     def _payload(item: ManagedCollection) -> dict[str, Any]:

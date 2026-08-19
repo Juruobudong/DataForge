@@ -36,6 +36,11 @@ class Settings:
     runner_timeout_seconds: float = 1860.0
     derived_runs_enabled: bool = False
     derived_run_commit_enabled: bool = False
+    instance_mode: str = "central"
+    instance_code: str = "central-default"
+    migration_signing_private_key: str | None = None
+    migration_trusted_public_keys: str | None = None
+    migration_signing_key_id: str = "central-default"
 
     @classmethod
     def load(
@@ -67,6 +72,11 @@ class Settings:
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
             derived_runs_enabled=os.getenv("DATAFORGE_DERIVED_RUNS_ENABLED", "0") == "1",
             derived_run_commit_enabled=os.getenv("DATAFORGE_DERIVED_RUN_COMMIT_ENABLED", "0") == "1",
+            instance_mode=os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower(),
+            instance_code=os.getenv("DATAFORGE_INSTANCE_CODE", "central-default").strip(),
+            migration_signing_private_key=_read_secret("DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY"),
+            migration_trusted_public_keys=_read_secret("DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS"),
+            migration_signing_key_id=os.getenv("DATAFORGE_MIGRATION_SIGNING_KEY_ID", "central-default").strip(),
         )
 
     @property
@@ -82,6 +92,11 @@ class Settings:
     def routing_dir(self) -> Path:
         configured = os.getenv("DATAFORGE_ROUTING_DIR")
         return Path(configured).resolve() if configured else self.state_dir / "routing"
+
+    @property
+    def migration_dir(self) -> Path:
+        configured = os.getenv("DATAFORGE_MIGRATION_DIR")
+        return Path(configured).resolve() if configured else self.state_dir / "migrations"
 
     @property
     def database_path(self) -> Path:
@@ -100,3 +115,4 @@ class Settings:
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.routing_dir.mkdir(parents=True, exist_ok=True)
+        self.migration_dir.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,7 @@ from .models import KnowledgeJob, Source, SourceVersion
 from .parser_runtime import content_list_pages, parse_with_mineru
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
+from .faq import FAQ_TYPE_CODE, normalize_faq_rows, parse_table_rows
 
 
 logger = logging.getLogger("dataforge.v7.runner")
@@ -504,10 +505,12 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
         else:
             text = _extract_text(source.original_filename, payload)
             profile = "native"
+        faq_table_rows = parse_table_rows(source.original_filename, payload) if suffix in {".csv", ".xlsx"} else []
         documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
                           "parser_adapter": select_parser_adapter(source.original_filename, profile),
                           "page_segments": page_segments, "_parser_artifacts": parser_artifacts,
+                          "_faq_table_rows": faq_table_rows,
                           "anchor": {"file": source.original_filename, "page": None, "section": None}})
     return documents
 
@@ -624,13 +627,16 @@ def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], co
         resolved = _resolve_type(config, raw.get("type"), relation=True)
         if resolved is None:
             # An empty relation_types schema is "unconstrained": keep the LLM's
-            # free-form relation type code instead of rejecting every relation.
+            # free-form source-language relation type instead of rejecting every relation.
             if config.relation_types and config.unknown_relation_policy == "reject":
                 continue
             code = str(raw.get("type") or "").strip() or "other"
-            label = code
+            label = str(raw.get("label") or code).strip()
         else:
-            code, label = resolved
+            code, schema_label = resolved
+            # The schema code remains the stable identity; the extracted label
+            # is the source-language relationship shown to business users.
+            label = str(raw.get("label") or schema_label).strip()
         relations.append({
             "source": source, "target": target, "type": code, "type_label": label,
             "description": str(raw.get("description") or "").strip(),
@@ -868,6 +874,54 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         # This is the formal provenance boundary.  Any further internal LLM
         # context-window splitting remains an execution artifact only.
         return [{**value, "source_chunk_id": hashlib.sha256(f"{value['source_version_id']}:{value['chunk_index']}".encode("utf-8")).hexdigest()} for value in values]
+    if ref == "faq-table-row-builder":
+        documents = [{**value, "table_rows": value.get("_faq_table_rows") or []} for value in values]
+        rows = normalize_faq_rows(documents)
+        document = documents[0]
+        return [{
+            "source_id": document["source_id"],
+            "source_version_id": document["source_version_id"],
+            "filename": document["filename"],
+            "content": row["full_text"],
+            "chunk_index": index,
+            "faq": {key: value for key, value in row.items() if key not in {"row_number", "sheet"}},
+            "anchor": {"file": document["filename"], "row": row["row_number"], "sheet": row["sheet"], "chunk_index": index},
+        } for index, row in enumerate(rows)]
+    if ref == "faq-record-mapper":
+        kind = str(params.get("knowledge_type") or "")
+        if kind != FAQ_TYPE_CODE:
+            raise ValueError("FAQ Record Mapper 只允许 qa-agent-faq")
+        contract = type_contracts.get(kind)
+        if not contract:
+            raise ValueError("qa-agent-faq 缺少已发布契约")
+        outcome = (generation if generation is not None else {}).setdefault(kind, {"successful": [], "failed": [], "targeted": []})
+        result: list[dict[str, Any]] = []
+        for chunk in values:
+            scope_key = (kind, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            if retry_scope is not None and scope_key not in retry_scope:
+                continue
+            outcome["targeted"].append(chunk)
+            try:
+                data = dict(chunk.get("faq") or {})
+                candidate = {
+                    "source_knowledge_id": f"faq:{data['aq_id']}",
+                    "canonical_content": data["full_text"],
+                    "data_json": data,
+                    "source_version_ids": [chunk["source_version_id"]],
+                    "source_chunk_id": chunk["source_chunk_id"],
+                    "source_anchor": f"{chunk['filename']}#row-{(chunk.get('anchor') or {}).get('row')}",
+                    "anchor_json": dict(chunk.get("anchor") or {}),
+                    "evidence_text": chunk["content"],
+                    "is_primary": True,
+                }
+                result.append(candidate); outcome["successful"].append(chunk)
+                if store and job_id:
+                    store.record_chunk_generation(job_id, kind, chunk, status="completed", candidate_count=1)
+            except Exception as exc:
+                outcome["failed"].append({**chunk, "error": str(exc)})
+                if store and job_id:
+                    store.record_chunk_generation(job_id, kind, chunk, status="failed", error=str(exc))
+        return result
     if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         kind = str(params.get("knowledge_type", ""))
         if ref == "qa-generator": kind = "qa"
@@ -1066,7 +1120,10 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
             if values:
                 values = [{**value, "_artifact_type": artifact_type} for value in values]
                 outputs[node_id] = values
-            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, values)
+            artifact_values = values
+            if ref == "document-parser":
+                artifact_values = [{key: value for key, value in item.items() if key not in {"_parser_artifacts", "_faq_table_rows"}} for item in values]
+            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values)
             if ref == "document-parser":
                 persisted_parser_keys.update(created_parser_keys)
                 outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]

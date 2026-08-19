@@ -4,8 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Iterable, Protocol
 
 from .store import V7Store
 
@@ -154,6 +158,12 @@ class V7Milvus:
         if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
             client.create_partition(collection_name=collection_name, partition_name=partition_name)
 
+    def partition_exists(self, collection_name: str, partition_name: str) -> bool:
+        self._assert_v7_partition(partition_name)
+        client = self.client()
+        return bool(client.has_collection(collection_name=collection_name) and
+                    client.has_partition(collection_name=collection_name, partition_name=partition_name))
+
     def upsert(self, collection_name: str, partition_name: str, rows: list[dict[str, Any]]) -> None:
         self._assert_v7_partition(partition_name)
         self.client().upsert(collection_name=collection_name, partition_name=partition_name, data=rows)
@@ -230,6 +240,167 @@ class V7Milvus:
             return
         expr = f'{field_name} in [{", ".join(json.dumps(item) for item in vector_ids)}]'
         self.client().delete(collection_name=collection_name, partition_name=partition_name, filter=expr)
+
+    def _primary_field(self, collection_name: str) -> str:
+        description = self.client().describe_collection(collection_name=collection_name)
+        for field in description.get("fields", []) if isinstance(description, dict) else []:
+            if field.get("is_primary") or field.get("primary"):
+                return str(field["name"])
+        return "id"
+
+    def iter_partition(self, collection_name: str, partition_name: str,
+                       batch_size: int = 1000) -> Iterable[list[dict[str, Any]]]:
+        self._assert_v7_partition(partition_name)
+        client = self.client()
+        if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
+            raise ValueError(f"Milvus Partition {partition_name} 不存在")
+        iterator_factory = getattr(client, "query_iterator", None)
+        if iterator_factory:
+            iterator = iterator_factory(collection_name=collection_name, partition_names=[partition_name],
+                                        filter="", output_fields=["*"], batch_size=batch_size)
+            try:
+                while True:
+                    rows = iterator.next()
+                    if not rows: break
+                    yield [dict(row) for row in rows]
+            finally:
+                close = getattr(iterator, "close", None)
+                if close: close()
+            return
+        offset = 0
+        while True:
+            rows = client.query(collection_name=collection_name, partition_names=[partition_name], filter="",
+                                output_fields=["*"], limit=batch_size, offset=offset)
+            if not rows: break
+            yield [dict(row) for row in rows]
+            if len(rows) < batch_size: break
+            offset += len(rows)
+
+    @staticmethod
+    def _row_digest(rows: Iterable[dict[str, Any]], primary_field: str) -> str:
+        digest = hashlib.sha256()
+        for row in sorted(rows, key=lambda item: str(item.get(primary_field, ""))):
+            digest.update(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                     default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value)).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _update_row_digest(digest, row: dict[str, Any]) -> None:
+        digest.update(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                 default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value)).encode("utf-8"))
+        digest.update(b"\n")
+
+    @contextmanager
+    def _sorted_partition_spool(self, collection_name: str, partition_name: str,
+                                primary_field: str, batch_size: int, parent: Path):
+        """Spill a Partition to disk and expose rows in stable primary-key order."""
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="dataforge-vector-sort-", dir=parent) as temporary:
+            connection = sqlite3.connect(str(Path(temporary) / "rows.sqlite3"))
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("CREATE TABLE rows (sort_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            count, json_fields = 0, set()
+            try:
+                for batch in self.iter_partition(collection_name, partition_name, batch_size):
+                    values = []
+                    for row in batch:
+                        sort_key = str(row.get(primary_field, ""))
+                        if not sort_key: raise ValueError(f"Partition row 缺少主键字段 {primary_field}")
+                        json_fields.update(key for key, value in row.items()
+                                           if key != "vector" and isinstance(value, (dict, list)))
+                        payload = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                             default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value))
+                        values.append((sort_key, payload)); count += 1
+                    try:
+                        connection.executemany("INSERT INTO rows(sort_key, payload) VALUES (?, ?)", values)
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError(f"Partition {partition_name} 存在重复主键") from exc
+                connection.commit()
+                yield connection, count, sorted(json_fields)
+            finally:
+                connection.close()
+
+    def export_partition(self, collection_name: str, partition_name: str,
+                         output_path: Path, batch_size: int = 1000) -> dict[str, Any]:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        primary_field = self._primary_field(collection_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        with self._sorted_partition_spool(collection_name, partition_name, primary_field,
+                                          batch_size, output_path.parent) as (spool, count, json_fields):
+            cursor = spool.execute("SELECT payload FROM rows ORDER BY sort_key")
+            writer = None
+            try:
+                while raw_rows := cursor.fetchmany(batch_size):
+                    rows = [json.loads(raw[0]) for raw in raw_rows]
+                    for row in rows: self._update_row_digest(digest, row)
+                    encoded = [{key: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                                if key in json_fields and value is not None else value
+                                for key, value in row.items()} for row in rows]
+                    table = pa.Table.from_pylist(encoded, schema=writer.schema if writer else None)
+                    if writer is None:
+                        metadata = dict(table.schema.metadata or {})
+                        metadata[b"dataforge_primary_field"] = primary_field.encode("utf-8")
+                        metadata[b"dataforge_json_fields"] = json.dumps(json_fields).encode("utf-8")
+                        table = table.replace_schema_metadata(metadata)
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
+                    writer.write_table(table)
+                if writer is None:
+                    empty = pa.table({primary_field: pa.array([], type=pa.string())})
+                    metadata = {b"dataforge_primary_field": primary_field.encode("utf-8"),
+                                b"dataforge_json_fields": b"[]"}
+                    writer = pq.ParquetWriter(output_path, empty.replace_schema_metadata(metadata).schema,
+                                              compression="zstd")
+            finally:
+                if writer is not None: writer.close()
+        return {"collection_name": collection_name, "partition_name": partition_name,
+                "count": count, "primary_field": primary_field, "digest": digest.hexdigest()}
+
+    def reset_partition(self, collection_name: str, partition_name: str) -> None:
+        self._assert_v7_partition(partition_name)
+        self.drop_partition(collection_name, partition_name)
+        self.ensure_partition(collection_name, partition_name)
+
+    def import_partition(self, collection_name: str, partition_name: str,
+                         input_path: Path, batch_size: int = 1000) -> dict[str, Any]:
+        import pyarrow.parquet as pq
+        parquet = pq.ParquetFile(input_path)
+        metadata = parquet.schema_arrow.metadata or {}
+        primary_field = metadata.get(b"dataforge_primary_field", b"id").decode("utf-8")
+        json_fields = set(json.loads(metadata.get(b"dataforge_json_fields", b"[]")))
+        count, digest = 0, hashlib.sha256()
+        for batch in parquet.iter_batches(batch_size=batch_size):
+            rows = batch.to_pylist()
+            decoded = [{key: json.loads(value) if key in json_fields and value is not None else value
+                        for key, value in row.items()} for row in rows]
+            if decoded: self.upsert(collection_name, partition_name, decoded)
+            for row in decoded: self._update_row_digest(digest, row)
+            count += len(decoded)
+        return {"count": count, "primary_field": primary_field,
+                "digest": digest.hexdigest()}
+
+    def count_partition(self, collection_name: str, partition_name: str) -> int:
+        return sum(len(batch) for batch in self.iter_partition(collection_name, partition_name))
+
+    def verify_partition(self, collection_name: str, partition_name: str,
+                         expected_count: int | None = None, expected_digest: str | None = None,
+                         primary_field: str | None = None) -> dict[str, Any]:
+        primary_field = primary_field or self._primary_field(collection_name)
+        digest = hashlib.sha256()
+        with self._sorted_partition_spool(collection_name, partition_name, primary_field, 1000,
+                                          Path(tempfile.gettempdir())) as (spool, count, _):
+            cursor = spool.execute("SELECT payload FROM rows ORDER BY sort_key")
+            while raw_rows := cursor.fetchmany(1000):
+                for raw in raw_rows: self._update_row_digest(digest, json.loads(raw[0]))
+        actual_digest = digest.hexdigest()
+        if expected_count is None and expected_digest is None:
+            return {"count": count, "digest": actual_digest, "primary_field": primary_field}
+        valid = count == expected_count and actual_digest == expected_digest
+        return {"valid": valid, "expected_count": expected_count, "target_count": count,
+                "expected_digest": expected_digest, "target_digest": actual_digest}
 
 
 def vector_id(profile_code: str, knowledge_library_id: str, source_knowledge_id: str) -> str:

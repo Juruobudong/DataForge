@@ -5,10 +5,11 @@ DataForge V7 从新上传的 PDF、CSV、Markdown、DOC、DOCX、TXT 生成稳�
 ## 数据边界
 
 - V7 使用名为 `dataforge` 的 MySQL 数据库和 MinIO bucket；部署目标必须是空库或已有 V7 schema。
-- 不迁移、不读取、不兼容旧数据、旧 MinIO 对象或旧 FAQ Collection；V7 只写自己的新 Source 对象键。
-- DataForge 只管理四个新 Collection：`dataforge_text_knowledge`、`dataforge_qa_question`、`dataforge_qa_full`、`dataforge_graph_knowledge`。Partition 是 V7 `knowledge_library_id`，不是 `org_code`。
+- 常规流程不迁移、不读取、不兼容旧数据或旧 MinIO 对象；唯一受控例外是用户显式执行 `scripts/migrate-qa-agent-faq-test.sh`，它只读 `.34/faq` 并将规范文件写为新的 V7 Source，绝不修改旧 Collection。
+- DataForge 管理内置与已发布扩展类型声明的受管 Collection；qa_agent FAQ 使用 `dataforge_qa_agent_faq`。所有知识库仍使用 `kl_<knowledge_library_id>` Partition，物理 Partition 不是 `org_code`。
 - `dataforge-migrate --upgrade-platform` 通过 Alembic 初始化空库或升级已有 V7 schema，并写入 V7 种子。
-- 不存在自动删除旧 MinIO、旧 Milvus Collection 或旧 FAQ Partition 的代码。
+- 不存在自动删除旧 MinIO、legacy/external Milvus Collection 或旧 FAQ Partition 的代码。
+- qa_agent FAQ 手工文件使用 `faq-{org_code}.csv|xlsx` 命名；机构由文件名补入知识数据，文件中的可选机构列必须与文件名一致。
 
 ## 运行架构
 

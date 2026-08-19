@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260815_graph_schema_snapshot"
+CURRENT_SCHEMA_REVISION = "20260817_qa_agent_route"
 
 
 def _config(database_url: str) -> Config:

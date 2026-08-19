@@ -11,10 +11,12 @@ from typing import Any
 from .graph_schema import GraphExtractionConfig, prompt_blocks
 
 _ENTITY_SYSTEM = (
-    "你是严谨的中文医学/业务知识实体抽取器。只返回符合要求的 JSON 对象，不要输出 Markdown 或解释。"
+    "你是严谨的医学/业务知识实体抽取器。实体名称、描述和别名必须使用当前来源分块的原文语言，"
+    "不得翻译；中文原文用中文，英文原文用英文。只返回符合要求的 JSON 对象，不要输出 Markdown 或解释。"
 )
 _RELATION_SYSTEM = (
-    "你是严谨的中文医学/业务知识关系抽取器。只返回符合要求的 JSON 对象，不要输出 Markdown 或解释。"
+    "你是严谨的医学/业务知识关系抽取器。关系 label、描述、关键词以及 source/target 必须使用当前来源分块的原文语言，"
+    "不得翻译；中文原文用中文，英文原文用英文。只返回符合要求的 JSON 对象，不要输出 Markdown 或解释。"
 )
 
 _ENTITY_JSON_SCHEMA = {
@@ -47,10 +49,11 @@ _RELATION_JSON_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["source", "type", "target"],
+                "required": ["source", "type", "label", "target"],
                 "properties": {
                     "source": {"type": "string"},
                     "type": {"type": "string"},
+                    "label": {"type": "string"},
                     "target": {"type": "string"},
                     "description": {"type": "string"},
                     "keywords": {"type": "array", "items": {"type": "string"}},
@@ -86,12 +89,13 @@ def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str) -> st
         type_note = f"{unknown_note}\n\n"
     else:
         # Empty schema means "unconstrained types": extract free-form entities
-        # with stable English codes instead of rejecting everything.
+        # in the source language instead of rejecting everything.
         type_block = ""
         type_note = (
             "未定义实体类型，请自由抽取当前分块中的全部实体。为每个实体给出："
-            "name（原文名称）、type（稳定的英文小写 code，如 disease、drug、symptom、department）、"
-            "description（简短中文描述）、aliases、confidence。\n\n"
+            "name（保留原文名称）、type（使用与原文相同语言的简洁、稳定类型名称，例如中文原文使用“疾病”“药物”，"
+            "英文原文使用 disease、drug）、description（使用原文语言的简短描述）、"
+            "aliases（仅保留原文出现或同语言的别名）、confidence。\n\n"
         )
     return (
         f"{type_block}"
@@ -99,6 +103,8 @@ def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str) -> st
         "可识别为字面值的内容（数字、范围、百分比、剂量、温度、时长、日期等）请在 object_kind 标记为 literal，"
         "不要当作实体输出。\n\n"
         f"{type_note}"
+        "除 Graph Schema 要求的 type 技术 code 外，所有实体文本字段必须保持当前来源分块的原文语言，不得翻译；"
+        "中文原文用中文，英文原文用英文。\n\n"
         "当前来源分块：\n"
         f"{source_chunk}\n\n"
         "返回 JSON 对象，其 entities 数组的每一项都符合以下 JSON Schema：\n"
@@ -123,15 +129,18 @@ def render_relation_prompt(config: GraphExtractionConfig, entities: list[str], s
         )
     else:
         # Empty schema means "unconstrained types": extract free-form relations
-        # with stable English codes instead of rejecting everything.
+        # in the source language instead of rejecting everything.
         type_block = (
             "未定义关系类型，请自由抽取已抽取实体之间的关系。"
-            "type 使用稳定的英文小写 code，并为每条关系给出简短中文 description。\n\n"
+            "type 和 label 使用与原文相同语言的简洁、稳定关系词，并为每条关系给出使用原文语言的简短 description。\n\n"
         )
     return (
         f"{type_block}"
         f"已抽取实体（只能从其中选择 source 与 target）：{entity_list}\n\n"
-        "source 与 target 必须是实体名称字符串，type 是关系类型的英文 code；"
+        "source 与 target 必须严格使用上方实体的原文名称。已定义 Graph Schema 时，type 使用 Schema 中的技术 code；"
+        "无论是否定义 Schema，label 都必须是原文语言的简洁关系词；未定义关系类型时，type 与 label 使用相同的原文关系词。"
+        "关系 description 和 keywords 同样保持原文语言，不得翻译；"
+        "中文原文用中文，英文原文用英文。"
         "禁止把数字、范围、剂量等字面值作为关系的 target。\n\n"
         "当前来源分块：\n"
         f"{source_chunk}\n\n"

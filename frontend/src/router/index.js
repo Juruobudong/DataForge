@@ -7,6 +7,7 @@ import JobListView from '../views/business/JobListView.vue'
 import KnowledgeBaseView from '../views/business/KnowledgeBaseView.vue'
 import KnowledgeLibraryDetailView from '../views/business/KnowledgeLibraryDetailView.vue'
 import ProjectAuthorizationView from '../views/business/ProjectAuthorizationView.vue'
+import KnowledgeMigrationView from '../views/business/KnowledgeMigrationView.vue'
 import KnowledgeTypesView from '../views/developer/KnowledgeTypesView.vue'
 import PipelineListView from '../views/developer/PipelineListView.vue'
 import TemplateListView from '../views/developer/TemplateListView.vue'
@@ -22,6 +23,7 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/business/knowledge', component: KnowledgeBaseView },
     { path: '/business/knowledge/:libraryId', component: KnowledgeLibraryDetailView, props: true },
     { path: '/business/authorization', component: ProjectAuthorizationView },
+    { path: '/business/migrations', component: KnowledgeMigrationView },
     { path: '/developer/knowledge-types', component: KnowledgeTypesView },
     { path: '/developer/standard-pipelines', component: PipelineListView },
     { path: '/developer/flow-templates', component: TemplateListView },

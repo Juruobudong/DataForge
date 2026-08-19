@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "alembic>=1.16,<2",
+  "cryptography>=45,<47",
   "minio>=7.2,<8",
   "httpx>=0.28,<1",
   "llama-index-embeddings-openai-like>=0.3,<0.4",
@@ -17,6 +18,7 @@ dependencies = [
   "openpyxl>=3.1,<4",
   "openai>=1.99,<2",
   "pypdf>=5.9,<7",
+  "pyarrow>=20,<22",
   "pymilvus>=2.5,<3",
   "PyMySQL>=1.1,<2",
   "python-docx>=1.2,<2",
@@ -41,11 +43,15 @@ dataforge-worker = "dataforge.v7.worker:main"
 dataforge-runner = "dataforge.v7.runner:main"
 dataforge-migrate = "dataforge.migration:main"
 dataforge-provision = "dataforge.v7.provisioning:main"
+dataforge-kg-legacy-import = "dataforge.v7.legacy_kg_import:main"
+dataforge-qa-faq-legacy-import = "dataforge.v7.legacy_qa_faq_import:main"
+dataforge-drop-stale-test-collections = "dataforge.v7.stale_collection_cleanup:main"
 
 [tool.setuptools]
 packages = [
   "dataforge",
   "dataforge.v7",
+  "dataforge.v7.migration",
 ]
 
 [tool.setuptools.package-dir]

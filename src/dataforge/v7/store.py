@@ -17,11 +17,12 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 
-from sqlalchemy import create_engine, delete, func, select, update
+from sqlalchemy import create_engine, delete, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .catalog import CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code, subflow_seeds
 from .flow import FlowCompiler, FlowValidationError
+from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
 from .graph_literal import detect_literal
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
 from .llm_serving import get_llm_serving_registry
@@ -73,10 +74,18 @@ from .models import (
     FlowRunEvent,
     FlowRunSinkPreview,
     Project,
+    DataForgeInstance,
+    Deployment,
+    DeploymentTarget,
+    MilvusTarget,
+    ProjectDeployment,
+    ProjectDeploymentTask,
     ProjectOrgRoute,
     ProjectOrgRouteLibrary,
     ProjectRouteVersion,
     ProjectTask,
+    KnowledgeMigrationJob,
+    KnowledgeMigrationItem,
     Source,
     SourceChunk,
     SourceVersion,
@@ -101,6 +110,35 @@ V7_TEMPLATE_SEEDS = (
 )
 LINEAR_TEMPLATE_STEPS = ("validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate")  # legacy API input only
 
+QA_AGENT_TEST_MILVUS_URL = os.environ.get("DATAFORGE_QA_AGENT_TEST_MILVUS_URL") or "http://milvus-central-test:19531"
+QA_AGENT_PRODUCTION_MILVUS_URL = os.environ.get("DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL") or "http://milvus-central-production:19531"
+CENTRAL_DEPLOYMENT_CODE = "dataforge-central"
+CENTRAL_DEPLOYMENT_ID = "deployment_dataforge_central"
+CENTRAL_STAGE_TARGETS = {
+    "test": ("milvus_dataforge_central_test", "DataForge 中心测试 Milvus", QA_AGENT_TEST_MILVUS_URL),
+    "production": ("milvus_dataforge_central_production", "DataForge 中心生产 Milvus", QA_AGENT_PRODUCTION_MILVUS_URL),
+}
+
+
+def is_qa_agent_project(project: Project | None) -> bool:
+    if not project:
+        return False
+    values = {
+        str(project.code or "").strip().lower().replace("_", "-").replace(" ", "-"),
+        str(project.name or "").strip().lower().replace("_", "-").replace(" ", "-"),
+    }
+    return any(value == "qa-agent" or value.startswith("qa-agent-") for value in values)
+
+
+def qa_agent_profile_contract(task: ProjectTask | None, profile: KnowledgeIndexProfile | None) -> bool:
+    if not task or not profile:
+        return False
+    expected = {
+        "knowledge_qa": ("qa-question", "dataforge_qa_question", "qa"),
+        "faq": (FAQ_PROFILE_CODE, FAQ_COLLECTION_NAME, FAQ_TYPE_CODE),
+    }.get(str(task.code or "").strip())
+    return bool(expected and (profile.code, profile.collection_name, profile.knowledge_type) == expected)
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(16)}"
@@ -119,6 +157,18 @@ DEFAULT_INDEX_FIELD_MAPPING = {
     "content": "content",
     "data": "data",
 }
+
+GRAPH_TRIPLE_INDEX_FIELD_MAPPING = {
+    **DEFAULT_INDEX_FIELD_MAPPING,
+    "subject": "subject",
+    "predicate": "predicate",
+    "object": "object",
+    "subject_type": "subject_type",
+    "object_type": "object_type",
+}
+
+KG_PROJECT_CODE = "kg-for-consultation"
+KG_DEPLOYMENT_CODE = CENTRAL_DEPLOYMENT_CODE
 
 
 def content_hash(content: str, data: dict[str, Any]) -> str:
@@ -207,6 +257,19 @@ def storage_spec_hash(schema: dict[str, Any], embedding: EmbeddingProfile, index
         "vector_type": "FLOAT_VECTOR", "index": index_spec or {"index_type": "AUTOINDEX"},
     }
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def builtin_provisioning_token(managed_collection_id: str, collection_name: str,
+                               spec_hash: str) -> str:
+    """Return a stable ownership token for an immutable built-in Contract.
+
+    Empty Compose rebuilds intentionally discard MySQL but retain the external
+    test Milvus.  Built-in IDs, names and spec hashes are deterministic, so the
+    marker token must be deterministic as well or every rebuild would reject
+    the Collection it created during the previous run.
+    """
+    material = f"dataforge-builtin:{managed_collection_id}:{collection_name}:{spec_hash}"
+    return hashlib.sha256(material.encode()).hexdigest()[:48]
 
 
 def normalise_relative_path(value: str) -> tuple[str, str]:
@@ -307,24 +370,46 @@ class V7Store:
                 ("graph-semantic", "graph", "dataforge_graph_semantic_knowledge"),
             )
             for code, kind, collection in index_seeds:
-                if not session.scalar(select(KnowledgeIndexProfile).where(KnowledgeIndexProfile.code == code)):
+                field_mapping = GRAPH_TRIPLE_INDEX_FIELD_MAPPING if code == "graph-triple" else DEFAULT_INDEX_FIELD_MAPPING
+                index_profile = session.scalar(select(KnowledgeIndexProfile).where(KnowledgeIndexProfile.code == code))
+                if not index_profile:
                     index_profile = KnowledgeIndexProfile(
                         id=f"index_{code}", code=code, knowledge_type=kind, collection_name=collection,
                         embedding_profile_id=profile_id,
-                        fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), origin="builtin", status="active",
+                        fields_json=dict(field_mapping), origin="builtin", status="active",
                     )
                     session.add(index_profile)
                     session.flush()
                     revision = KnowledgeIndexProfileRevision(
                         id=f"indexrev_{code}_1", knowledge_index_profile_id=index_profile.id, revision_no=1,
                         collection_name=collection, embedding_profile_id=profile_id,
-                        fields_json=dict(DEFAULT_INDEX_FIELD_MAPPING), status="published", published_at=utc_now(),
+                        fields_json=dict(field_mapping), status="published", published_at=utc_now(),
                     )
                     session.add(revision)
+                    index_profile.current_revision_id = revision.id
+                elif code == "graph-triple" and dict(index_profile.fields_json or {}) != field_mapping:
+                    current = session.get(KnowledgeIndexProfileRevision, index_profile.current_revision_id) \
+                        if index_profile.current_revision_id else None
+                    next_revision = int(session.scalar(select(func.max(KnowledgeIndexProfileRevision.revision_no)).where(
+                        KnowledgeIndexProfileRevision.knowledge_index_profile_id == index_profile.id,
+                    )) or 0) + 1
+                    revision = KnowledgeIndexProfileRevision(
+                        id=new_id("indexrev"), knowledge_index_profile_id=index_profile.id,
+                        revision_no=next_revision, collection_name=collection,
+                        embedding_profile_id=(current.embedding_profile_id if current else profile_id),
+                        fields_json=dict(field_mapping),
+                        storage_contract_revision_id=(current.storage_contract_revision_id if current else None),
+                        collection_policy=(current.collection_policy if current else "managed"),
+                        status="published", published_at=utc_now(),
+                    )
+                    session.add(revision); session.flush()
+                    index_profile.fields_json = dict(field_mapping)
                     index_profile.current_revision_id = revision.id
             session.flush()
             self._seed_storage_contracts(session, profile)
             self._seed_governance(session)
+            self._seed_qa_agent(session)
+            self._seed_kg_for_consultation(session)
             session.flush()
             for template in session.scalars(select(KnowledgeFlowTemplate)):
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
@@ -333,6 +418,127 @@ class V7Store:
                 ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
                 if revision and not revision.execution_snapshot_id:
                     self._create_execution_snapshot(session, revision, template.output_types)
+
+    def _ensure_central_deployment(self, session: Session) -> Deployment:
+        deployment = session.scalar(select(Deployment).where(Deployment.code == CENTRAL_DEPLOYMENT_CODE))
+        if not deployment:
+            deployment = Deployment(
+                id=CENTRAL_DEPLOYMENT_ID, code=CENTRAL_DEPLOYMENT_CODE,
+                name="DataForge 中心环境", scope="central", release_stage="test", status="active",
+            )
+            session.add(deployment); session.flush()
+        for stage, (target_id, target_name, target_url) in CENTRAL_STAGE_TARGETS.items():
+            target = session.get(MilvusTarget, target_id)
+            if not target:
+                target = MilvusTarget(id=target_id, name=target_name, milvus_url=target_url)
+                session.add(target); session.flush()
+            else:
+                target.name, target.milvus_url = target_name, target_url
+            link = session.scalar(select(DeploymentTarget).where(
+                DeploymentTarget.deployment_id == deployment.id,
+                DeploymentTarget.release_stage == stage,
+                DeploymentTarget.target_kind == "milvus",
+            ))
+            if not link:
+                session.add(DeploymentTarget(
+                    id=f"deployment_target_dataforge_central_{stage}",
+                    deployment_id=deployment.id, release_stage=stage,
+                    target_kind="milvus", milvus_target_id=target.id,
+                ))
+        session.flush()
+        return deployment
+
+    def _ensure_project_binding(self, session: Session, project: Project, deployment: Deployment) -> ProjectDeployment:
+        binding = session.scalar(select(ProjectDeployment).where(
+            ProjectDeployment.project_id == project.id,
+            ProjectDeployment.deployment_id == deployment.id,
+        ))
+        if not binding:
+            binding = ProjectDeployment(
+                id=new_id("pdeploy"), project_id=project.id, deployment_id=deployment.id, status="active",
+            )
+            session.add(binding); session.flush()
+        return binding
+
+    def _seed_qa_agent(self, session: Session) -> None:
+        """Install the qa-agent project and its central question-search task."""
+        deployment = self._ensure_central_deployment(session)
+
+        project = session.scalar(select(Project).where(Project.code == "qa-agent"))
+        if not project:
+            project = Project(
+                id="project_qa_agent", code="qa-agent", name="qa_agent", status="active",
+            )
+            session.add(project); session.flush()
+
+        task = session.scalar(select(ProjectTask).where(
+            ProjectTask.project_id == project.id,
+            ProjectTask.code == "knowledge_qa",
+        ))
+        if not task:
+            task = ProjectTask(
+                id="task_qa_agent_knowledge_qa", project_id=project.id,
+                code="knowledge_qa", name="知识问答", knowledge_type="qa",
+                description="qa-agent DataForge 知识问答任务", status="active",
+            )
+            session.add(task); session.flush()
+
+        project_deployment = self._ensure_project_binding(session, project, deployment)
+        existing = session.scalar(select(ProjectDeploymentTask).where(
+            ProjectDeploymentTask.project_deployment_id == project_deployment.id,
+            ProjectDeploymentTask.project_task_id == task.id,
+        ))
+        if not existing:
+            profile = session.scalar(select(KnowledgeIndexProfile).where(
+                KnowledgeIndexProfile.code == "qa-question",
+            ))
+            if not profile:
+                raise ValueError("qa-agent 种子要求 qa-question Index Profile")
+            session.add(ProjectDeploymentTask(
+                id="dtask_qa_agent_knowledge_qa",
+                project_deployment_id=project_deployment.id,
+                project_task_id=task.id, index_profile_id=profile.id,
+                qa_embedding_mode="question", top_k=10, enabled=True,
+            ))
+
+    def _seed_kg_for_consultation(self, session: Session) -> None:
+        """Install the test-only project binding on the shared central Deployment."""
+        deployment = self._ensure_central_deployment(session)
+
+        project = session.scalar(select(Project).where(Project.code == KG_PROJECT_CODE))
+        if not project:
+            project = Project(id="project_kg_for_consultation", code=KG_PROJECT_CODE,
+                              name="kg_for_consultation", status="active")
+            session.add(project); session.flush()
+
+        task_specs = (
+            ("task_kg_clinical_guideline_graph", "clinical_guideline_graph", "临床指南图谱检索", "graph", "index_graph-triple", 20),
+            ("task_kg_department_text_infectious", "department_text.infectious_disease", "传染科文本检索", "text", "index_text", 10),
+        )
+        tasks: list[tuple[ProjectTask, str, int]] = []
+        for task_id, code, name, knowledge_type, profile_id, top_k in task_specs:
+            task = session.scalar(select(ProjectTask).where(ProjectTask.project_id == project.id,
+                                                            ProjectTask.code == code))
+            if not task:
+                task = ProjectTask(id=task_id, project_id=project.id, code=code, name=name,
+                                   knowledge_type=knowledge_type,
+                                   description="kg_for_consultation 第一阶段测试任务", status="active")
+                session.add(task); session.flush()
+            tasks.append((task, profile_id, top_k))
+
+        project_deployment = self._ensure_project_binding(session, project, deployment)
+
+        for task, profile_id, top_k in tasks:
+            existing = session.scalar(select(ProjectDeploymentTask).where(
+                ProjectDeploymentTask.project_deployment_id == project_deployment.id,
+                ProjectDeploymentTask.project_task_id == task.id,
+            ))
+            if not existing:
+                session.add(ProjectDeploymentTask(
+                    id=f"dtask_{task.id.removeprefix('task_')}",
+                    project_deployment_id=project_deployment.id, project_task_id=task.id,
+                    index_profile_id=profile_id, top_k=top_k, enabled=True,
+                ))
 
     def _seed_governance(self, session: Session) -> None:
         """Seed published governance assets.  They are normal revisions, not constants."""
@@ -492,14 +698,21 @@ class V7Store:
                 session.add(revision); session.flush()
             contract.current_revision_id = revision.id
             collection_name = seed["collection"]
+            managed_id = f"collection_{code}"
+            stable_token = builtin_provisioning_token(managed_id, collection_name, spec_hash)
             managed = session.scalar(select(ManagedCollection).where(ManagedCollection.collection_name == collection_name))
             if not managed:
                 managed = ManagedCollection(
-                    id=f"collection_{code}", storage_contract_revision_id=revision.id,
-                    collection_name=collection_name, provisioning_token=secrets.token_hex(24),
+                    id=managed_id, storage_contract_revision_id=revision.id,
+                    collection_name=collection_name, provisioning_token=stable_token,
                     desired_spec_hash=spec_hash, status="planned",
                 )
                 session.add(managed)
+            elif managed.id == managed_id and managed.desired_spec_hash == spec_hash:
+                # Repair pre-deterministic empty-volume seeds in place.  The
+                # matching Milvus marker is reconciled separately and remains
+                # fail-closed until one explicit cleanup/re-provision cycle.
+                managed.provisioning_token = stable_token
             profile = session.scalar(select(KnowledgeIndexProfile).where(KnowledgeIndexProfile.code == code))
             if profile:
                 profile.origin = "builtin"
@@ -950,9 +1163,12 @@ class V7Store:
         collision = session.scalar(select(ManagedCollection).where(ManagedCollection.collection_name == resolved_name))
         if collision:
             raise ValueError("Collection 名已登记；如需复用请显式选择该受管 Collection")
+        stable_first_party = code == "qa-agent-faq-default" and resolved_name == "dataforge_qa_agent_faq"
+        managed_id = "collection_qa-agent-faq" if stable_first_party else new_id("collection")
+        token = builtin_provisioning_token(managed_id, resolved_name, spec_hash) if stable_first_party else secrets.token_hex(24)
         managed = ManagedCollection(
-            id=new_id("collection"), storage_contract_revision_id=revision.id,
-            collection_name=resolved_name, provisioning_token=secrets.token_hex(24),
+            id=managed_id, storage_contract_revision_id=revision.id,
+            collection_name=resolved_name, provisioning_token=token,
             desired_spec_hash=spec_hash, status="planned",
         )
         session.add(managed); session.flush()
@@ -1300,7 +1516,9 @@ class V7Store:
 
     @staticmethod
     def _library_payload(item: DocumentLibrary) -> dict[str, Any]:
-        return {"id": item.id, "code": item.code, "name": item.name, "description": item.description, "status": item.status, "updated_at": item.updated_at.isoformat()}
+        return {"id": item.id, "code": item.code, "name": item.name, "description": item.description,
+                "status": item.status, "origin_type": item.origin_type, "origin_state": item.origin_state,
+                "updated_at": item.updated_at.isoformat()}
 
     @staticmethod
     def _source_payload(source: Source, version: SourceVersion | None = None) -> dict[str, Any]:
@@ -1322,19 +1540,24 @@ class V7Store:
                 query = query.where(DocumentLibrary.status == status)
             return [self._library_payload(item) for item in session.scalars(query)]
 
-    def create_document_library(self, name: str, description: str = "") -> dict[str, Any]:
+    def create_document_library(self, name: str, description: str = "", *, code: str | None = None) -> dict[str, Any]:
         name = name.strip()
         if not name:
             raise ValueError("文档库名称不能为空")
         with self.sessions.begin() as session:
-            date_part = utc_now().strftime("%Y%m%d")
-            for _ in range(32):
-                code = f"DL-{date_part}-{secrets.token_hex(3).upper()}"
-                if not session.scalar(select(DocumentLibrary.id).where(DocumentLibrary.code == code)):
-                    break
+            resolved_code = str(code or "").strip()
+            if resolved_code:
+                if session.scalar(select(DocumentLibrary.id).where(DocumentLibrary.code == resolved_code)):
+                    raise ValueError("文档库编码已存在")
             else:
-                raise ValueError("文档库编码生成失败，请稍后重试")
-            item = DocumentLibrary(id=new_id("dl"), code=code, name=name, description=description.strip())
+                date_part = utc_now().strftime("%Y%m%d")
+                for _ in range(32):
+                    resolved_code = f"DL-{date_part}-{secrets.token_hex(3).upper()}"
+                    if not session.scalar(select(DocumentLibrary.id).where(DocumentLibrary.code == resolved_code)):
+                        break
+                else:
+                    raise ValueError("文档库编码生成失败，请稍后重试")
+            item = DocumentLibrary(id=new_id("dl"), code=resolved_code, name=name, description=description.strip())
             session.add(item); self.audit(session, "document_library.created", "document_library", item.id)
             session.flush()
             return self._library_payload(item)
@@ -1385,6 +1608,15 @@ class V7Store:
             version = SourceVersion(id=new_id("srcv"), source_id=source.id, version_no=version_no, object_key=object_key, sha256=sha256, size_bytes=size_bytes, mime_type=mime_type)
             source.current_version_id, source.original_filename, source.status = version.id, filename, "uploaded"
             session.add(version)
+            document_library = session.get(DocumentLibrary, source.document_library_id)
+            if document_library and document_library.origin_type == "central_import":
+                document_library.origin_state = "forked"
+            dependent_libraries = session.scalars(select(KnowledgeLibrary).join(
+                KnowledgeItem, KnowledgeItem.knowledge_library_id == KnowledgeLibrary.id
+            ).join(KnowledgeItemSource, KnowledgeItemSource.knowledge_item_id == KnowledgeItem.id).join(
+                SourceVersion, SourceVersion.id == KnowledgeItemSource.source_version_id
+            ).where(SourceVersion.source_id == source.id, KnowledgeLibrary.origin_type == "central_import")).all()
+            for library in dependent_libraries: library.origin_state = "forked"
             # The new source version is processed asynchronously.  Existing
             # formal evidence is retained until its result replaces it; this
             # prevents a brief no-knowledge window for multi-source graph data.
@@ -1947,7 +2179,9 @@ class V7Store:
                   "graph_mode": item.graph_mode, "display_type": ({"triple": "三元组图谱", "semantic": "语义图谱"}.get(item.graph_mode) if item.knowledge_type == "graph" else None),
                   "knowledge_type_revision_id": item.knowledge_type_revision_id, "description": item.description, "embedding_profile_id": item.embedding_profile_id, "index_profile_id": item.index_profile_id, "partition_name": item.partition_name, "status": item.status, "updated_at": item.updated_at.isoformat(),
                   "graph_schema_hash": getattr(item, "graph_schema_hash", None), "source_template_revision_id": getattr(item, "source_template_revision_id", None),
-                  "graph_schema_snapshot": getattr(item, "graph_schema_snapshot_json", None)}
+                  "graph_schema_snapshot": getattr(item, "graph_schema_snapshot_json", None),
+                  "origin_type": item.origin_type, "origin_state": item.origin_state,
+                  "migration_status": item.migration_status}
         if ready is not None:
             result["vector_ready"] = ready
         if knowledge_item_count is not None:
@@ -2090,6 +2324,15 @@ class V7Store:
                 raise ValueError("知识库不存在")
             return item
 
+    @staticmethod
+    def _active_jobs_for_library(session: Session, library_id: str) -> list[KnowledgeJob]:
+        jobs = session.scalars(select(KnowledgeJob).where(
+            KnowledgeJob.status.in_(("queued", "running")),
+        ).order_by(KnowledgeJob.created_at)).all()
+        return [job for job in jobs if library_id in set(
+            (job.sink_library_ids or job.output_library_ids or {}).values()
+        )]
+
     def knowledge_library_delete_check(self, library_id: str) -> dict[str, Any]:
         with self.sessions() as session:
             library = session.get(KnowledgeLibrary, library_id)
@@ -2097,7 +2340,8 @@ class V7Store:
                 raise ValueError("知识库不存在")
             rows = session.execute(
                 select(Project, ProjectTask, ProjectOrgRoute).join(ProjectTask, ProjectTask.project_id == Project.id)
-                .join(ProjectOrgRoute, ProjectOrgRoute.project_task_id == ProjectTask.id)
+                .join(ProjectDeploymentTask, ProjectDeploymentTask.project_task_id == ProjectTask.id)
+                .join(ProjectOrgRoute, ProjectOrgRoute.project_deployment_task_id == ProjectDeploymentTask.id)
                 .join(ProjectOrgRouteLibrary, ProjectOrgRouteLibrary.project_org_route_id == ProjectOrgRoute.id)
                 .where(ProjectOrgRouteLibrary.knowledge_library_id == library_id)
                 .order_by(Project.code, ProjectTask.code, ProjectOrgRoute.org_code)
@@ -2106,18 +2350,28 @@ class V7Store:
                            "task_code": task.code, "task_name": task.name, "org_code": route.org_code,
                            "route_status": route.status} for project, task, route in rows]
             binding_rows = session.execute(
-                select(DocumentLibrary, KnowledgeFlowTemplate, DocumentLibraryTemplateBinding)
+                select(DocumentLibrary, KnowledgeFlowTemplate, DocumentLibraryTemplateBinding,
+                       DocumentLibraryTemplateOutput)
                 .join(DocumentLibraryTemplateBinding, DocumentLibraryTemplateBinding.document_library_id == DocumentLibrary.id)
                 .join(DocumentLibraryTemplateOutput, DocumentLibraryTemplateOutput.document_library_template_binding_id == DocumentLibraryTemplateBinding.id)
                 .join(KnowledgeFlowTemplate, KnowledgeFlowTemplate.id == DocumentLibraryTemplateBinding.knowledge_flow_template_id)
                 .where(DocumentLibraryTemplateOutput.knowledge_library_id == library_id, DocumentLibraryTemplateBinding.status == "active")
             ).all()
             binding_references = [{"document_library_id": doc.id, "document_library_name": doc.name,
-                                   "template_id": template.id, "template_code": template.code,
-                                   "binding_id": binding.id} for doc, template, binding in binding_rows]
+                                    "template_id": template.id, "template_code": template.code,
+                                    "template_name": template.name, "binding_id": binding.id,
+                                    "output_key": output.output_key, "knowledge_type": output.knowledge_type,
+                                    "graph_mode": output.graph_mode}
+                                   for doc, template, binding, output in binding_rows]
+            active_jobs = self._active_jobs_for_library(session, library_id)
+            active_job_references = [{"job_id": job.id, "status": job.status,
+                                      "document_library_template_binding_id": job.document_library_template_binding_id,
+                                      "created_at": job.created_at.isoformat()}
+                                     for job in active_jobs]
             return {"knowledge_library_id": library.id, "status": library.status,
-                    "deletable": library.status == "active" and not references and not binding_references,
-                    "references": references, "template_binding_references": binding_references}
+                    "deletable": library.status == "active" and not references and not active_job_references,
+                    "references": references, "active_job_references": active_job_references,
+                    "template_binding_references": binding_references}
 
     def request_knowledge_library_deletion(self, library_id: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -2127,11 +2381,11 @@ class V7Store:
             references = session.scalar(select(func.count()).select_from(ProjectOrgRouteLibrary).where(
                 ProjectOrgRouteLibrary.knowledge_library_id == library_id,
             )) or 0
-            binding_references = session.scalar(select(func.count()).select_from(DocumentLibraryTemplateOutput)
-                .join(DocumentLibraryTemplateBinding, DocumentLibraryTemplateBinding.id == DocumentLibraryTemplateOutput.document_library_template_binding_id)
-                .where(DocumentLibraryTemplateOutput.knowledge_library_id == library_id, DocumentLibraryTemplateBinding.status == "active")) or 0
-            if references or binding_references:
-                raise ValueError("知识库仍被路由或文档库模板绑定引用，不能删除")
+            active_jobs = self._active_jobs_for_library(session, library_id)
+            if references:
+                raise ValueError("知识库仍被项目路由引用，不能删除")
+            if active_jobs:
+                raise ValueError("知识库仍有排队或运行中的处理任务，不能删除")
             if library.status == "deleted":
                 raise ValueError("知识库已经删除")
             queued = session.scalar(select(KnowledgeLibraryDeletionJob).where(
@@ -2140,9 +2394,23 @@ class V7Store:
             ).order_by(KnowledgeLibraryDeletionJob.created_at.desc()))
             if queued:
                 return {"id": queued.id, "knowledge_library_id": library.id, "status": queued.status, "idempotent": True}
+            bindings = session.scalars(select(DocumentLibraryTemplateBinding).join(
+                DocumentLibraryTemplateOutput,
+                DocumentLibraryTemplateOutput.document_library_template_binding_id == DocumentLibraryTemplateBinding.id,
+            ).where(
+                DocumentLibraryTemplateOutput.knowledge_library_id == library_id,
+                DocumentLibraryTemplateBinding.status == "active",
+            ).with_for_update()).all()
+            for binding in bindings:
+                # Keep the output association for audit/recreation, but force
+                # the next explicit processing request to rebuild all current
+                # source versions for this template revision.
+                binding.last_successful_revision_id = None
             library.status = "deleting"
             job = KnowledgeLibraryDeletionJob(id=new_id("kldel"), knowledge_library_id=library.id)
-            session.add(job); self.audit(session, "knowledge_library.deletion_queued", "knowledge_library", library.id, {"job_id": job.id})
+            session.add(job); self.audit(session, "knowledge_library.deletion_queued", "knowledge_library", library.id, {
+                "job_id": job.id, "retained_template_binding_ids": [binding.id for binding in bindings],
+            })
             return {"id": job.id, "knowledge_library_id": library.id, "status": job.status}
 
     def list_library_deletion_jobs(self, library_id: str) -> list[dict[str, Any]]:
@@ -2419,10 +2687,16 @@ class V7Store:
             source_versions = session.scalars(select(SourceVersion).where(SourceVersion.id.in_(source_version_ids), SourceVersion.status == "active")).all()
             if len(source_versions) != len(set(source_version_ids)):
                 raise ValueError("来源版本不存在或不是当前有效版本")
+            locked_libraries = {library.id: library for library in session.scalars(
+                select(KnowledgeLibrary).where(
+                    KnowledgeLibrary.id.in_(sorted(set(normalized_outputs.values()))),
+                ).order_by(KnowledgeLibrary.id).with_for_update()
+            ).all()}
             for output_type, library_id in normalized_outputs.items():
                 knowledge_type, graph_mode = output_contract(output_type)
-                library = session.get(KnowledgeLibrary, library_id)
-                if not library or library.status != "active" or library.knowledge_type != knowledge_type or graph_mode and library.graph_mode != graph_mode:
+                library = locked_libraries.get(library_id)
+                if (not library or library.status != "active" or library.knowledge_type != knowledge_type
+                        or (graph_mode and library.graph_mode != graph_mode)):
                     raise ValueError(f"{output_type} 必须显式绑定同类型的有效知识库")
             snapshot = session.get(FlowExecutionSnapshot, revision.execution_snapshot_id) if revision.execution_snapshot_id else None
             if not snapshot:
@@ -3373,6 +3647,8 @@ class V7Store:
             library = session.get(KnowledgeLibrary, library_id) if library_id else None
             if not library or library.knowledge_type != knowledge_type or graph_mode and library.graph_mode != graph_mode:
                 raise ValueError("任务没有为该产出绑定有效知识库")
+            if library.origin_type == "central_import":
+                library.origin_state = "forked"
             revision = session.get(KnowledgeTypeRevision, library.knowledge_type_revision_id) if library.knowledge_type_revision_id else None
             if not revision or revision.status != "published":
                 raise ValueError("目标知识库没有已发布知识类型契约")
@@ -4030,7 +4306,7 @@ class V7Store:
                                    "knowledge_library_id": output.knowledge_library_id}
                                   for output, binding in template_rows],
             "template_binding_count": len(template_rows),
-            "routes": [{"route_id": route.id, "project_task_id": route.project_task_id,
+            "routes": [{"route_id": route.id, "project_deployment_task_id": route.project_deployment_task_id,
                         "org_code": route.org_code, "knowledge_library_id": link.knowledge_library_id}
                        for link, route in route_rows],
             "route_count": len(route_rows),
@@ -4187,8 +4463,6 @@ class V7Store:
             return {"id": profile.id, "status": profile.status}
 
     def create_project(self, name: str, legacy_name: str | None = None) -> dict[str, Any]:
-        # The optional form avoids breaking old private callers; public API uses
-        # one argument and always gets a generated code.
         code, name = (name, legacy_name) if legacy_name is not None else (generated_business_code("PRJ"), name)
         if not str(name or "").strip():
             raise ValueError("项目名称不能为空")
@@ -4196,142 +4470,883 @@ class V7Store:
             if session.scalar(select(Project).where(Project.code == code)):
                 raise ValueError("项目编码已存在")
             project = Project(id=new_id("project"), code=code.strip(), name=name.strip())
-            session.add(project); self.audit(session, "project.created", "project", project.id)
+            session.add(project); session.flush()
+            self._ensure_project_binding(session, project, self._ensure_central_deployment(session))
+            self.audit(session, "project.created", "project", project.id)
             return {"id": project.id, "code": project.code, "name": project.name, "status": project.status}
 
-    def create_project_task(self, project_id: str, code: str, name: str) -> dict[str, Any]:
+    def create_project_task(self, project_id: str, code: str, name: str,
+                            knowledge_type: str | None = None, description: str = "") -> dict[str, Any]:
         with self.sessions.begin() as session:
             if not session.get(Project, project_id):
                 raise ValueError("项目不存在")
-            task = ProjectTask(id=new_id("task"), project_id=project_id, code=code.strip(), name=name.strip())
+            if knowledge_type and not session.scalar(select(KnowledgeType).where(
+                    KnowledgeType.code == knowledge_type, KnowledgeType.status == "active")):
+                raise ValueError("Knowledge Type 不存在或未启用")
+            task = ProjectTask(id=new_id("task"), project_id=project_id, code=code.strip(), name=name.strip(),
+                               knowledge_type=knowledge_type, description=description.strip())
             session.add(task); self.audit(session, "project_task.created", "project_task", task.id)
-            return {"id": task.id, "project_id": task.project_id, "code": task.code, "name": task.name, "status": task.status}
+            return self._task_payload(task)
 
-    def list_projects(self) -> list[dict[str, Any]]:
+    @staticmethod
+    def _task_payload(task: ProjectTask) -> dict[str, Any]:
+        return {"id": task.id, "project_id": task.project_id, "code": task.code, "name": task.name,
+                "knowledge_type": task.knowledge_type, "description": task.description, "status": task.status}
+
+    @staticmethod
+    def _target_payload(target: MilvusTarget) -> dict[str, Any]:
+        return {"id": target.id, "name": target.name, "milvus_url": target.milvus_url,
+                "created_at": target.created_at.isoformat(), "updated_at": target.updated_at.isoformat()}
+
+    @staticmethod
+    def _shared_deployment_payload(deployment: Deployment, targets: dict[str, MilvusTarget] | None = None) -> dict[str, Any]:
+        result = {
+            "id": deployment.id, "code": deployment.code, "name": deployment.name,
+            "scope": deployment.scope, "institution_name": deployment.institution_name,
+            "institution_code": deployment.institution_code,
+            "release_stage": deployment.release_stage, "status": deployment.status,
+            "created_at": deployment.created_at.isoformat(), "updated_at": deployment.updated_at.isoformat(),
+        }
+        result["stage_targets"] = {
+            stage: V7Store._target_payload(target) for stage, target in sorted((targets or {}).items())
+        }
+        current = (targets or {}).get(deployment.release_stage)
+        if current:
+            result["milvus_target_id"] = current.id
+            result["milvus_target"] = V7Store._target_payload(current)
+        return result
+
+    @staticmethod
+    def _deployment_payload(binding: ProjectDeployment, deployment: Deployment,
+                            targets: dict[str, MilvusTarget] | None = None) -> dict[str, Any]:
+        shared = V7Store._shared_deployment_payload(deployment, targets)
+        return {
+            **shared,
+            "id": binding.id,
+            "project_deployment_id": binding.id,
+            "project_id": binding.project_id,
+            "deployment_id": deployment.id,
+            "binding_status": binding.status,
+            "deployment": shared,
+        }
+
+    @staticmethod
+    def _deployment_targets(session: Session, deployment_id: str) -> dict[str, MilvusTarget]:
+        rows = session.execute(select(DeploymentTarget, MilvusTarget).join(
+            MilvusTarget, MilvusTarget.id == DeploymentTarget.milvus_target_id,
+        ).where(
+            DeploymentTarget.deployment_id == deployment_id,
+            DeploymentTarget.target_kind == "milvus",
+        )).all()
+        return {link.release_stage: target for link, target in rows}
+
+    def list_milvus_targets(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
+            return [self._target_payload(item) for item in session.scalars(select(MilvusTarget).order_by(MilvusTarget.name))]
+
+    def create_milvus_target(self, name: str, milvus_url: str) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("Milvus Target 名称不能为空")
+        with self.sessions.begin() as session:
+            value = MilvusTarget(id=new_id("mt"), name=name.strip(), milvus_url=milvus_url.strip())
+            session.add(value); self.audit(session, "milvus_target.created", "milvus_target", value.id)
+            session.flush(); return self._target_payload(value)
+
+    def patch_milvus_target(self, target_id: str, *, name: str | None = None,
+                            milvus_url: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            value = session.get(MilvusTarget, target_id)
+            if not value:
+                raise ValueError("Milvus Target 不存在")
+            if name is not None:
+                if not name.strip(): raise ValueError("Milvus Target 名称不能为空")
+                value.name = name.strip()
+            if milvus_url is not None: value.milvus_url = milvus_url.strip()
+            session.flush(); return self._target_payload(value)
+
+    def list_deployments(self, project_id: str, *, allowed_deployment_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(ProjectDeployment, Deployment).join(
+                Deployment, Deployment.id == ProjectDeployment.deployment_id,
+            ).where(ProjectDeployment.project_id == project_id).order_by(Deployment.created_at)
+            if allowed_deployment_id:
+                query = query.where(ProjectDeployment.deployment_id == allowed_deployment_id)
+            return [self._deployment_payload(binding, deployment, self._deployment_targets(session, deployment.id))
+                    for binding, deployment in session.execute(query)]
+
+    def list_shared_deployments(self, *, allowed_deployment_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(Deployment).order_by(Deployment.created_at)
+            if allowed_deployment_id:
+                query = query.where(Deployment.id == allowed_deployment_id)
+            return [self._shared_deployment_payload(item, self._deployment_targets(session, item.id))
+                    for item in session.scalars(query)]
+
+    @staticmethod
+    def _stage_target(session: Session, deployment_id: str, release_stage: str) -> MilvusTarget:
+        if release_stage not in {"test", "production"}:
+            raise ValueError("release_stage 只允许 test 或 production")
+        target = session.scalar(select(MilvusTarget).join(
+            DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
+        ).where(
+            DeploymentTarget.deployment_id == deployment_id,
+            DeploymentTarget.release_stage == release_stage,
+            DeploymentTarget.target_kind == "milvus",
+        ))
+        if not target:
+            raise ValueError(f"Deployment 尚未配置 {release_stage} Milvus Target")
+        return target
+
+    @staticmethod
+    def _put_stage_target(session: Session, deployment: Deployment, release_stage: str,
+                          milvus_url: str, *, name: str | None = None) -> MilvusTarget:
+        if release_stage not in {"test", "production"}:
+            raise ValueError("release_stage 只允许 test 或 production")
+        normalized_uri = str(milvus_url or "").strip()
+        if not normalized_uri:
+            raise ValueError("Milvus Target URI 不能为空")
+        link = session.scalar(select(DeploymentTarget).where(
+            DeploymentTarget.deployment_id == deployment.id,
+            DeploymentTarget.release_stage == release_stage,
+            DeploymentTarget.target_kind == "milvus",
+        ))
+        target = session.get(MilvusTarget, link.milvus_target_id) if link else None
+        if not target:
+            target = MilvusTarget(
+                id=new_id("mt"), name=(name or f"{deployment.name} · {release_stage} Milvus").strip(),
+                milvus_url=normalized_uri,
+            )
+            session.add(target); session.flush()
+        else:
+            target.name = (name or target.name).strip()
+            target.milvus_url = normalized_uri
+        if not link:
+            session.add(DeploymentTarget(
+                id=new_id("dtarget"), deployment_id=deployment.id, release_stage=release_stage,
+                target_kind="milvus", milvus_target_id=target.id,
+            ))
+        session.flush()
+        return target
+
+    def create_shared_deployment(self, code: str, name: str, *, scope: str = "institution",
+                                 institution_name: str | None = None,
+                                 institution_code: str | None = None,
+                                 test_milvus_uri: str = QA_AGENT_TEST_MILVUS_URL) -> dict[str, Any]:
+        normalized_code = str(code or "").strip()
+        normalized_name = str(name or "").strip()
+        normalized_institution = str(institution_name or "").strip() or None
+        normalized_institution_code = str(institution_code or "").strip() or None
+        if not normalized_code or not normalized_name:
+            raise ValueError("Deployment 编码和名称不能为空")
+        if scope not in {"central", "institution"}:
+            raise ValueError("Deployment scope 只允许 central 或 institution")
+        if scope == "institution" and (not normalized_institution or not normalized_institution_code):
+            raise ValueError("医院 Deployment 必须填写医院机构名称和机构代码")
+        with self.sessions.begin() as session:
+            if session.scalar(select(Deployment).where(Deployment.code == normalized_code)):
+                raise ValueError("Deployment 编码已存在")
+            if normalized_institution_code and session.scalar(select(Deployment).where(
+                    Deployment.institution_code == normalized_institution_code)):
+                raise ValueError("该医院机构代码已有 Deployment")
+            deployment = Deployment(
+                id=new_id("deployment"), code=normalized_code, name=normalized_name, scope=scope,
+                institution_name=normalized_institution, institution_code=normalized_institution_code,
+                release_stage="test", status="active",
+            )
+            session.add(deployment); session.flush()
+            self._put_stage_target(session, deployment, "test", test_milvus_uri)
+            if normalized_code == CENTRAL_DEPLOYMENT_CODE:
+                self._put_stage_target(session, deployment, "production", QA_AGENT_PRODUCTION_MILVUS_URL)
+            self.audit(session, "deployment.created", "deployment", deployment.id)
+            session.flush()
+            return self._shared_deployment_payload(deployment, self._deployment_targets(session, deployment.id))
+
+    def put_deployment_target(self, deployment_id: str, release_stage: str, milvus_uri: str, *,
+                              confirm_production: bool = False,
+                              expected_target_uri: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, deployment_id)
+            if not deployment:
+                raise ValueError("Deployment 不存在")
+            normalized_uri = str(milvus_uri or "").strip()
+            if release_stage == "production" and (
+                    confirm_production is not True or expected_target_uri != normalized_uri):
+                raise ValueError("配置生产 Target 必须确认完整的医院生产 URI")
+            target = self._put_stage_target(session, deployment, release_stage, normalized_uri)
+            self.audit(session, "deployment.target_updated", "deployment", deployment.id,
+                       {"release_stage": release_stage, "milvus_url": normalized_uri})
+            return {"deployment_id": deployment.id, "release_stage": release_stage,
+                    "target_kind": "milvus", "milvus_target": self._target_payload(target)}
+
+    def bind_project_deployment(self, deployment_id: str, project_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            deployment, project = session.get(Deployment, deployment_id), session.get(Project, project_id)
+            if not deployment or not project:
+                raise ValueError("Deployment 或 Project 不存在")
+            if session.scalar(select(ProjectDeployment).where(
+                    ProjectDeployment.project_id == project_id,
+                    ProjectDeployment.deployment_id == deployment_id)):
+                raise ValueError("Project 已绑定该 Deployment")
+            binding = ProjectDeployment(
+                id=new_id("pdeploy"), project_id=project.id, deployment_id=deployment.id, status="active",
+            )
+            session.add(binding); session.flush()
+            self.audit(session, "project_deployment.created", "project_deployment", binding.id)
+            return self._deployment_payload(binding, deployment, self._deployment_targets(session, deployment.id))
+
+    def list_deployment_projects(self, deployment_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            if not session.get(Deployment, deployment_id):
+                raise ValueError("Deployment 不存在")
+            rows = session.execute(select(ProjectDeployment, Project).join(
+                Project, Project.id == ProjectDeployment.project_id,
+            ).where(ProjectDeployment.deployment_id == deployment_id).order_by(Project.name)).all()
+            return [{"project_deployment_id": binding.id, "deployment_id": deployment_id,
+                     "status": binding.status, "project": {
+                         "id": project.id, "code": project.code, "name": project.name,
+                     }} for binding, project in rows]
+
+    def create_deployment(self, project_id: str, code: str, name: str, deployment_type: str,
+                          milvus_target_id: str, *, institution_name: str | None = None,
+                          institution_code: str | None = None,
+                          release_stage: str = "test") -> dict[str, Any]:
+        if release_stage != "test":
+            raise ValueError("新 Deployment 必须先以 test 阶段创建，再由管理员手工切换生产")
+        test_uri = QA_AGENT_TEST_MILVUS_URL
+        with self.sessions() as session:
+            requested_target = session.get(MilvusTarget, milvus_target_id) if milvus_target_id else None
+            if requested_target and requested_target.milvus_url:
+                test_uri = requested_target.milvus_url
+        shared = self.create_shared_deployment(
+            code, name, scope="institution" if institution_code or institution_name else "central",
+            institution_name=institution_name, institution_code=institution_code,
+            test_milvus_uri=test_uri,
+        )
+        return self.bind_project_deployment(shared["id"], project_id)
+
+    def patch_deployment(self, deployment_id: str, **changes: Any) -> dict[str, Any]:
+        with self.sessions() as session:
+            binding = session.get(ProjectDeployment, deployment_id)
+            if not binding:
+                raise ValueError("ProjectDeployment 不存在")
+            shared_id = binding.deployment_id
+        self.patch_shared_deployment(shared_id, **changes)
+        with self.sessions() as session:
+            binding = session.get(ProjectDeployment, deployment_id)
+            deployment = session.get(Deployment, shared_id)
+            return self._deployment_payload(binding, deployment, self._deployment_targets(session, shared_id))
+
+    def patch_shared_deployment(self, deployment_id: str, **changes: Any) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            value = session.get(Deployment, deployment_id)
+            if not value:
+                raise ValueError("Deployment 不存在")
+            if "name" in changes and changes["name"] is not None:
+                normalized_name = str(changes["name"]).strip()
+                if not normalized_name:
+                    raise ValueError("Deployment 名称不能为空")
+                value.name = normalized_name
+            if "institution_name" in changes and changes["institution_name"] is not None:
+                normalized = str(changes["institution_name"]).strip()
+                if value.scope == "institution" and not normalized:
+                    raise ValueError("医院机构名称不能为空")
+                value.institution_name = normalized or None
+            if "institution_code" in changes and changes["institution_code"] is not None:
+                normalized_code = str(changes["institution_code"]).strip()
+                if value.scope == "institution" and not normalized_code:
+                    raise ValueError("医院机构代码不能为空")
+                duplicate = session.scalar(select(Deployment).where(
+                    Deployment.institution_code == normalized_code,
+                    Deployment.id != value.id,
+                )) if normalized_code else None
+                if duplicate:
+                    raise ValueError("该医院机构代码已有 Deployment")
+                value.institution_code = normalized_code or None
+            if "status" in changes and changes["status"] is not None:
+                if changes["status"] not in {"active", "disabled"}:
+                    raise ValueError("Deployment 状态无效")
+                value.status = changes["status"]
+            requested_stage = changes.get("release_stage")
+            if requested_stage is not None and requested_stage != value.release_stage:
+                target = self._stage_target(session, value.id, requested_stage)
+                if requested_stage == "production" and (
+                        changes.get("confirm_production") is not True
+                        or changes.get("expected_target_uri") != target.milvus_url):
+                    raise ValueError("切换生产必须确认当前医院配置的完整生产 URI")
+                value.release_stage = requested_stage
+                self.audit(session, "deployment.release_stage_changed", "deployment", value.id,
+                           {"release_stage": requested_stage, "milvus_url": target.milvus_url,
+                            "institution_name": value.institution_name,
+                            "institution_code": value.institution_code})
+            if value.scope == "institution" and (not value.institution_name or not value.institution_code):
+                raise ValueError("医院 Deployment 必须填写医院机构名称和机构代码")
+            session.flush()
+            return self._shared_deployment_payload(value, self._deployment_targets(session, value.id))
+
+    def create_deployment_task(self, deployment_id: str, project_task_id: str, index_profile_id: str,
+                               *, qa_embedding_mode: str | None = None, top_k: int = 10,
+                               enabled: bool = True) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            deployment = session.get(ProjectDeployment, deployment_id)
+            task = session.get(ProjectTask, project_task_id)
+            profile = session.get(KnowledgeIndexProfile, index_profile_id)
+            if not deployment or not task or task.project_id != deployment.project_id:
+                raise ValueError("Deployment 或 ProjectTask 不存在")
+            if not profile or profile.status != "active": raise ValueError("Index Profile 不存在或未发布")
+            if task.knowledge_type and profile.knowledge_type != task.knowledge_type:
+                raise ValueError("ProjectTask 与 Index Profile 的 Knowledge Type 不匹配")
+            if profile.knowledge_type == "qa":
+                expected = {"qa-question": "question", "qa-full": "full"}.get(profile.code)
+                if expected and qa_embedding_mode not in {None, expected}:
+                    raise ValueError("qa_embedding_mode 与 QA Index Profile 不匹配")
+                qa_embedding_mode = qa_embedding_mode or expected
+            elif qa_embedding_mode is not None:
+                raise ValueError("非 QA 任务不能配置 qa_embedding_mode")
+            if top_k <= 0: raise ValueError("top_k 必须大于 0")
+            existing = session.scalar(select(ProjectDeploymentTask).where(
+                ProjectDeploymentTask.project_deployment_id == deployment_id,
+                ProjectDeploymentTask.project_task_id == project_task_id,
+            ))
+            if existing: raise ValueError("DeploymentTask 已存在")
+            value = ProjectDeploymentTask(id=new_id("dtask"), project_deployment_id=deployment_id,
+                                          project_task_id=project_task_id, index_profile_id=index_profile_id,
+                                          qa_embedding_mode=qa_embedding_mode, top_k=top_k, enabled=enabled)
+            session.add(value); session.flush(); return self._deployment_task_payload(session, value)
+
+    def _deployment_task_payload(self, session: Session, value: ProjectDeploymentTask) -> dict[str, Any]:
+        task = session.get(ProjectTask, value.project_task_id)
+        profile = session.get(KnowledgeIndexProfile, value.index_profile_id) if value.index_profile_id else None
+        return {"id": value.id, "project_deployment_id": value.project_deployment_id,
+                "project_task_id": value.project_task_id, "task": self._task_payload(task) if task else None,
+                "index_profile_id": value.index_profile_id,
+                "index_profile": {"id": profile.id, "code": profile.code, "knowledge_type": profile.knowledge_type} if profile else None,
+                "qa_embedding_mode": value.qa_embedding_mode, "top_k": value.top_k, "enabled": value.enabled}
+
+    def list_deployment_tasks(self, deployment_id: str) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            if not session.get(ProjectDeployment, deployment_id): raise ValueError("Deployment 不存在")
+            return [self._deployment_task_payload(session, value) for value in session.scalars(select(ProjectDeploymentTask).where(
+                ProjectDeploymentTask.project_deployment_id == deployment_id).order_by(ProjectDeploymentTask.created_at))]
+
+    def list_projects(self, *, allowed_deployment_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(Project).order_by(Project.created_at.desc())
+            if allowed_deployment_id:
+                project_ids = select(ProjectDeployment.project_id).where(
+                    ProjectDeployment.deployment_id == allowed_deployment_id,
+                    ProjectDeployment.status == "active",
+                )
+                query = query.where(Project.id.in_(project_ids))
             result = []
-            for project in session.scalars(select(Project).order_by(Project.created_at.desc())):
+            for project in session.scalars(query):
                 tasks = session.scalars(select(ProjectTask).where(ProjectTask.project_id == project.id)).all()
-                result.append({"id": project.id, "code": project.code, "name": project.name, "status": project.status, "tasks": [{"id": task.id, "code": task.code, "name": task.name, "status": task.status} for task in tasks]})
+                deployments = self.list_deployments(project.id, allowed_deployment_id=allowed_deployment_id)
+                result.append({"id": project.id, "code": project.code, "name": project.name, "status": project.status,
+                               "tasks": [self._task_payload(task) for task in tasks], "deployments": deployments})
             return result
 
+    def _ensure_legacy_deployment_task(self, session: Session, task: ProjectTask,
+                                       libraries: list[KnowledgeLibrary]) -> ProjectDeploymentTask:
+        value = session.scalar(select(ProjectDeploymentTask).where(ProjectDeploymentTask.project_task_id == task.id))
+        if value: return value
+        deployment = session.scalar(select(ProjectDeployment).where(ProjectDeployment.project_id == task.project_id).order_by(ProjectDeployment.created_at))
+        if not deployment:
+            project = session.get(Project, task.project_id)
+            deployment = self._ensure_project_binding(session, project, self._ensure_central_deployment(session))
+        profile_sets = [{item.id for item in self._index_profile_snapshots_for_library(session, library)} for library in libraries]
+        common = set.intersection(*profile_sets) if profile_sets else set()
+        preferred = {library.index_profile_id for library in libraries if library.index_profile_id}
+        preferred.intersection_update(common)
+        if len(preferred) == 1:
+            profile_id = next(iter(preferred))
+        elif len(common) == 1:
+            profile_id = next(iter(common))
+        else:
+            raise ValueError("旧 ProjectTask 无法唯一推导 Index Profile，请先配置 DeploymentTask")
+        profile = session.get(KnowledgeIndexProfile, profile_id)
+        if not task.knowledge_type: task.knowledge_type = libraries[0].knowledge_type
+        value = ProjectDeploymentTask(id=new_id("dtask"), project_deployment_id=deployment.id,
+            project_task_id=task.id, index_profile_id=profile_id,
+            qa_embedding_mode={"qa-question": "question", "qa-full": "full"}.get(profile.code if profile else ""), enabled=True)
+        session.add(value); session.flush(); return value
+
     def put_route(self, task_id: str, org_code: str, library_ids: list[str]) -> dict[str, Any]:
-        if not org_code.strip():
-            raise ValueError("org_code 不能为空；general 也必须显式配置")
-        if not library_ids:
-            raise ValueError("路由至少要选择一个知识库")
+        """Compatibility service entry; public HTTP clients must use DeploymentTask API."""
         with self.sessions.begin() as session:
-            if not session.get(ProjectTask, task_id):
-                raise ValueError("项目任务不存在")
-            libraries = session.scalars(select(KnowledgeLibrary).where(KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active")).all()
-            if len(libraries) != len(set(library_ids)):
-                raise ValueError("路由包含不存在或不可用的知识库")
-            route = session.scalar(select(ProjectOrgRoute).where(ProjectOrgRoute.project_task_id == task_id, ProjectOrgRoute.org_code == org_code.strip()))
-            if not route:
-                route = ProjectOrgRoute(id=new_id("route"), project_task_id=task_id, org_code=org_code.strip())
-                session.add(route); session.flush()
-            existing = session.scalars(select(ProjectOrgRouteLibrary).where(ProjectOrgRouteLibrary.project_org_route_id == route.id)).all()
-            for item in existing:
-                session.delete(item)
+            task = session.get(ProjectTask, task_id)
+            if not task: raise ValueError("项目任务不存在")
+            libraries = list(session.scalars(select(KnowledgeLibrary).where(KnowledgeLibrary.id.in_(library_ids))))
+            deployment_task = self._ensure_legacy_deployment_task(session, task, libraries)
+            deployment_task_id = deployment_task.id
+        return self.put_deployment_route(deployment_task_id, org_code, "", library_ids)
+
+    def put_deployment_route(self, deployment_task_id: str, org_code: str, org_name: str,
+                             library_ids: list[str]) -> dict[str, Any]:
+        if not org_code.strip(): raise ValueError("org_code 不能为空；general 也必须显式配置")
+        if not library_ids: raise ValueError("授权至少要选择一个知识库")
+        with self.sessions.begin() as session:
+            deployment_task = session.get(ProjectDeploymentTask, deployment_task_id)
+            if not deployment_task or not deployment_task.enabled: raise ValueError("DeploymentTask 不存在或未启用")
+            deployment = session.get(ProjectDeployment, deployment_task.project_deployment_id)
+            project = session.get(Project, deployment.project_id) if deployment else None
+            project_task = session.get(ProjectTask, deployment_task.project_task_id)
+            profile = session.get(KnowledgeIndexProfile, deployment_task.index_profile_id) if deployment_task.index_profile_id else None
+            if is_qa_agent_project(project) and not qa_agent_profile_contract(project_task, profile):
+                raise ValueError("qa-agent org route 的 Task 与 Index Profile 合同不匹配")
+            libraries = list(session.scalars(select(KnowledgeLibrary).where(
+                KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
+                KnowledgeLibrary.migration_status == "ready")))
+            if len(libraries) != len(set(library_ids)): raise ValueError("授权包含不存在、迁移中或不可用的知识库")
             for library in libraries:
-                session.add(ProjectOrgRouteLibrary(id=new_id("rl"), project_org_route_id=route.id, knowledge_library_id=library.id))
+                if project_task and project_task.knowledge_type and library.knowledge_type != project_task.knowledge_type:
+                    raise ValueError("KnowledgeLibrary 与 ProjectTask 的 Knowledge Type 不匹配")
+                compatible = {item.id for item in self._index_profile_snapshots_for_library(session, library)}
+                if not profile or profile.id not in compatible:
+                    raise ValueError("KnowledgeLibrary 与 DeploymentTask 的 Index Profile 不匹配")
+            route = session.scalar(select(ProjectOrgRoute).where(
+                ProjectOrgRoute.project_deployment_task_id == deployment_task_id,
+                ProjectOrgRoute.org_code == org_code.strip()))
+            if not route:
+                route = ProjectOrgRoute(id=new_id("route"), project_deployment_task_id=deployment_task_id,
+                                        org_code=org_code.strip(), org_name=org_name.strip())
+                session.add(route); session.flush()
+            else:
+                route.org_name, route.enabled = org_name.strip(), True
+            for item in session.scalars(select(ProjectOrgRouteLibrary).where(
+                    ProjectOrgRouteLibrary.project_org_route_id == route.id)):
+                session.delete(item)
+            for priority, library in enumerate(libraries):
+                session.add(ProjectOrgRouteLibrary(id=new_id("rl"), project_org_route_id=route.id,
+                    knowledge_library_id=library.id, priority=priority, enabled=True))
             route.status = "draft"; self.audit(session, "routing.draft_updated", "project_org_route", route.id, {"library_ids": library_ids})
-            return {"id": route.id, "project_task_id": route.project_task_id, "org_code": route.org_code, "library_ids": library_ids, "status": route.status}
+            return {"id": route.id, "project_deployment_task_id": route.project_deployment_task_id,
+                    "org_code": route.org_code, "org_name": route.org_name,
+                    "knowledge_library_ids": library_ids, "enabled": route.enabled, "status": route.status}
 
-    def routing_snapshot(self, project_id: str) -> dict[str, Any]:
+    def list_authorizations(self, deployment_id: str) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            project = session.get(Project, project_id)
-            if not project:
-                raise ValueError("项目不存在")
-            tasks = session.scalars(select(ProjectTask).where(ProjectTask.project_id == project_id, ProjectTask.status == "active")).all()
-            routes = []
-            for task in tasks:
-                for route in session.scalars(select(ProjectOrgRoute).where(ProjectOrgRoute.project_task_id == task.id)):
-                    links = session.scalars(select(ProjectOrgRouteLibrary).where(ProjectOrgRouteLibrary.project_org_route_id == route.id)).all()
-                    libraries = [session.get(KnowledgeLibrary, link.knowledge_library_id) for link in links]
-                    library_routes = []
-                    for library in libraries:
-                        if not library:
+            rows = session.execute(select(ProjectOrgRoute, ProjectDeploymentTask, ProjectTask).join(
+                ProjectDeploymentTask, ProjectDeploymentTask.id == ProjectOrgRoute.project_deployment_task_id,
+            ).join(ProjectTask, ProjectTask.id == ProjectDeploymentTask.project_task_id).where(
+                ProjectDeploymentTask.project_deployment_id == deployment_id,
+            ).order_by(ProjectTask.code, ProjectOrgRoute.org_code)).all()
+            result = []
+            for route, deployment_task, task in rows:
+                links = list(session.scalars(select(ProjectOrgRouteLibrary).where(
+                    ProjectOrgRouteLibrary.project_org_route_id == route.id,
+                    ProjectOrgRouteLibrary.enabled.is_(True)).order_by(ProjectOrgRouteLibrary.priority)))
+                result.append({"id": route.id, "project_deployment_task_id": deployment_task.id,
+                    "task_code": task.code, "org_code": route.org_code, "org_name": route.org_name,
+                    "enabled": route.enabled, "knowledge_library_ids": [item.knowledge_library_id for item in links]})
+            return result
+
+    def _resolve_deployment(self, session: Session, boundary_id: str) -> ProjectDeployment:
+        deployment = session.get(ProjectDeployment, boundary_id)
+        if deployment: return deployment
+        if not session.get(Project, boundary_id): raise ValueError("Deployment 不存在")
+        values = list(session.scalars(select(ProjectDeployment).where(ProjectDeployment.project_id == boundary_id).order_by(ProjectDeployment.created_at)))
+        if len(values) != 1: raise ValueError("Project 存在多个 Deployment，必须显式指定 deployment_id")
+        return values[0]
+
+    def routing_snapshot(self, boundary_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            project = session.get(Project, project_deployment.project_id)
+            if not project or not deployment:
+                raise ValueError("ProjectDeployment 的 Project 或 Deployment 不存在")
+            if deployment.release_stage not in {"test", "production"}:
+                raise ValueError("Deployment release_stage 无效")
+            target = self._stage_target(session, deployment.id, deployment.release_stage)
+            if is_qa_agent_project(project):
+                if deployment.scope == "institution" and (
+                        not deployment.institution_name or not deployment.institution_code):
+                    raise ValueError("qa-agent Deployment 尚未绑定医院机构名称和机构代码")
+            if project.code == KG_PROJECT_CODE and deployment.release_stage != "test":
+                raise ValueError("kg_for_consultation 当前没有 production RoutingSnapshot")
+            task_rows = session.execute(select(ProjectDeploymentTask, ProjectTask).join(
+                ProjectTask, ProjectTask.id == ProjectDeploymentTask.project_task_id).where(
+                ProjectDeploymentTask.project_deployment_id == project_deployment.id,
+                ProjectDeploymentTask.enabled.is_(True), ProjectTask.status == "active").order_by(ProjectTask.code)).all()
+            tasks, flat_routes = [], []
+            for deployment_task, task in task_rows:
+                profile = session.get(KnowledgeIndexProfile, deployment_task.index_profile_id) if deployment_task.index_profile_id else None
+                revision = session.get(KnowledgeIndexProfileRevision, profile.current_revision_id) if profile and profile.current_revision_id else None
+                contract = session.get(StorageContractRevision, revision.storage_contract_revision_id) \
+                    if revision and revision.storage_contract_revision_id else None
+                embedding = session.get(EmbeddingProfile, revision.embedding_profile_id) if revision else None
+                profile_payload = None if not profile or not revision else {
+                    "index_profile_id": profile.id, "index_profile_code": profile.code,
+                    "index_profile_revision_id": revision.id, "collection_name": revision.collection_name,
+                    "fields": revision.fields_json, "collection_policy": revision.collection_policy,
+                    "storage_contract_revision_id": revision.storage_contract_revision_id,
+                    "embedding": None if not embedding else {"profile_id": embedding.id, "model": embedding.model,
+                        "dimension": embedding.dimension, "metric_type": embedding.metric_type},
+                    "storage": None if not contract else {"dimension": contract.dimension,
+                        "metric_type": contract.metric_type, "index": contract.index_json,
+                        "storage_spec_hash": contract.storage_spec_hash},
+                }
+                org_routes = []
+                for route in session.scalars(select(ProjectOrgRoute).where(
+                        ProjectOrgRoute.project_deployment_task_id == deployment_task.id,
+                        ProjectOrgRoute.enabled.is_(True)).order_by(ProjectOrgRoute.org_code)):
+                    if is_qa_agent_project(project) and not qa_agent_profile_contract(task, profile):
+                        raise ValueError("qa-agent RoutingSnapshot 的 Task/Profile/Collection 合同不匹配")
+                    links = list(session.scalars(select(ProjectOrgRouteLibrary).where(
+                        ProjectOrgRouteLibrary.project_org_route_id == route.id,
+                        ProjectOrgRouteLibrary.enabled.is_(True)).order_by(ProjectOrgRouteLibrary.priority)))
+                    libraries = []
+                    for link in links:
+                        library = session.get(KnowledgeLibrary, link.knowledge_library_id)
+                        if not library: continue
+                        library_payload = {"knowledge_library_id": library.id, "knowledge_type": library.knowledge_type,
+                            "partition_name": library.partition_name, "indexes": [{**profile_payload,
+                                "partition_name": library.partition_name}] if profile_payload else []}
+                        libraries.append(library_payload)
+                    org_payload = {"org_code": route.org_code, "org_name": route.org_name,
+                                   "knowledge_library_ids": [item["knowledge_library_id"] for item in libraries],
+                                   "libraries": libraries}
+                    org_routes.append(org_payload)
+                    flat_routes.append({"task_code": task.code, "org_code": route.org_code,
+                                        "top_k": deployment_task.top_k, "libraries": libraries})
+                tasks.append({"deployment_task_id": deployment_task.id, "task_id": task.id, "task_code": task.code,
+                              "task_name": task.name, "knowledge_type": task.knowledge_type,
+                              "qa_embedding_mode": deployment_task.qa_embedding_mode, "top_k": deployment_task.top_k,
+                              "index_profile": profile_payload, "org_routes": org_routes})
+            return {"schema": "dataforge.routing-snapshot.v7", "schema_version": 3,
+                    "release_stage": deployment.release_stage,
+                    "project": {"id": project.id, "code": project.code, "name": project.name},
+                    "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
+                                    "institution_name": deployment.institution_name,
+                                    "institution_code": deployment.institution_code,
+                                    "scope": deployment.scope,
+                                    "release_stage": deployment.release_stage},
+                    "project_deployment": {"id": project_deployment.id,
+                                           "project_id": project_deployment.project_id,
+                                           "deployment_id": project_deployment.deployment_id,
+                                           "status": project_deployment.status},
+                    "milvus_target": {"id": target.id, "name": target.name, "milvus_url": target.milvus_url},
+                    "tasks": tasks, "routes": flat_routes}
+
+    def validate_routing(self, boundary_id: str, milvus=None) -> dict[str, Any]:
+        snapshot = self.routing_snapshot(boundary_id); problems: list[str] = []
+        with self.sessions() as session:
+            if not snapshot["routes"]: problems.append("Deployment 没有授权路由")
+            for task in snapshot["tasks"]:
+                if not task["index_profile"]: problems.append(f"任务 {task['task_code']} 没有已发布 Index Profile")
+                for route in task["org_routes"]:
+                    if not route["libraries"]: problems.append(f"任务 {task['task_code']} / {route['org_code']} 没有知识库")
+                    for info in route["libraries"]:
+                        library = session.get(KnowledgeLibrary, info["knowledge_library_id"])
+                        if not library or library.migration_status != "ready" or not self._library_ready(session, library):
+                            problems.append(f"知识库 {info['knowledge_library_id']} 向量未就绪")
                             continue
-                        profiles = self._index_profile_snapshots_for_library(session, library)
-                        library_routes.append({"knowledge_library_id": library.id, "knowledge_type": library.knowledge_type,
-                            "partition_name": library.partition_name, "indexes": [{"index_profile_id": profile.id, "index_profile_code": profile.code,
-                                "collection_name": profile.collection_name, "fields": profile.fields_json,
-                                "partition_name": library.partition_name} for profile in profiles]})
-                    routes.append({"task_code": task.code, "org_code": route.org_code, "libraries": library_routes})
-            return {"schema": "dataforge.routing-snapshot.v7", "project": {"id": project.id, "code": project.code}, "routes": routes}
-
-    def validate_routing(self, project_id: str) -> dict[str, Any]:
-        snapshot = self.routing_snapshot(project_id); problems: list[str] = []
-        with self.sessions() as session:
-            if not snapshot["routes"]:
-                problems.append("项目没有路由")
-            for route in snapshot["routes"]:
-                if not route["libraries"]:
-                    problems.append(f"任务 {route['task_code']} / {route['org_code']} 没有知识库")
-                for library_info in route["libraries"]:
-                    library = session.get(KnowledgeLibrary, library_info["knowledge_library_id"])
-                    if not self._library_ready(session, library):
-                        problems.append(f"知识库 {library.code} 向量未就绪")
+                        if milvus:
+                            indexes = info.get("indexes") or []
+                            collection = indexes[0].get("collection_name") if indexes else None
+                            try:
+                                if not collection or not milvus.partition_exists(collection, library.partition_name):
+                                    problems.append(f"知识库 {library.id} 的目标 Partition 不存在")
+                            except Exception as exc:
+                                problems.append(f"知识库 {library.id} 的目标 Milvus 校验失败：{exc}")
         return {"valid": not problems, "problems": problems, "snapshot": snapshot}
 
-    def routing_diff(self, project_id: str) -> dict[str, Any]:
-        """Compare the in-progress routing draft with the last known good snapshot."""
-        current = self.routing_snapshot(project_id)
+    def routing_diff(self, boundary_id: str, release_stage: str | None = None) -> dict[str, Any]:
+        current = self.routing_snapshot(boundary_id)
+        deployment_id = current["project_deployment"]["id"]
+        stage = release_stage or current["release_stage"]
+        if stage != current["release_stage"]:
+            raise ValueError("Diff 阶段必须与 Deployment 当前 release_stage 一致")
         with self.sessions() as session:
-            previous = session.scalar(select(ProjectRouteVersion).where(ProjectRouteVersion.project_id == project_id, ProjectRouteVersion.status == "published").order_by(ProjectRouteVersion.version_no.desc()))
+            previous = session.scalar(select(ProjectRouteVersion).where(
+                ProjectRouteVersion.project_deployment_id == deployment_id,
+                ProjectRouteVersion.release_stage == stage,
+                ProjectRouteVersion.status == "published").order_by(ProjectRouteVersion.version_no.desc()))
         def route_map(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
             return {f"{route['task_code']}:{route['org_code']}": route for route in snapshot.get("routes", [])}
         before, after = route_map(previous.snapshot_json if previous else {}), route_map(current)
-        return {
-            "from_version": previous.version_no if previous else None,
-            "added": [after[key] for key in sorted(after.keys() - before.keys())],
-            "removed": [before[key] for key in sorted(before.keys() - after.keys())],
-            "changed": [{"before": before[key], "after": after[key]} for key in sorted(after.keys() & before.keys()) if before[key] != after[key]],
-        }
+        return {"release_stage": stage, "from_version": previous.version_no if previous else None,
+                "added": [after[key] for key in sorted(after.keys() - before.keys())],
+                "removed": [before[key] for key in sorted(before.keys() - after.keys())],
+                "changed": [{"before": before[key], "after": after[key]} for key in sorted(after.keys() & before.keys()) if before[key] != after[key]]}
 
-    def create_route_version(self, project_id: str, snapshot: dict[str, Any], *, status: str = "draft", checksum: str | None = None, object_key: str | None = None) -> ProjectRouteVersion:
+    def create_route_version(self, boundary_id: str, snapshot: dict[str, Any], *, status: str = "draft",
+                             checksum: str | None = None, object_key: str | None = None,
+                             origin: str = "central") -> ProjectRouteVersion:
         with self.sessions.begin() as session:
-            max_version = session.scalar(select(func.max(ProjectRouteVersion.version_no)).where(ProjectRouteVersion.project_id == project_id)) or 0
-            value = ProjectRouteVersion(id=new_id("routev"), project_id=project_id, version_no=max_version + 1, status=status, snapshot_json=snapshot, checksum=checksum, object_key=object_key, published_at=utc_now() if status == "published" else None)
-            session.add(value); self.audit(session, "routing.version_created", "project_route_version", value.id, {"version_no": value.version_no, "status": status})
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            if not deployment:
+                raise ValueError("Deployment 不存在")
+            release_stage = str(snapshot.get("release_stage") or deployment.release_stage)
+            if release_stage not in {"test", "production"}:
+                raise ValueError("RoutingSnapshot release_stage 无效")
+            max_version = session.scalar(select(func.max(ProjectRouteVersion.version_no)).where(
+                ProjectRouteVersion.project_deployment_id == project_deployment.id,
+                ProjectRouteVersion.release_stage == release_stage)) or 0
+            value = ProjectRouteVersion(id=new_id("routev"), project_id=project_deployment.project_id,
+                project_deployment_id=project_deployment.id, release_stage=release_stage,
+                version_no=max_version + 1, origin=origin,
+                status=status, snapshot_json=snapshot, checksum=checksum, object_key=object_key,
+                published_at=utc_now() if status == "published" else None)
+            session.add(value); self.audit(session, "routing.version_created", "project_route_version", value.id,
+                                           {"version_no": value.version_no, "status": status,
+                                             "project_deployment_id": project_deployment.id,
+                                             "deployment_id": deployment.id,
+                                             "release_stage": release_stage})
             return value
 
     def mark_route_published(self, version_id: str, checksum: str, object_key: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
             version = session.get(ProjectRouteVersion, version_id)
-            if not version:
-                raise ValueError("路由版本不存在")
+            if not version: raise ValueError("路由版本不存在")
             version.status, version.checksum, version.object_key, version.published_at = "published", checksum, object_key, utc_now()
-            for route in session.scalars(select(ProjectOrgRoute).join(ProjectTask).where(ProjectTask.project_id == version.project_id)):
+            for route in session.scalars(select(ProjectOrgRoute).join(ProjectDeploymentTask,
+                    ProjectDeploymentTask.id == ProjectOrgRoute.project_deployment_task_id).where(
+                    ProjectDeploymentTask.project_deployment_id == version.project_deployment_id)):
                 route.status = "published"
             self.audit(session, "routing.published", "project_route_version", version.id, {"checksum": checksum})
-            return {"id": version.id, "project_id": version.project_id, "version_no": version.version_no, "status": version.status, "checksum": checksum, "object_key": object_key}
+            return {"id": version.id, "project_id": version.project_id,
+                    "project_deployment_id": version.project_deployment_id, "origin": version.origin,
+                    "release_stage": version.release_stage, "version_no": version.version_no,
+                    "status": version.status, "checksum": checksum, "object_key": object_key}
 
-    def published_route_version(self, project_id: str, version_no: int | None = None) -> ProjectRouteVersion:
+    def published_route_version(self, boundary_id: str, version_no: int | None = None,
+                                release_stage: str | None = None) -> ProjectRouteVersion:
         with self.sessions() as session:
-            query = select(ProjectRouteVersion).where(ProjectRouteVersion.project_id == project_id, ProjectRouteVersion.status == "published")
-            if version_no is not None:
-                query = query.where(ProjectRouteVersion.version_no == version_no)
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            stage = release_stage or deployment.release_stage
+            query = select(ProjectRouteVersion).where(ProjectRouteVersion.project_deployment_id == project_deployment.id,
+                                                       ProjectRouteVersion.release_stage == stage,
+                                                       ProjectRouteVersion.status == "published")
+            if version_no is not None: query = query.where(ProjectRouteVersion.version_no == version_no)
             value = session.scalar(query.order_by(ProjectRouteVersion.version_no.desc()))
-            if not value:
-                raise ValueError("没有可回滚的已发布路由版本")
+            if not value: raise ValueError("没有可回滚的已发布路由版本")
             return value
 
-    def list_route_versions(self, project_id: str) -> list[dict[str, Any]]:
-        with self.sessions() as session:
-            return [{"id": item.id, "project_id": item.project_id, "version_no": item.version_no, "status": item.status, "checksum": item.checksum, "object_key": item.object_key, "created_at": item.created_at.isoformat(), "published_at": item.published_at.isoformat() if item.published_at else None} for item in session.scalars(select(ProjectRouteVersion).where(ProjectRouteVersion.project_id == project_id).order_by(ProjectRouteVersion.version_no.desc()))]
+    def restore_authorizations(self, deployment_id: str, snapshot: dict[str, Any]) -> None:
+        if snapshot.get("project_deployment", {}).get("id") != deployment_id:
+            raise ValueError("历史 RoutingSnapshot 不属于当前 Deployment")
+        with self.sessions.begin() as session:
+            tasks = {value.id: value for value in session.scalars(select(ProjectDeploymentTask).where(
+                ProjectDeploymentTask.project_deployment_id == deployment_id))}
+            for task_payload in snapshot.get("tasks", []):
+                deployment_task = tasks.get(task_payload.get("deployment_task_id"))
+                if not deployment_task: raise ValueError("历史 RoutingSnapshot 引用的 DeploymentTask 不存在")
+                for route in session.scalars(select(ProjectOrgRoute).where(
+                        ProjectOrgRoute.project_deployment_task_id == deployment_task.id)):
+                    session.delete(route)
+                session.flush()
+                for org in task_payload.get("org_routes", []):
+                    route = ProjectOrgRoute(id=new_id("route"), project_deployment_task_id=deployment_task.id,
+                        org_code=str(org.get("org_code", "")), org_name=str(org.get("org_name", "")), enabled=True)
+                    session.add(route); session.flush()
+                    for priority, library_id in enumerate(org.get("knowledge_library_ids", [])):
+                        if not session.get(KnowledgeLibrary, library_id): raise ValueError("历史 RoutingSnapshot 引用的知识库不存在")
+                        session.add(ProjectOrgRouteLibrary(id=new_id("rl"), project_org_route_id=route.id,
+                            knowledge_library_id=library_id, priority=priority, enabled=True))
 
-    def route_version_detail(self, project_id: str, version_no: int) -> dict[str, Any]:
+    def list_route_versions(self, boundary_id: str, release_stage: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            stage = release_stage or deployment.release_stage
+            return [{"id": item.id, "project_id": item.project_id, "project_deployment_id": item.project_deployment_id,
+                     "origin": item.origin, "release_stage": item.release_stage,
+                     "version_no": item.version_no, "status": item.status,
+                     "checksum": item.checksum, "object_key": item.object_key,
+                     "created_at": item.created_at.isoformat(), "published_at": item.published_at.isoformat() if item.published_at else None}
+                    for item in session.scalars(select(ProjectRouteVersion).where(
+                        ProjectRouteVersion.project_deployment_id == project_deployment.id,
+                        ProjectRouteVersion.release_stage == stage).order_by(ProjectRouteVersion.version_no.desc()))]
+
+    def route_version_detail(self, boundary_id: str, version_no: int,
+                             release_stage: str | None = None) -> dict[str, Any]:
+        with self.sessions() as session:
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            stage = release_stage or deployment.release_stage
             value = session.scalar(select(ProjectRouteVersion).where(
-                ProjectRouteVersion.project_id == project_id, ProjectRouteVersion.version_no == version_no,
-            ))
-            if not value:
-                raise ValueError("路由版本不存在")
-            return {"id": value.id, "project_id": value.project_id, "version_no": value.version_no, "status": value.status,
+                ProjectRouteVersion.project_deployment_id == project_deployment.id,
+                ProjectRouteVersion.release_stage == stage,
+                ProjectRouteVersion.version_no == version_no))
+            if not value: raise ValueError("路由版本不存在")
+            return {"id": value.id, "project_id": value.project_id, "project_deployment_id": value.project_deployment_id,
+                    "origin": value.origin, "release_stage": value.release_stage,
+                    "version_no": value.version_no, "status": value.status,
                     "checksum": value.checksum, "object_key": value.object_key, "snapshot": value.snapshot_json,
                     "created_at": value.created_at.isoformat(), "published_at": value.published_at.isoformat() if value.published_at else None}
+
+    def runtime_routing_snapshot(self, project_code: str, deployment_code: str,
+                                 release_stage: str) -> dict[str, Any]:
+        if release_stage not in {"test", "production"}:
+            raise ValueError("release_stage 只允许 test 或 production")
+        with self.sessions() as session:
+            project = session.scalar(select(Project).where(Project.code == project_code))
+            if not project:
+                raise ValueError("Project 不存在")
+            row = session.execute(select(ProjectDeployment, Deployment).join(
+                Deployment, Deployment.id == ProjectDeployment.deployment_id,
+            ).where(
+                ProjectDeployment.project_id == project.id,
+                Deployment.code == deployment_code,
+            )).first()
+            if not row:
+                raise ValueError("Deployment 不存在")
+            project_deployment, deployment = row
+            if deployment.release_stage != release_stage:
+                raise ValueError("Deployment 当前阶段与请求阶段不一致")
+            if project.code == KG_PROJECT_CODE and release_stage != "test":
+                raise ValueError("kg_for_consultation 当前没有 production RoutingSnapshot")
+            version = session.scalar(select(ProjectRouteVersion).where(
+                ProjectRouteVersion.project_deployment_id == project_deployment.id,
+                ProjectRouteVersion.release_stage == release_stage,
+                ProjectRouteVersion.status == "published",
+            ).order_by(ProjectRouteVersion.version_no.desc()))
+            if not version:
+                raise ValueError("该阶段没有已发布 RoutingSnapshot")
+            payload = dict(version.snapshot_json or {})
+            payload.update({"version": version.version_no, "checksum": version.checksum,
+                            "published_at": version.published_at.isoformat() if version.published_at else None})
+            return payload
+
+    @staticmethod
+    def _migration_job_payload(job: KnowledgeMigrationJob, items: list[KnowledgeMigrationItem] | None = None) -> dict[str, Any]:
+        return {
+            "id": job.id, "direction": job.direction, "package_kind": job.package_kind,
+            "package_id": job.package_id, "project_id": job.project_id,
+            "project_deployment_id": job.project_deployment_id, "status": job.status, "stage": job.stage,
+            "checkpoint": job.checkpoint_json or {}, "conflicts": job.conflict_json or {},
+            "signature_status": job.signature_status, "package_path": job.package_path,
+            "package_sha256": job.package_sha256, "attempt_count": job.attempt_count,
+            "error": job.error, "created_at": job.created_at.isoformat(),
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+            "items": [{"id": item.id, "knowledge_library_id": item.knowledge_library_id,
+                       "collection_name": item.collection_name, "partition_name": item.partition_name,
+                       "source_count": item.source_count, "target_count": item.target_count,
+                       "source_digest": item.source_digest, "target_digest": item.target_digest,
+                       "status": item.status, "resolution": item.resolution,
+                       "detail": item.detail_json or {}, "error": item.error}
+                      for item in (items or [])],
+        }
+
+    def create_migration_job(self, *, direction: str, package_kind: str, project_id: str | None = None,
+                             project_deployment_id: str | None = None, package_id: str | None = None,
+                             package_path: str | None = None, package_sha256: str | None = None,
+                             status: str = "planning", stage: str = "planning", checkpoint: dict | None = None,
+                             signature_status: str | None = None, items: list[dict] | None = None) -> dict[str, Any]:
+        if direction not in {"export", "import"} or package_kind not in {"deployment_seed", "knowledge_update"}:
+            raise ValueError("migration job 类型无效")
+        with self.sessions.begin() as session:
+            if package_id:
+                existing = session.scalar(select(KnowledgeMigrationJob).where(KnowledgeMigrationJob.package_id == package_id))
+                if existing:
+                    existing_items = list(session.scalars(select(KnowledgeMigrationItem).where(
+                        KnowledgeMigrationItem.migration_job_id == existing.id)))
+                    return self._migration_job_payload(existing, existing_items)
+            job = KnowledgeMigrationJob(id=new_id("mig"), direction=direction, package_kind=package_kind,
+                package_id=package_id, project_id=project_id, project_deployment_id=project_deployment_id,
+                status=status, stage=stage, checkpoint_json=checkpoint or {}, package_path=package_path,
+                package_sha256=package_sha256, signature_status=signature_status)
+            session.add(job); session.flush()
+            values = []
+            for item in items or []:
+                value = KnowledgeMigrationItem(id=new_id("migi"), migration_job_id=job.id,
+                    knowledge_library_id=item["knowledge_library_id"], collection_name=item["collection_name"],
+                    partition_name=item["partition_name"], source_count=item.get("source_count", 0),
+                    source_digest=item.get("source_digest"), detail_json=item.get("detail", {}))
+                session.add(value); values.append(value)
+            self.audit(session, "migration.job_created", "knowledge_migration_job", job.id,
+                       {"direction": direction, "package_kind": package_kind})
+            return self._migration_job_payload(job, values)
+
+    def get_migration_job(self, job_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            job = session.get(KnowledgeMigrationJob, job_id)
+            if not job: raise ValueError("迁移任务不存在")
+            items = list(session.scalars(select(KnowledgeMigrationItem).where(
+                KnowledgeMigrationItem.migration_job_id == job.id).order_by(KnowledgeMigrationItem.created_at)))
+            return self._migration_job_payload(job, items)
+
+    def list_migration_jobs(self, *, direction: str | None = None, deployment_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(KnowledgeMigrationJob)
+            if direction: query = query.where(KnowledgeMigrationJob.direction == direction)
+            if deployment_id: query = query.where(KnowledgeMigrationJob.project_deployment_id == deployment_id)
+            jobs = list(session.scalars(query.order_by(KnowledgeMigrationJob.created_at.desc())))
+            return [self._migration_job_payload(job) for job in jobs]
+
+    def claim_migration_job(self, owner: str) -> KnowledgeMigrationJob | None:
+        with self.sessions.begin() as session:
+            job = session.scalar(select(KnowledgeMigrationJob).where(
+                or_(KnowledgeMigrationJob.status == "queued",
+                    (KnowledgeMigrationJob.status == "running") &
+                    (KnowledgeMigrationJob.lease_expires_at < utc_now()))
+            ).order_by(KnowledgeMigrationJob.created_at).with_for_update(skip_locked=True))
+            if not job: return None
+            job.status, job.lease_owner = "running", owner
+            job.lease_expires_at = utc_now() + timedelta(minutes=30)
+            job.attempt_count += 1
+            job.started_at = job.started_at or utc_now()
+            return job
+
+    def update_migration_job(self, job_id: str, *, status: str | None = None, stage: str | None = None,
+                             checkpoint: dict | None = None, conflicts: dict | None = None,
+                             signature_status: str | None = None, package_path: str | None = None,
+                             package_sha256: str | None = None, package_id: str | None = None,
+                             error: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeMigrationJob, job_id, with_for_update=True)
+            if not job: raise ValueError("迁移任务不存在")
+            if status is not None: job.status = status
+            if stage is not None: job.stage = stage
+            if checkpoint is not None: job.checkpoint_json = checkpoint
+            if conflicts is not None: job.conflict_json = conflicts
+            if signature_status is not None: job.signature_status = signature_status
+            if package_path is not None: job.package_path = package_path
+            if package_sha256 is not None: job.package_sha256 = package_sha256
+            if package_id is not None: job.package_id = package_id
+            job.error = error
+            if status in {"completed", "failed", "ready", "conflict"}:
+                job.finished_at = utc_now() if status in {"completed", "failed"} else None
+                job.lease_owner = None; job.lease_expires_at = None
+            return self._migration_job_payload(job)
+
+    def update_migration_item(self, job_id: str, library_id: str, collection_name: str, **values) -> None:
+        allowed = {"source_count", "target_count", "source_digest", "target_digest", "status", "resolution", "detail_json", "error"}
+        with self.sessions.begin() as session:
+            item = session.scalar(select(KnowledgeMigrationItem).where(
+                KnowledgeMigrationItem.migration_job_id == job_id,
+                KnowledgeMigrationItem.knowledge_library_id == library_id,
+                KnowledgeMigrationItem.collection_name == collection_name,
+            ).with_for_update())
+            if not item: raise ValueError("迁移明细不存在")
+            for key, value in values.items():
+                if key in allowed: setattr(item, key, value)
+
+    def queue_migration_import(self, job_id: str, resolutions: dict[str, str] | None = None) -> dict[str, Any]:
+        allowed = {"keep_local", "replace_with_central", "import_as_new"}
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeMigrationJob, job_id, with_for_update=True)
+            if not job or job.direction != "import": raise ValueError("导入任务不存在")
+            if job.status not in {"inspected", "conflict", "failed"}: raise ValueError("导入任务当前不可执行")
+            for library_id, resolution in (resolutions or {}).items():
+                if resolution not in allowed: raise ValueError("冲突处理方式无效")
+                for item in session.scalars(select(KnowledgeMigrationItem).where(
+                    KnowledgeMigrationItem.migration_job_id == job.id,
+                    KnowledgeMigrationItem.knowledge_library_id == library_id,
+                )): item.resolution = resolution
+            job.status, job.stage, job.error, job.finished_at = "queued", "verified", None, None
+            return self._migration_job_payload(job)
+
+    def retry_migration_job(self, job_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeMigrationJob, job_id, with_for_update=True)
+            if not job or job.status != "failed": raise ValueError("只有失败的迁移任务可以重试")
+            job.status, job.error, job.finished_at = "queued", None, None
+            return self._migration_job_payload(job)
 
     def close(self) -> None:
         self.engine.dispose()
