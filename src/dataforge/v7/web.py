@@ -5,26 +5,28 @@ import logging
 import json
 import os
 import secrets
+import shutil
 import threading
 from datetime import timedelta
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import Settings
 from .auth import SESSION_COOKIE, verify_admin_password
-from .models import AdminSession, utc_now
+from .models import AdminSession, Deployment, utc_now
 from .runner import preview_template_definition
 from .routing import AtomicRoutingPublisher
 from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
 from .instance import InstanceContext
+from .local_config import LocalMilvusConfigurationService
 from .migration.package import inspect_package
-from .migration.planner import MigrationPlanner
+from .migration.planner import InstitutionReleasePlanner
 from .store import (
     V7Store,
 )
@@ -256,6 +258,52 @@ class MigrationImportRequest(BaseModel):
     conflict_resolutions: dict[str, Literal["keep_local", "replace_with_central", "import_as_new"]] = Field(default_factory=dict)
 
 
+class RouteCandidateBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_ids: list[str] = Field(min_length=1)
+
+
+class InstitutionReleaseDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    target_deployment_id: str
+    package_kind: Literal["deployment_seed", "institution_release", "knowledge_update"]
+    route_version_ids: list[str] = Field(default_factory=list)
+    knowledge_library_ids: list[str] = Field(default_factory=list)
+    base_release_id: str | None = None
+    include_full_document_library: bool = False
+
+
+class InstitutionReleaseDraftPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    route_version_ids: list[str] | None = None
+    knowledge_library_ids: list[str] | None = None
+    base_release_id: str | None = None
+    include_full_document_library: bool | None = None
+    milvus_override: dict | None = None
+    milvus_override_reason: str | None = None
+
+
+class LocalMilvusConfigurationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    uri: str
+    database_name: str = "default"
+    tls_enabled: bool = False
+    username: str | None = None
+    secret: str | None = None
+    preserve_secret: bool = True
+
+
+class MigrationResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selected_import_target: Literal["current_target", "candidate_target"] | None = None
+
+
+class KnowledgeAssetGcRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    execute: bool = False
+    confirmation: str | None = None
+
+
 def _objects(settings: Settings):
     if settings.minio_endpoint and settings.minio_access_key and settings.minio_secret_key:
         return MinioObjectStore(settings.minio_endpoint, settings.minio_access_key, settings.minio_secret_key, settings.minio_bucket)
@@ -284,8 +332,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         store.assert_schema_current()
     instance = InstanceContext.load(store, resolved)
     objects = _objects(resolved)
+    local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
     app.state.store, app.state.objects, app.state.instance = store, objects, instance
+    app.state.local_milvus_config = local_milvus_config
     app.state.routing_publications = set()
     app.state.routing_publications_lock = threading.RLock()
 
@@ -306,7 +356,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         app.state.instance = InstanceContext.load(store, resolved)
         current = app.state.instance
         if current.mode == "local" and not current.bound_deployment_id and request.url.path.startswith("/api/"):
-            allowed_prefixes = ("/api/health", "/api/auth/", "/api/instance", "/api/migrations/import",
+            allowed_prefixes = ("/api/health", "/api/auth/", "/api/instance", "/api/local/",
+                                "/api/migrations/import",
                                 "/api/migrations/", "/api/runtime/routing/")
             project_creation = request.method == "POST" and request.url.path == "/api/projects"
             if not project_creation and not any(request.url.path.startswith(prefix) for prefix in allowed_prefixes):
@@ -315,11 +366,52 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "platform": "v7", "storage": "minio" if resolved.minio_endpoint else "local-dev", "database": "mysql" if resolved.database_url else "sqlite-dev"}
+        components: dict[str, dict] = {}
+        try:
+            with store.engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+            components["mysql"] = {"status": "ok", "kind": "mysql" if resolved.database_url else "sqlite-dev"}
+        except SQLAlchemyError as exc:
+            components["mysql"] = {"status": "failed", "error": str(exc)}
+        components["minio"] = {
+            "status": "configured" if resolved.minio_endpoint else "local-dev",
+            "endpoint_configured": bool(resolved.minio_endpoint),
+        }
+        configurations = {item["slot"]: item for item in local_milvus_config.list(app.state.instance.id)} \
+            if app.state.instance.mode == "local" else {}
+        current_target = configurations.get("current_target")
+        components["milvus"] = {
+            "status": current_target["status"] if current_target else
+                      ("environment" if os.getenv("DATAFORGE_MILVUS_URI") else "not_configured"),
+            "target": current_target,
+        }
+        components["worker"] = {"status": "unknown", "detail": "当前 schema 尚无 Worker heartbeat，不伪造在线"}
+        components["runner"] = {"status": "configured_unverified" if resolved.runner_url else "not_configured"}
+        components["parser"] = {"status": "unknown", "detail": "由 Runner 执行实际解析健康检查"}
+        components["embedding"] = {"status": "configured_unverified", "detail": "实际向量任务验证 Profile endpoint"}
+        components["llm"] = {"status": "optional", "configured": bool(os.getenv("DATAFORGE_LLM_BASE_URL"))}
+        usage = shutil.disk_usage(resolved.state_dir)
+        components["disk"] = {"status": "ok" if usage.free > 1024 ** 3 else "warning",
+                              "total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
+        failed = any(item["status"] == "failed" for item in components.values())
+        return {"status": "failed" if failed else "ok", "platform": "v7", "components": components}
 
     @app.get("/api/instance")
     def instance_info():
-        return app.state.instance.payload()
+        payload = app.state.instance.payload()
+        payload["deployment_flavor"] = (
+            "central_control_plane" if app.state.instance.mode == "central" else "institution_private"
+        )
+        payload["display_name"] = "智能中心"
+        if app.state.instance.mode == "local":
+            payload["display_name"] = "机构本地"
+            if app.state.instance.bound_deployment_id:
+                with store.sessions() as session:
+                    deployment = session.get(Deployment, app.state.instance.bound_deployment_id)
+                    if deployment:
+                        payload["display_name"] = deployment.institution_name or deployment.name
+                        payload["institution_code"] = deployment.institution_code
+        return payload
 
     @app.get("/api/auth/status")
     def auth_status(request: Request):
@@ -351,6 +443,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/document-libraries")
     def document_libraries(keyword: str = "", status: str | None = None):
         return store.list_document_libraries(keyword, status)
+
+    @app.get("/api/dashboard/overview")
+    def dashboard_overview():
+        return store.dashboard_overview(app.state.instance.mode)
 
     @app.post("/api/document-libraries", status_code=201)
     def create_document_library(payload: DocumentLibraryRequest):
@@ -635,8 +731,29 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/graph/entities/{entity_id}/neighbors")
-    def graph_neighbors(library_id: str, entity_id: str, depth: int = 1):
-        try: return store.graph_neighbors(library_id, entity_id, depth)
+    def graph_neighbors(library_id: str, entity_id: str, depth: int = 1,
+                        entity_types: Annotated[list[str] | None, Query()] = None,
+                        relation_types: Annotated[list[str] | None, Query()] = None,
+                        confirm_large: bool = False):
+        try:
+            return store.graph_neighbors(
+                library_id, entity_id, depth,
+                entity_types=set(entity_types or []),
+                relation_types=set(relation_types or []),
+                confirm_large=confirm_large,
+            )
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/knowledge-libraries/{library_id}/graph/entities/{entity_id}/neighbors/preview")
+    def graph_neighbor_preview(library_id: str, entity_id: str, depth: int = 1,
+                               entity_types: Annotated[list[str] | None, Query()] = None,
+                               relation_types: Annotated[list[str] | None, Query()] = None):
+        try:
+            return store.graph_neighbor_preview(
+                library_id, entity_id, depth,
+                entity_types=set(entity_types or []),
+                relation_types=set(relation_types or []),
+            )
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/graph/relations/{relation_id}/evidence")
@@ -1248,6 +1365,16 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.route_version_detail(deployment_id, version_no, release_stage)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/project-deployments/{deployment_id}/routing/freeze", status_code=201)
+    def freeze_deployment_routing(deployment_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以冻结机构离线路由")
+        _deployment_boundary(deployment_id)
+        try:
+            return store.freeze_route_version(deployment_id)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
     @app.post("/api/project-deployments/{deployment_id}/routing/publish")
     def publish_deployment_routing(deployment_id: str, payload: RoutingActionRequest | None = None):
         _deployment_boundary(deployment_id)
@@ -1317,6 +1444,63 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
         finally: _end_routing_action(deployment_id)
 
+    @app.get("/api/imported-route-candidates")
+    def imported_route_candidates(migration_job_id: str | None = None):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以查看导入候选路由")
+        values = store.list_imported_route_candidates(migration_job_id)
+        visible = []
+        for value in values:
+            try:
+                app.state.instance.require_deployment(store, value["project_deployment_id"])
+                visible.append(value)
+            except LookupError:
+                continue
+        return visible
+
+    def _activate_route_candidate(candidate_id: str):
+        started = store.start_route_candidate_activation(candidate_id)
+        app.state.instance.require_deployment(store, started["project_deployment_id"])
+        if started.get("idempotent"):
+            return next(item for item in store.list_imported_route_candidates()
+                        if item["id"] == candidate_id)
+        snapshot = started["snapshot"]
+        try:
+            checksum, object_key = AtomicRoutingPublisher(resolved.routing_dir).publish(
+                snapshot["project"]["code"], snapshot["deployment"]["code"],
+                started["version_no"], snapshot, release_stage=snapshot["release_stage"],
+            )
+            return store.finish_route_candidate_activation(
+                candidate_id, started["route_version_id"], checksum, object_key,
+            )
+        except Exception as exc:
+            store.finish_route_candidate_activation(
+                candidate_id, started["route_version_id"], None, None, str(exc),
+            )
+            raise
+
+    @app.post("/api/imported-route-candidates/{candidate_id}/activate")
+    def activate_imported_route_candidate(candidate_id: str):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以激活导入候选路由")
+        try:
+            return _activate_route_candidate(candidate_id)
+        except (ValueError, LookupError) as exc:
+            raise _error(ValueError(str(exc))) from exc
+
+    @app.post("/api/imported-route-candidates/activate-ready")
+    def activate_ready_route_candidates(payload: RouteCandidateBatchRequest):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以批量激活候选路由")
+        results = []
+        for candidate_id in payload.candidate_ids:
+            try:
+                results.append({"candidate_id": candidate_id, "ok": True,
+                                "result": _activate_route_candidate(candidate_id)})
+            except Exception as exc:
+                results.append({"candidate_id": candidate_id, "ok": False, "error": str(exc)})
+        return {"atomic": False, "results": results}
+
     @app.get("/api/runtime/routing/{project_code}/{deployment_code}/{release_stage}")
     def runtime_routing(project_code: str, deployment_code: str,
                         release_stage: Literal["test", "production"], request: Request):
@@ -1335,29 +1519,152 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse(content=snapshot, headers={"ETag": etag, "Cache-Control": "no-store"})
 
-    @app.post("/api/migrations/export/plan")
-    def migration_export_plan(payload: MigrationExportRequest):
-        if app.state.instance.mode != "central": raise HTTPException(status_code=403, detail="只有 central 实例可以导出")
+    @app.post("/api/institution-deployments/drafts", status_code=201)
+    def create_institution_release_draft(payload: InstitutionReleaseDraftRequest):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以创建机构发布草稿")
         try:
-            return MigrationPlanner(store).plan(payload.project_deployment_id, payload.knowledge_library_ids,
-                include_full_document_library=payload.include_full_document_library, package_kind=payload.package_kind)
-        except ValueError as exc: raise _error(exc) from exc
+            return store.create_institution_release_draft(
+                payload.target_deployment_id, payload.package_kind,
+                route_version_ids=payload.route_version_ids,
+                knowledge_library_ids=payload.knowledge_library_ids,
+                base_release_id=payload.base_release_id,
+                include_full_document_library=payload.include_full_document_library,
+            )
+        except ValueError as exc:
+            raise _error(exc) from exc
 
-    @app.post("/api/migrations/export", status_code=202)
-    def migration_export(payload: MigrationExportRequest):
-        if app.state.instance.mode != "central": raise HTTPException(status_code=403, detail="只有 central 实例可以导出")
+    @app.get("/api/institution-deployments/drafts/{draft_id}")
+    def institution_release_draft(draft_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以查看机构发布草稿")
+        try:
+            return store.get_institution_release_draft(draft_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/institution-deployments/drafts/{draft_id}")
+    def update_institution_release_draft(draft_id: str, payload: InstitutionReleaseDraftPatch):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以编辑机构发布草稿")
+        try:
+            return store.update_institution_release_draft(draft_id, **payload.model_dump())
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.get("/api/institution-deployments/drafts/{draft_id}/plan")
+    def plan_institution_release(draft_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以规划机构发布")
+        try:
+            return InstitutionReleasePlanner(store).plan(draft_id)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.post("/api/institution-deployments/drafts/{draft_id}/freeze", status_code=201)
+    def freeze_institution_release(draft_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以冻结机构发布")
+        try:
+            plan = InstitutionReleasePlanner(store).plan(draft_id)
+            return store.freeze_institution_release_snapshot(draft_id, plan)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.get("/api/institution-deployments/releases")
+    def institution_releases(target_deployment_id: str | None = None):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以查看机构发布")
+        return store.list_institution_release_snapshots(target_deployment_id)
+
+    @app.get("/api/institution-deployments/releases/{release_id}")
+    def institution_release(release_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以查看机构发布")
+        try:
+            return store.get_institution_release_snapshot(release_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/institution-deployments/releases/{release_id}/build", status_code=202)
+    def build_institution_release(release_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以构建机构发布包")
         if not resolved.migration_signing_private_key:
             raise HTTPException(status_code=503, detail="未配置 migration Ed25519 签名私钥")
         try:
-            plan = MigrationPlanner(store).plan(payload.project_deployment_id, payload.knowledge_library_ids,
-                include_full_document_library=payload.include_full_document_library, package_kind=payload.package_kind)
-            items = [{"knowledge_library_id": item["knowledge_library_id"], "collection_name": collection,
-                      "partition_name": item["partition_name"], "detail": item}
+            release = store.get_institution_release_snapshot(release_id)
+            existing = next((item for item in store.list_migration_jobs(direction="export")
+                             if item.get("release_snapshot_id") == release_id and
+                             item["status"] in {"queued", "running", "ready"}), None)
+            if existing:
+                return existing
+            plan = release["snapshot"]
+            items = [{"knowledge_library_id": item["knowledge_library_id"],
+                      "collection_name": collection, "partition_name": item["partition_name"],
+                      "detail": item}
                      for collection, values in plan["collections"].items() for item in values]
-            return store.create_migration_job(direction="export", package_kind=payload.package_kind,
-                project_id=plan["project"]["id"], project_deployment_id=payload.project_deployment_id,
-                status="queued", stage="planned", checkpoint={"options": payload.model_dump()}, items=items)
-        except ValueError as exc: raise _error(exc) from exc
+            return store.create_migration_job(
+                direction="export", package_kind=release["package_kind"],
+                target_deployment_id=release["target_deployment_id"],
+                release_snapshot_id=release_id, status="queued", stage="planned", items=items,
+            )
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.get("/api/local/milvus-configurations")
+    def local_milvus_configurations():
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以管理 Milvus 配置")
+        return local_milvus_config.list(app.state.instance.id)
+
+    @app.put("/api/local/milvus-configurations/{slot}")
+    def put_local_milvus_configuration(slot: str, payload: LocalMilvusConfigurationRequest):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以管理 Milvus 配置")
+        try:
+            return local_milvus_config.put(app.state.instance.id, slot, **payload.model_dump())
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.post("/api/local/milvus-configurations/{slot}/verify")
+    def verify_local_milvus_configuration(slot: str):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以验证 Milvus 配置")
+        try:
+            return local_milvus_config.verify(app.state.instance.id, slot)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.post("/api/local/milvus-configurations/candidate_target/promote")
+    def promote_local_milvus_candidate():
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以切换 Milvus 配置")
+        try:
+            return local_milvus_config.promote_candidate(app.state.instance.id)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.get("/api/knowledge-asset-gc/plan")
+    def knowledge_asset_gc_plan():
+        return store.knowledge_asset_gc_plan()
+
+    @app.post("/api/knowledge-asset-gc/jobs", status_code=202)
+    def create_knowledge_asset_gc_job(payload: KnowledgeAssetGcRequest):
+        try:
+            return store.create_knowledge_asset_gc_job(
+                execute=payload.execute, confirmation=payload.confirmation,
+            )
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.post("/api/migrations/export/plan")
+    def migration_export_plan(payload: MigrationExportRequest):
+        raise HTTPException(status_code=410, detail="新包只生成 schema v2；请使用机构发布部署 Draft/Release API")
+
+    @app.post("/api/migrations/export", status_code=202)
+    def migration_export(payload: MigrationExportRequest):
+        raise HTTPException(status_code=410, detail="新包只生成 schema v2；请使用机构发布部署 Draft/Release API")
 
     @app.get("/api/migrations")
     def migrations(direction: Literal["export", "import"] | None = None):
@@ -1414,8 +1721,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                     current = session.get(KnowledgeLibrary, library_id)
                     if current and current.origin_state == "forked": conflicts[library_id] = "forked"
             if conflicts: status = "conflict"
+            projects = manifest.get("projects") or []
+            project_payload = manifest.get("project") or ((projects[0] or {}).get("project") if projects else {}) or {}
             created = store.create_migration_job(direction="import", package_kind=manifest["package_kind"],
-                package_id=manifest["package_id"], project_id=manifest["project"]["id"],
+                package_id=manifest["package_id"], project_id=project_payload.get("id"),
                 project_deployment_id=(manifest.get("project_deployment") or {}).get("id"), package_path=str(target),
                 package_sha256=digest.hexdigest(), status=status, stage="verified",
                 checkpoint={"verified": True, "upload_size": size}, signature_status="verified", items=items)
@@ -1438,6 +1747,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def migration_retry(job_id: str):
         try: return store.retry_migration_job(job_id)
         except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/migrations/{job_id}/resume", status_code=202)
+    def migration_resume(job_id: str, payload: MigrationResumeRequest):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以继续导入任务")
+        try:
+            return store.resume_migration_job(
+                job_id, selected_import_target=payload.selected_import_target,
+            )
+        except ValueError as exc:
+            raise _error(exc) from exc
 
     return app
 

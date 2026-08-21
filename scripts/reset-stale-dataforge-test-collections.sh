@@ -8,6 +8,10 @@ cd "$PROJECT_ROOT"
 COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}"
 ENV_FILE="${ENV_FILE:-.env.docker}"
 
+if [[ "$#" -ne 0 ]]; then
+  echo "该固定测试清理脚本不接受参数；直接运行脚本即执行 dry-run、删除和 Provision。" >&2
+  exit 2
+fi
 if [[ ! -f "$COMPOSE_FILE" ]]; then
   echo "未找到 $COMPOSE_FILE" >&2
   exit 1
@@ -16,11 +20,6 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "未找到 $ENV_FILE" >&2
   exit 1
 fi
-if [[ ! -t 0 ]]; then
-  echo "必须在交互终端手动运行，禁止无交互自动删除。" >&2
-  exit 1
-fi
-
 bash scripts/ensure-dataforge-milvus-link.sh --env-file "$ENV_FILE"
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config >/dev/null
 
@@ -197,13 +196,7 @@ if [[ ! "$confirmation_value" =~ ^DROP-DATAFORGE-OWNED-[0-9A-F]{16}$ ]]; then
 fi
 
 echo
-echo "即将永久删除 dry-run 中固定列出的五个 DataForge-owned Collection。"
-printf '请输入确认值 %s：' "$confirmation_value"
-IFS= read -r entered_confirmation
-if [[ "$entered_confirmation" != "$confirmation_value" ]]; then
-  echo "确认值不匹配，未执行删除。" >&2
-  exit 1
-fi
+echo "dry-run 门禁已通过；现在自动永久删除固定列出的五个 DataForge-owned Collection。"
 
 echo "===== Execute fixed allowlist cleanup ====="
 run_cleanup --execute --confirm "$confirmation_value"

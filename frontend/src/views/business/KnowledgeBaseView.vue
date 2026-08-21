@@ -1,39 +1,33 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
+import { buildKnowledgeCards, filterKnowledgeLibraries, normalizeKnowledgeTypeFilter } from './knowledgeOverviewModel'
 
-const router = useRouter()
-const libraries = ref([]), types = ref([]), keyword = ref(''), error = ref('')
+const route = useRoute(), router = useRouter()
+const libraries = ref([]), types = ref([]), keyword = ref(''), error = ref(''), loading = ref(true)
 const deletingId = ref('')
-const builtinCards = [
-  { key: 'text', family: 'text', mode: null, icon: '文', name: '文本知识', detail: '文档片段与结构化文本' },
-  { key: 'qa', family: 'qa', mode: null, icon: '问', name: '问答知识', detail: '问题与完整答案' },
-  { key: 'graph:triple', family: 'graph', mode: 'triple', icon: '△', name: '三元组图谱', detail: '适用于明确 S / P / O 关系' },
-  { key: 'graph:semantic', family: 'graph', mode: 'semantic', icon: '⬡', name: '语义图谱', detail: '实体、关系描述与 Evidence' },
-]
+const activeType = computed(() => normalizeKnowledgeTypeFilter(String(route.query.type || '')))
+const typeCards = computed(() => buildKnowledgeCards(libraries.value))
+const activeCard = computed(() => typeCards.value.find(card => card.key === activeType.value) || null)
+const visibleLibraries = computed(() => filterKnowledgeLibraries(libraries.value, activeType.value, keyword.value))
 
 async function load() {
-  try { [libraries.value, types.value] = await Promise.all([api.knowledgeLibraries(), api.knowledgeTypes()]); error.value = '' } catch (err) { error.value = err.message }
+  try {
+    ;[libraries.value, types.value] = await Promise.all([api.knowledgeLibraries(), api.knowledgeTypes()])
+    error.value = ''
+  } catch (err) { error.value = err.message }
+  finally { loading.value = false }
 }
 
-const additionalCards = computed(() => types.value
-  .filter(item => !['text', 'qa', 'graph'].includes(item.code))
-  .map(item => ({ key: item.code, family: item.code, mode: null, icon: item.icon || '知', name: item.name || item.code, detail: '扩展知识类型' })))
-const typeCards = computed(() => [...builtinCards, ...additionalCards.value])
-const visibleLibraries = computed(() => {
-  const needle = keyword.value.trim().toLocaleLowerCase()
-  if (!needle) return libraries.value
-  return libraries.value.filter(item => [item.name, item.code, item.id, item.display_type, item.knowledge_type]
-    .filter(Boolean).some(value => String(value).toLocaleLowerCase().includes(needle)))
-})
-const libraryGroups = computed(() => typeCards.value.map(card => {
-  const values = visibleLibraries.value.filter(item => item.knowledge_type === card.family && (card.mode === null || item.graph_mode === card.mode))
-  const allValues = libraries.value.filter(item => item.knowledge_type === card.family && (card.mode === null || item.graph_mode === card.mode))
-  return { ...card, libraries: values, libraryCount: allValues.length, itemCount: allValues.reduce((sum, item) => sum + (item.knowledge_item_count || 0), 0) }
-}).filter(group => group.libraryCount || builtinCards.some(card => card.key === group.key)))
-
+function selectType(key) { router.push({ path: '/business/knowledge', query: { ...route.query, type: key } }) }
+function clearType() {
+  const query = { ...route.query }
+  delete query.type
+  router.push({ path: '/business/knowledge', query })
+}
 function openLibrary(library) { router.push(`/business/knowledge/${library.id}`) }
+async function copyId(value) { await navigator.clipboard?.writeText(value) }
 async function requestDelete(library) {
   if (deletingId.value) return
   deletingId.value = library.id; error.value = ''
@@ -56,29 +50,44 @@ async function requestDelete(library) {
     if (!window.confirm(message)) return
     await api.deleteKnowledgeLibrary(library.id)
     await load()
-  } catch (err) { error.value = err.message } finally { deletingId.value = '' }
+  } catch (err) { error.value = err.message }
+  finally { deletingId.value = '' }
 }
-function typeName(library) { return library.display_type || types.value.find(item => item.code === library.knowledge_type)?.name || library.knowledge_type }
-function shortId(value) { return value?.length > 18 ? `${value.slice(0, 18)}…` : value }
+function typeName(library) {
+  if (library.graph_mode === 'triple') return '三元组图谱'
+  if (library.graph_mode === 'semantic') return '语义图谱'
+  return library.display_type || types.value.find(item => item.code === library.knowledge_type)?.name || library.knowledge_type
+}
+function sourceLibraryLabel(library) {
+  const values = library.source_document_libraries || []
+  return values.length ? values.map(item => item.name).join('、') : '—（迁入或手工创建）'
+}
+function formatTime(value) { return value ? new Date(value).toLocaleString() : '—' }
 onMounted(load)
 </script>
 
 <template>
   <section class="knowledge-overview">
-    <div class="page-head"><div><h2>知识库</h2><p>按知识类型查看由文档处理或迁移产生的成果库、活跃知识量和向量就绪状态。</p></div></div>
-    <div class="knowledge-search"><label class="sr-only" for="knowledge-search">搜索知识库</label><input id="knowledge-search" v-model="keyword" placeholder="搜索知识库名称或技术 ID"></div>
+    <div class="page-head"><div><h2>知识库</h2><p>统一查看知识库数量、知识条数、来源与向量物理位置。</p></div></div>
     <p v-if="error" class="error">{{ error }}</p>
-    <section class="type-summary" aria-label="知识类型总览"><article v-for="group in libraryGroups" :key="group.key"><span class="type-icon">{{ group.icon }}</span><div><b>{{ group.name }}</b><small>{{ group.libraryCount }} 个知识库 · {{ group.itemCount.toLocaleString() }} 条知识</small></div></article></section>
-    <section v-if="!libraries.length" class="empty-guidance"><b>尚无知识库</b><p>请前往文档管理，为文档库绑定已发布的知识流程模板；处理文档后会自动生成结果知识库。也可以通过知识库迁移导入已有成果。</p><button class="primary" type="button" @click="router.push('/business/documents')">前往文档管理</button></section>
-    <template v-else><section v-for="group in libraryGroups" :key="`list-${group.key}`" class="knowledge-group"><div class="section-heading"><div><h3>{{ group.name }}</h3><p>{{ group.detail }} · 共 {{ group.libraryCount }} 个</p></div></div><div v-if="group.libraries.length" class="library-grid"><div v-for="library in group.libraries" :key="library.id" class="library-card"><button class="library-card-main" type="button" @click="openLibrary(library)"><span class="library-type">{{ group.icon }} {{ typeName(library) }}</span><b>{{ library.name }}</b><span><span class="badge" :class="library.origin_state==='forked'?'amber':library.origin_type==='central_import'?'blue':'green'">{{ library.origin_state==='forked'?'已本地修改':library.origin_type==='central_import'?'中心迁入':'本地创建' }}</span></span><span class="library-metrics"><span>{{ (library.knowledge_item_count || 0).toLocaleString() }} 条知识</span><span v-if="library.status === 'deleting'" class="badge amber">正在删除</span><span v-else :class="['badge', library.vector_ready ? 'green' : 'amber']">向量 {{ library.vector_ready ? '就绪' : '未就绪' }}</span></span><small :title="library.id">{{ shortId(library.code || library.id) }} · {{ library.status === 'deleting' ? '等待 Partition 清理完成' : `更新于 ${new Date(library.updated_at).toLocaleString()}` }}</small></button><div class="library-card-actions"><button v-if="library.status !== 'deleting'" class="danger" :disabled="deletingId === library.id" @click="requestDelete(library)">{{ deletingId === library.id ? '检查中…' : '删除' }}</button></div></div></div><p v-else-if="keyword" class="empty-group">没有匹配的知识库。</p><p v-else class="empty-group">暂无此类知识库。</p></section></template>
+    <p v-else-if="loading" class="loading">正在加载知识库…</p>
+    <template v-else>
+      <section class="type-summary" aria-label="知识类型总览">
+        <button v-for="card in typeCards" :key="card.key" :class="['type-card', { active: activeType === card.key }]" type="button" :aria-pressed="activeType === card.key" @click="selectType(card.key)"><span class="type-icon">{{ card.icon }}</span><span><b>{{ card.name }}</b><small>{{ card.libraryCount }} 个知识库 · {{ card.itemCount.toLocaleString() }} 条知识</small></span></button>
+      </section>
+      <div class="knowledge-toolbar"><div><label class="sr-only" for="knowledge-search">搜索知识库</label><input id="knowledge-search" v-model="keyword" placeholder="搜索名称、技术 ID、来源文档库或 Collection"></div><button v-if="activeType" type="button" @click="clearType">查看全部知识库</button><span v-else class="muted">未筛选时包含扩展知识类型</span></div>
+
+      <section v-if="activeCard?.libraryCount === 0" class="empty-guidance type-empty"><span class="type-icon">{{ activeCard.icon }}</span><b>当前类型暂无知识库</b><p>该知识类型目前为 0 个知识库 · 0 条知识</p></section>
+      <section v-else-if="!libraries.length" class="empty-guidance"><b>尚无知识库</b><p>请前往文档管理，为文档库绑定已发布的知识流程模板；处理文档后会自动生成结果知识库。</p><button class="primary" type="button" @click="router.push('/business/documents')">前往文档管理</button></section>
+      <section v-else class="knowledge-list-panel">
+        <div class="section-heading"><div><h3>{{ activeCard?.name || '全部知识库' }}</h3><p>{{ activeCard ? `${activeCard.libraryCount} 个知识库 · ${activeCard.itemCount.toLocaleString()} 条知识` : `共 ${libraries.length} 个知识库` }}</p></div></div>
+        <div v-if="visibleLibraries.length" class="table-wrap"><table class="knowledge-table"><thead><tr><th>知识库名称</th><th>技术 ID</th><th>知识类型</th><th>来源文档库</th><th>知识数量</th><th>向量状态</th><th>Collection</th><th>Partition</th><th>最近更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="library in visibleLibraries" :key="library.id"><td><button class="library-link" type="button" @click="openLibrary(library)">{{ library.name }}</button><span v-if="library.status === 'deleting'" class="badge amber">正在删除</span><span v-else-if="library.origin_state === 'forked'" class="badge amber">已本地修改</span><span v-else :class="['badge', library.origin_type === 'central_import' ? 'blue' : 'green']">{{ library.origin_type === 'central_import' ? '中心迁入' : '本地创建' }}</span></td><td><button class="technical-id" type="button" :title="library.id" @click="copyId(library.id)"><code>{{ library.id }}</code><small>点击复制</small></button></td><td>{{ typeName(library) }}</td><td>{{ sourceLibraryLabel(library) }}</td><td><b>{{ (library.knowledge_item_count || 0).toLocaleString() }}</b> 条</td><td><span v-if="library.status === 'deleting'" class="badge amber">等待清理</span><span v-else :class="['badge', library.vector_ready ? 'green' : 'amber']">{{ library.vector_ready ? 'Vector Ready' : '未就绪' }}</span></td><td><div v-if="library.collection_names?.length" class="technical-stack"><code v-for="name in library.collection_names" :key="name">{{ name }}</code></div><span v-else>—</span></td><td><code>{{ library.partition_name || '—' }}</code></td><td>{{ formatTime(library.updated_at) }}</td><td><div class="row-actions"><button type="button" @click="openLibrary(library)">详情</button><button v-if="library.status !== 'deleting'" class="danger" type="button" :disabled="deletingId === library.id" @click="requestDelete(library)">{{ deletingId === library.id ? '检查中…' : '删除' }}</button></div></td></tr></tbody></table></div>
+        <div v-else class="empty-guidance search-empty"><b>未找到匹配的知识库</b><p>请调整搜索关键词，或清除当前知识类型筛选。</p></div>
+      </section>
+    </template>
   </section>
 </template>
 
 <style scoped>
-  .knowledge-search{max-width:640px;margin:0 0 20px}.knowledge-search input{width:100%}.type-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:30px}.type-summary article{display:flex;min-width:0;align-items:center;gap:12px;padding:18px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.type-summary b,.type-summary small{display:block}.type-summary b{font-size:16px}.type-summary small{margin-top:5px;color:var(--muted);font-size:13px}.type-icon{display:grid;width:42px;height:42px;flex:0 0 auto;place-items:center;border-radius:12px;color:var(--blue);background:var(--blue-soft);font-size:20px;font-weight:800}.knowledge-group{margin-top:28px}.section-heading h3{margin:0;font-size:20px}.section-heading p{margin:6px 0 12px;color:var(--muted);font-size:13px}.library-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.library-card{display:flex;flex-direction:column;min-width:0;min-height:158px;gap:9px;padding:18px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow);text-align:left}.library-card:hover{border-color:#b9cff7;box-shadow:0 10px 28px rgba(47,111,237,.12)}.library-card-main{display:grid;flex:1 1 auto;min-width:0;align-content:start;gap:9px;padding:0;border:0;background:transparent;text-align:left}.library-card-main>b{overflow:hidden;font-size:16px;text-overflow:ellipsis;white-space:nowrap}.library-card-actions{display:flex;justify-content:flex-end;margin-top:2px}.library-type{color:var(--blue);font-size:13px;font-weight:800}.library-metrics{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;color:#536177;font-size:14px}.library-card small{overflow:hidden;color:var(--muted);font-size:12px;text-overflow:ellipsis;white-space:nowrap}.empty-group,.empty-guidance{margin:0;padding:24px;border:1px dashed var(--border);border-radius:var(--radius);color:var(--muted);background:var(--panel-muted)}.empty-guidance{display:grid;justify-items:start;gap:10px}.empty-guidance b{color:var(--text);font-size:17px}.empty-guidance p{max-width:720px;margin:0}.empty-guidance button{margin-top:4px}@media(max-width:1440px){.type-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.library-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:1100px){.library-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:900px){.type-summary,.library-grid{grid-template-columns:1fr}}
-</style>
-<style scoped>
-@media (min-width: 901px) and (max-width: 1440px) {
-  .library-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
+.type-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px}.type-card{display:flex;min-width:0;align-items:center;gap:12px;padding:18px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow);text-align:left}.type-card:hover,.type-card.active{border-color:#8fb3f5;box-shadow:0 10px 28px rgba(47,111,237,.12)}.type-card.active{background:var(--blue-soft);box-shadow:0 0 0 2px rgba(47,111,237,.12)}.type-card b,.type-card small{display:block}.type-card b{font-size:16px}.type-card small{margin-top:5px;color:var(--muted);font-size:13px}.type-icon{display:grid;width:42px;height:42px;flex:0 0 auto;place-items:center;border-radius:12px;color:var(--blue);background:var(--blue-soft);font-size:20px;font-weight:800}.knowledge-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:22px}.knowledge-toolbar>div{width:min(640px,100%)}.knowledge-toolbar input{width:100%}.knowledge-list-panel{margin-top:8px}.section-heading h3{margin:0;font-size:20px}.section-heading p{margin:6px 0 12px;color:var(--muted);font-size:13px}.knowledge-table{min-width:1460px}.knowledge-table th,.knowledge-table td{vertical-align:top}.knowledge-table th{white-space:nowrap}.knowledge-table td:first-child{min-width:210px}.knowledge-table td:nth-child(2){max-width:240px}.library-link{display:block;max-width:260px;padding:0;border:0;background:transparent;color:var(--text);font-weight:800;text-align:left}.library-link:hover{color:var(--blue)}.knowledge-table td:first-child .badge{display:inline-block;margin-top:8px}.technical-id{display:grid;max-width:230px;gap:3px;padding:0;border:0;background:transparent;text-align:left}.technical-id code{overflow:hidden;text-overflow:ellipsis}.technical-id small{color:var(--blue)}.technical-stack{display:grid;gap:5px}.technical-stack code{max-width:240px;overflow:hidden;text-overflow:ellipsis}.row-actions{display:flex;gap:6px}.empty-guidance{display:grid;justify-items:start;gap:10px;margin:0;padding:26px;border:1px dashed var(--border);border-radius:var(--radius);color:var(--muted);background:var(--panel-muted)}.empty-guidance b{color:var(--text);font-size:17px}.empty-guidance p{margin:0}.type-empty{justify-items:center;padding:46px;text-align:center}.type-empty .type-icon{margin-bottom:4px}.search-empty{margin-top:12px}@media(max-width:1440px){.type-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:900px){.type-summary{grid-template-columns:1fr}.knowledge-toolbar{align-items:stretch;flex-direction:column}.knowledge-toolbar>div{width:100%}}
 </style>

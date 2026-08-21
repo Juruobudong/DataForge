@@ -7,10 +7,14 @@ from typing import Any
 from sqlalchemy import func, select
 
 from ..models import (
+    DocumentLibraryProcessingRecord,
+    DocumentLibraryTemplateBinding,
+    DocumentLibraryTemplateOutput,
     KnowledgeIndexProfile,
     KnowledgeIndexProfileRevision,
     KnowledgeItem,
     KnowledgeLibrary,
+    KnowledgeAssetVersion,
     Project,
     Deployment,
     DeploymentTarget,
@@ -20,7 +24,12 @@ from ..models import (
     ProjectOrgRoute,
     ProjectOrgRouteLibrary,
     ProjectRouteVersion,
+    ProjectRouteVersionAsset,
+    InstitutionReleaseDraft,
+    InstitutionReleaseDraftProject,
+    InstitutionReleaseSnapshot,
     ProjectTask,
+    Source, SourceVersion,
 )
 from ..store import V7Store
 from .dependency import resolve_dependencies
@@ -143,4 +152,220 @@ class MigrationPlanner:
                 "include_full_document_library": include_full_document_library,
                 "base_route_version": latest_route.version_no if latest_route else None,
                 "base_route_snapshot": latest_route.snapshot_json if latest_route else None,
+            }
+
+
+class InstitutionReleasePlanner:
+    """Freeze one institution-wide, multi-project release closure."""
+
+    def __init__(self, store: V7Store):
+        self.store = store
+
+    def plan(self, draft_id: str) -> dict[str, Any]:
+        with self.store.sessions() as session:
+            draft = session.get(InstitutionReleaseDraft, draft_id)
+            if not draft or draft.status not in {"draft", "planned", "failed"}:
+                raise ValueError("机构发布草稿当前不可规划")
+            deployment = session.get(Deployment, draft.target_deployment_id)
+            if not deployment or deployment.scope != "institution" or not deployment.institution_code:
+                raise ValueError("机构发布目标身份不完整")
+            project_links = list(session.scalars(select(InstitutionReleaseDraftProject).where(
+                InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
+            ).order_by(InstitutionReleaseDraftProject.created_at)))
+            projects: list[dict[str, Any]] = []
+            asset_ids: set[str] = set()
+            if draft.package_kind in {"deployment_seed", "institution_release"}:
+                if not project_links:
+                    raise ValueError("Seed/Institution Release 至少选择一个项目版本")
+                for link in project_links:
+                    binding = session.get(ProjectDeployment, link.project_deployment_id)
+                    route = session.get(ProjectRouteVersion, link.project_route_version_id)
+                    project = session.get(Project, binding.project_id) if binding else None
+                    if not binding or binding.deployment_id != deployment.id or not project:
+                        raise ValueError("机构发布项目不属于目标机构")
+                    if not route or route.status != "frozen" or route.project_deployment_id != binding.id:
+                        raise ValueError("机构发布只能引用当前机构的 frozen RouteVersion")
+                    route_assets = list(session.scalars(select(ProjectRouteVersionAsset).where(
+                        ProjectRouteVersionAsset.project_route_version_id == route.id,
+                    )))
+                    if not route_assets:
+                        raise ValueError(f"项目 {project.name} 的 frozen RouteVersion 没有 AssetVersion")
+                    asset_ids.update(item.knowledge_asset_version_id for item in route_assets)
+                    projects.append({
+                        "project": {"id": project.id, "code": project.code, "name": project.name},
+                        "project_deployment_id": binding.id,
+                        "route_version_id": route.id, "route_version": route.version_no,
+                        "route_checksum": route.checksum, "route_snapshot": route.snapshot_json,
+                    })
+            else:
+                selected = list(dict.fromkeys((draft.selection_json or {}).get("knowledge_library_ids") or []))
+                if not selected:
+                    raise ValueError("Knowledge Update 至少选择一个知识库")
+                for library_id in selected:
+                    latest_by_profile: dict[str, KnowledgeAssetVersion] = {}
+                    for asset in session.scalars(select(KnowledgeAssetVersion).where(
+                        KnowledgeAssetVersion.knowledge_library_id == library_id,
+                        KnowledgeAssetVersion.status == "ready",
+                    ).order_by(KnowledgeAssetVersion.version_no.desc())):
+                        latest_by_profile.setdefault(asset.index_profile_id, asset)
+                    if not latest_by_profile:
+                        raise ValueError(f"知识库 {library_id} 没有 Ready AssetVersion")
+                    asset_ids.update(item.id for item in latest_by_profile.values())
+
+            assets = list(session.scalars(select(KnowledgeAssetVersion).where(
+                KnowledgeAssetVersion.id.in_(asset_ids), KnowledgeAssetVersion.status == "ready",
+            ))) if asset_ids else []
+            if {item.id for item in assets} != asset_ids:
+                raise ValueError("发布引用的 AssetVersion 已失效")
+            library_ids = sorted({item.knowledge_library_id for item in assets})
+            libraries = {item.id: item for item in session.scalars(select(KnowledgeLibrary).where(
+                KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
+            ))}
+            if set(libraries) != set(library_ids):
+                raise ValueError("发布引用的知识库不存在或不可用")
+            # A logical library may be shared by projects only when its selected
+            # physical contract is identical.  Multiple profiles remain legal
+            # only for an asset-only Knowledge Update.
+            if draft.package_kind != "knowledge_update":
+                for library_id in library_ids:
+                    contracts = {(item.index_profile_revision_id, item.storage_contract_revision_id,
+                                  item.collection_name, item.partition_name)
+                                 for item in assets if item.knowledge_library_id == library_id}
+                    if len(contracts) != 1:
+                        raise ValueError(f"知识库 {library_id} 在多项目中引用了不同 AssetVersion/Contract")
+            include_full = (draft.package_kind in {"deployment_seed", "institution_release"} or
+                            bool((draft.selection_json or {}).get("include_full_document_library")))
+            dependencies = resolve_dependencies(session, library_ids,
+                                                 include_full_document_library=include_full)
+            closure_outputs = list(session.scalars(select(DocumentLibraryTemplateOutput).where(
+                DocumentLibraryTemplateOutput.knowledge_library_id.in_(library_ids),
+            ))) if library_ids else []
+            closure_binding_ids = {item.document_library_template_binding_id for item in closure_outputs}
+            closure_bindings = list(session.scalars(select(DocumentLibraryTemplateBinding).where(
+                DocumentLibraryTemplateBinding.id.in_(closure_binding_ids),
+                DocumentLibraryTemplateBinding.document_library_id.in_(dependencies.document_library_ids),
+            ))) if closure_binding_ids and dependencies.document_library_ids else []
+            closure_binding_ids = {item.id for item in closure_bindings}
+            closure_outputs = [item for item in closure_outputs
+                               if item.document_library_template_binding_id in closure_binding_ids]
+            closure_records = list(session.scalars(select(DocumentLibraryProcessingRecord).where(
+                DocumentLibraryProcessingRecord.document_library_template_binding_id.in_(closure_binding_ids),
+                DocumentLibraryProcessingRecord.source_version_id.in_(dependencies.source_version_ids),
+            ))) if closure_binding_ids and dependencies.source_version_ids else []
+            closure_revision_ids = {
+                item.last_successful_revision_id for item in closure_bindings if item.last_successful_revision_id
+            } | {item.knowledge_flow_template_revision_id for item in closure_records}
+            inventory_items = list(session.scalars(select(KnowledgeItem).where(
+                KnowledgeItem.knowledge_library_id.in_(library_ids), KnowledgeItem.status == "active",
+            ))) if library_ids else []
+            inventory_sources = list(session.scalars(select(Source).where(
+                Source.id.in_(dependencies.source_ids), Source.status != "deleted",
+            ))) if dependencies.source_ids else []
+            inventory_versions = list(session.scalars(select(SourceVersion).where(
+                SourceVersion.id.in_(dependencies.source_version_ids), SourceVersion.status != "deleted",
+            ))) if dependencies.source_version_ids else []
+            content_inventory = {
+                "knowledge_items": [{"id": item.id, "knowledge_library_id": item.knowledge_library_id,
+                                     "content_hash": item.content_hash} for item in inventory_items],
+                "sources": [{"id": item.id, "document_library_id": item.document_library_id}
+                            for item in inventory_sources],
+                "source_versions": [{"id": item.id, "source_id": item.source_id, "sha256": item.sha256}
+                                    for item in inventory_versions],
+            }
+            collections: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for asset in sorted(assets, key=lambda item: (item.collection_name, item.partition_name)):
+                collections[asset.collection_name].append({
+                    "knowledge_library_id": asset.knowledge_library_id,
+                    "knowledge_library_name": libraries[asset.knowledge_library_id].name,
+                    "asset_version_id": asset.id, "asset_version_no": asset.version_no,
+                    "index_profile_id": asset.index_profile_id,
+                    "index_profile_revision_id": asset.index_profile_revision_id,
+                    "storage_contract_revision_id": asset.storage_contract_revision_id,
+                    "collection_name": asset.collection_name, "partition_name": asset.partition_name,
+                    "item_count": asset.item_count, "content_digest": asset.content_digest,
+                })
+            base = session.get(InstitutionReleaseSnapshot, draft.base_release_id) if draft.base_release_id else None
+            if draft.base_release_id and (not base or base.target_deployment_id != deployment.id):
+                raise ValueError("base release 不属于当前目标机构")
+            previous_assets = {
+                str(item.get("id")): item for item in ((base.snapshot_json or {}).get("asset_versions") or [])
+            } if base else {}
+            current_assets = {item.id: item for item in assets}
+            added = sorted(set(current_assets) - set(previous_assets))
+            removed = sorted(set(previous_assets) - set(current_assets))
+            reused = sorted(set(current_assets) & set(previous_assets))
+            tombstones = [{"kind": "asset_version", "id": asset_id,
+                           "knowledge_library_id": previous_assets[asset_id].get("knowledge_library_id")}
+                          for asset_id in removed]
+            base_inventory = (base.snapshot_json or {}).get("content_inventory") or {} if base else {}
+            content_diff: dict[str, dict[str, int]] = {}
+            for kind in ("knowledge_items", "sources", "source_versions"):
+                previous = {str(item["id"]): item for item in base_inventory.get(kind) or []}
+                current = {str(item["id"]): item for item in content_inventory[kind]}
+                comparable = (kind == "knowledge_items" or not base or
+                              (include_full and bool((base.snapshot_json or {}).get(
+                                  "include_full_document_library"))))
+                removed_ids = sorted(set(previous) - set(current))
+                if not comparable:
+                    removed_ids = []
+                added_ids = sorted(set(current) - set(previous))
+                updated_ids = sorted(identifier for identifier in set(previous) & set(current)
+                                     if previous[identifier] != current[identifier])
+                content_diff[kind] = {"added": len(added_ids), "updated": len(updated_ids),
+                                      "removed": len(removed_ids),
+                                      "reused": len(set(previous) & set(current)) - len(updated_ids)}
+                tombstone_kind = {"knowledge_items": "knowledge_item", "sources": "source",
+                                  "source_versions": "source_version"}[kind]
+                tombstones.extend({"kind": tombstone_kind, **previous[identifier]}
+                                  for identifier in removed_ids)
+            target = session.scalar(select(MilvusTarget).join(
+                DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
+            ).where(DeploymentTarget.deployment_id == deployment.id,
+                    DeploymentTarget.release_stage == deployment.release_stage,
+                    DeploymentTarget.target_kind == "milvus"))
+            milvus_preset = dict(draft.milvus_override_json or {})
+            if not milvus_preset and target:
+                milvus_preset = {"uri": target.milvus_url}
+            object_size = session.scalar(select(func.sum(SourceVersion.size_bytes)).where(
+                SourceVersion.id.in_(dependencies.source_version_ids)
+            )) if dependencies.source_version_ids else 0
+            return {
+                "package_kind": draft.package_kind,
+                "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
+                               "institution_name": deployment.institution_name,
+                               "institution_code": deployment.institution_code, "scope": deployment.scope,
+                               "release_stage": deployment.release_stage,
+                               "milvus_preset": milvus_preset or None},
+                "projects": projects,
+                "knowledge_library_ids": library_ids,
+                "asset_versions": [item for values in collections.values() for item in values],
+                "libraries": [item for values in collections.values() for item in values],
+                "collections": dict(collections),
+                "dependencies": {
+                    "document_library_ids": list(dependencies.document_library_ids),
+                    "source_ids": list(dependencies.source_ids),
+                    "source_version_ids": list(dependencies.source_version_ids),
+                    "source_chunk_ids": list(dependencies.source_chunk_ids),
+                },
+                "runtime_closure": {
+                    "binding_ids": sorted(closure_binding_ids),
+                    "output_ids": sorted(item.id for item in closure_outputs),
+                    "processing_record_ids": sorted(item.id for item in closure_records),
+                    "template_revision_ids": sorted(closure_revision_ids),
+                },
+                "content_inventory": content_inventory,
+                "include_full_document_library": include_full,
+                "base_release_id": draft.base_release_id,
+                "base_manifest_digest": base.manifest_digest if base else None,
+                "diff_summary": {"asset_versions": {"added": len(added), "updated": 0,
+                                                        "removed": len(removed), "reused": len(reused)},
+                                 **content_diff,
+                                 "added_ids": added, "removed_ids": removed, "reused_ids": reused},
+                "tombstones": tombstones,
+                "counts": {"projects": len(projects), "knowledge_libraries": len(library_ids),
+                           "document_libraries": len(dependencies.document_library_ids),
+                           "collections": len(collections), "partitions": len(assets),
+                           "object_size_bytes": int(object_size or 0),
+                           "vector_item_count": sum(int(item.item_count or 0) for item in assets)},
+                "milvus_override_reason": draft.milvus_override_reason,
             }

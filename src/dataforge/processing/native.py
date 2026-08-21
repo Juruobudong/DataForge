@@ -15,6 +15,11 @@ PARAGRAPH_RE = re.compile(r"\n{2,}")
 
 
 def normalize_medical_text(value: Any) -> str:
+    """通用文本规范化（与具体行业无关）。
+
+    统一空值、换行符、全角/半角与多余空白；医疗、金融、制造等
+    各行业文档均可复用，不限定医疗领域。
+    """
     text = unicodedata.normalize("NFKC", "" if value is None else str(value))
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [WHITESPACE_RE.sub(" ", line).strip() for line in text.split("\n")]
@@ -113,6 +118,11 @@ def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
 
 
 class NativeMedicalEngine:
+    """本地通用文档分块引擎（行业无关）。
+
+    基于 normalize_medical_text 与 split_text 完成标准化与分段，
+    适用于任意行业的文档库，不限定医疗领域。
+    """
     name = "native"
     version = "1"
 

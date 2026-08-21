@@ -42,6 +42,7 @@ logger = logging.getLogger("dataforge.v7.runner")
 class RunRequest(BaseModel):
     job_id: str | None = None
     flow_run_id: str | None = None
+    lease_owner: str | None = None
 
 
 def _objects(settings: Settings):
@@ -1053,7 +1054,9 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     raise ValueError(f"Runner 没有批准的算子 Adapter：{ref}")
 
 
-def execute_job(store: V7Store, objects, job_id: str) -> dict:
+def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
+    if lease_owner:
+        store.assert_work_lease("knowledge", job_id, lease_owner)
     with store.sessions() as session:
         job = session.get(KnowledgeJob, job_id)
         if not job:
@@ -1069,6 +1072,7 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
     outputs: dict[str, list[dict[str, Any]]] = {}
     artifact_ids: dict[str, list[str]] = {}
     changes: dict[str, dict[str, int]] = {}
+    committed_sinks: set[str] = set()
     sink_errors: dict[str, str] = {}
     node_errors: dict[str, str] = {}
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -1131,6 +1135,8 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         # failed chunk stays out of a Sink's replacement range, so successful
         # neighbouring chunks can publish without erasing it.
         for node in sink_nodes:
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             node_id = node["id"]
             source_nodes = incoming.get(node_id, [])
             input_values = [value for source_id in source_nodes for value in outputs.get(source_id, [])]
@@ -1147,6 +1153,7 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                     changes[output_key] = store.apply_knowledge_output(
                         job_id, output_key, input_values, successful_chunks=successful,
                     )
+                    committed_sinks.add(output_key)
                 else:
                     changes[output_key] = {"ADD": 0, "UPDATE": 0, "INACTIVE": 0, "UNCHANGED": 0}
                 outputs[node_id] = [{"_artifact_type": f"knowledge_item:{output_key}", "knowledge_type": knowledge_type, "graph_mode": node.get("graph_mode"), "change": changes[output_key]}]
@@ -1159,11 +1166,13 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         for knowledge_type in missing_generation:
             sink_errors[knowledge_type] = "流程没有执行该知识类型的生成节点"
         successful_chunks = [entry for outcome in generation.values() for entry in outcome["successful"]]
-        if not successful_chunks:
+        if not successful_chunks or not committed_sinks:
             detail = "; ".join(f"{kind}: {error}" for kind, error in sink_errors.items())
             if not detail:
-                detail = "所有知识生成分块均失败"
+                detail = "所有知识生成分块均失败" if not successful_chunks else "所有 Knowledge Sink 均未成功提交"
             store.finish_flow_run(flow_run["id"], detail)
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             store.mark_job_failed(job_id, detail)
             return {"id": job_id, "status": "failed", "flow_run_id": flow_run["id"], "changes": changes, "sink_errors": sink_errors}
         warnings = [{"knowledge_type": kind, "source_version_id": item["source_version_id"], "source_chunk_id": item["source_chunk_id"], "chunk_index": item["chunk_index"], "error": item["error"]} for kind, outcome in generation.items() for item in outcome["failed"]]
@@ -1173,6 +1182,8 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         # older missing chunk be withdrawn.  A failure in any target type keeps
         # the whole source-version history, including on a failed-only retry.
         if not warnings:
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             cleanup_source_versions = store.completed_source_versions_for_cleanup(
                 job_id, set(sink_libraries), current_source_chunks,
             )
@@ -1185,10 +1196,22 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                     )
         store.finish_flow_run(flow_run["id"], "部分分块生成失败" if warnings else None,
                               status="completed_with_warnings" if warnings else "completed")
+        if lease_owner:
+            store.assert_work_lease("knowledge", job_id, lease_owner)
         store.complete_job(job_id, warnings=warnings)
-        vector_jobs = {library_id: store.create_vector_sync_jobs(library_id) for library_id in sink_libraries.values()}
+        vector_jobs = {
+            library_id: store.create_vector_sync_jobs(library_id)
+            for output_key, library_id in sink_libraries.items()
+            if output_key in committed_sinks
+        }
         return {"id": job_id, "status": "completed_with_warnings" if warnings else "completed", "flow_run_id": flow_run["id"], "changes": changes, "warnings": warnings, "vector_sync_jobs": vector_jobs}
     except Exception as exc:
+        if lease_owner:
+            try:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
+            except ValueError:
+                store.finish_flow_run(flow_run["id"], "任务执行租约已失效")
+                raise
         for object_key in created_parser_keys:
             if object_key not in persisted_parser_keys:
                 try:
@@ -1297,7 +1320,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         verify(authorization)
         try:
             if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
-            if payload.job_id: return execute_job(store, objects, payload.job_id)
+            if payload.job_id:
+                if not payload.lease_owner:
+                    raise ValueError("知识任务请求缺少 lease_owner")
+                return execute_job(store, objects, payload.job_id, lease_owner=payload.lease_owner)
             raise ValueError("job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 

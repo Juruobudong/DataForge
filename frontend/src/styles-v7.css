@@ -387,11 +387,25 @@ pre {
 
 .metric { padding: 18px; }
 
+.metrics > div { padding: 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); box-shadow: var(--shadow); }
+.metrics > div b { display: block; margin-bottom: 5px; font-size: 22px; }
+.metrics > div span { color: var(--muted); font-size: var(--font-assist); }
+
 .metric b { display: block; margin-bottom: 5px; font-size: 22px; }
 
 .metric span { font-size: var(--font-assist); color: var(--muted); }
 
 .card { padding: 20px; }
+
+.card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.stat-card { display: grid; gap: 7px; min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
+.stat-card b { font-size: var(--font-card); }
+.stat-card small, .stat-card span { color: var(--muted); font-size: var(--font-assist); }
+.notice { margin: 14px 0; padding: 12px 14px; border: 1px solid #bdd4f5; border-radius: 10px; color: #174f93 !important; background: #eef5ff; }
+.timeline { display: grid; gap: 8px; margin: 14px 0; padding: 0; list-style: none; }
+.timeline li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: #f8fafc; }
+.timeline li.done { color: var(--text); border-color: #bee3cf; background: #f1fbf5; }
+.timeline li.failed { border-color: #efcccc; background: var(--red-soft); }
 
 .panel { padding: 20px; }
 

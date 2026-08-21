@@ -1,6 +1,6 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-18
+更新日期：2026-08-20
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
 
 ## 状态定义
@@ -24,8 +24,9 @@
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
-| 业务工作区 | 项目发布：共享 Deployment、多 Project 关联、医院/阶段 Target、DeploymentTask 授权、验证、Diff、历史、发布、回滚 | `DONE` | Snapshot v3 由 ProjectDeployment 级授权生成；医院 production Target 手工配置，生产三次独立确认；local 只显示绑定的顶层 Deployment。 |
-| 业务工作区 | 知识库迁移：Seed/Update 规划、生成、验签、冲突、重试与记录 | `DONE` | `.dfm`、SHA-256、Ed25519、真实 Parquet 和 Worker 检查点已实现；真实服务验收为 C-08。 |
+| 业务工作区 | 项目发布：任务/授权/优先级、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | institution scope 只 freeze 且不生成包；central scope 保留在线发布。Snapshot v3 固化版本化 Partition，机构码首次冻结后锁定。 |
+| 业务工作区 | 机构发布部署：多项目 Seed/Release、Knowledge Update、差异、构建、导入与激活 | `DONE` | `.dfm` v2、共享资产去重、模板闭包、正常 waiting、AES-GCM local target、逐项目/非原子批量激活已本地验证；`.34` 真实服务验收仍为 `CONNECT`。 |
+| 业务工作区 | local 初始化、组件健康与导入任务详情 | `DONE` | 向导不创建管理员或动态配置 MySQL/MinIO；展示组件状态、candidate 验证、检查点恢复和项目就绪矩阵。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 标准流程 | `DONE` | Document Parse / Clean / Chunk / Production / Publish 由受控子图与节点组成。 |
 | 流程开发区 | 模板 / 算子库 / 可复用子图 | `DONE` | 九类动态目录、业务/技术契约 Inspector、共享四模式 FlowCanvas、Mini DAG、只读 revision 与复制草稿；禁止任意代码、环和运行时改图。 |
@@ -52,12 +53,12 @@
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | 使用 `EMBEDDING_*` 和 `OpenAILikeEmbedding`；发布的模型/维度仍约束运行，环境模型/维度仅初始化新默认 Profile。 |
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格默认独立、仅显式选择兼容 ready 登记时复用。旧 `graph` Profile 仅供已有库冻结兼容，不参与受管供应或容量探测；真实供应仍属部署验收。 |
-| RoutingSnapshot Diff、版本列表、单版本预览、发布、回滚 | `DONE` | 按 ProjectDeployment/阶段隔离，文件路径含 Project、Deployment 与 `release_stage`；Runtime Token/ETag API 已接入 qa-agent 和 kg-for-consultation。 |
-| Instance / Deployment / Milvus Target | `DONE` | 顶层 Deployment 可关联多个 Project；local 单环境绑定且后端 404；阶段 Target 不保存 Collection/Partition 镜像。 |
-| `.dfm` Deployment Seed / Knowledge Update | `DONE` | 唯一 Deployment、最小文档依赖、指定 `kl_*` Partition、Ed25519、冲突三策略与幂等 Job。 |
+| RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/阶段隔离；Snapshot v3 指向 Ready `kl_*__vN`，local 单项目激活原子，批量明确非原子。 |
+| Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；Deployment 可关联多个 Project，机构码可锁定；local current/candidate/preset 凭据 AES-GCM 入库且响应脱敏。 |
+| `.dfm` v2 Seed / Institution Release / Knowledge Update | `DONE` | 多 frozen 项目、完整当前资产、差异/Tombstone、模板运行闭包、Ed25519、v1 导入兼容与检查点恢复。 |
 | Knowledge Type / Profile 发布契约 | `DONE` | 草稿只登记 planned 资源；发布自动 Provision 扩展/Manual create，实时校验 Manual attach，再冻结 Profile 与 Type Revision；同一 Type Revision 拒绝重复 Collection。 |
 | qa_agent FAQ 专用文件生产与固定迁移 | `DONE` | `qa-agent-faq`、自动 Profile、受管 Collection、无 LLM CSV/XLSX 模板、固定 12 Partition CLI/Bash 和 qa_agent `legacy/shadow/primary` 已实现并完成本地定向测试；真实导入归 C-10。 |
-| Collection 与 `kl_` Partition 生命周期 | `DONE` | 每库始终使用独立 `kl_<library-id>`；知识库/Profile/Type 不自动删整库。受管整库仅经 ownership/hash/引用/Partition 预检和异步任务显式删除；external 只能解绑。 |
+| Collection 与版本化 `kl_*__vN` Partition 生命周期 | `DONE` | 候选构建不 reset 运行版本；GC 引用保护、30 天和最近两版门禁，默认 dry-run 且只由显式 Job 执行。受管整库治理保持独立。 |
 | V7 受控重建 | `DONE` | 仅 `dataforge-migrate --rebuild-v7 --confirm=REBUILD-V7`，基于 DB manifest 删除 V7 对象/分区/表数据，绝不删除 Collection 或旧资源。 |
 
 ## 尚未完成项（按执行顺序）
@@ -73,7 +74,7 @@
 | C-05 | 上线签字与验收记录 | `CONNECT` | 依照 `docs/releases/v7-acceptance.md` 留存 C-01～C-04 的证据、负责人和批准记录。 |
 | C-06 | `qa_agent` 消费新的 V7 RoutingSnapshot | `DONE` | 绑定医院/阶段、LKG、dense `dataforge_qa_question/kl_*`、回退与 503 已实现并完成定向测试。 |
 | C-07 | 旧 MySQL/MinIO/Milvus 资源处置 | `DEFER` | 仅在人工清单、备份和明确批准后进行，V7 不自动清理。 |
-| C-08 | Deployment Seed/Update 真实离线迁移验收 | `CONNECT` | 在 `测试环境（空卷 Compose）` 空卷环境挂载签名密钥和 migration volume，完成 MySQL/MinIO/Milvus 真实 Partition 导出导入、同名不兼容预检、失败恢复、第二次 Seed 拒绝和 Update 不覆盖 local 自治数据。 |
+| C-08 | 多项目 Seed/Release/Update 真实离线迁移验收 | `CONNECT` | 在 `.34` 空卷环境挂载签名与配置加密密钥，完成双项目 Seed、无 Milvus waiting、candidate 验证/导入、逐项目/非原子激活、Update 路由不变、再发布采用新资产、Tombstone/Fork/失败恢复与 GC dry-run。 |
 | C-09 | 共享医院 Deployment 多 Project 真实验收 | `CONNECT` | 验证医院名称/代码、逐院 production URI、qa-agent 与 kg-for-consultation 共用 deployment code 但 Snapshot/授权独立、相同 org_code 跨 Project/医院隔离、生产备份恢复、Embedding 契约、dense 召回和 503 fail-closed。 |
 | C-10 | qa_agent FAQ `.34` 导入与文件替换验收 | `CONNECT` | 运行固定 dry-run/execute，证明 12 个文档库/Source/结果库/`kl_*`、MySQL 与目标 Milvus 8,281 条一致、旧 `faq` 完全不变；替换一个测试机构文件验证 ADD/UPDATE/INACTIVE 和新向量。随后单独配置 FAQ Routing 并按 shadow/primary 切换。 |
 

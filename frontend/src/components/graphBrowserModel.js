@@ -34,6 +34,15 @@ export function relationTypes(edges) {
   return values.sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'))
 }
 
+export function pushGraphViewSnapshot(history, snapshot) {
+  return [...history, snapshot]
+}
+
+export function takeGraphViewSnapshot(history, index = history.length - 1) {
+  if (index < 0 || index >= history.length) return { history: [...history], snapshot: null }
+  return { history: history.slice(0, index), snapshot: history[index] }
+}
+
 export function layoutGraph(graph) {
   const layout = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
   layout.setGraph({ rankdir: 'LR', ranksep: 92, nodesep: 54, edgesep: 28, marginx: 34, marginy: 34 })

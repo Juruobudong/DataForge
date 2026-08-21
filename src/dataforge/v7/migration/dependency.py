@@ -25,20 +25,33 @@ class DependencyScope:
 
 
 def resolve_dependencies(session, library_ids: list[str], *, include_full_document_library: bool = False) -> DependencyScope:
-    item_ids = list(session.scalars(select(KnowledgeItem.id).where(KnowledgeItem.knowledge_library_id.in_(library_ids))))
+    item_ids = list(session.scalars(select(KnowledgeItem.id).where(
+        KnowledgeItem.knowledge_library_id.in_(library_ids), KnowledgeItem.status == "active",
+    )))
     links = list(session.scalars(select(KnowledgeItemSource).where(KnowledgeItemSource.knowledge_item_id.in_(item_ids)))) if item_ids else []
     version_ids = {link.source_version_id for link in links}
-    versions = list(session.scalars(select(SourceVersion).where(SourceVersion.id.in_(version_ids)))) if version_ids else []
+    versions = list(session.scalars(select(SourceVersion).where(
+        SourceVersion.id.in_(version_ids), SourceVersion.status != "deleted",
+    ))) if version_ids else []
     source_ids = {version.source_id for version in versions}
-    sources = list(session.scalars(select(Source).where(Source.id.in_(source_ids)))) if source_ids else []
+    sources = list(session.scalars(select(Source).where(
+        Source.id.in_(source_ids), Source.status != "deleted",
+    ))) if source_ids else []
     library_ids_set = {source.document_library_id for source in sources}
 
     if include_full_document_library and library_ids_set:
         member_source_ids = set(session.scalars(select(DocumentLibraryMember.source_id).where(
             DocumentLibraryMember.document_library_id.in_(library_ids_set)
         )))
-        source_ids.update(member_source_ids)
-        versions = list(session.scalars(select(SourceVersion).where(SourceVersion.source_id.in_(source_ids))))
+        source_ids.update(session.scalars(select(Source.id).where(
+            Source.id.in_(member_source_ids), Source.status != "deleted",
+        )))
+        version_ids.update(session.scalars(select(Source.current_version_id).where(
+            Source.id.in_(source_ids), Source.status == "uploaded", Source.current_version_id.is_not(None),
+        )))
+        versions = list(session.scalars(select(SourceVersion).where(
+            SourceVersion.id.in_(version_ids), SourceVersion.status != "deleted",
+        )))
         version_ids = {version.id for version in versions}
 
     chunks: list[SourceChunk] = []

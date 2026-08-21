@@ -462,14 +462,23 @@ class VectorSyncService:
             return {"question": data.get("question"), "answer": data.get("answer")}
         return {}
 
-    def run(self, sync_job_id: str) -> dict[str, Any]:
+    def run(self, sync_job_id: str, *, lease_owner: str | None = None) -> dict[str, Any]:
+        if lease_owner:
+            self.store.assert_work_lease("vector_sync", sync_job_id, lease_owner)
         context = self.store.vector_sync_context(sync_job_id)
         if not self.milvus or not self.embeddings:
             return self.store.finish_vector_sync(sync_job_id, [], "未配置 DATAFORGE_MILVUS_URI 或 EMBEDDING_API_BASE，不能标记 Vector Ready")
         job, library, profile, embedding, items = context["job"], context["library"], context["profile"], context["embedding"], context["items"]
+        asset = context.get("asset_version")
+        partition_name = asset.partition_name if asset else library.partition_name
         try:
             self.milvus.validate_collection(profile.collection_name, profile.fields_json, embedding.dimension)
-            self.milvus.ensure_partition(profile.collection_name, library.partition_name)
+            # Only an unpublished candidate may be rebuilt on retry.  Never
+            # reset or drop the stable/ready Partition used by a RouteVersion.
+            if asset and asset.status != "ready" and hasattr(self.milvus, "partition_exists") \
+                    and self.milvus.partition_exists(profile.collection_name, partition_name):
+                self.milvus.drop_partition(profile.collection_name, partition_name)
+            self.milvus.ensure_partition(profile.collection_name, partition_name)
             inputs = [self._input(profile.code, item) for item in items]
             vectors = self.embeddings.embed(inputs, model=embedding.model, dimension=embedding.dimension)
             rows = []
@@ -485,9 +494,26 @@ class VectorSyncService:
                 rows.append(row)
                 states.append({"knowledge_item_id": item.id, "vector_id": stable_id, "content_hash": item.content_hash})
             if rows:
-                self.milvus.upsert(profile.collection_name, library.partition_name, rows)
+                self.milvus.upsert(profile.collection_name, partition_name, rows)
+            if asset:
+                self.store.mark_asset_version_verifying(job.id)
+                verified = self.milvus.verify_partition(profile.collection_name, partition_name)
+                if int(verified.get("count", -1)) != len(rows):
+                    raise ValueError(
+                        f"候选 Partition 行数 {verified.get('count')} 与正式知识 {len(rows)} 不一致"
+                    )
+                self.milvus.load_partition(profile.collection_name, partition_name)
+                if lease_owner:
+                    self.store.assert_work_lease("vector_sync", job.id, lease_owner)
+                return self.store.finish_vector_sync(
+                    job.id, states, asset_count=len(rows), asset_digest=str(verified.get("digest") or ""),
+                )
+            if lease_owner:
+                self.store.assert_work_lease("vector_sync", job.id, lease_owner)
             return self.store.finish_vector_sync(job.id, states)
         except Exception as exc:
+            if lease_owner:
+                self.store.assert_work_lease("vector_sync", job.id, lease_owner)
             return self.store.finish_vector_sync(job.id, [], str(exc))
 
     def capacity_report(self) -> list[dict[str, Any]]:
@@ -503,6 +529,38 @@ class VectorSyncService:
             return skipped + [{"collection_name": name, "available": False, "reason": "Milvus 未配置"} for name in names]
         checked = [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names)]
         return skipped + checked
+
+
+class KnowledgeAssetGcService:
+    """Explicit, allowlisted deletion of unreferenced versioned Partitions."""
+
+    def __init__(self, store: V7Store, milvus: V7Milvus | None = None):
+        self.store, self.milvus = store, milvus
+
+    @classmethod
+    def from_environment(cls, store: V7Store) -> "KnowledgeAssetGcService":
+        uri = os.getenv("DATAFORGE_MILVUS_URI")
+        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
+
+    def run(self, job_id: str) -> dict[str, Any]:
+        context = self.store.knowledge_asset_gc_context(job_id)
+        if not self.milvus:
+            return self.store.finish_knowledge_asset_gc_job(job_id, [], "未配置 Milvus，不能执行 AssetVersion GC")
+        deleted: list[str] = []
+        try:
+            for item in context["plan"].get("eligible", []):
+                partition = str(item["partition_name"])
+                if "__v" not in partition:
+                    raise ValueError(f"拒绝删除非版本化 Partition：{partition}")
+                collection = str(item["collection_name"])
+                if self.milvus.partition_exists(collection, partition):
+                    self.milvus.drop_partition(collection, partition)
+                if self.milvus.partition_exists(collection, partition):
+                    raise ValueError(f"Partition 删除后仍存在：{collection}/{partition}")
+                deleted.append(str(item["asset_version_id"]))
+            return self.store.finish_knowledge_asset_gc_job(job_id, deleted)
+        except Exception as exc:
+            return self.store.finish_knowledge_asset_gc_job(job_id, deleted, str(exc))
 
 
 class VectorDeletionService:

@@ -18,6 +18,7 @@ const deployments = computed(() => selectedProject.value?.deployments || [])
 const local = computed(() => instance.value?.instance_mode === 'local')
 const central = computed(() => instance.value?.instance_mode === 'central')
 const selectedDeployment = computed(() => deployments.value.find(item => item.id === deploymentId.value))
+const freezesForInstitution = computed(() => central.value && selectedDeployment.value?.scope === 'institution')
 const deploymentLabel = computed(() => `${selectedDeployment.value?.name || '—'} (${selectedDeployment.value?.code || '—'})`)
 const isKgConsultation = computed(() => selectedProject.value?.code === 'kg-for-consultation')
 const testMilvusTarget = computed(() => selectedDeployment.value?.stage_targets?.test?.milvus_url || '')
@@ -200,6 +201,14 @@ async function publish() {
     error.value = 'kg_for_consultation 第一阶段只允许发布测试 Routing'
     return
   }
+  if (freezesForInstitution.value) {
+    try {
+      result.value = await api.freezeRouting(deploymentId.value)
+      await loadDeployment(); tab.value = 'history'
+      notice.value = '项目版本已冻结；冻结本身不生成机构发布包，请到“机构发布部署”组合多项目 Release。'
+    } catch (e) { error.value = e.message }
+    return
+  }
   const production = desiredStage.value === 'production'
   if (production && !window.confirm(`确认发布「${institutionName.value}」生产 Routing？\nDeployment：${deploymentLabel.value}\n目标：${stageTarget.value}`)) return
   try { result.value = await api.publishRouting(deploymentId.value, releaseBody(production)); await loadDeployment(); tab.value = 'history' } catch (e) { error.value = e.message }
@@ -242,7 +251,7 @@ onMounted(load)
       <form v-if="selectedDeployment" class="stack" @submit.prevent="saveDeployment">
         <template v-if="selectedDeployment.scope==='institution'">
           <label>医院机构名称<input v-model="institutionName" required></label>
-          <label>医院机构代码<input v-model="institutionCode" required></label>
+          <label>医院机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"><small v-if="selectedDeployment.institution_code_locked">首次冻结后已锁定；普通编辑接口不再允许修改。</small></label>
         </template>
         <p v-else>中心技术环境不伪造医院身份。</p>
         <label>当前阶段<select v-model="desiredStage"><option value="test">测试</option><option value="production">生产</option></select></label>
@@ -298,8 +307,8 @@ onMounted(load)
       <p v-if="!deploymentTasks.length" class="muted">当前 Deployment 还没有运行任务，Routing 暂不能发布。</p>
       <table v-else><thead><tr><th>任务</th><th>类型</th><th>Profile</th><th>QA 模式</th><th>Top K</th><th>状态</th></tr></thead><tbody><tr v-for="task in deploymentTasks" :key="task.id"><td>{{ task.task?.name }}</td><td>{{ task.task?.knowledge_type }}</td><td>{{ task.index_profile?.code }}</td><td>{{ task.qa_embedding_mode || '—' }}</td><td>{{ task.top_k }}</td><td><span class="badge" :class="task.enabled?'green':'amber'">{{ task.enabled?'启用':'未启用' }}</span></td></tr></tbody></table>
     </section>
-    <section v-else-if="tab==='auth'" class="panel"><h3>知识授权</h3><p v-if="!deploymentTasks.some(item=>item.enabled)" class="muted">请先在“任务配置”中创建并启用 Deployment Task。</p><form class="stack" @submit.prevent="saveRoute"><label>Deployment Task<select v-model="deploymentTaskId" required><option value="">选择任务</option><option v-for="task in deploymentTasks.filter(item=>item.enabled)" :key="task.id" :value="task.id">{{ task.task?.name }} / {{ task.index_profile?.code }}</option></select></label><label>org_code<input v-model="orgCode" required><small>默认使用医院机构代码，可按院内搜索配置调整。</small></label><label>机构名称<input v-model="orgName"></label><label>知识库<select v-model="chosen" multiple required><option v-for="library in availableLibraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.origin_type==='central_import'?'中心迁入':'本地创建' }}{{ library.origin_state==='forked'?' · 已本地修改':'' }}</option></select></label><button class="primary" :disabled="!deploymentTaskId">保存授权</button></form><pre v-if="authorizations.length">{{ JSON.stringify(authorizations,null,2) }}</pre></section>
-    <section v-else-if="tab==='routing'" class="panel"><h3>Routing 校验与发布 · {{ desiredStage==='production'?'生产':'测试' }}</h3><p>{{ institutionName || selectedDeployment?.name }} · {{ stageTarget }}</p><p v-if="!publishState.ready" class="muted">发布前还需完成：{{ publishState.problems.join('；') }}</p><div class="actions"><button @click="diff">结构化 Diff</button><button class="success" @click="validate">校验</button><button class="primary" :disabled="!publishState.ready" @click="publish">发布</button></div><pre v-if="preview">{{ JSON.stringify(preview.snapshot,null,2) }}</pre><pre v-else-if="result">{{ JSON.stringify(result,null,2) }}</pre></section>
+    <section v-else-if="tab==='auth'" class="panel"><h3>知识授权</h3><p v-if="!deploymentTasks.some(item=>item.enabled)" class="muted">请先在“任务配置”中创建并启用 Deployment Task。</p><form class="stack" @submit.prevent="saveRoute"><label>Deployment Task<select v-model="deploymentTaskId" required><option value="">选择任务</option><option v-for="task in deploymentTasks.filter(item=>item.enabled)" :key="task.id" :value="task.id">{{ task.task?.name }} / {{ task.index_profile?.code }}</option></select></label><label>org_code<input v-model="orgCode" required :readonly="selectedDeployment?.scope==='institution'"><small>机构项目固定等于只读 institution_code。</small></label><label>机构名称<input v-model="orgName"></label><label>知识库（顺序即优先级）<select v-model="chosen" multiple required><option v-for="library in availableLibraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.origin_type==='central_import'?'中心迁入':'本地创建' }}{{ library.origin_state==='forked'?' · 已本地修改':'' }}</option></select></label><button class="primary" :disabled="!deploymentTaskId">保存授权</button></form><pre v-if="authorizations.length">{{ JSON.stringify(authorizations,null,2) }}</pre></section>
+    <section v-else-if="tab==='routing'" class="panel"><h3>Routing 就绪检查 · {{ desiredStage==='production'?'生产':'测试' }}</h3><p>{{ institutionName || selectedDeployment?.name }} · {{ stageTarget }}</p><p v-if="freezesForInstitution" class="notice">机构项目在智能中心只冻结不可变 RouteVersion，不在此生成包，也不会冒充机构本地激活。</p><p v-if="!publishState.ready" class="muted">发布前还需完成：{{ publishState.problems.join('；') }}</p><div class="actions"><button @click="diff">结构化 Diff</button><button class="success" @click="validate">校验</button><button class="primary" :disabled="!publishState.ready" @click="publish">{{ freezesForInstitution?'冻结项目版本':'发布' }}</button></div><pre v-if="preview">{{ JSON.stringify(preview.snapshot,null,2) }}</pre><pre v-else-if="result">{{ JSON.stringify(result,null,2) }}</pre></section>
     <section v-else class="panel"><h3>{{ desiredStage==='production'?'生产':'测试' }}发布记录</h3><table><thead><tr><th>版本</th><th>阶段</th><th>来源</th><th>状态</th><th>发布时间</th><th>操作</th></tr></thead><tbody><tr v-for="version in versions" :key="version.id"><td>v{{ version.version_no }}</td><td>{{ version.release_stage }}</td><td>{{ version.origin }}</td><td>{{ version.status }}</td><td>{{ version.published_at || '—' }}</td><td><button @click="showVersion(version.version_no)">预览</button><button v-if="version.status==='published'" @click="rollback(version.version_no)">回滚</button></td></tr></tbody></table></section>
     <p v-if="notice" class="muted">{{ notice }}</p>
     <p v-if="error" class="error">{{ error }}</p>

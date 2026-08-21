@@ -148,6 +148,28 @@ class DocumentLibraryProcessingRecord(Timestamped, Base):
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
 
 
+class DocumentLibraryProcessingBaseline(Timestamped, Base):
+    """Read-only processing success imported without fabricating a local Job/Run."""
+    __tablename__ = "document_library_processing_baselines"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_library_template_binding_id", "source_version_id",
+            "knowledge_flow_template_revision_id", name="uq_doc_processing_baseline",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_library_template_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("document_library_template_bindings.id"), nullable=False, index=True
+    )
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    knowledge_flow_template_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True
+    )
+    origin_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    imported_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    last_success_status: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
+
+
 class KnowledgeType(Timestamped, Base):
     __tablename__ = "knowledge_types"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -262,6 +284,18 @@ class KnowledgeJob(Timestamped, Base):
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class KnowledgeLibraryWorkLease(Timestamped, Base):
+    """Cross-process writer lease shared by knowledge and vector work."""
+    __tablename__ = "knowledge_library_work_leases"
+    knowledge_library_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_libraries.id"), primary_key=True
+    )
+    work_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    work_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    lease_owner: Mapped[str] = mapped_column(String(255), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
 
 class KnowledgeChunkGeneration(Timestamped, Base):
@@ -663,9 +697,48 @@ class VectorSyncJob(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_library_id: Mapped[str] = mapped_column(ForeignKey("knowledge_libraries.id"), nullable=False, index=True)
     index_profile_id: Mapped[str] = mapped_column(ForeignKey("knowledge_index_profiles.id"), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
     total_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     synced_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    asset_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("knowledge_asset_versions.id"), nullable=True, index=True
+    )
+
+
+class KnowledgeAssetVersion(Timestamped, Base):
+    """Immutable physical vector snapshot for one logical knowledge library."""
+    __tablename__ = "knowledge_asset_versions"
+    __table_args__ = (
+        UniqueConstraint("knowledge_library_id", "version_no", name="uq_library_asset_version"),
+        UniqueConstraint("collection_name", "partition_name", name="uq_asset_physical_partition"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    knowledge_library_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_libraries.id"), nullable=False, index=True
+    )
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    index_profile_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_index_profiles.id"), nullable=False, index=True
+    )
+    index_profile_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_index_profile_revisions.id"), nullable=False, index=True
+    )
+    storage_contract_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("storage_contract_revisions.id"), nullable=True, index=True
+    )
+    collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    partition_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="building", nullable=False, index=True)
+    item_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_migration_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    unreferenced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -760,6 +833,7 @@ class Deployment(Timestamped, Base):
     institution_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
     release_stage: Mapped[str] = mapped_column(String(16), default="test", nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
+    institution_code_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DeploymentTarget(Timestamped, Base):
@@ -847,6 +921,113 @@ class ProjectRouteVersion(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ProjectRouteVersionAsset(Base):
+    """Immutable knowledge-library to physical asset mapping for a route version."""
+    __tablename__ = "project_route_version_assets"
+    __table_args__ = (
+        UniqueConstraint("project_route_version_id", "knowledge_library_id", name="uq_route_version_library_asset"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_route_version_id: Mapped[str] = mapped_column(
+        ForeignKey("project_route_versions.id"), nullable=False, index=True
+    )
+    knowledge_library_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    knowledge_asset_version_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_asset_versions.id"), nullable=False, index=True
+    )
+    collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    partition_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class InstitutionReleaseDraft(Timestamped, Base):
+    __tablename__ = "institution_release_drafts"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    target_deployment_id: Mapped[str] = mapped_column(ForeignKey("deployments.id"), nullable=False, index=True)
+    package_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
+    revision_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    base_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    selection_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    milvus_override_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    milvus_override_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class InstitutionReleaseDraftProject(Timestamped, Base):
+    __tablename__ = "institution_release_draft_projects"
+    __table_args__ = (
+        UniqueConstraint("institution_release_draft_id", "project_deployment_id", name="uq_release_draft_project"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    institution_release_draft_id: Mapped[str] = mapped_column(
+        ForeignKey("institution_release_drafts.id"), nullable=False, index=True
+    )
+    project_deployment_id: Mapped[str] = mapped_column(ForeignKey("project_deployments.id"), nullable=False, index=True)
+    project_route_version_id: Mapped[str] = mapped_column(ForeignKey("project_route_versions.id"), nullable=False, index=True)
+
+
+class InstitutionReleaseSnapshot(Timestamped, Base):
+    __tablename__ = "institution_release_snapshots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    institution_release_draft_id: Mapped[str | None] = mapped_column(
+        ForeignKey("institution_release_drafts.id"), nullable=True, index=True
+    )
+    target_deployment_id: Mapped[str] = mapped_column(ForeignKey("deployments.id"), nullable=False, index=True)
+    package_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    base_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    diff_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    tombstones_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="frozen", nullable=False, index=True)
+
+
+class LocalMilvusConfiguration(Timestamped, Base):
+    __tablename__ = "local_milvus_configurations"
+    __table_args__ = (UniqueConstraint("dataforge_instance_id", "slot", name="uq_local_milvus_slot"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dataforge_instance_id: Mapped[str] = mapped_column(ForeignKey("dataforge_instances.id"), nullable=False, index=True)
+    slot: Mapped[str] = mapped_column(String(32), nullable=False)
+    uri: Mapped[str] = mapped_column(String(1024), nullable=False)
+    database_name: Mapped[str] = mapped_column(String(255), default="default", nullable=False)
+    tls_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    secret_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secret_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending_verification", nullable=False, index=True)
+    verified_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ImportedRouteCandidate(Timestamped, Base):
+    __tablename__ = "imported_route_candidates"
+    __table_args__ = (
+        UniqueConstraint("migration_job_id", "project_deployment_id", name="uq_import_route_candidate"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    migration_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_migration_jobs.id"), nullable=False, index=True)
+    project_deployment_id: Mapped[str] = mapped_column(ForeignKey("project_deployments.id"), nullable=False, index=True)
+    source_route_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_route_checksum: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="waiting_assets", nullable=False, index=True)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    readiness_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    activated_route_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("project_route_versions.id"), nullable=True, index=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class KnowledgeAssetGcJob(Timestamped, Base):
+    __tablename__ = "knowledge_asset_gc_jobs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="planned", nullable=False, index=True)
+    execute_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    plan_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class KnowledgeMigrationJob(Timestamped, Base):
     __tablename__ = "knowledge_migration_jobs"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -855,6 +1036,10 @@ class KnowledgeMigrationJob(Timestamped, Base):
     package_id: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     project_id: Mapped[str | None] = mapped_column(ForeignKey("projects.id"), nullable=True, index=True)
     project_deployment_id: Mapped[str | None] = mapped_column(ForeignKey("project_deployments.id"), nullable=True, index=True)
+    target_deployment_id: Mapped[str | None] = mapped_column(ForeignKey("deployments.id"), nullable=True, index=True)
+    release_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("institution_release_snapshots.id"), nullable=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(32), default="planning", nullable=False, index=True)
     stage: Mapped[str] = mapped_column(String(64), default="planning", nullable=False)
     checkpoint_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)

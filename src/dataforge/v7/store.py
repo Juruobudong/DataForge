@@ -17,7 +17,8 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 
-from sqlalchemy import create_engine, delete, func, or_, select, update
+from sqlalchemy import create_engine, delete, func, or_, select, tuple_, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .catalog import CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code, subflow_seeds
@@ -33,6 +34,7 @@ from .models import (
     DocumentLibrary,
     DocumentLibraryMember,
     DocumentDeletionJob,
+    DocumentLibraryProcessingBaseline,
     DocumentLibraryProcessingRecord,
     DocumentLibraryTemplateBinding,
     DocumentLibraryTemplateOutput,
@@ -55,6 +57,13 @@ from .models import (
     KnowledgeChunkGeneration,
     KnowledgeJob,
     KnowledgeLibrary,
+    KnowledgeLibraryWorkLease,
+    KnowledgeAssetVersion,
+    KnowledgeAssetGcJob,
+    InstitutionReleaseSnapshot,
+    InstitutionReleaseDraft,
+    InstitutionReleaseDraftProject,
+    ImportedRouteCandidate,
     KnowledgeLibraryDeletionJob,
     KnowledgeType,
     OperatorDefinition,
@@ -83,6 +92,7 @@ from .models import (
     ProjectOrgRoute,
     ProjectOrgRouteLibrary,
     ProjectRouteVersion,
+    ProjectRouteVersionAsset,
     ProjectTask,
     KnowledgeMigrationJob,
     KnowledgeMigrationItem,
@@ -101,13 +111,30 @@ V7_TYPE_META = {
     "qa": ("问", "问答知识"),
     "graph": ("图", "图谱知识"),
 }
-V7_TEMPLATE_SEEDS = (
-    ("standard-text", "标准文本知识流程", ["text"]),
-    ("standard-qa", "标准问答知识流程", ["qa"]),
-    ("standard-graph-triple", "标准三元组图谱流程", ["graph:triple"]),
-    ("standard-graph-semantic", "标准语义图谱流程", ["graph:semantic"]),
-    ("standard-multi", "标准多产出知识流程", ["text", "qa", "graph"]),
+FIXED_KNOWLEDGE_ASSET_TYPES = (
+    {"key": "text", "knowledge_type": "text", "graph_mode": None, "label": "文本知识", "icon": "文"},
+    {"key": "qa", "knowledge_type": "qa", "graph_mode": None, "label": "问答知识", "icon": "问"},
+    {"key": "graph:triple", "knowledge_type": "graph", "graph_mode": "triple", "label": "三元组图谱", "icon": "△"},
+    {"key": "graph:semantic", "knowledge_type": "graph", "graph_mode": "semantic", "label": "语义图谱", "icon": "⬡"},
 )
+V7_TEMPLATE_SEEDS = (
+    ("standard-text", "文本知识流程", ["text"]),
+    ("standard-qa", "问答知识流程", ["qa"]),
+    ("standard-graph-triple", "三元组图谱流程", ["graph:triple"]),
+    ("standard-graph-semantic", "语义图谱流程", ["graph:semantic"]),
+    ("standard-multi", "多产出知识流程", ["text", "qa", "graph"]),
+)
+V7_TEMPLATE_LEGACY_NAMES = {
+    "standard-text": "标准文本知识流程",
+    "standard-qa": "标准问答知识流程",
+    "standard-graph-triple": "标准三元组图谱流程",
+    "standard-graph-semantic": "标准语义图谱流程",
+    "standard-multi": "标准多产出知识流程",
+}
+V7_BUILTIN_TEMPLATE_CODES = frozenset(code for code, _, _ in V7_TEMPLATE_SEEDS)
+WORK_LEASE_DURATION = timedelta(minutes=5)
+GRAPH_NEIGHBOR_NOTICE_THRESHOLD = 100
+GRAPH_NEIGHBOR_CONFIRM_THRESHOLD = 500
 LINEAR_TEMPLATE_STEPS = ("validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate")  # legacy API input only
 
 QA_AGENT_TEST_MILVUS_URL = os.environ.get("DATAFORGE_QA_AGENT_TEST_MILVUS_URL") or "http://milvus-central-test:19531"
@@ -332,6 +359,8 @@ class V7Store:
                     )
                     session.add(template)
                     session.flush()
+                elif template.name == V7_TEMPLATE_LEGACY_NAMES[code]:
+                    template.name = name
                 if not session.scalar(select(KnowledgeFlowTemplateRevision).where(KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id)):
                     session.add(KnowledgeFlowTemplateRevision(
                         id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
@@ -1858,6 +1887,11 @@ class V7Store:
             DocumentLibraryProcessingRecord.document_library_template_binding_id == binding.id,
             DocumentLibraryProcessingRecord.knowledge_flow_template_revision_id == revision.id,
         )))
+        processed.update(session.scalars(select(DocumentLibraryProcessingBaseline.source_version_id).where(
+            DocumentLibraryProcessingBaseline.document_library_template_binding_id == binding.id,
+            DocumentLibraryProcessingBaseline.knowledge_flow_template_revision_id == revision.id,
+            DocumentLibraryProcessingBaseline.last_success_status == "completed",
+        )))
         in_flight = set()
         for job in session.scalars(select(KnowledgeJob).where(
             KnowledgeJob.document_library_template_binding_id == binding.id,
@@ -2313,9 +2347,139 @@ class V7Store:
                 KnowledgeItem.knowledge_library_id.in_(library_ids),
                 KnowledgeItem.status == "active",
             ).group_by(KnowledgeItem.knowledge_library_id)).all())
-            return [self._knowledge_library_payload(
-                item, self._library_ready(session, item), item_counts.get(item.id, 0),
-            ) for item in libraries]
+            source_document_libraries: dict[str, dict[str, dict[str, str]]] = {}
+            for library_id, document_library_id, document_library_name in session.execute(select(
+                DocumentLibraryTemplateOutput.knowledge_library_id,
+                DocumentLibrary.id,
+                DocumentLibrary.name,
+            ).join(
+                DocumentLibraryTemplateBinding,
+                DocumentLibraryTemplateBinding.id == DocumentLibraryTemplateOutput.document_library_template_binding_id,
+            ).join(
+                DocumentLibrary,
+                DocumentLibrary.id == DocumentLibraryTemplateBinding.document_library_id,
+            ).where(DocumentLibraryTemplateOutput.knowledge_library_id.in_(library_ids))):
+                source_document_libraries.setdefault(library_id, {})[document_library_id] = {
+                    "id": document_library_id,
+                    "name": document_library_name,
+                }
+            payloads = []
+            for item in libraries:
+                payload = self._knowledge_library_payload(
+                    item, self._library_ready(session, item), item_counts.get(item.id, 0),
+                )
+                payload["source_document_libraries"] = list(source_document_libraries.get(item.id, {}).values())
+                payload["collection_names"] = list(dict.fromkeys(
+                    profile.collection_name for profile in self._index_profile_snapshots_for_library(session, item)
+                    if profile.collection_name
+                ))
+                payloads.append(payload)
+            return payloads
+
+    def dashboard_overview(self, instance_mode: str) -> dict[str, Any]:
+        """Return one authoritative set of dashboard counters for central or local UI."""
+        if instance_mode not in {"central", "local"}:
+            raise ValueError("实例模式无效")
+        with self.sessions() as session:
+            document_library_count = int(session.scalar(select(func.count()).select_from(DocumentLibrary).where(
+                DocumentLibrary.status != "deleted",
+            )) or 0)
+            file_count = int(session.scalar(select(func.count()).select_from(Source).where(
+                Source.status.not_in(("deleting", "deleted")),
+            )) or 0)
+            active_template_binding_count = int(session.scalar(select(func.count()).select_from(
+                DocumentLibraryTemplateBinding,
+            ).where(DocumentLibraryTemplateBinding.status == "active")) or 0)
+            active_job_count = int(session.scalar(select(func.count()).select_from(KnowledgeJob).where(
+                KnowledgeJob.status.in_(("queued", "running")),
+            )) or 0)
+            job_alert_count = int(session.scalar(select(func.count()).select_from(KnowledgeJob).where(
+                KnowledgeJob.status.in_(("failed", "completed_with_warnings")),
+            )) or 0)
+
+            libraries = list(session.scalars(select(KnowledgeLibrary).where(
+                KnowledgeLibrary.status.in_(("active", "deleting")),
+            )))
+            library_ids = [item.id for item in libraries]
+            item_counts = dict(session.execute(select(
+                KnowledgeItem.knowledge_library_id, func.count(KnowledgeItem.id),
+            ).where(
+                KnowledgeItem.knowledge_library_id.in_(library_ids),
+                KnowledgeItem.status == "active",
+            ).group_by(KnowledgeItem.knowledge_library_id)).all()) if library_ids else {}
+            active_libraries = [item for item in libraries if item.status == "active"]
+            vector_ready_count = sum(1 for item in active_libraries if self._library_ready(session, item))
+            active_knowledge_count = sum(int(item_counts.get(item.id, 0)) for item in active_libraries)
+            knowledge_assets = []
+            for definition in FIXED_KNOWLEDGE_ASSET_TYPES:
+                matched = [item for item in libraries if item.knowledge_type == definition["knowledge_type"] and (
+                    definition["graph_mode"] is None or item.graph_mode == definition["graph_mode"]
+                )]
+                knowledge_assets.append({
+                    **definition,
+                    "library_count": len(matched),
+                    "knowledge_item_count": sum(int(item_counts.get(item.id, 0)) for item in matched),
+                })
+
+            if instance_mode == "central":
+                releases = list(session.scalars(select(InstitutionReleaseSnapshot)))
+                release_ids_with_jobs = set(session.scalars(select(
+                    KnowledgeMigrationJob.release_snapshot_id,
+                ).where(
+                    KnowledgeMigrationJob.direction == "export",
+                    KnowledgeMigrationJob.release_snapshot_id.is_not(None),
+                )))
+                pending_package_count = sum(
+                    1 for item in releases if item.status == "frozen" and item.id not in release_ids_with_jobs
+                )
+                publication_statuses = ("frozen", "building", "ready", "failed")
+                publication_counts = {
+                    status: sum(1 for item in releases if item.status == status)
+                    for status in publication_statuses
+                }
+                package_summary = {
+                    "mode": "export",
+                    "label": "待导出发布包",
+                    "pending_count": pending_package_count,
+                    "alert_count": publication_counts["failed"],
+                }
+            else:
+                imports = list(session.scalars(select(KnowledgeMigrationJob).where(
+                    KnowledgeMigrationJob.direction == "import",
+                )))
+                publication_statuses = ("queued", "running", "waiting", "conflict", "completed", "failed")
+                publication_counts = {
+                    status: sum(1 for item in imports if item.status == status)
+                    for status in publication_statuses
+                }
+                package_summary = {
+                    "mode": "import",
+                    "label": "待处理导入任务",
+                    "pending_count": sum(
+                        publication_counts[status] for status in ("queued", "running", "waiting", "conflict")
+                    ),
+                    "alert_count": publication_counts["failed"],
+                }
+
+            return {
+                "instance_mode": instance_mode,
+                "runtime": {
+                    "documents": {"library_count": document_library_count, "file_count": file_count},
+                    "tasks": {"active_count": active_job_count, "alert_count": job_alert_count},
+                    "vector": {"ready_count": vector_ready_count, "library_count": len(active_libraries)},
+                    "packages": package_summary,
+                },
+                "knowledge_assets": knowledge_assets,
+                "production": {
+                    "document_library_count": document_library_count,
+                    "active_template_binding_count": active_template_binding_count,
+                    "active_job_count": active_job_count,
+                    "knowledge_item_count": active_knowledge_count,
+                    "vector_ready_count": vector_ready_count,
+                    "vector_library_count": len(active_libraries),
+                },
+                "publication": {"mode": package_summary["mode"], "status_counts": publication_counts},
+            }
 
     def get_knowledge_library(self, library_id: str) -> KnowledgeLibrary:
         with self.sessions() as session:
@@ -2577,7 +2741,8 @@ class V7Store:
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                     KnowledgeFlowTemplateRevision.knowledge_flow_template_id == item.id,
                 ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
-                values.append({"id": item.id, "code": item.code, "name": item.name, "output_types": item.output_types,
+                values.append({"id": item.id, "code": item.code, "name": item.name,
+                               "is_builtin": item.code in V7_BUILTIN_TEMPLATE_CODES, "output_types": item.output_types,
                                "definition": revision.definition_json if revision else item.definition_json,
                                "status": item.status, "is_default": item.is_default,
                                "revision": revision.revision_no if revision else None,
@@ -2990,15 +3155,175 @@ class V7Store:
                    for knowledge_type in knowledge_types for chunk_id in chunk_ids)
         }
 
+    @staticmethod
+    def _job_library_ids(job: KnowledgeJob) -> list[str]:
+        return sorted(set((job.sink_library_ids or job.output_library_ids or {}).values()))
+
+    @staticmethod
+    def _lease_is_active(lease: KnowledgeLibraryWorkLease, now) -> bool:
+        expires = lease.lease_expires_at
+        if expires.tzinfo is None and now.tzinfo is not None:
+            expires = expires.replace(tzinfo=now.tzinfo)
+        return expires >= now
+
+    def _acquire_library_work_leases(self, session: Session, library_ids: list[str], *,
+                                     work_kind: str, work_id: str, owner: str, now) -> bool:
+        if not library_ids:
+            return False
+        try:
+            with session.begin_nested():
+                existing = {
+                    item.knowledge_library_id: item
+                    for item in session.scalars(select(KnowledgeLibraryWorkLease).where(
+                        KnowledgeLibraryWorkLease.knowledge_library_id.in_(library_ids),
+                    ).order_by(KnowledgeLibraryWorkLease.knowledge_library_id).with_for_update()).all()
+                }
+                for library_id in library_ids:
+                    lease = existing.get(library_id)
+                    if lease and self._lease_is_active(lease, now):
+                        return False
+                expires_at = now + WORK_LEASE_DURATION
+                for library_id in library_ids:
+                    lease = existing.get(library_id)
+                    if lease:
+                        lease.work_kind, lease.work_id = work_kind, work_id
+                        lease.lease_owner, lease.lease_expires_at = owner, expires_at
+                    else:
+                        session.add(KnowledgeLibraryWorkLease(
+                            knowledge_library_id=library_id, work_kind=work_kind, work_id=work_id,
+                            lease_owner=owner, lease_expires_at=expires_at,
+                        ))
+                session.flush()
+            return True
+        except IntegrityError:
+            return False
+
     def claim_job(self, owner: str) -> KnowledgeJob | None:
+        now = utc_now()
         with self.sessions.begin() as session:
-            job = session.scalar(select(KnowledgeJob).where((KnowledgeJob.status == "queued") | ((KnowledgeJob.status == "running") & (KnowledgeJob.lease_expires_at < utc_now()))).order_by(KnowledgeJob.created_at).with_for_update(skip_locked=True).limit(1))
-            if not job:
-                return None
-            job.status, job.stage, job.lease_owner, job.lease_expires_at = "running", "processing", owner, utc_now() + timedelta(minutes=5)
-            job.attempt_count += 1
-            self.audit(session, "knowledge_job.claimed", "knowledge_job", job.id, {"owner": owner, "attempt": job.attempt_count})
-            return job
+            candidate_ids = list(session.scalars(select(KnowledgeJob.id).where(
+                (KnowledgeJob.status == "queued") |
+                ((KnowledgeJob.status == "running") & (KnowledgeJob.lease_expires_at < now))
+            ).order_by(KnowledgeJob.created_at)))
+            for job_id in candidate_ids:
+                job = session.scalar(select(KnowledgeJob).where(
+                    KnowledgeJob.id == job_id,
+                    (KnowledgeJob.status == "queued") |
+                    ((KnowledgeJob.status == "running") & (KnowledgeJob.lease_expires_at < now)),
+                ).with_for_update(skip_locked=True))
+                if not job:
+                    continue
+                library_ids = self._job_library_ids(job)
+                if not self._acquire_library_work_leases(
+                    session, library_ids, work_kind="knowledge", work_id=job.id, owner=owner, now=now,
+                ):
+                    continue
+                job.status, job.stage = "running", "processing"
+                job.lease_owner, job.lease_expires_at = owner, now + WORK_LEASE_DURATION
+                job.attempt_count += 1
+                self.audit(session, "knowledge_job.claimed", "knowledge_job", job.id, {
+                    "owner": owner, "attempt": job.attempt_count, "knowledge_library_ids": library_ids,
+                })
+                return job
+            return None
+
+    def renew_work_lease(self, work_kind: str, work_id: str, owner: str) -> bool:
+        now = utc_now()
+        expires_at = now + WORK_LEASE_DURATION
+        with self.sessions.begin() as session:
+            if work_kind == "knowledge":
+                job = session.get(KnowledgeJob, work_id, with_for_update=True)
+                library_ids = self._job_library_ids(job) if job else []
+            elif work_kind == "vector_sync":
+                job = session.get(VectorSyncJob, work_id, with_for_update=True)
+                library_ids = [job.knowledge_library_id] if job else []
+            else:
+                raise ValueError("未知 Worker 租约类型")
+            if not job or job.status != "running" or job.lease_owner != owner:
+                return False
+            leases = list(session.scalars(select(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.knowledge_library_id.in_(library_ids),
+                KnowledgeLibraryWorkLease.work_kind == work_kind,
+                KnowledgeLibraryWorkLease.work_id == work_id,
+                KnowledgeLibraryWorkLease.lease_owner == owner,
+            ).with_for_update()))
+            if len(leases) != len(library_ids):
+                return False
+            job.lease_expires_at = expires_at
+            for lease in leases:
+                lease.lease_expires_at = expires_at
+            return True
+
+    def assert_work_lease(self, work_kind: str, work_id: str, owner: str) -> None:
+        now = utc_now()
+        with self.sessions() as session:
+            if work_kind == "knowledge":
+                job = session.get(KnowledgeJob, work_id)
+                library_ids = self._job_library_ids(job) if job else []
+            elif work_kind == "vector_sync":
+                job = session.get(VectorSyncJob, work_id)
+                library_ids = [job.knowledge_library_id] if job else []
+            else:
+                raise ValueError("未知 Worker 租约类型")
+            if not job or job.status != "running" or job.lease_owner != owner:
+                raise ValueError("任务执行租约已失效")
+            expires = job.lease_expires_at
+            if not expires:
+                raise ValueError("任务执行租约已失效")
+            if expires.tzinfo is None and now.tzinfo is not None:
+                expires = expires.replace(tzinfo=now.tzinfo)
+            if expires < now:
+                raise ValueError("任务执行租约已过期")
+            leases = list(session.scalars(select(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.knowledge_library_id.in_(library_ids),
+                KnowledgeLibraryWorkLease.work_kind == work_kind,
+                KnowledgeLibraryWorkLease.work_id == work_id,
+                KnowledgeLibraryWorkLease.lease_owner == owner,
+                KnowledgeLibraryWorkLease.lease_expires_at >= now,
+            )))
+            if len(leases) != len(library_ids):
+                raise ValueError("目标知识库执行租约已失效")
+
+    def release_work_lease(self, work_kind: str, work_id: str, owner: str | None = None) -> None:
+        with self.sessions.begin() as session:
+            query = delete(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.work_kind == work_kind,
+                KnowledgeLibraryWorkLease.work_id == work_id,
+            )
+            if owner is not None:
+                query = query.where(KnowledgeLibraryWorkLease.lease_owner == owner)
+            session.execute(query)
+
+    def has_pending_exclusive_work(self) -> bool:
+        now = utc_now()
+        with self.sessions() as session:
+            checks = (
+                select(KnowledgeMigrationJob.id).where(
+                    (KnowledgeMigrationJob.status == "queued") |
+                    ((KnowledgeMigrationJob.status == "running") & (KnowledgeMigrationJob.lease_expires_at < now))
+                ),
+                select(FlowRun.id).where(FlowRun.status == "queued", FlowRun.parent_flow_run_id.is_not(None)),
+                select(KnowledgeAssetGcJob.id).where(
+                    KnowledgeAssetGcJob.status == "queued", KnowledgeAssetGcJob.execute_requested.is_(True),
+                ),
+                select(VectorDeletionJob.id).where(
+                    (VectorDeletionJob.status == "queued") |
+                    ((VectorDeletionJob.status == "running") & (VectorDeletionJob.lease_expires_at < now))
+                ),
+                select(KnowledgeLibraryDeletionJob.id).where(
+                    (KnowledgeLibraryDeletionJob.status == "queued") |
+                    ((KnowledgeLibraryDeletionJob.status == "running") & (KnowledgeLibraryDeletionJob.lease_expires_at < now))
+                ),
+                select(DocumentDeletionJob.id).where(
+                    (DocumentDeletionJob.status == "queued") |
+                    ((DocumentDeletionJob.status == "running") & (DocumentDeletionJob.lease_expires_at < now))
+                ),
+                select(ManagedCollectionDeletionJob.id).where(
+                    (ManagedCollectionDeletionJob.status == "queued") |
+                    ((ManagedCollectionDeletionJob.status == "running") & (ManagedCollectionDeletionJob.lease_expires_at < now))
+                ),
+            )
+            return any(session.scalar(query.limit(1)) is not None for query in checks)
 
     def get_job(self, job_id: str) -> KnowledgeJob:
         with self.sessions() as session:
@@ -3132,6 +3457,10 @@ class V7Store:
             if blocked:
                 error = f"{error}；自动结果知识库仍被项目路由引用，请先解除路由后再清理：{'、'.join(blocked)}"
             job.status, job.stage, job.error, job.lease_owner, job.lease_expires_at = "failed", "failed", error, None, None
+            session.execute(delete(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.work_kind == "knowledge",
+                KnowledgeLibraryWorkLease.work_id == job.id,
+            ))
             self.audit(session, "knowledge_job.failed", "knowledge_job", job_id, {"error": error})
 
     def complete_job(self, job_id: str, *, warnings: list[dict[str, Any]] | None = None) -> None:
@@ -3145,6 +3474,10 @@ class V7Store:
                 None,
                 None,
             )
+            session.execute(delete(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.work_kind == "knowledge",
+                KnowledgeLibraryWorkLease.work_id == job.id,
+            ))
             if not has_warnings and job.document_library_template_binding_id and job.knowledge_flow_template_revision_id:
                 binding = session.get(DocumentLibraryTemplateBinding, job.document_library_template_binding_id)
                 if binding:
@@ -3720,7 +4053,13 @@ class V7Store:
                 before_snapshot = None
                 if not item:
                     item = KnowledgeItem(id=new_id("ki"), knowledge_library_id=library.id, knowledge_type_revision_id=revision.id, source_knowledge_id=key, canonical_content=content, data_json=data, content_hash=digest, status="active")
-                    session.add(item); change = "ADD"; before = None
+                    session.add(item)
+                    # A logical graph relation may be emitted by several source
+                    # chunks in the same Sink batch.  Reuse the pending item so
+                    # later candidates add Evidence instead of scheduling a
+                    # second row with the same library/identity unique key.
+                    current[key] = item
+                    change = "ADD"; before = None
                 elif item.content_hash != digest or item.status != "active":
                     before_snapshot = {"content": item.canonical_content, "data": item.data_json, "status": item.status}
                     before, item.canonical_content, item.data_json, item.content_hash, item.status = item.content_hash, content, data, digest, "active"; item.knowledge_type_revision_id = revision.id; change = "UPDATE"
@@ -4026,27 +4365,138 @@ class V7Store:
                 "facts": list(facts.values()),
             }
 
-    def graph_neighbors(self, library_id: str, entity_id: str, depth: int = 1) -> dict[str, Any]:
+    @staticmethod
+    def _graph_neighbor_selection(
+        nodes: dict[str, dict[str, Any]],
+        edges: dict[str, dict[str, Any]],
+        entity_id: str,
+        depth: int,
+        *,
+        entity_types: set[str] | None = None,
+        relation_types: set[str] | None = None,
+    ) -> tuple[set[str], set[str]]:
         if depth not in {1, 2}:
             raise ValueError("图谱邻居深度只支持 1 或 2")
+        if entity_id not in nodes:
+            raise ValueError("图谱实体不存在")
+        entity_types = {str(value) for value in (entity_types or set()) if str(value)}
+        relation_types = {str(value) for value in (relation_types or set()) if str(value)}
+
+        def node_allowed(node_id: str) -> bool:
+            if node_id == entity_id or not entity_types:
+                return True
+            node = nodes[node_id]
+            return str(node.get("type_code") or node.get("type") or "") in entity_types
+
+        def edge_allowed(edge: dict[str, Any]) -> bool:
+            if relation_types and str(edge.get("relation_type") or edge.get("predicate") or "") not in relation_types:
+                return False
+            return node_allowed(edge["source"]) and node_allowed(edge["target"])
+
+        selected, frontier = {entity_id}, {entity_id}
+        selected_edges: set[str] = set()
+        for _ in range(depth):
+            next_frontier: set[str] = set()
+            for edge_id, edge in edges.items():
+                if not edge_allowed(edge):
+                    continue
+                if edge["source"] in frontier or edge["target"] in frontier:
+                    selected_edges.add(edge_id)
+                    next_frontier.update((edge["source"], edge["target"]))
+            frontier = next_frontier - selected
+            selected.update(next_frontier)
+        return selected, selected_edges
+
+    @staticmethod
+    def _graph_neighbor_facets(
+        nodes: dict[str, dict[str, Any]],
+        edges: dict[str, dict[str, Any]],
+        selected: set[str],
+        selected_edges: set[str],
+        center_id: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        entity_facets: dict[str, dict[str, Any]] = {}
+        for node_id in selected - {center_id}:
+            node = nodes[node_id]
+            key = str(node.get("type_code") or node.get("type") or "未分类")
+            facet = entity_facets.setdefault(key, {
+                "key": key, "label": node.get("type_label") or node.get("type") or key, "count": 0,
+            })
+            facet["count"] += 1
+        relation_facets: dict[str, dict[str, Any]] = {}
+        for edge_id in selected_edges:
+            edge = edges[edge_id]
+            key = str(edge.get("relation_type") or edge.get("predicate") or "未分类")
+            facet = relation_facets.setdefault(key, {
+                "key": key, "label": edge.get("relation_type_label") or edge.get("predicate") or key, "count": 0,
+            })
+            facet["count"] += 1
+        sort_key = lambda item: (str(item["label"]).casefold(), item["key"])
+        return sorted(entity_facets.values(), key=sort_key), sorted(relation_facets.values(), key=sort_key)
+
+    def graph_neighbor_preview(
+        self,
+        library_id: str,
+        entity_id: str,
+        depth: int = 1,
+        *,
+        entity_types: set[str] | None = None,
+        relation_types: set[str] | None = None,
+    ) -> dict[str, Any]:
+        with self.sessions() as session:
+            nodes, edges, _ = self._graph_projection(session, library_id)
+            selected, selected_edges = self._graph_neighbor_selection(
+                nodes, edges, entity_id, depth,
+                entity_types=entity_types, relation_types=relation_types,
+            )
+            entity_facets, relation_facets = self._graph_neighbor_facets(
+                nodes, edges, selected, selected_edges, entity_id,
+            )
+            neighbor_count = max(0, len(selected) - 1)
+            return {
+                "center_id": entity_id,
+                "depth": depth,
+                "node_count": len(selected),
+                "neighbor_count": neighbor_count,
+                "edge_count": len(selected_edges),
+                "notice_required": neighbor_count > GRAPH_NEIGHBOR_NOTICE_THRESHOLD,
+                "confirmation_required": neighbor_count > GRAPH_NEIGHBOR_CONFIRM_THRESHOLD,
+                "entity_type_facets": entity_facets,
+                "relation_type_facets": relation_facets,
+            }
+
+    def graph_neighbors(
+        self,
+        library_id: str,
+        entity_id: str,
+        depth: int = 1,
+        *,
+        entity_types: set[str] | None = None,
+        relation_types: set[str] | None = None,
+        confirm_large: bool = False,
+    ) -> dict[str, Any]:
         with self.sessions() as session:
             nodes, edges, facts = self._graph_projection(session, library_id)
-            if entity_id not in nodes:
-                raise ValueError("图谱实体不存在")
-            selected, frontier = {entity_id}, {entity_id}
-            selected_edges: set[str] = set()
-            for _ in range(depth):
-                next_frontier: set[str] = set()
-                for edge_id, edge in edges.items():
-                    if edge["source"] in frontier or edge["target"] in frontier:
-                        selected_edges.add(edge_id); next_frontier.update((edge["source"], edge["target"]))
-                frontier = next_frontier - selected
-                selected.update(next_frontier)
-                if len(selected) >= 100:
-                    break
+            selected, selected_edges = self._graph_neighbor_selection(
+                nodes, edges, entity_id, depth,
+                entity_types=entity_types, relation_types=relation_types,
+            )
+            neighbor_count = max(0, len(selected) - 1)
+            if neighbor_count > GRAPH_NEIGHBOR_CONFIRM_THRESHOLD and not confirm_large:
+                raise ValueError(f"预计展开 {neighbor_count} 个邻居，请筛选或确认后重试")
             local_facts = [fact for fact in facts.values() if fact["subject_entity_id"] in selected]
-            return {"center_id": entity_id, "depth": depth, "nodes": [nodes[node_id] for node_id in sorted(selected)[:100]],
-                    "edges": [edges[edge_id] for edge_id in sorted(selected_edges)[:200]], "facts": local_facts}
+            node_sort_key = lambda node_id: (nodes[node_id]["name"].casefold(), node_id)
+            edge_sort_key = lambda edge_id: (edges[edge_id]["predicate"].casefold(), edge_id)
+            return {
+                "center_id": entity_id,
+                "depth": depth,
+                "node_count": len(selected),
+                "neighbor_count": neighbor_count,
+                "edge_count": len(selected_edges),
+                "nodes": [nodes[node_id] for node_id in sorted(selected, key=node_sort_key)],
+                "edges": [edges[edge_id] for edge_id in sorted(selected_edges, key=edge_sort_key)],
+                "facts": local_facts,
+            }
 
     def graph_entity_detail(self, library_id: str, entity_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -4085,9 +4535,33 @@ class V7Store:
                 raise ValueError("知识库不存在")
             profiles = self._index_profile_snapshots_for_library(session, library)
             count = session.scalar(select(func.count()).select_from(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library.id, KnowledgeItem.status == "active")) or 0
-            jobs = [VectorSyncJob(id=new_id("vsj"), knowledge_library_id=library.id, index_profile_id=profile.id, total_count=count) for profile in profiles]
-            session.add_all(jobs); self.audit(session, "vector_sync.queued", "knowledge_library", library.id, {"jobs": [item.id for item in jobs]})
-            return [{"id": item.id, "knowledge_library_id": item.knowledge_library_id, "index_profile_id": item.index_profile_id, "status": item.status, "total_count": item.total_count} for item in jobs]
+            next_version = int(session.scalar(select(func.max(KnowledgeAssetVersion.version_no)).where(
+                KnowledgeAssetVersion.knowledge_library_id == library.id,
+            )) or 0)
+            jobs: list[VectorSyncJob] = []
+            assets: list[KnowledgeAssetVersion] = []
+            for profile in profiles:
+                next_version += 1
+                asset = KnowledgeAssetVersion(
+                    id=new_id("kav"), knowledge_library_id=library.id, version_no=next_version,
+                    index_profile_id=profile.id, index_profile_revision_id=profile.revision_id,
+                    storage_contract_revision_id=profile.storage_contract_revision_id,
+                    collection_name=profile.collection_name,
+                    partition_name=f"{library.partition_name}__v{next_version}", status="building",
+                )
+                job = VectorSyncJob(
+                    id=new_id("vsj"), knowledge_library_id=library.id,
+                    index_profile_id=profile.id, total_count=count, asset_version_id=asset.id,
+                )
+                session.add(asset); session.add(job); assets.append(asset); jobs.append(job)
+            self.audit(session, "vector_sync.queued", "knowledge_library", library.id, {
+                "jobs": [item.id for item in jobs], "asset_versions": [item.id for item in assets],
+            })
+            return [{
+                "id": item.id, "knowledge_library_id": item.knowledge_library_id,
+                "index_profile_id": item.index_profile_id, "asset_version_id": item.asset_version_id,
+                "status": item.status, "total_count": item.total_count, "attempt_count": item.attempt_count,
+            } for item in jobs]
 
     def vector_sync_context(self, job_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -4103,17 +4577,40 @@ class V7Store:
             embedding = session.get(EmbeddingProfile, profile.embedding_profile_id)
             storage_contract = session.get(StorageContractRevision, profile.storage_contract_revision_id) if profile.storage_contract_revision_id else None
             items = session.scalars(select(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library.id, KnowledgeItem.status == "active")).all()
+            asset = session.get(KnowledgeAssetVersion, job.asset_version_id) if job.asset_version_id else None
+            if job.asset_version_id and not asset:
+                raise ValueError("向量同步任务引用的 AssetVersion 不存在")
             return {"job": job, "library": library, "profile": profile, "embedding": embedding,
-                    "storage_contract": storage_contract, "items": items}
+                    "storage_contract": storage_contract, "items": items, "asset_version": asset}
 
-    def finish_vector_sync(self, job_id: str, vector_rows: Iterable[dict[str, Any]], error: str | None = None) -> dict[str, Any]:
+    def mark_asset_version_verifying(self, job_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(VectorSyncJob, job_id)
+            asset = session.get(KnowledgeAssetVersion, job.asset_version_id) if job and job.asset_version_id else None
+            if not job or not asset:
+                raise ValueError("向量同步任务没有候选 AssetVersion")
+            if asset.status == "ready":
+                return {"id": asset.id, "status": asset.status, "partition_name": asset.partition_name}
+            asset.status, asset.error = "verifying", None
+            return {"id": asset.id, "status": asset.status, "partition_name": asset.partition_name}
+
+    def finish_vector_sync(self, job_id: str, vector_rows: Iterable[dict[str, Any]], error: str | None = None,
+                           *, asset_count: int | None = None, asset_digest: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
             job = session.get(VectorSyncJob, job_id)
             if not job:
                 raise ValueError("向量同步任务不存在")
+            asset = session.get(KnowledgeAssetVersion, job.asset_version_id) if job.asset_version_id else None
             if error:
                 job.status, job.error = "failed", error
-                return {"id": job.id, "status": job.status, "error": error}
+                job.lease_owner, job.lease_expires_at = None, None
+                session.execute(delete(KnowledgeLibraryWorkLease).where(
+                    KnowledgeLibraryWorkLease.work_kind == "vector_sync",
+                    KnowledgeLibraryWorkLease.work_id == job.id,
+                ))
+                if asset and asset.status != "ready":
+                    asset.status, asset.error = "building", error
+                return {"id": job.id, "status": job.status, "asset_version_id": job.asset_version_id, "error": error}
             count = 0
             for row in vector_rows:
                 state = session.scalar(select(VectorRecordState).where(VectorRecordState.knowledge_item_id == row["knowledge_item_id"], VectorRecordState.index_profile_id == job.index_profile_id))
@@ -4124,15 +4621,34 @@ class V7Store:
                     state.vector_id, state.content_hash, state.error = row["vector_id"], row["content_hash"], None
                 state.status = "ready"; count += 1
             job.status, job.synced_count, job.error = "ready", count, None
-            self.audit(session, "vector_sync.ready", "vector_sync_job", job.id, {"synced_count": count})
-            return {"id": job.id, "status": job.status, "synced_count": count}
+            job.lease_owner, job.lease_expires_at = None, None
+            session.execute(delete(KnowledgeLibraryWorkLease).where(
+                KnowledgeLibraryWorkLease.work_kind == "vector_sync",
+                KnowledgeLibraryWorkLease.work_id == job.id,
+            ))
+            if asset:
+                asset.status, asset.error = "ready", None
+                asset.item_count = int(asset_count if asset_count is not None else count)
+                asset.content_digest = asset_digest
+                asset.ready_at, asset.unreferenced_at = utc_now(), utc_now()
+            self.audit(session, "vector_sync.ready", "vector_sync_job", job.id, {
+                "synced_count": count, "asset_version_id": job.asset_version_id,
+                "asset_digest": asset_digest,
+            })
+            return {"id": job.id, "status": job.status, "synced_count": count,
+                    "asset_version_id": job.asset_version_id,
+                    "partition_name": asset.partition_name if asset else None}
 
     def list_vector_sync_jobs(self, library_id: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
             query = select(VectorSyncJob).order_by(VectorSyncJob.created_at.desc())
             if library_id:
                 query = query.where(VectorSyncJob.knowledge_library_id == library_id)
-            return [{"id": item.id, "knowledge_library_id": item.knowledge_library_id, "index_profile_id": item.index_profile_id, "status": item.status, "total_count": item.total_count, "synced_count": item.synced_count, "error": item.error, "created_at": item.created_at.isoformat()} for item in session.scalars(query)]
+            return [{"id": item.id, "knowledge_library_id": item.knowledge_library_id,
+                     "index_profile_id": item.index_profile_id, "asset_version_id": item.asset_version_id,
+                     "status": item.status, "total_count": item.total_count,
+                     "synced_count": item.synced_count, "attempt_count": item.attempt_count, "error": item.error,
+                     "created_at": item.created_at.isoformat()} for item in session.scalars(query)]
 
     def vector_status(self, library_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -4150,16 +4666,193 @@ class V7Store:
             states: dict[str, dict[str, int]] = {}
             for code, status, count in profile_rows:
                 states.setdefault(code, {})[status] = int(count)
-            return {"knowledge_library_id": library_id, "ready": self._library_ready(session, library), "jobs": jobs, "record_states": states}
+            versions = [{
+                "id": item.id, "version_no": item.version_no, "index_profile_id": item.index_profile_id,
+                "index_profile_revision_id": item.index_profile_revision_id,
+                "collection_name": item.collection_name, "partition_name": item.partition_name,
+                "status": item.status, "item_count": item.item_count,
+                "content_digest": item.content_digest,
+                "ready_at": item.ready_at.isoformat() if item.ready_at else None,
+            } for item in session.scalars(select(KnowledgeAssetVersion).where(
+                KnowledgeAssetVersion.knowledge_library_id == library_id,
+            ).order_by(KnowledgeAssetVersion.version_no.desc()))]
+            return {"knowledge_library_id": library_id, "ready": self._library_ready(session, library),
+                    "jobs": jobs, "record_states": states, "asset_versions": versions}
 
-    def claim_vector_sync_job(self, owner: str) -> VectorSyncJob | None:
+    @staticmethod
+    def _asset_ids_in_json(value: Any) -> set[str]:
+        found: set[str] = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"asset_version_id", "knowledge_asset_version_id"} and isinstance(child, str):
+                    found.add(child)
+                elif key in {"asset_version_ids", "knowledge_asset_version_ids"} and isinstance(child, list):
+                    found.update(str(item) for item in child if item)
+                else:
+                    found.update(V7Store._asset_ids_in_json(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.update(V7Store._asset_ids_in_json(child))
+        return found
+
+    def knowledge_asset_gc_plan(self, *, retention_days: int = 30, minimum_versions: int = 2) -> dict[str, Any]:
+        if retention_days < 1 or minimum_versions < 1:
+            raise ValueError("AssetVersion GC 保留参数无效")
+        cutoff = utc_now() - timedelta(days=retention_days)
+        with self.sessions() as session:
+            referenced = set(session.scalars(select(ProjectRouteVersionAsset.knowledge_asset_version_id)))
+            for candidate in session.scalars(select(ImportedRouteCandidate).where(
+                ImportedRouteCandidate.status.in_(("waiting_assets", "ready", "activating", "activated")),
+            )):
+                referenced.update(self._asset_ids_in_json(candidate.snapshot_json))
+                referenced.update(self._asset_ids_in_json(candidate.readiness_json))
+            for release in session.scalars(select(InstitutionReleaseSnapshot).where(
+                InstitutionReleaseSnapshot.status.in_(("frozen", "building", "ready")),
+            )):
+                referenced.update(self._asset_ids_in_json(release.snapshot_json))
+            migration_partitions = {(collection, partition) for collection, partition in session.execute(
+                select(KnowledgeMigrationItem.collection_name, KnowledgeMigrationItem.partition_name)
+                .join(KnowledgeMigrationJob, KnowledgeMigrationJob.id == KnowledgeMigrationItem.migration_job_id)
+                .where(KnowledgeMigrationJob.status.in_((
+                    "planning", "queued", "running", "ready", "inspected", "conflict", "waiting",
+                )))
+            ).all()}
+            if migration_partitions:
+                referenced.update(session.scalars(select(KnowledgeAssetVersion.id).where(
+                    tuple_(KnowledgeAssetVersion.collection_name, KnowledgeAssetVersion.partition_name)
+                    .in_(migration_partitions)
+                )))
+
+            eligible: list[dict[str, Any]] = []
+            protected: list[dict[str, Any]] = []
+            library_ids = list(session.scalars(select(KnowledgeAssetVersion.knowledge_library_id).distinct()))
+            for library_id in library_ids:
+                values = list(session.scalars(select(KnowledgeAssetVersion).where(
+                    KnowledgeAssetVersion.knowledge_library_id == library_id,
+                    KnowledgeAssetVersion.status == "ready",
+                ).order_by(KnowledgeAssetVersion.version_no.desc())))
+                newest = {item.id for item in values[:minimum_versions]}
+                for item in values:
+                    reason = None
+                    unreferenced_at = item.unreferenced_at
+                    if unreferenced_at and unreferenced_at.tzinfo is None:
+                        unreferenced_at = unreferenced_at.replace(tzinfo=utc_now().tzinfo)
+                    if item.id in referenced:
+                        reason = "referenced"
+                    elif item.id in newest:
+                        reason = "minimum_versions"
+                    elif not unreferenced_at or unreferenced_at > cutoff:
+                        reason = "retention_window"
+                    payload = {
+                        "asset_version_id": item.id, "knowledge_library_id": item.knowledge_library_id,
+                        "version_no": item.version_no, "collection_name": item.collection_name,
+                        "partition_name": item.partition_name,
+                    }
+                    if reason:
+                        protected.append({**payload, "reason": reason})
+                    else:
+                        eligible.append(payload)
+            confirmation = hashlib.sha256(json.dumps(eligible, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            return {"retention_days": retention_days, "minimum_versions": minimum_versions,
+                    "eligible": eligible, "protected": protected, "confirmation": confirmation}
+
+    def create_knowledge_asset_gc_job(self, *, execute: bool = False, confirmation: str | None = None) -> dict[str, Any]:
+        plan = self.knowledge_asset_gc_plan()
+        if execute and confirmation != plan["confirmation"]:
+            raise ValueError("AssetVersion GC 确认值与当前清单不一致")
         with self.sessions.begin() as session:
-            job = session.scalar(select(VectorSyncJob).where(VectorSyncJob.status == "queued").order_by(VectorSyncJob.created_at).with_for_update(skip_locked=True).limit(1))
+            job = KnowledgeAssetGcJob(
+                id=new_id("kagc"), status="queued" if execute else "planned",
+                execute_requested=execute, plan_json=plan,
+            )
+            session.add(job)
+            self.audit(session, "knowledge_asset_gc.planned", "knowledge_asset_gc_job", job.id, {
+                "execute": execute, "eligible": len(plan["eligible"]),
+            })
+            return {"id": job.id, "status": job.status, "execute_requested": execute, "plan": plan}
+
+    def claim_knowledge_asset_gc_job(self) -> KnowledgeAssetGcJob | None:
+        with self.sessions.begin() as session:
+            job = session.scalar(select(KnowledgeAssetGcJob).where(
+                KnowledgeAssetGcJob.status == "queued", KnowledgeAssetGcJob.execute_requested.is_(True),
+            ).order_by(KnowledgeAssetGcJob.created_at).with_for_update(skip_locked=True))
             if not job:
                 return None
+            current = self.knowledge_asset_gc_plan()
+            if current["confirmation"] != (job.plan_json or {}).get("confirmation"):
+                job.status, job.error = "failed", "GC 清单在执行前发生变化"
+                return None
             job.status = "running"
-            self.audit(session, "vector_sync.claimed", "vector_sync_job", job.id, {"owner": owner})
+            for item in (job.plan_json or {}).get("eligible", []):
+                asset = session.get(KnowledgeAssetVersion, item["asset_version_id"], with_for_update=True)
+                if not asset or asset.status != "ready":
+                    job.status, job.error = "failed", "GC 候选 AssetVersion 状态在执行前发生变化"
+                    return None
+                asset.status, asset.error = "delete_pending", None
             return job
+
+    def knowledge_asset_gc_context(self, job_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            job = session.get(KnowledgeAssetGcJob, job_id)
+            if not job or job.status != "running" or not job.execute_requested:
+                raise ValueError("AssetVersion GC 任务当前不可执行")
+            return {"id": job.id, "plan": dict(job.plan_json or {})}
+
+    def finish_knowledge_asset_gc_job(self, job_id: str, deleted_ids: list[str], error: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeAssetGcJob, job_id, with_for_update=True)
+            if not job:
+                raise ValueError("AssetVersion GC 任务不存在")
+            if error:
+                job.status, job.error = "failed", error
+                deleted = set(deleted_ids)
+                for item in (job.plan_json or {}).get("eligible", []):
+                    asset = session.get(KnowledgeAssetVersion, item["asset_version_id"])
+                    if not asset:
+                        continue
+                    if asset.id in deleted:
+                        asset.status = "deleted"
+                    elif asset.status == "delete_pending":
+                        asset.status, asset.error = "ready", error
+                return {"id": job.id, "status": job.status, "error": error}
+            for asset_id in deleted_ids:
+                asset = session.get(KnowledgeAssetVersion, asset_id)
+                if asset:
+                    asset.status = "deleted"
+            job.status, job.error = "completed", None
+            self.audit(session, "knowledge_asset_gc.completed", "knowledge_asset_gc_job", job.id,
+                       {"deleted_asset_version_ids": deleted_ids})
+            return {"id": job.id, "status": job.status, "deleted_asset_version_ids": deleted_ids}
+
+    def claim_vector_sync_job(self, owner: str) -> VectorSyncJob | None:
+        now = utc_now()
+        with self.sessions.begin() as session:
+            candidate_ids = list(session.scalars(select(VectorSyncJob.id).where(
+                (VectorSyncJob.status == "queued") |
+                ((VectorSyncJob.status == "running") & (VectorSyncJob.lease_expires_at < now))
+            ).order_by(VectorSyncJob.created_at)))
+            for job_id in candidate_ids:
+                job = session.scalar(select(VectorSyncJob).where(
+                    VectorSyncJob.id == job_id,
+                    (VectorSyncJob.status == "queued") |
+                    ((VectorSyncJob.status == "running") & (VectorSyncJob.lease_expires_at < now)),
+                ).with_for_update(skip_locked=True))
+                if not job:
+                    continue
+                if not self._acquire_library_work_leases(
+                    session, [job.knowledge_library_id], work_kind="vector_sync",
+                    work_id=job.id, owner=owner, now=now,
+                ):
+                    continue
+                job.status, job.lease_owner = "running", owner
+                job.lease_expires_at = now + WORK_LEASE_DURATION
+                job.attempt_count += 1
+                self.audit(session, "vector_sync.claimed", "vector_sync_job", job.id, {
+                    "owner": owner, "attempt": job.attempt_count,
+                    "knowledge_library_id": job.knowledge_library_id,
+                })
+                return job
+            return None
 
     def claim_vector_deletion_job(self, owner: str) -> VectorDeletionJob | None:
         with self.sessions.begin() as session:
@@ -4504,6 +5197,9 @@ class V7Store:
             "id": deployment.id, "code": deployment.code, "name": deployment.name,
             "scope": deployment.scope, "institution_name": deployment.institution_name,
             "institution_code": deployment.institution_code,
+            "institution_code_locked": bool(deployment.institution_code_locked_at),
+            "institution_code_locked_at": deployment.institution_code_locked_at.isoformat()
+                if deployment.institution_code_locked_at else None,
             "release_stage": deployment.release_stage, "status": deployment.status,
             "created_at": deployment.created_at.isoformat(), "updated_at": deployment.updated_at.isoformat(),
         }
@@ -4755,6 +5451,8 @@ class V7Store:
                 normalized_code = str(changes["institution_code"]).strip()
                 if value.scope == "institution" and not normalized_code:
                     raise ValueError("医院机构代码不能为空")
+                if value.institution_code_locked_at and normalized_code != value.institution_code:
+                    raise ValueError("机构代码已在首次发布后锁定；请使用专用机构码迁移流程")
                 duplicate = session.scalar(select(Deployment).where(
                     Deployment.institution_code == normalized_code,
                     Deployment.id != value.id,
@@ -4888,11 +5586,18 @@ class V7Store:
             deployment_task = session.get(ProjectDeploymentTask, deployment_task_id)
             if not deployment_task or not deployment_task.enabled: raise ValueError("DeploymentTask 不存在或未启用")
             deployment = session.get(ProjectDeployment, deployment_task.project_deployment_id)
+            shared_deployment = session.get(Deployment, deployment.deployment_id) if deployment else None
             project = session.get(Project, deployment.project_id) if deployment else None
             project_task = session.get(ProjectTask, deployment_task.project_task_id)
             profile = session.get(KnowledgeIndexProfile, deployment_task.index_profile_id) if deployment_task.index_profile_id else None
             if is_qa_agent_project(project) and not qa_agent_profile_contract(project_task, profile):
                 raise ValueError("qa-agent org route 的 Task 与 Index Profile 合同不匹配")
+            if shared_deployment and shared_deployment.scope == "institution":
+                if not shared_deployment.institution_code:
+                    raise ValueError("机构 Deployment 尚未配置 institution_code")
+                if org_code.strip() != shared_deployment.institution_code:
+                    raise ValueError("机构 Deployment 的 org_code 必须等于 institution_code")
+                org_name = shared_deployment.institution_name or org_name
             libraries = list(session.scalars(select(KnowledgeLibrary).where(
                 KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
                 KnowledgeLibrary.migration_status == "ready")))
@@ -4948,6 +5653,16 @@ class V7Store:
         if len(values) != 1: raise ValueError("Project 存在多个 Deployment，必须显式指定 deployment_id")
         return values[0]
 
+    @staticmethod
+    def _ready_asset_for_route(session: Session, library_id: str, profile_id: str,
+                               profile_revision_id: str) -> KnowledgeAssetVersion | None:
+        return session.scalar(select(KnowledgeAssetVersion).where(
+            KnowledgeAssetVersion.knowledge_library_id == library_id,
+            KnowledgeAssetVersion.index_profile_id == profile_id,
+            KnowledgeAssetVersion.index_profile_revision_id == profile_revision_id,
+            KnowledgeAssetVersion.status == "ready",
+        ).order_by(KnowledgeAssetVersion.version_no.desc()))
+
     def routing_snapshot(self, boundary_id: str) -> dict[str, Any]:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
@@ -4999,9 +5714,18 @@ class V7Store:
                     for link in links:
                         library = session.get(KnowledgeLibrary, link.knowledge_library_id)
                         if not library: continue
+                        asset = self._ready_asset_for_route(
+                            session, library.id, profile.id, revision.id,
+                        ) if profile and revision else None
+                        physical_partition = asset.partition_name if asset else library.partition_name
                         library_payload = {"knowledge_library_id": library.id, "knowledge_type": library.knowledge_type,
-                            "partition_name": library.partition_name, "indexes": [{**profile_payload,
-                                "partition_name": library.partition_name}] if profile_payload else []}
+                            "priority": link.priority,
+                            "asset_version_id": asset.id if asset else None,
+                            "asset_version_no": asset.version_no if asset else None,
+                            "partition_name": physical_partition, "indexes": [{**profile_payload,
+                                "asset_version_id": asset.id if asset else None,
+                                "asset_version_no": asset.version_no if asset else None,
+                                "partition_name": physical_partition}] if profile_payload else []}
                         libraries.append(library_payload)
                     org_payload = {"org_code": route.org_code, "org_name": route.org_name,
                                    "knowledge_library_ids": [item["knowledge_library_id"] for item in libraries],
@@ -5041,11 +5765,14 @@ class V7Store:
                         if not library or library.migration_status != "ready" or not self._library_ready(session, library):
                             problems.append(f"知识库 {info['knowledge_library_id']} 向量未就绪")
                             continue
+                        if not info.get("asset_version_id"):
+                            problems.append(f"知识库 {library.id} 没有 Ready AssetVersion")
+                            continue
                         if milvus:
                             indexes = info.get("indexes") or []
                             collection = indexes[0].get("collection_name") if indexes else None
                             try:
-                                if not collection or not milvus.partition_exists(collection, library.partition_name):
+                                if not collection or not milvus.partition_exists(collection, info["partition_name"]):
                                     problems.append(f"知识库 {library.id} 的目标 Partition 不存在")
                             except Exception as exc:
                                 problems.append(f"知识库 {library.id} 的目标 Milvus 校验失败：{exc}")
@@ -5089,12 +5816,361 @@ class V7Store:
                 version_no=max_version + 1, origin=origin,
                 status=status, snapshot_json=snapshot, checksum=checksum, object_key=object_key,
                 published_at=utc_now() if status == "published" else None)
-            session.add(value); self.audit(session, "routing.version_created", "project_route_version", value.id,
+            session.add(value); session.flush()
+            asset_links: dict[str, dict[str, Any]] = {}
+            for route in snapshot.get("routes", []):
+                for library in route.get("libraries", []):
+                    asset_id = library.get("asset_version_id")
+                    if asset_id:
+                        asset_links[str(library["knowledge_library_id"])] = {
+                            **library, "priority": int(library.get("priority", 0)),
+                        }
+            for library_id, payload in asset_links.items():
+                asset = session.get(KnowledgeAssetVersion, payload["asset_version_id"])
+                if not asset or asset.status != "ready":
+                    raise ValueError(f"RouteVersion 引用的 AssetVersion 不可用：{payload['asset_version_id']}")
+                session.add(ProjectRouteVersionAsset(
+                    id=new_id("rva"), project_route_version_id=value.id,
+                    knowledge_library_id=library_id, knowledge_asset_version_id=asset.id,
+                    collection_name=asset.collection_name, partition_name=asset.partition_name,
+                    priority=int(payload.get("priority", 0)),
+                ))
+                asset.unreferenced_at = None
+            self.audit(session, "routing.version_created", "project_route_version", value.id,
                                            {"version_no": value.version_no, "status": status,
                                              "project_deployment_id": project_deployment.id,
                                              "deployment_id": deployment.id,
                                              "release_stage": release_stage})
             return value
+
+    def freeze_route_version(self, boundary_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            project_deployment = self._resolve_deployment(session, boundary_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id)
+            if not deployment or deployment.scope != "institution":
+                raise ValueError("只有 institution Deployment 可以冻结离线路由版本")
+        check = self.validate_routing(boundary_id)
+        if not check["valid"]:
+            raise ValueError("路由校验失败：" + "；".join(check["problems"]))
+        encoded = json.dumps(check["snapshot"], ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        checksum = hashlib.sha256(encoded).hexdigest()
+        version = self.create_route_version(
+            boundary_id, check["snapshot"], status="frozen", checksum=checksum,
+            origin="central_offline",
+        )
+        with self.sessions.begin() as session:
+            project_deployment = session.get(ProjectDeployment, version.project_deployment_id)
+            deployment = session.get(Deployment, project_deployment.deployment_id) if project_deployment else None
+            if deployment and not deployment.institution_code_locked_at:
+                deployment.institution_code_locked_at = utc_now()
+            for route in session.scalars(select(ProjectOrgRoute).join(
+                ProjectDeploymentTask,
+                ProjectDeploymentTask.id == ProjectOrgRoute.project_deployment_task_id,
+            ).where(ProjectDeploymentTask.project_deployment_id == version.project_deployment_id)):
+                route.status = "frozen"
+        return {"id": version.id, "project_deployment_id": version.project_deployment_id,
+                "release_stage": version.release_stage, "version_no": version.version_no,
+                "status": version.status, "checksum": checksum}
+
+    def create_imported_route_candidates(self, migration_job_id: str,
+                                         projects: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeMigrationJob, migration_job_id)
+            if not job or job.direction != "import":
+                raise ValueError("导入任务不存在")
+            values = []
+            for payload in projects:
+                deployment_id = str(payload.get("project_deployment_id") or
+                                    (payload.get("project_deployment") or {}).get("id") or "")
+                if not deployment_id or not session.get(ProjectDeployment, deployment_id):
+                    raise ValueError("候选路由引用的 ProjectDeployment 不存在")
+                existing = session.scalar(select(ImportedRouteCandidate).where(
+                    ImportedRouteCandidate.migration_job_id == migration_job_id,
+                    ImportedRouteCandidate.project_deployment_id == deployment_id,
+                ))
+                if existing:
+                    values.append(existing); continue
+                snapshot = dict(payload.get("snapshot") or payload.get("route_snapshot") or {})
+                asset_ids = sorted(self._asset_ids_in_json(snapshot))
+                assets = list(session.scalars(select(KnowledgeAssetVersion).where(
+                    KnowledgeAssetVersion.id.in_(asset_ids), KnowledgeAssetVersion.status == "ready",
+                ))) if asset_ids else []
+                ready = len(assets) == len(asset_ids)
+                value = ImportedRouteCandidate(
+                    id=new_id("irc"), migration_job_id=migration_job_id,
+                    project_deployment_id=deployment_id,
+                    source_route_version=int(payload.get("route_version") or payload.get("version_no") or 0),
+                    source_route_checksum=payload.get("route_checksum") or payload.get("checksum"),
+                    status="ready" if ready else "waiting_assets", snapshot_json=snapshot,
+                    readiness_json={"asset_version_ids": asset_ids,
+                                    "ready_asset_version_ids": sorted(item.id for item in assets)},
+                )
+                session.add(value); values.append(value)
+            return [self._route_candidate_payload(item) for item in values]
+
+    @staticmethod
+    def _route_candidate_payload(item: ImportedRouteCandidate) -> dict[str, Any]:
+        return {"id": item.id, "migration_job_id": item.migration_job_id,
+                "project_deployment_id": item.project_deployment_id,
+                "source_route_version": item.source_route_version,
+                "source_route_checksum": item.source_route_checksum, "status": item.status,
+                "snapshot": item.snapshot_json, "readiness": item.readiness_json,
+                "activated_route_version_id": item.activated_route_version_id,
+                "error": item.error}
+
+    def list_imported_route_candidates(self, migration_job_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(ImportedRouteCandidate).order_by(ImportedRouteCandidate.created_at)
+            if migration_job_id:
+                query = query.where(ImportedRouteCandidate.migration_job_id == migration_job_id)
+            return [self._route_candidate_payload(item) for item in session.scalars(query)]
+
+    def start_route_candidate_activation(self, candidate_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            candidate = session.get(ImportedRouteCandidate, candidate_id, with_for_update=True)
+            if not candidate:
+                raise ValueError("候选路由不存在")
+            if candidate.status == "activated":
+                version = session.get(ProjectRouteVersion, candidate.activated_route_version_id)
+                return {"candidate_id": candidate.id, "route_version_id": version.id,
+                        "project_deployment_id": candidate.project_deployment_id,
+                        "version_no": version.version_no, "snapshot": version.snapshot_json,
+                        "idempotent": True}
+            if candidate.status not in {"ready", "failed"}:
+                raise ValueError("候选路由当前不可激活")
+            asset_ids = self._asset_ids_in_json(candidate.snapshot_json)
+            ready_ids = set(session.scalars(select(KnowledgeAssetVersion.id).where(
+                KnowledgeAssetVersion.id.in_(asset_ids), KnowledgeAssetVersion.status == "ready",
+            ))) if asset_ids else set()
+            if ready_ids != asset_ids:
+                raise ValueError("候选路由引用的 AssetVersion 尚未全部 Ready")
+            candidate.status, candidate.error = "activating", None
+            snapshot = dict(candidate.snapshot_json)
+        version = self.create_route_version(
+            candidate.project_deployment_id, snapshot, status="draft", origin="institution_release",
+        )
+        return {"candidate_id": candidate_id, "route_version_id": version.id,
+                "project_deployment_id": candidate.project_deployment_id,
+                "version_no": version.version_no, "snapshot": snapshot, "idempotent": False}
+
+    def finish_route_candidate_activation(self, candidate_id: str, route_version_id: str,
+                                          checksum: str | None, object_key: str | None,
+                                          error: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            candidate = session.get(ImportedRouteCandidate, candidate_id, with_for_update=True)
+            version = session.get(ProjectRouteVersion, route_version_id, with_for_update=True)
+            if not candidate or not version:
+                raise ValueError("候选路由或 RouteVersion 不存在")
+            if error:
+                candidate.status, candidate.error = "failed", error
+                return self._route_candidate_payload(candidate)
+            version.status, version.checksum, version.object_key = "published", checksum, object_key
+            version.published_at = utc_now()
+            candidate.status, candidate.error = "activated", None
+            candidate.activated_route_version_id = version.id
+            for route in session.scalars(select(ProjectOrgRoute).join(
+                ProjectDeploymentTask,
+                ProjectDeploymentTask.id == ProjectOrgRoute.project_deployment_task_id,
+            ).where(ProjectDeploymentTask.project_deployment_id == candidate.project_deployment_id)):
+                route.status = "published"
+            self.audit(session, "routing.candidate_activated", "imported_route_candidate", candidate.id,
+                       {"route_version_id": version.id, "checksum": checksum})
+            return self._route_candidate_payload(candidate)
+
+    def create_institution_release_draft(self, target_deployment_id: str, package_kind: str,
+                                         *, route_version_ids: list[str] | None = None,
+                                         knowledge_library_ids: list[str] | None = None,
+                                         base_release_id: str | None = None,
+                                         include_full_document_library: bool = False) -> dict[str, Any]:
+        if package_kind not in {"deployment_seed", "institution_release", "knowledge_update"}:
+            raise ValueError("机构发布包类型无效")
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, target_deployment_id)
+            if not deployment or deployment.scope != "institution":
+                raise ValueError("机构发布目标必须是 institution Deployment")
+            route_ids = list(dict.fromkeys(route_version_ids or []))
+            library_ids = list(dict.fromkeys(knowledge_library_ids or []))
+            if package_kind == "knowledge_update":
+                if route_ids or not library_ids:
+                    raise ValueError("Knowledge Update 只允许选择知识库")
+            elif not route_ids:
+                raise ValueError("Seed/Institution Release 至少选择一个 frozen RouteVersion")
+            routes = list(session.scalars(select(ProjectRouteVersion).where(
+                ProjectRouteVersion.id.in_(route_ids), ProjectRouteVersion.status == "frozen",
+            ))) if route_ids else []
+            if len(routes) != len(route_ids):
+                raise ValueError("机构发布包含不存在或未 frozen 的 RouteVersion")
+            project_deployments = {item.id: item for item in session.scalars(select(ProjectDeployment).where(
+                ProjectDeployment.id.in_([item.project_deployment_id for item in routes]),
+            ))} if routes else {}
+            if any(project_deployments[item.project_deployment_id].deployment_id != deployment.id for item in routes):
+                raise ValueError("多项目 RouteVersion 必须属于同一目标机构")
+            if len({item.project_deployment_id for item in routes}) != len(routes):
+                raise ValueError("同一 ProjectDeployment 只能选择一个 RouteVersion")
+            draft = InstitutionReleaseDraft(
+                id=new_id("reldraft"), target_deployment_id=deployment.id,
+                package_kind=package_kind, base_release_id=base_release_id,
+                selection_json={"route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                                "include_full_document_library": bool(include_full_document_library)},
+            )
+            session.add(draft); session.flush()
+            for route in routes:
+                session.add(InstitutionReleaseDraftProject(
+                    id=new_id("reldp"), institution_release_draft_id=draft.id,
+                    project_deployment_id=route.project_deployment_id,
+                    project_route_version_id=route.id,
+                ))
+            self.audit(session, "institution_release.draft_created", "institution_release_draft", draft.id,
+                       {"package_kind": package_kind, "target_deployment_id": deployment.id,
+                        "route_version_ids": route_ids, "knowledge_library_ids": library_ids})
+            return self._institution_release_draft_payload(session, draft)
+
+    @staticmethod
+    def _institution_release_draft_payload(session: Session, draft: InstitutionReleaseDraft) -> dict[str, Any]:
+        projects = [{
+            "project_deployment_id": item.project_deployment_id,
+            "project_route_version_id": item.project_route_version_id,
+        } for item in session.scalars(select(InstitutionReleaseDraftProject).where(
+            InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
+        ).order_by(InstitutionReleaseDraftProject.created_at))]
+        return {"id": draft.id, "target_deployment_id": draft.target_deployment_id,
+                "package_kind": draft.package_kind, "status": draft.status,
+                "revision_no": draft.revision_no, "base_release_id": draft.base_release_id,
+                "selection": draft.selection_json or {}, "milvus_override": draft.milvus_override_json or {},
+                "milvus_override_reason": draft.milvus_override_reason, "projects": projects,
+                "created_at": draft.created_at.isoformat(), "updated_at": draft.updated_at.isoformat()}
+
+    def get_institution_release_draft(self, draft_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            draft = session.get(InstitutionReleaseDraft, draft_id)
+            if not draft:
+                raise ValueError("机构发布草稿不存在")
+            return self._institution_release_draft_payload(session, draft)
+
+    def update_institution_release_draft(self, draft_id: str, *, route_version_ids: list[str] | None = None,
+                                         knowledge_library_ids: list[str] | None = None,
+                                         base_release_id: str | None = None,
+                                         include_full_document_library: bool | None = None,
+                                         milvus_override: dict[str, Any] | None = None,
+                                         milvus_override_reason: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            draft = session.get(InstitutionReleaseDraft, draft_id, with_for_update=True)
+            if not draft or draft.status not in {"draft", "planned", "failed"}:
+                raise ValueError("机构发布草稿当前不可编辑")
+            current = dict(draft.selection_json or {})
+            route_ids = list(dict.fromkeys(route_version_ids if route_version_ids is not None
+                                           else current.get("route_version_ids") or []))
+            library_ids = list(dict.fromkeys(knowledge_library_ids if knowledge_library_ids is not None
+                                             else current.get("knowledge_library_ids") or []))
+            if draft.package_kind == "knowledge_update":
+                if route_ids or not library_ids:
+                    raise ValueError("Knowledge Update 只允许选择知识库")
+            elif not route_ids:
+                raise ValueError("Seed/Institution Release 至少选择一个 frozen RouteVersion")
+            routes = list(session.scalars(select(ProjectRouteVersion).where(
+                ProjectRouteVersion.id.in_(route_ids), ProjectRouteVersion.status == "frozen",
+            ))) if route_ids else []
+            if len(routes) != len(route_ids):
+                raise ValueError("机构发布包含不存在或未 frozen 的 RouteVersion")
+            bindings = {item.id: item for item in session.scalars(select(ProjectDeployment).where(
+                ProjectDeployment.id.in_([item.project_deployment_id for item in routes]),
+            ))} if routes else {}
+            if any(bindings[item.project_deployment_id].deployment_id != draft.target_deployment_id for item in routes):
+                raise ValueError("多项目 RouteVersion 必须属于同一目标机构")
+            if len({item.project_deployment_id for item in routes}) != len(routes):
+                raise ValueError("同一 ProjectDeployment 只能选择一个 RouteVersion")
+            if milvus_override:
+                if not str(milvus_override_reason or "").strip():
+                    raise ValueError("临时 Milvus 覆盖必须填写原因")
+                forbidden = {"password", "token", "secret", "api_key"} & {
+                    str(key).lower() for key in milvus_override
+                }
+                if forbidden:
+                    raise ValueError("Release Snapshot 禁止保存 Milvus 凭据")
+            session.execute(delete(InstitutionReleaseDraftProject).where(
+                InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
+            ))
+            for route in routes:
+                session.add(InstitutionReleaseDraftProject(
+                    id=new_id("reldp"), institution_release_draft_id=draft.id,
+                    project_deployment_id=route.project_deployment_id,
+                    project_route_version_id=route.id,
+                ))
+            draft.selection_json = {
+                "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                "include_full_document_library": bool(
+                    current.get("include_full_document_library", False)
+                    if include_full_document_library is None else include_full_document_library
+                ),
+            }
+            draft.base_release_id = base_release_id
+            draft.milvus_override_json = dict(milvus_override or {})
+            draft.milvus_override_reason = str(milvus_override_reason or "").strip() or None
+            draft.revision_no += 1
+            draft.status = "draft"
+            session.flush()
+            return self._institution_release_draft_payload(session, draft)
+
+    def freeze_institution_release_snapshot(self, draft_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        with self.sessions.begin() as session:
+            draft = session.get(InstitutionReleaseDraft, draft_id, with_for_update=True)
+            if not draft or draft.status not in {"draft", "planned", "failed"}:
+                raise ValueError("机构发布草稿当前不可冻结")
+            existing = session.scalar(select(InstitutionReleaseSnapshot).where(
+                InstitutionReleaseSnapshot.manifest_digest == digest,
+            ))
+            if existing:
+                draft.status = "frozen"
+                return self._institution_release_snapshot_payload(existing)
+            value = InstitutionReleaseSnapshot(
+                id=new_id("release"), institution_release_draft_id=draft.id,
+                target_deployment_id=draft.target_deployment_id, package_kind=draft.package_kind,
+                base_release_id=draft.base_release_id, manifest_digest=digest,
+                snapshot_json=snapshot, diff_json=dict(snapshot.get("diff_summary") or {}),
+                tombstones_json=list(snapshot.get("tombstones") or []), status="frozen",
+            )
+            session.add(value); draft.status = "frozen"; session.flush()
+            self.audit(session, "institution_release.frozen", "institution_release_snapshot", value.id,
+                       {"draft_id": draft.id, "manifest_digest": digest})
+            return self._institution_release_snapshot_payload(value)
+
+    @staticmethod
+    def _institution_release_snapshot_payload(value: InstitutionReleaseSnapshot) -> dict[str, Any]:
+        return {"id": value.id, "draft_id": value.institution_release_draft_id,
+                "target_deployment_id": value.target_deployment_id, "package_kind": value.package_kind,
+                "base_release_id": value.base_release_id, "manifest_digest": value.manifest_digest,
+                "snapshot": value.snapshot_json, "diff": value.diff_json,
+                "tombstones": value.tombstones_json, "status": value.status,
+                "created_at": value.created_at.isoformat()}
+
+    def get_institution_release_snapshot(self, release_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            value = session.get(InstitutionReleaseSnapshot, release_id)
+            if not value:
+                raise ValueError("机构发布快照不存在")
+            return self._institution_release_snapshot_payload(value)
+
+    def list_institution_release_snapshots(self, target_deployment_id: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            query = select(InstitutionReleaseSnapshot)
+            if target_deployment_id:
+                query = query.where(InstitutionReleaseSnapshot.target_deployment_id == target_deployment_id)
+            return [self._institution_release_snapshot_payload(item) for item in session.scalars(
+                query.order_by(InstitutionReleaseSnapshot.created_at.desc())
+            )]
+
+    def update_institution_release_status(self, release_id: str, status: str) -> dict[str, Any]:
+        if status not in {"frozen", "building", "ready", "failed"}:
+            raise ValueError("机构 Release 状态无效")
+        with self.sessions.begin() as session:
+            value = session.get(InstitutionReleaseSnapshot, release_id, with_for_update=True)
+            if not value:
+                raise ValueError("机构 Release 不存在")
+            value.status = status
+            return self._institution_release_snapshot_payload(value)
 
     def mark_route_published(self, version_id: str, checksum: str, object_key: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -5172,10 +6248,19 @@ class V7Store:
                 ProjectRouteVersion.release_stage == stage,
                 ProjectRouteVersion.version_no == version_no))
             if not value: raise ValueError("路由版本不存在")
+            assets = [{
+                "knowledge_library_id": item.knowledge_library_id,
+                "knowledge_asset_version_id": item.knowledge_asset_version_id,
+                "collection_name": item.collection_name, "partition_name": item.partition_name,
+                "priority": item.priority,
+            } for item in session.scalars(select(ProjectRouteVersionAsset).where(
+                ProjectRouteVersionAsset.project_route_version_id == value.id,
+            ).order_by(ProjectRouteVersionAsset.priority))]
             return {"id": value.id, "project_id": value.project_id, "project_deployment_id": value.project_deployment_id,
                     "origin": value.origin, "release_stage": value.release_stage,
                     "version_no": value.version_no, "status": value.status,
                     "checksum": value.checksum, "object_key": value.object_key, "snapshot": value.snapshot_json,
+                    "assets": assets,
                     "created_at": value.created_at.isoformat(), "published_at": value.published_at.isoformat() if value.published_at else None}
 
     def runtime_routing_snapshot(self, project_code: str, deployment_code: str,
@@ -5216,7 +6301,10 @@ class V7Store:
         return {
             "id": job.id, "direction": job.direction, "package_kind": job.package_kind,
             "package_id": job.package_id, "project_id": job.project_id,
-            "project_deployment_id": job.project_deployment_id, "status": job.status, "stage": job.stage,
+            "project_deployment_id": job.project_deployment_id,
+            "target_deployment_id": job.target_deployment_id,
+            "release_snapshot_id": job.release_snapshot_id,
+            "status": job.status, "stage": job.stage,
             "checkpoint": job.checkpoint_json or {}, "conflicts": job.conflict_json or {},
             "signature_status": job.signature_status, "package_path": job.package_path,
             "package_sha256": job.package_sha256, "attempt_count": job.attempt_count,
@@ -5234,10 +6322,13 @@ class V7Store:
 
     def create_migration_job(self, *, direction: str, package_kind: str, project_id: str | None = None,
                              project_deployment_id: str | None = None, package_id: str | None = None,
+                             target_deployment_id: str | None = None, release_snapshot_id: str | None = None,
                              package_path: str | None = None, package_sha256: str | None = None,
                              status: str = "planning", stage: str = "planning", checkpoint: dict | None = None,
                              signature_status: str | None = None, items: list[dict] | None = None) -> dict[str, Any]:
-        if direction not in {"export", "import"} or package_kind not in {"deployment_seed", "knowledge_update"}:
+        if direction not in {"export", "import"} or package_kind not in {
+            "deployment_seed", "institution_release", "knowledge_update",
+        }:
             raise ValueError("migration job 类型无效")
         with self.sessions.begin() as session:
             if package_id:
@@ -5248,6 +6339,7 @@ class V7Store:
                     return self._migration_job_payload(existing, existing_items)
             job = KnowledgeMigrationJob(id=new_id("mig"), direction=direction, package_kind=package_kind,
                 package_id=package_id, project_id=project_id, project_deployment_id=project_deployment_id,
+                target_deployment_id=target_deployment_id, release_snapshot_id=release_snapshot_id,
                 status=status, stage=stage, checkpoint_json=checkpoint or {}, package_path=package_path,
                 package_sha256=package_sha256, signature_status=signature_status)
             session.add(job); session.flush()
@@ -5309,7 +6401,7 @@ class V7Store:
             if package_sha256 is not None: job.package_sha256 = package_sha256
             if package_id is not None: job.package_id = package_id
             job.error = error
-            if status in {"completed", "failed", "ready", "conflict"}:
+            if status in {"completed", "failed", "ready", "conflict", "waiting"}:
                 job.finished_at = utc_now() if status in {"completed", "failed"} else None
                 job.lease_owner = None; job.lease_expires_at = None
             return self._migration_job_payload(job)
@@ -5345,6 +6437,20 @@ class V7Store:
         with self.sessions.begin() as session:
             job = session.get(KnowledgeMigrationJob, job_id, with_for_update=True)
             if not job or job.status != "failed": raise ValueError("只有失败的迁移任务可以重试")
+            job.status, job.error, job.finished_at = "queued", None, None
+            return self._migration_job_payload(job)
+
+    def resume_migration_job(self, job_id: str, *, selected_import_target: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(KnowledgeMigrationJob, job_id, with_for_update=True)
+            if not job or job.direction != "import" or job.status != "waiting":
+                raise ValueError("只有等待中的导入任务可以继续")
+            if selected_import_target:
+                if selected_import_target not in {"current_target", "candidate_target"}:
+                    raise ValueError("selected_import_target 无效")
+                checkpoint = dict(job.checkpoint_json or {})
+                checkpoint["selected_import_target"] = selected_import_target
+                job.checkpoint_json = checkpoint
             job.status, job.error, job.finished_at = "queued", None, None
             return self._migration_job_payload(job)
 

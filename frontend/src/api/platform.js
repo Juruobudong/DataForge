@@ -3,7 +3,17 @@ async function request(path, options = {}) {
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '请求失败')
   return response.status === 204 ? null : response.json()
 }
+
+function graphNeighborQuery(depth, filters = {}, confirmLarge = false) {
+  const params = new URLSearchParams({ depth: String(depth) })
+  for (const value of filters.entityTypes || []) params.append('entity_types', value)
+  for (const value of filters.relationTypes || []) params.append('relation_types', value)
+  if (confirmLarge) params.set('confirm_large', 'true')
+  return params.toString()
+}
+
 export const api = {
+  dashboardOverview: () => request('/api/dashboard/overview'),
   documentLibraries: (keyword = '', status = '') => request(`/api/document-libraries?keyword=${encodeURIComponent(keyword)}${status ? `&status=${encodeURIComponent(status)}` : ''}`),
   createDocumentLibrary: body => request('/api/document-libraries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   sources: (libraryId = '', keyword = '', status = '') => request(libraryId ? `/api/document-libraries/${libraryId}/sources?keyword=${encodeURIComponent(keyword)}${status ? `&status=${status}` : ''}` : `/api/sources?keyword=${encodeURIComponent(keyword)}${status ? `&status=${status}` : ''}`),
@@ -41,7 +51,8 @@ export const api = {
   knowledgeItemSources: itemId => request(`/api/knowledge-items/${itemId}/sources`),
   graphEntities: (libraryId, q = '') => request(`/api/knowledge-libraries/${libraryId}/graph/entities?q=${encodeURIComponent(q)}`),
   graphEntity: (libraryId, entityId) => request(`/api/knowledge-libraries/${libraryId}/graph/entities/${entityId}`),
-  graphNeighbors: (libraryId, entityId, depth = 1) => request(`/api/knowledge-libraries/${libraryId}/graph/entities/${entityId}/neighbors?depth=${depth}`),
+  graphNeighborPreview: (libraryId, entityId, depth = 1, filters = {}) => request(`/api/knowledge-libraries/${libraryId}/graph/entities/${entityId}/neighbors/preview?${graphNeighborQuery(depth, filters)}`),
+  graphNeighbors: (libraryId, entityId, depth = 1, filters = {}, confirmLarge = false) => request(`/api/knowledge-libraries/${libraryId}/graph/entities/${entityId}/neighbors?${graphNeighborQuery(depth, filters, confirmLarge)}`),
   graphEvidence: (libraryId, relationId) => request(`/api/knowledge-libraries/${libraryId}/graph/relations/${relationId}/evidence`),
   knowledgeJobs: () => request('/api/knowledge-jobs'),
   createKnowledgeJob: body => request('/api/knowledge-jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
@@ -122,6 +133,23 @@ export const api = {
   routeVersions: (deploymentId, stage) => request(`/api/project-deployments/${deploymentId}/routing/versions?release_stage=${encodeURIComponent(stage)}`),
   routeVersion: (deploymentId, version, stage) => request(`/api/project-deployments/${deploymentId}/routing/versions/${version}?release_stage=${encodeURIComponent(stage)}`),
   rollbackRouting: (deploymentId, version, body) => request(`/api/project-deployments/${deploymentId}/routing/rollback/${version}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  freezeRouting: deploymentId => request(`/api/project-deployments/${deploymentId}/routing/freeze`, { method: 'POST' }),
+  createInstitutionReleaseDraft: body => request('/api/institution-deployments/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  institutionReleaseDraft: draftId => request(`/api/institution-deployments/drafts/${draftId}`),
+  updateInstitutionReleaseDraft: (draftId, body) => request(`/api/institution-deployments/drafts/${draftId}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  institutionReleasePlan: draftId => request(`/api/institution-deployments/drafts/${draftId}/plan`),
+  freezeInstitutionRelease: draftId => request(`/api/institution-deployments/drafts/${draftId}/freeze`, { method: 'POST' }),
+  institutionReleases: deploymentId => request(`/api/institution-deployments/releases${deploymentId ? `?target_deployment_id=${encodeURIComponent(deploymentId)}` : ''}`),
+  institutionRelease: releaseId => request(`/api/institution-deployments/releases/${releaseId}`),
+  buildInstitutionRelease: releaseId => request(`/api/institution-deployments/releases/${releaseId}/build`, { method: 'POST' }),
+  health: () => request('/api/health'),
+  localMilvusConfigurations: () => request('/api/local/milvus-configurations'),
+  putLocalMilvusConfiguration: (slot, body) => request(`/api/local/milvus-configurations/${slot}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  verifyLocalMilvusConfiguration: slot => request(`/api/local/milvus-configurations/${slot}/verify`, { method: 'POST' }),
+  promoteLocalMilvusCandidate: () => request('/api/local/milvus-configurations/candidate_target/promote', { method: 'POST' }),
+  importedRouteCandidates: jobId => request(`/api/imported-route-candidates${jobId ? `?migration_job_id=${encodeURIComponent(jobId)}` : ''}`),
+  activateImportedRouteCandidate: candidateId => request(`/api/imported-route-candidates/${candidateId}/activate`, { method: 'POST' }),
+  activateReadyRouteCandidates: candidate_ids => request('/api/imported-route-candidates/activate-ready', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ candidate_ids }) }),
   migrationPlan: body => request('/api/migrations/export/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   exportMigration: body => request('/api/migrations/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   migrations: direction => request(`/api/migrations${direction ? `?direction=${direction}` : ''}`),
@@ -130,4 +158,6 @@ export const api = {
   inspectMigration: form => request('/api/migrations/import/inspect', { method: 'POST', body: form }),
   importMigration: body => request('/api/migrations/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   retryMigration: jobId => request(`/api/migrations/${jobId}/retry`, { method: 'POST' }),
+  resumeMigration: (jobId, body = {}) => request(`/api/migrations/${jobId}/resume`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  knowledgeAssetGcPlan: () => request('/api/knowledge-asset-gc/plan'),
 }
