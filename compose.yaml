@@ -52,8 +52,17 @@ services:
     command: ["dataforge-migrate", "--upgrade-platform"]
     environment:
       DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_INSTANCE_MODE: ${DATAFORGE_INSTANCE_MODE:-central}
+      DATAFORGE_INSTANCE_CODE: ${DATAFORGE_INSTANCE_CODE:-central-default}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      DATAFORGE_CENTRAL_TEST_MILVUS_URI: ${DATAFORGE_CENTRAL_TEST_MILVUS_URI:-}
+      DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI: ${DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI:-}
+      DATAFORGE_QA_AGENT_TEST_MILVUS_URL: ${DATAFORGE_QA_AGENT_TEST_MILVUS_URL:-}
+      DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL: ${DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL:-}
+      DATAFORGE_KG_TEST_MILVUS_URL: ${DATAFORGE_KG_TEST_MILVUS_URL:-}
+      DATAFORGE_FAQ_TEST_MILVUS_URI: ${DATAFORGE_FAQ_TEST_MILVUS_URI:-}
+      DATAFORGE_TEST_TARGET_URI: ${DATAFORGE_TEST_TARGET_URI:-}
     depends_on:
       mysql:
         condition: service_healthy
@@ -69,6 +78,9 @@ services:
       DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
       DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
       DATAFORGE_MILVUS_TOKEN: ${DATAFORGE_MILVUS_TOKEN:-}
+      DATAFORGE_TEST_MILVUS_TOKEN: ${DATAFORGE_TEST_MILVUS_TOKEN:-}
+      DATAFORGE_PRODUCTION_MILVUS_TOKEN: ${DATAFORGE_PRODUCTION_MILVUS_TOKEN:-}
+      DATAFORGE_RUNTIME_TOKEN: ${DATAFORGE_RUNTIME_TOKEN:-}
     depends_on:
       dataforge-migrate:
         condition: service_completed_successfully
@@ -119,6 +131,13 @@ services:
       DATAFORGE_RUNNER_URL: http://dataforge-runner:8010
       DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
       DATAFORGE_ROUTING_DIR: /var/lib/dataforge/routing
+      DATAFORGE_MIGRATION_DIR: /var/lib/dataforge/migrations
+      DATAFORGE_INSTANCE_MODE: ${DATAFORGE_INSTANCE_MODE:-central}
+      DATAFORGE_INSTANCE_CODE: ${DATAFORGE_INSTANCE_CODE:-central-default}
+      DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY: ${DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY:-}
+      DATAFORGE_MIGRATION_SIGNING_KEY_ID: ${DATAFORGE_MIGRATION_SIGNING_KEY_ID:-central-default}
+      DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS: ${DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS:-}
+      DATAFORGE_CONFIG_ENCRYPTION_KEY: ${DATAFORGE_CONFIG_ENCRYPTION_KEY:-}
       DATAFORGE_ADMIN_PASSWORD_HASH_FILE: /run/secrets/dataforge_admin_password_hash
       DATAFORGE_SESSION_SECRET_FILE: /run/secrets/dataforge_session_secret
       DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
@@ -128,6 +147,13 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      DATAFORGE_CENTRAL_TEST_MILVUS_URI: ${DATAFORGE_CENTRAL_TEST_MILVUS_URI:-}
+      DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI: ${DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI:-}
+      DATAFORGE_QA_AGENT_TEST_MILVUS_URL: ${DATAFORGE_QA_AGENT_TEST_MILVUS_URL:-}
+      DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL: ${DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL:-}
+      DATAFORGE_KG_TEST_MILVUS_URL: ${DATAFORGE_KG_TEST_MILVUS_URL:-}
+      DATAFORGE_FAQ_TEST_MILVUS_URI: ${DATAFORGE_FAQ_TEST_MILVUS_URI:-}
+      DATAFORGE_TEST_TARGET_URI: ${DATAFORGE_TEST_TARGET_URI:-}
     secrets:
       - dataforge_admin_password_hash
       - dataforge_session_secret
@@ -144,6 +170,7 @@ services:
     networks: [milvus-egress, private]
     volumes:
       - routing-snapshots:/var/lib/dataforge/routing
+      - migration-packages:/var/lib/dataforge/migrations
     logging: *default-logging
     deploy:
       resources:
@@ -162,9 +189,23 @@ services:
     init: true
     environment:
       DATAFORGE_DATABASE_URL: mysql+pymysql://dataforge:${MYSQL_PASSWORD:-dataforge}@mysql:3306/dataforge
+      DATAFORGE_MINIO_ENDPOINT: minio:9000
+      DATAFORGE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-dataforge}
+      DATAFORGE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-dataforge-minio}
+      DATAFORGE_MINIO_BUCKET: dataforge
+      DATAFORGE_ROUTING_DIR: /var/lib/dataforge/routing
+      DATAFORGE_MIGRATION_DIR: /var/lib/dataforge/migrations
+      DATAFORGE_INSTANCE_MODE: ${DATAFORGE_INSTANCE_MODE:-central}
+      DATAFORGE_INSTANCE_CODE: ${DATAFORGE_INSTANCE_CODE:-central-default}
+      DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY: ${DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY:-}
+      DATAFORGE_MIGRATION_SIGNING_KEY_ID: ${DATAFORGE_MIGRATION_SIGNING_KEY_ID:-central-default}
+      DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS: ${DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS:-}
+      DATAFORGE_CONFIG_ENCRYPTION_KEY: ${DATAFORGE_CONFIG_ENCRYPTION_KEY:-}
       DATAFORGE_RUNNER_URL: http://dataforge-runner:8010
       DATAFORGE_RUNNER_SERVICE_TOKEN: ${RUNNER_SERVICE_TOKEN:-change-me}
       DATAFORGE_RUNNER_TIMEOUT_SECONDS: ${DATAFORGE_RUNNER_TIMEOUT_SECONDS:-1860}
+      DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY: ${DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY:-3}
+      DATAFORGE_VECTOR_SYNC_CONCURRENCY: ${DATAFORGE_VECTOR_SYNC_CONCURRENCY:-2}
       DATAFORGE_MILVUS_URI: ${DATAFORGE_MILVUS_URI:-}
       DATAFORGE_MILVUS_TOKEN: ${DATAFORGE_MILVUS_TOKEN:-}
       EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
@@ -172,6 +213,13 @@ services:
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bce-embedding-base}
       EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
       EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      DATAFORGE_CENTRAL_TEST_MILVUS_URI: ${DATAFORGE_CENTRAL_TEST_MILVUS_URI:-}
+      DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI: ${DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI:-}
+      DATAFORGE_QA_AGENT_TEST_MILVUS_URL: ${DATAFORGE_QA_AGENT_TEST_MILVUS_URL:-}
+      DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL: ${DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL:-}
+      DATAFORGE_KG_TEST_MILVUS_URL: ${DATAFORGE_KG_TEST_MILVUS_URL:-}
+      DATAFORGE_FAQ_TEST_MILVUS_URI: ${DATAFORGE_FAQ_TEST_MILVUS_URI:-}
+      DATAFORGE_TEST_TARGET_URI: ${DATAFORGE_TEST_TARGET_URI:-}
     depends_on:
       mysql:
         condition: service_healthy
@@ -181,8 +229,13 @@ services:
         condition: service_started
       dataforge-api:
         condition: service_started
+      minio:
+        condition: service_healthy
     restart: unless-stopped
     networks: [milvus-egress, private]
+    volumes:
+      - routing-snapshots:/var/lib/dataforge/routing
+      - migration-packages:/var/lib/dataforge/migrations
     logging: *default-logging
     deploy:
       resources:
@@ -301,6 +354,7 @@ volumes:
   mysql-data: {}
   minio-data: {}
   routing-snapshots: {}
+  migration-packages: {}
 
 networks:
   edge: {}

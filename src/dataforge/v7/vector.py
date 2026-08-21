@@ -4,8 +4,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Iterable, Protocol
 
 from .store import V7Store
 
@@ -154,6 +158,12 @@ class V7Milvus:
         if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
             client.create_partition(collection_name=collection_name, partition_name=partition_name)
 
+    def partition_exists(self, collection_name: str, partition_name: str) -> bool:
+        self._assert_v7_partition(partition_name)
+        client = self.client()
+        return bool(client.has_collection(collection_name=collection_name) and
+                    client.has_partition(collection_name=collection_name, partition_name=partition_name))
+
     def upsert(self, collection_name: str, partition_name: str, rows: list[dict[str, Any]]) -> None:
         self._assert_v7_partition(partition_name)
         self.client().upsert(collection_name=collection_name, partition_name=partition_name, data=rows)
@@ -167,11 +177,21 @@ class V7Milvus:
         self.client().release_partitions(collection_name=collection_name, partition_names=[partition_name])
 
     def drop_partition(self, collection_name: str, partition_name: str) -> None:
-        """Drop one verified V7 library partition without touching its Collection."""
+        """Drop one verified V7 library partition without touching its Collection.
+
+        Milvus rejects dropping a partition that is currently loaded, so release it
+        first. Releasing an already-released partition is a no-op; if the release
+        itself fails we still attempt the drop so the underlying error surfaces.
+        """
         self._assert_v7_partition(partition_name)
         client = self.client()
-        if client.has_partition(collection_name=collection_name, partition_name=partition_name):
-            client.drop_partition(collection_name=collection_name, partition_name=partition_name)
+        if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
+            return
+        try:
+            client.release_partitions(collection_name=collection_name, partition_names=[partition_name])
+        except Exception:
+            pass
+        client.drop_partition(collection_name=collection_name, partition_name=partition_name)
 
     def inspect_managed_collection(self, collection_name: str, expected_description: str) -> dict[str, Any]:
         """Read the facts required by the fail-closed managed deletion preflight."""
@@ -220,6 +240,167 @@ class V7Milvus:
             return
         expr = f'{field_name} in [{", ".join(json.dumps(item) for item in vector_ids)}]'
         self.client().delete(collection_name=collection_name, partition_name=partition_name, filter=expr)
+
+    def _primary_field(self, collection_name: str) -> str:
+        description = self.client().describe_collection(collection_name=collection_name)
+        for field in description.get("fields", []) if isinstance(description, dict) else []:
+            if field.get("is_primary") or field.get("primary"):
+                return str(field["name"])
+        return "id"
+
+    def iter_partition(self, collection_name: str, partition_name: str,
+                       batch_size: int = 1000) -> Iterable[list[dict[str, Any]]]:
+        self._assert_v7_partition(partition_name)
+        client = self.client()
+        if not client.has_partition(collection_name=collection_name, partition_name=partition_name):
+            raise ValueError(f"Milvus Partition {partition_name} 不存在")
+        iterator_factory = getattr(client, "query_iterator", None)
+        if iterator_factory:
+            iterator = iterator_factory(collection_name=collection_name, partition_names=[partition_name],
+                                        filter="", output_fields=["*"], batch_size=batch_size)
+            try:
+                while True:
+                    rows = iterator.next()
+                    if not rows: break
+                    yield [dict(row) for row in rows]
+            finally:
+                close = getattr(iterator, "close", None)
+                if close: close()
+            return
+        offset = 0
+        while True:
+            rows = client.query(collection_name=collection_name, partition_names=[partition_name], filter="",
+                                output_fields=["*"], limit=batch_size, offset=offset)
+            if not rows: break
+            yield [dict(row) for row in rows]
+            if len(rows) < batch_size: break
+            offset += len(rows)
+
+    @staticmethod
+    def _row_digest(rows: Iterable[dict[str, Any]], primary_field: str) -> str:
+        digest = hashlib.sha256()
+        for row in sorted(rows, key=lambda item: str(item.get(primary_field, ""))):
+            digest.update(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                     default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value)).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    @staticmethod
+    def _update_row_digest(digest, row: dict[str, Any]) -> None:
+        digest.update(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                 default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value)).encode("utf-8"))
+        digest.update(b"\n")
+
+    @contextmanager
+    def _sorted_partition_spool(self, collection_name: str, partition_name: str,
+                                primary_field: str, batch_size: int, parent: Path):
+        """Spill a Partition to disk and expose rows in stable primary-key order."""
+        parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="dataforge-vector-sort-", dir=parent) as temporary:
+            connection = sqlite3.connect(str(Path(temporary) / "rows.sqlite3"))
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("CREATE TABLE rows (sort_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+            count, json_fields = 0, set()
+            try:
+                for batch in self.iter_partition(collection_name, partition_name, batch_size):
+                    values = []
+                    for row in batch:
+                        sort_key = str(row.get(primary_field, ""))
+                        if not sort_key: raise ValueError(f"Partition row 缺少主键字段 {primary_field}")
+                        json_fields.update(key for key, value in row.items()
+                                           if key != "vector" and isinstance(value, (dict, list)))
+                        payload = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                                             default=lambda value: value.tolist() if hasattr(value, "tolist") else str(value))
+                        values.append((sort_key, payload)); count += 1
+                    try:
+                        connection.executemany("INSERT INTO rows(sort_key, payload) VALUES (?, ?)", values)
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError(f"Partition {partition_name} 存在重复主键") from exc
+                connection.commit()
+                yield connection, count, sorted(json_fields)
+            finally:
+                connection.close()
+
+    def export_partition(self, collection_name: str, partition_name: str,
+                         output_path: Path, batch_size: int = 1000) -> dict[str, Any]:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        primary_field = self._primary_field(collection_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        with self._sorted_partition_spool(collection_name, partition_name, primary_field,
+                                          batch_size, output_path.parent) as (spool, count, json_fields):
+            cursor = spool.execute("SELECT payload FROM rows ORDER BY sort_key")
+            writer = None
+            try:
+                while raw_rows := cursor.fetchmany(batch_size):
+                    rows = [json.loads(raw[0]) for raw in raw_rows]
+                    for row in rows: self._update_row_digest(digest, row)
+                    encoded = [{key: json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                                if key in json_fields and value is not None else value
+                                for key, value in row.items()} for row in rows]
+                    table = pa.Table.from_pylist(encoded, schema=writer.schema if writer else None)
+                    if writer is None:
+                        metadata = dict(table.schema.metadata or {})
+                        metadata[b"dataforge_primary_field"] = primary_field.encode("utf-8")
+                        metadata[b"dataforge_json_fields"] = json.dumps(json_fields).encode("utf-8")
+                        table = table.replace_schema_metadata(metadata)
+                        writer = pq.ParquetWriter(output_path, table.schema, compression="zstd")
+                    writer.write_table(table)
+                if writer is None:
+                    empty = pa.table({primary_field: pa.array([], type=pa.string())})
+                    metadata = {b"dataforge_primary_field": primary_field.encode("utf-8"),
+                                b"dataforge_json_fields": b"[]"}
+                    writer = pq.ParquetWriter(output_path, empty.replace_schema_metadata(metadata).schema,
+                                              compression="zstd")
+            finally:
+                if writer is not None: writer.close()
+        return {"collection_name": collection_name, "partition_name": partition_name,
+                "count": count, "primary_field": primary_field, "digest": digest.hexdigest()}
+
+    def reset_partition(self, collection_name: str, partition_name: str) -> None:
+        self._assert_v7_partition(partition_name)
+        self.drop_partition(collection_name, partition_name)
+        self.ensure_partition(collection_name, partition_name)
+
+    def import_partition(self, collection_name: str, partition_name: str,
+                         input_path: Path, batch_size: int = 1000) -> dict[str, Any]:
+        import pyarrow.parquet as pq
+        parquet = pq.ParquetFile(input_path)
+        metadata = parquet.schema_arrow.metadata or {}
+        primary_field = metadata.get(b"dataforge_primary_field", b"id").decode("utf-8")
+        json_fields = set(json.loads(metadata.get(b"dataforge_json_fields", b"[]")))
+        count, digest = 0, hashlib.sha256()
+        for batch in parquet.iter_batches(batch_size=batch_size):
+            rows = batch.to_pylist()
+            decoded = [{key: json.loads(value) if key in json_fields and value is not None else value
+                        for key, value in row.items()} for row in rows]
+            if decoded: self.upsert(collection_name, partition_name, decoded)
+            for row in decoded: self._update_row_digest(digest, row)
+            count += len(decoded)
+        return {"count": count, "primary_field": primary_field,
+                "digest": digest.hexdigest()}
+
+    def count_partition(self, collection_name: str, partition_name: str) -> int:
+        return sum(len(batch) for batch in self.iter_partition(collection_name, partition_name))
+
+    def verify_partition(self, collection_name: str, partition_name: str,
+                         expected_count: int | None = None, expected_digest: str | None = None,
+                         primary_field: str | None = None) -> dict[str, Any]:
+        primary_field = primary_field or self._primary_field(collection_name)
+        digest = hashlib.sha256()
+        with self._sorted_partition_spool(collection_name, partition_name, primary_field, 1000,
+                                          Path(tempfile.gettempdir())) as (spool, count, _):
+            cursor = spool.execute("SELECT payload FROM rows ORDER BY sort_key")
+            while raw_rows := cursor.fetchmany(1000):
+                for raw in raw_rows: self._update_row_digest(digest, json.loads(raw[0]))
+        actual_digest = digest.hexdigest()
+        if expected_count is None and expected_digest is None:
+            return {"count": count, "digest": actual_digest, "primary_field": primary_field}
+        valid = count == expected_count and actual_digest == expected_digest
+        return {"valid": valid, "expected_count": expected_count, "target_count": count,
+                "expected_digest": expected_digest, "target_digest": actual_digest}
 
 
 def vector_id(profile_code: str, knowledge_library_id: str, source_knowledge_id: str) -> str:
@@ -281,14 +462,23 @@ class VectorSyncService:
             return {"question": data.get("question"), "answer": data.get("answer")}
         return {}
 
-    def run(self, sync_job_id: str) -> dict[str, Any]:
+    def run(self, sync_job_id: str, *, lease_owner: str | None = None) -> dict[str, Any]:
+        if lease_owner:
+            self.store.assert_work_lease("vector_sync", sync_job_id, lease_owner)
         context = self.store.vector_sync_context(sync_job_id)
         if not self.milvus or not self.embeddings:
             return self.store.finish_vector_sync(sync_job_id, [], "未配置 DATAFORGE_MILVUS_URI 或 EMBEDDING_API_BASE，不能标记 Vector Ready")
         job, library, profile, embedding, items = context["job"], context["library"], context["profile"], context["embedding"], context["items"]
+        asset = context.get("asset_version")
+        partition_name = asset.partition_name if asset else library.partition_name
         try:
             self.milvus.validate_collection(profile.collection_name, profile.fields_json, embedding.dimension)
-            self.milvus.ensure_partition(profile.collection_name, library.partition_name)
+            # Only an unpublished candidate may be rebuilt on retry.  Never
+            # reset or drop the stable/ready Partition used by a RouteVersion.
+            if asset and asset.status != "ready" and hasattr(self.milvus, "partition_exists") \
+                    and self.milvus.partition_exists(profile.collection_name, partition_name):
+                self.milvus.drop_partition(profile.collection_name, partition_name)
+            self.milvus.ensure_partition(profile.collection_name, partition_name)
             inputs = [self._input(profile.code, item) for item in items]
             vectors = self.embeddings.embed(inputs, model=embedding.model, dimension=embedding.dimension)
             rows = []
@@ -304,9 +494,26 @@ class VectorSyncService:
                 rows.append(row)
                 states.append({"knowledge_item_id": item.id, "vector_id": stable_id, "content_hash": item.content_hash})
             if rows:
-                self.milvus.upsert(profile.collection_name, library.partition_name, rows)
+                self.milvus.upsert(profile.collection_name, partition_name, rows)
+            if asset:
+                self.store.mark_asset_version_verifying(job.id)
+                verified = self.milvus.verify_partition(profile.collection_name, partition_name)
+                if int(verified.get("count", -1)) != len(rows):
+                    raise ValueError(
+                        f"候选 Partition 行数 {verified.get('count')} 与正式知识 {len(rows)} 不一致"
+                    )
+                self.milvus.load_partition(profile.collection_name, partition_name)
+                if lease_owner:
+                    self.store.assert_work_lease("vector_sync", job.id, lease_owner)
+                return self.store.finish_vector_sync(
+                    job.id, states, asset_count=len(rows), asset_digest=str(verified.get("digest") or ""),
+                )
+            if lease_owner:
+                self.store.assert_work_lease("vector_sync", job.id, lease_owner)
             return self.store.finish_vector_sync(job.id, states)
         except Exception as exc:
+            if lease_owner:
+                self.store.assert_work_lease("vector_sync", job.id, lease_owner)
             return self.store.finish_vector_sync(job.id, [], str(exc))
 
     def capacity_report(self) -> list[dict[str, Any]]:
@@ -322,6 +529,38 @@ class VectorSyncService:
             return skipped + [{"collection_name": name, "available": False, "reason": "Milvus 未配置"} for name in names]
         checked = [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names)]
         return skipped + checked
+
+
+class KnowledgeAssetGcService:
+    """Explicit, allowlisted deletion of unreferenced versioned Partitions."""
+
+    def __init__(self, store: V7Store, milvus: V7Milvus | None = None):
+        self.store, self.milvus = store, milvus
+
+    @classmethod
+    def from_environment(cls, store: V7Store) -> "KnowledgeAssetGcService":
+        uri = os.getenv("DATAFORGE_MILVUS_URI")
+        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
+
+    def run(self, job_id: str) -> dict[str, Any]:
+        context = self.store.knowledge_asset_gc_context(job_id)
+        if not self.milvus:
+            return self.store.finish_knowledge_asset_gc_job(job_id, [], "未配置 Milvus，不能执行 AssetVersion GC")
+        deleted: list[str] = []
+        try:
+            for item in context["plan"].get("eligible", []):
+                partition = str(item["partition_name"])
+                if "__v" not in partition:
+                    raise ValueError(f"拒绝删除非版本化 Partition：{partition}")
+                collection = str(item["collection_name"])
+                if self.milvus.partition_exists(collection, partition):
+                    self.milvus.drop_partition(collection, partition)
+                if self.milvus.partition_exists(collection, partition):
+                    raise ValueError(f"Partition 删除后仍存在：{collection}/{partition}")
+                deleted.append(str(item["asset_version_id"]))
+            return self.store.finish_knowledge_asset_gc_job(job_id, deleted)
+        except Exception as exc:
+            return self.store.finish_knowledge_asset_gc_job(job_id, deleted, str(exc))
 
 
 class VectorDeletionService:

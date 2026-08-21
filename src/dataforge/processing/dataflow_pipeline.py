@@ -20,6 +20,8 @@ from .native import normalize_medical_text, split_text
 
 @OPERATOR_REGISTRY.register()
 class NormalizeMedicalTextOperator(OperatorABC):
+    """通用文档文本规范化算子（行业无关）。"""
+
     def run(
         self,
         storage: DataFlowStorage,
@@ -36,6 +38,8 @@ class NormalizeMedicalTextOperator(OperatorABC):
 
 @OPERATOR_REGISTRY.register()
 class ChunkMedicalTextOperator(OperatorABC):
+    """通用文档分段算子（行业无关）。"""
+
     def __init__(self, chunk_size: int, chunk_overlap: int):
         super().__init__()
         self.chunk_size = chunk_size
@@ -81,6 +85,8 @@ class ChunkMedicalTextOperator(OperatorABC):
 
 
 class MedicalDocumentPipeline(PipelineABC):
+    """通用文档处理流水线（行业无关）：先标准化再分段，供各行业文档库复用。"""
+
     def __init__(
         self,
         input_file: Path,

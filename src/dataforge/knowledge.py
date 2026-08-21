@@ -57,7 +57,7 @@ KNOWLEDGE_TYPES = [
 STANDARD_PIPELINES = [
     {
         "id": "std-text-chunk-v1",
-        "name": "医疗文档文本分块流程",
+        "name": "文档文本分块流程",
         "knowledge_type_id": "text_chunk",
         "pipeline_ref": "medical-document-v1",
         "engine": "dataflow",

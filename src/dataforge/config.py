@@ -19,6 +19,17 @@ def _read_secret(name: str) -> str | None:
         return None
 
 
+def _positive_int_environment(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} 必须是正整数") from exc
+    if value <= 0:
+        raise ValueError(f"{name} 必须是正整数")
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     project_root: Path
@@ -34,8 +45,16 @@ class Settings:
     runner_url: str | None = None
     runner_service_token: str | None = None
     runner_timeout_seconds: float = 1860.0
+    knowledge_job_concurrency: int = 3
+    vector_sync_concurrency: int = 2
     derived_runs_enabled: bool = False
     derived_run_commit_enabled: bool = False
+    instance_mode: str = "central"
+    instance_code: str = "central-default"
+    migration_signing_private_key: str | None = None
+    migration_trusted_public_keys: str | None = None
+    migration_signing_key_id: str = "central-default"
+    config_encryption_key: str | None = None
 
     @classmethod
     def load(
@@ -65,8 +84,16 @@ class Settings:
             runner_url=os.getenv("DATAFORGE_RUNNER_URL"),
             runner_service_token=_read_secret("DATAFORGE_RUNNER_SERVICE_TOKEN"),
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
+            knowledge_job_concurrency=_positive_int_environment("DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY", 3),
+            vector_sync_concurrency=_positive_int_environment("DATAFORGE_VECTOR_SYNC_CONCURRENCY", 2),
             derived_runs_enabled=os.getenv("DATAFORGE_DERIVED_RUNS_ENABLED", "0") == "1",
             derived_run_commit_enabled=os.getenv("DATAFORGE_DERIVED_RUN_COMMIT_ENABLED", "0") == "1",
+            instance_mode=os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower(),
+            instance_code=os.getenv("DATAFORGE_INSTANCE_CODE", "central-default").strip(),
+            migration_signing_private_key=_read_secret("DATAFORGE_MIGRATION_SIGNING_PRIVATE_KEY"),
+            migration_trusted_public_keys=_read_secret("DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS"),
+            migration_signing_key_id=os.getenv("DATAFORGE_MIGRATION_SIGNING_KEY_ID", "central-default").strip(),
+            config_encryption_key=_read_secret("DATAFORGE_CONFIG_ENCRYPTION_KEY"),
         )
 
     @property
@@ -82,6 +109,11 @@ class Settings:
     def routing_dir(self) -> Path:
         configured = os.getenv("DATAFORGE_ROUTING_DIR")
         return Path(configured).resolve() if configured else self.state_dir / "routing"
+
+    @property
+    def migration_dir(self) -> Path:
+        configured = os.getenv("DATAFORGE_MIGRATION_DIR")
+        return Path(configured).resolve() if configured else self.state_dir / "migrations"
 
     @property
     def database_path(self) -> Path:
@@ -100,3 +132,4 @@ class Settings:
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.routing_dir.mkdir(parents=True, exist_ok=True)
+        self.migration_dir.mkdir(parents=True, exist_ok=True)

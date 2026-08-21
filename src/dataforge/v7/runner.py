@@ -24,11 +24,16 @@ from sqlalchemy import select
 
 from ..config import Settings
 from .catalog import catalog_by_code
+from .graph_literal import classify_object, detect_literal
+from .graph_prompt import entity_prompt_for, relation_prompt_for
+from .graph_quality import evaluate_graph_quality
+from .graph_schema import GraphExtractionConfig, normalize_graph_config
 from .llm_serving import DEFAULT_LLM_SERVING_ID, get_llm_serving_registry
 from .models import KnowledgeJob, Source, SourceVersion
 from .parser_runtime import content_list_pages, parse_with_mineru
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
+from .faq import FAQ_TYPE_CODE, normalize_faq_rows, parse_table_rows
 
 
 logger = logging.getLogger("dataforge.v7.runner")
@@ -37,6 +42,7 @@ logger = logging.getLogger("dataforge.v7.runner")
 class RunRequest(BaseModel):
     job_id: str | None = None
     flow_run_id: str | None = None
+    lease_owner: str | None = None
 
 
 def _objects(settings: Settings):
@@ -143,15 +149,24 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
     if ref == "source-chunk-builder":
         return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
     if ref == "entity-extractor":
-        return [{**value, "entities": [{"name": "高血压", "type": "疾病"}, {"name": "规范随访", "type": "医疗行为"}]} for value in values]
+        return [{**value, "entities": [
+            {"name": "高血压", "type": "disease", "type_label": "疾病", "object_kind": "entity", "description": "常见心血管疾病", "aliases": [], "confidence": 0.9},
+            {"name": "2500~3100 g", "object_kind": "literal", "literal_datatype": "range", "literal_unit": "g",
+             "literal_raw_value": "2500~3100 g", "literal_normalized_value": {"min": 2500, "max": 3100}},
+        ]} for value in values]
     if ref == "relation-extractor":
-        return [{**value, "relations": [{"source": "高血压", "relation": "需要", "target": "规范随访"}]} for value in values]
+        return [{**value, "relations": [{"source": "高血压", "type": "uses_drug", "type_label": "使用药物", "target": "阿司匹林", "description": "", "keywords": [], "weight": None}]} for value in values]
+    if ref == "literal-detector":
+        return [_annotate_literals(value) for value in values]
     if ref == "entity-normalizer":
-        return [{**value, "entities": list(value.get("entities") or [])} for value in values]
-    if ref == "semantic-relation-builder":
-        return [{**value, "semantic_relations": [{"source_entity": "高血压", "relation": "患者需要", "target_entity": "规范随访"}]} for value in values]
-    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa", "triple-builder", "evidence-binder"}:
+        return [{**value, "entities": [{**item, "entity_id": item.get("entity_id", f"preview-ent-{index}")}
+                                       for index, item in enumerate((value.get("entities") or [])) if item.get("object_kind") != "literal"]} for value in values]
+    if ref in {"triple-builder", "semantic-relation-builder", "evidence-binder"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
+    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+        return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
+    if ref == "graph-quality-validator":
+        return [{**value, "graph_quality": {"hard_fail": False, "warnings": []}} for value in values]
     if ref == "artifact-merge":
         return [dict(value) for value in values]
     if ref == "quality-evaluator":
@@ -285,7 +300,7 @@ def _initialize_llm_servings():
     return get_llm_serving_registry()
 
 
-def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> dict[str, Any]:
+def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system: str = "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。") -> dict[str, Any]:
     """Call one configured Model Serving and parse its structured response."""
     registry = _initialize_llm_servings()
     serving, client = registry.client(llm_serving)
@@ -297,7 +312,7 @@ def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> dict
         response = client.chat.completions.create(
             model=serving.model_name,
             messages=[
-                {"role": "system", "content": "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。"},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
@@ -491,16 +506,339 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
         else:
             text = _extract_text(source.original_filename, payload)
             profile = "native"
+        faq_table_rows = parse_table_rows(source.original_filename, payload) if suffix in {".csv", ".xlsx"} else []
         documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
                           "parser_adapter": select_parser_adapter(source.original_filename, profile),
                           "page_segments": page_segments, "_parser_artifacts": parser_artifacts,
+                          "_faq_table_rows": faq_table_rows,
                           "anchor": {"file": source.original_filename, "page": None, "section": None}})
     return documents
 
 
-def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None) -> list[dict[str, Any]]:
+def _normalized_name(value: str) -> str:
+    """Normalize an entity name for identity and merging."""
+    return re.sub(r"[\s　]+", "", str(value or "")).casefold().strip("。，,;；:：()（）[]《》")
+
+
+def _graph_output_key(params: dict[str, Any]) -> str:
+    mode = str(params.get("graph_mode") or "")
+    return f"graph:{mode}" if mode else "graph"
+
+
+def _graph_config_from_contracts(type_contracts: dict[str, dict[str, Any]]) -> GraphExtractionConfig:
+    for contract in type_contracts.values():
+        if contract.get("graph_config") is not None:
+            return normalize_graph_config(contract["graph_config"])
+    return normalize_graph_config(None)
+
+
+def _resolve_type(config: GraphExtractionConfig, raw_type: Any, *, relation: bool = False) -> tuple[str, str] | None:
+    """Resolve an LLM-reported type to ``(code, label)`` when it matches the schema."""
+    if not raw_type:
+        return None
+    raw = str(raw_type).strip()
+    definitions = config.relation_types if relation else config.entity_types
+    for item in definitions:
+        if item.code == raw:
+            return item.code, item.label
+    for item in definitions:
+        if item.label == raw:
+            return item.code, item.label
+    return None
+
+
+def _graph_entity_id(library_id: str, type_code: str | None, name: str) -> str:
+    return "ent_" + hashlib.sha256(f"{library_id}|{type_code or ''}|{_normalized_name(name)}".encode("utf-8")).hexdigest()[:24]
+
+
+def _graph_relation_id(library_id: str, source_id: str, rel_type: str, target_id: str) -> str:
+    return "rel_" + hashlib.sha256(f"{library_id}|{source_id}|{rel_type}|{target_id}".encode("utf-8")).hexdigest()[:24]
+
+
+def _graph_knowledge_id(library_id: str, graph_mode: str, *parts: str) -> str:
+    return hashlib.sha256("|".join((library_id, graph_mode, *parts)).encode("utf-8")).hexdigest()
+
+
+def _literal_entity(name: str) -> dict[str, Any] | None:
+    literal = detect_literal(name)
+    if literal is None:
+        return None
+    return {
+        "name": name, "type": None, "type_label": None, "object_kind": "literal",
+        "literal_datatype": literal.datatype, "literal_unit": literal.unit,
+        "literal_raw_value": literal.raw_value, "literal_normalized_value": literal.normalized_value,
+        "description": "", "aliases": [], "confidence": 1.0,
+    }
+
+
+def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_serving: str) -> list[dict[str, Any]]:
+    """One LLM call extracting typed entities from a single source chunk."""
+    system, prompt = entity_prompt_for(config, str(chunk.get("content", "")))
+    response = _llm_json(prompt, llm_serving=llm_serving, system=system)
+    raw_entities = response.get("entities") if isinstance(response, dict) else None
+    if not isinstance(raw_entities, list):
+        raise ValueError("LLM 实体抽取未返回 entities 数组")
+    entities: list[dict[str, Any]] = []
+    for raw in raw_entities:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        literal_entity = _literal_entity(name)
+        if literal_entity is not None:
+            entities.append(literal_entity)
+            continue
+        resolved = _resolve_type(config, raw.get("type"))
+        if resolved is None:
+            # An empty entity_types schema is "unconstrained": keep the LLM's
+            # free-form type code instead of rejecting every entity.
+            if config.entity_types and config.unknown_entity_policy == "reject":
+                continue  # schema-defined templates reject unknown types, never "未分类"
+            code = str(raw.get("type") or "").strip() or "other"
+            label = code
+        else:
+            code, label = resolved
+        entities.append({
+            "name": name, "type": code, "type_label": label,
+            "description": str(raw.get("description") or "").strip(),
+            "aliases": [str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()],
+            "object_kind": "entity", "confidence": float(raw.get("confidence") or 1.0),
+        })
+    return entities
+
+
+def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str) -> list[dict[str, Any]]:
+    """One LLM call extracting relations between already-extracted entities."""
+    entity_names = [item["name"] for item in entities if item.get("object_kind") != "literal"]
+    system, prompt = relation_prompt_for(config, entity_names, str(chunk.get("content", "")))
+    response = _llm_json(prompt, llm_serving=llm_serving, system=system)
+    raw_relations = response.get("relations") if isinstance(response, dict) else None
+    if not isinstance(raw_relations, list):
+        raise ValueError("LLM 关系抽取未返回 relations 数组")
+    relations: list[dict[str, Any]] = []
+    for raw in raw_relations:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or "").strip()
+        target = str(raw.get("target") or "").strip()
+        if not source or not target:
+            continue
+        resolved = _resolve_type(config, raw.get("type"), relation=True)
+        if resolved is None:
+            # An empty relation_types schema is "unconstrained": keep the LLM's
+            # free-form source-language relation type instead of rejecting every relation.
+            if config.relation_types and config.unknown_relation_policy == "reject":
+                continue
+            code = str(raw.get("type") or "").strip() or "other"
+            label = str(raw.get("label") or code).strip()
+        else:
+            code, schema_label = resolved
+            # The schema code remains the stable identity; the extracted label
+            # is the source-language relationship shown to business users.
+            label = str(raw.get("label") or schema_label).strip()
+        relations.append({
+            "source": source, "target": target, "type": code, "type_label": label,
+            "description": str(raw.get("description") or "").strip(),
+            "keywords": [str(item).strip() for item in (raw.get("keywords") or []) if str(item).strip()],
+            "weight": float(raw["weight"]) if raw.get("weight") not in (None, "") else None,
+        })
+    return relations
+
+
+def _annotate_literals(record: dict[str, Any]) -> dict[str, Any]:
+    """Literal Detector: rule classification is already applied in extraction; re-assert here."""
+    value = dict(record)
+    entities = []
+    for item in value.get("entities") or []:
+        item = dict(item)
+        if item.get("object_kind") != "literal":
+            literal_entity = _literal_entity(str(item.get("name") or ""))
+            if literal_entity is not None:
+                entities.append(literal_entity)
+                continue
+        entities.append(item)
+    value["entities"] = entities
+    return value
+
+
+def _normalize_entities(record: dict[str, Any], library_id: str, config: GraphExtractionConfig) -> dict[str, Any]:
+    """Entity Normalizer: drop literals (semantic never uses them as nodes) and merge aliases."""
+    value = dict(record)
+    merged: list[dict[str, Any]] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in value.get("entities") or []:
+        item = dict(item)
+        if item.get("object_kind") == "literal":
+            continue  # semantic literals leave the entity set; they are facts, not nodes
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        key = _normalized_name(name)
+        existing = by_name.get(key)
+        if existing is None:
+            by_name[key] = item
+            merged.append(item)
+            continue
+        existing["aliases"] = sorted(set((existing.get("aliases") or []) + [name] + (item.get("aliases") or [])))
+        existing["confidence"] = max(float(existing.get("confidence") or 0), float(item.get("confidence") or 0))
+    for item in merged:
+        item["entity_id"] = _graph_entity_id(library_id, item.get("type"), item["name"])
+    value["entities"] = merged
+    return value
+
+
+def _candidate_meta(source: Source, version: SourceVersion, chunk: dict[str, Any], canonical: str, data_json: dict[str, Any]) -> dict[str, Any]:
+    anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    return {
+        "canonical_content": canonical,
+        "data_json": data_json,
+        "source_version_ids": [version.id],
+        "source_chunk_id": chunk["source_chunk_id"],
+        "source_anchor": f"{source.original_filename}#chunk-{chunk['chunk_index']}",
+        "anchor_json": anchor,
+        "evidence_text": chunk["content"],
+        "is_primary": True,
+    }
+
+
+def _build_triples(record: dict[str, Any], config: GraphExtractionConfig, library_id: str, sources: dict[str, Source], versions: dict[str, SourceVersion]) -> list[dict[str, Any]]:
+    """Triple Builder: assemble entity→entity relations and entity→literal facts."""
+    entities = {_normalized_name(item["name"]): item for item in record.get("entities") or []}
+    source = sources[record["source_id"]]
+    version = versions[record["source_version_id"]]
+    candidates: list[dict[str, Any]] = []
+    for rel in record.get("relations") or []:
+        subject_name = str(rel.get("source") or "").strip()
+        target_text = str(rel.get("target") or "").strip()
+        if not subject_name or not target_text:
+            continue
+        subject = entities.get(_normalized_name(subject_name)) or {"name": subject_name, "type": None, "type_label": None, "object_kind": "entity"}
+        target = entities.get(_normalized_name(target_text))
+        literal = detect_literal(target_text) if (target is None or target.get("object_kind") != "entity") else None
+        predicate_code = str(rel.get("type") or "")
+        predicate_label = str(rel.get("type_label") or rel.get("type") or "")
+        if target is not None and target.get("object_kind") == "literal":
+            data = {"object_kind": "literal", "literal_datatype": target.get("literal_datatype"),
+                    "literal_unit": target.get("literal_unit"), "literal_raw_value": target.get("literal_raw_value", target_text),
+                    "literal_normalized_value": target.get("literal_normalized_value")}
+            object_type = None
+            identity = ("literal", _normalized_name(subject_name), predicate_code, str(target.get("literal_normalized_value") or target_text), str(target.get("literal_unit") or ""))
+        elif literal is not None:
+            data = {"object_kind": "literal", "literal_datatype": literal.datatype, "literal_unit": literal.unit,
+                    "literal_raw_value": literal.raw_value, "literal_normalized_value": literal.normalized_value}
+            object_type = None
+            identity = ("literal", _normalized_name(subject_name), predicate_code, str(literal.normalized_value), str(literal.unit or ""))
+        else:
+            data = {"object_kind": "entity"}
+            object_type = (target or {}).get("type")
+            identity = ("entity", _normalized_name(subject_name), predicate_code, _normalized_name(target_text))
+        data_json: dict[str, Any] = {
+            "subject": subject_name, "predicate": predicate_label, "predicate_code": predicate_code or None,
+            "object": target_text, "data": data,
+        }
+        if subject.get("type"):
+            data_json["subject_type"] = subject.get("type")
+            data_json["subject_type_label"] = subject.get("type_label")
+        if object_type:
+            data_json["object_type"] = object_type
+        canonical = " ".join(str(part).strip() for part in (subject_name, predicate_label or predicate_code, target_text) if part)
+        candidate = _candidate_meta(source, version, record, canonical, data_json)
+        candidate["source_knowledge_id"] = _graph_knowledge_id(library_id, "triple", *identity)
+        candidates.append(candidate)
+    return candidates
+
+
+def _build_semantic_relations(record: dict[str, Any], config: GraphExtractionConfig, library_id: str, sources: dict[str, Source], versions: dict[str, SourceVersion]) -> list[dict[str, Any]]:
+    """Semantic Relation Builder: only Entity → Entity, with type + description."""
+    entities = {_normalized_name(item["name"]): item for item in record.get("entities") or []}
+    source = sources[record["source_id"]]
+    version = versions[record["source_version_id"]]
+    candidates: list[dict[str, Any]] = []
+    for rel in record.get("relations") or []:
+        source_name = str(rel.get("source") or "").strip()
+        target_name = str(rel.get("target") or "").strip()
+        source_entity = entities.get(_normalized_name(source_name))
+        target_entity = entities.get(_normalized_name(target_name))
+        if source_entity is None or target_entity is None:
+            continue  # semantic endpoints must be known entities, never literals
+        if detect_literal(source_name) is not None or detect_literal(target_name) is not None:
+            continue
+        relation_type = str(rel.get("type") or "")
+        source_id = source_entity.get("entity_id") or _graph_entity_id(library_id, source_entity.get("type"), source_name)
+        target_id = target_entity.get("entity_id") or _graph_entity_id(library_id, target_entity.get("type"), target_name)
+        relation_id = _graph_relation_id(library_id, source_id, relation_type, target_id)
+        data_json = {
+            "source_entity": {"entity_id": source_id, "name": source_name, "type": source_entity.get("type"),
+                              "type_label": source_entity.get("type_label"), "description": source_entity.get("description") or "",
+                              "aliases": source_entity.get("aliases") or [], "confidence": source_entity.get("confidence")},
+            "target_entity": {"entity_id": target_id, "name": target_name, "type": target_entity.get("type"),
+                              "type_label": target_entity.get("type_label"), "description": target_entity.get("description") or "",
+                              "aliases": target_entity.get("aliases") or [], "confidence": target_entity.get("confidence")},
+            "relation": {"relation_id": relation_id, "type": relation_type, "type_label": rel.get("type_label"),
+                         "description": rel.get("description") or "", "keywords": rel.get("keywords") or [], "weight": rel.get("weight")},
+        }
+        canonical = " ".join(str(part).strip() for part in (source_name, rel.get("type_label") or relation_type, target_name) if part)
+        candidate = _candidate_meta(source, version, record, canonical, data_json)
+        candidate["source_knowledge_id"] = _graph_knowledge_id(library_id, "semantic", source_id, relation_type, target_id)
+        candidates.append(candidate)
+    return candidates
+
+
+def _bind_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Evidence Binder: attach the source chunk reference to every semantic relation."""
+    result = []
+    for candidate in candidates:
+        candidate = dict(candidate)
+        data = dict(candidate.get("data_json") or {})
+        data["evidence"] = [{"source_version_id": (candidate.get("source_version_ids") or [None])[0],
+                             "source_chunk_id": str(candidate.get("source_chunk_id") or "")}]
+        candidate["data_json"] = data
+        result.append(candidate)
+    return result
+
+
+def _validate_graph_item(data: dict[str, Any], config: GraphExtractionConfig, graph_mode: str) -> None:
+    """Schema Validator: enforce the template graph schema on one assembled item."""
+    entity_codes = config.entity_codes()
+    relation_codes = {item.code for item in config.relation_types}
+    if graph_mode == "semantic":
+        source, target, relation = (data.get(key) or {} for key in ("source_entity", "target_entity", "relation"))
+        for role, entity in (("source_entity", source), ("target_entity", target)):
+            if not entity.get("name"):
+                raise ValueError("语义实体缺少 name")
+            if not entity.get("description"):
+                raise ValueError(f"{role} 缺少 description")
+            if entity_codes and entity.get("type") not in entity_codes:
+                raise ValueError(f"{role} 实体类型非法：{entity.get('type')}")
+            if detect_literal(str(entity.get("name"))) is not None:
+                raise ValueError(f"{role} 是字面值，禁止作为语义实体节点")
+        if relation_codes and relation.get("type") not in relation_codes:
+            raise ValueError(f"关系类型非法：{relation.get('type')}")
+        relation_def = config.relation_by_code(str(relation.get("type") or ""))
+        if relation_def is not None:
+            if relation_def.source_types and source.get("type") not in relation_def.source_types:
+                raise ValueError(f"关系 {relation_def.code} 不允许 source 类型 {source.get('type')}")
+            if relation_def.target_types and target.get("type") not in relation_def.target_types:
+                raise ValueError(f"关系 {relation_def.code} 不允许 target 类型 {target.get('type')}")
+        if not relation.get("description"):
+            raise ValueError("语义关系缺少 description")
+        if not data.get("evidence"):
+            raise ValueError("语义关系缺少 Evidence")
+    else:
+        if entity_codes and data.get("subject_type") not in entity_codes:
+            raise ValueError(f"三元组 subject_type 非法：{data.get('subject_type')}")
+        object_kind = (data.get("data") or {}).get("object_kind")
+        if object_kind != "literal":
+            if entity_codes and data.get("object_type") not in entity_codes:
+                raise ValueError(f"三元组 object_type 非法：{data.get('object_type')}")
+
+
+def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Execute only DataForge adapters; DataFlow class names never enter a Flow."""
+    cfg = graph_config or _graph_config_from_contracts(type_contracts)
+    library_id = str((sink_libraries or {}).get(_graph_output_key(params)) or "")
     if ref == "document-parser":
         return root_documents
     if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
@@ -537,8 +875,55 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         # This is the formal provenance boundary.  Any further internal LLM
         # context-window splitting remains an execution artifact only.
         return [{**value, "source_chunk_id": hashlib.sha256(f"{value['source_version_id']}:{value['chunk_index']}".encode("utf-8")).hexdigest()} for value in values]
-    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa",
-               "triple-builder", "evidence-binder"}:
+    if ref == "faq-table-row-builder":
+        documents = [{**value, "table_rows": value.get("_faq_table_rows") or []} for value in values]
+        rows = normalize_faq_rows(documents)
+        document = documents[0]
+        return [{
+            "source_id": document["source_id"],
+            "source_version_id": document["source_version_id"],
+            "filename": document["filename"],
+            "content": row["full_text"],
+            "chunk_index": index,
+            "faq": {key: value for key, value in row.items() if key not in {"row_number", "sheet"}},
+            "anchor": {"file": document["filename"], "row": row["row_number"], "sheet": row["sheet"], "chunk_index": index},
+        } for index, row in enumerate(rows)]
+    if ref == "faq-record-mapper":
+        kind = str(params.get("knowledge_type") or "")
+        if kind != FAQ_TYPE_CODE:
+            raise ValueError("FAQ Record Mapper 只允许 qa-agent-faq")
+        contract = type_contracts.get(kind)
+        if not contract:
+            raise ValueError("qa-agent-faq 缺少已发布契约")
+        outcome = (generation if generation is not None else {}).setdefault(kind, {"successful": [], "failed": [], "targeted": []})
+        result: list[dict[str, Any]] = []
+        for chunk in values:
+            scope_key = (kind, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            if retry_scope is not None and scope_key not in retry_scope:
+                continue
+            outcome["targeted"].append(chunk)
+            try:
+                data = dict(chunk.get("faq") or {})
+                candidate = {
+                    "source_knowledge_id": f"faq:{data['aq_id']}",
+                    "canonical_content": data["full_text"],
+                    "data_json": data,
+                    "source_version_ids": [chunk["source_version_id"]],
+                    "source_chunk_id": chunk["source_chunk_id"],
+                    "source_anchor": f"{chunk['filename']}#row-{(chunk.get('anchor') or {}).get('row')}",
+                    "anchor_json": dict(chunk.get("anchor") or {}),
+                    "evidence_text": chunk["content"],
+                    "is_primary": True,
+                }
+                result.append(candidate); outcome["successful"].append(chunk)
+                if store and job_id:
+                    store.record_chunk_generation(job_id, kind, chunk, status="completed", candidate_count=1)
+            except Exception as exc:
+                outcome["failed"].append({**chunk, "error": str(exc)})
+                if store and job_id:
+                    store.record_chunk_generation(job_id, kind, chunk, status="failed", error=str(exc))
+        return result
+    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         kind = str(params.get("knowledge_type", ""))
         if ref == "qa-generator": kind = "qa"
         if ref == "graph-extractor": kind = "graph"
@@ -572,8 +957,63 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 if store and job_id:
                     store.record_chunk_generation(job_id, output_key, chunk, status="failed", error=str(exc))
         return result
-    if ref in {"entity-extractor", "relation-extractor", "entity-normalizer", "semantic-relation-builder"}:
-        return [dict(value) for value in values]
+    if ref == "entity-extractor":
+        output_key = _graph_output_key(params)
+        if not params.get("graph_mode"):
+            raise ValueError("entity-extractor 缺少 graph_mode")
+        llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
+        _initialize_llm_servings().require(llm_serving)
+        outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
+        result: list[dict[str, Any]] = []
+        for chunk in values:
+            scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            if retry_scope is not None and scope_key not in retry_scope:
+                continue
+            outcome["targeted"].append(chunk)
+            try:
+                entities = _extract_entities(chunk, cfg, llm_serving)
+                result.append({**chunk, "entities": entities})
+                outcome["successful"].append(chunk)
+                if store and job_id:
+                    store.record_chunk_generation(job_id, output_key, chunk, status="completed", candidate_count=len(entities))
+            except Exception as exc:
+                outcome["failed"].append({**chunk, "error": str(exc)})
+                if store and job_id:
+                    store.record_chunk_generation(job_id, output_key, chunk, status="failed", error=str(exc))
+        return result
+    if ref == "relation-extractor":
+        output_key = _graph_output_key(params)
+        llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
+        _initialize_llm_servings().require(llm_serving)
+        outcome = (generation if generation is not None else {}).get(output_key)
+        result = []
+        for record in values:
+            try:
+                relations = _extract_relations(record, record.get("entities") or [], cfg, llm_serving)
+                result.append({**record, "relations": relations})
+            except Exception as exc:
+                if outcome is not None:
+                    outcome["successful"] = [item for item in outcome.get("successful", []) if str(item.get("source_chunk_id")) != str(record.get("source_chunk_id"))]
+                    outcome["failed"].append({**record, "error": str(exc)})
+                if store and job_id:
+                    store.record_chunk_generation(job_id, output_key, record, status="failed", error=str(exc))
+        return result
+    if ref == "literal-detector":
+        return [_annotate_literals(value) for value in values]
+    if ref == "entity-normalizer":
+        return [_normalize_entities(value, library_id, cfg) for value in values]
+    if ref == "triple-builder":
+        result = []
+        for record in values:
+            result.extend(_build_triples(record, cfg, library_id, sources, versions))
+        return result
+    if ref == "semantic-relation-builder":
+        result = []
+        for record in values:
+            result.extend(_build_semantic_relations(record, cfg, library_id, sources, versions))
+        return result
+    if ref == "evidence-binder":
+        return _bind_evidence(values)
     if ref == "artifact-merge":
         return [dict(value) for value in values]
     if ref == "quality-evaluator":
@@ -586,7 +1026,24 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             result.append({**value, "quality_status": "pass" if score >= 0.8 else "review"})
         return result
-    if ref in {"source-binding", "schema-validator", "knowledge-diff", "deduplicate", "prompted-refiner"}:
+    if ref == "schema-validator":
+        if str(params.get("knowledge_type") or "") == "graph":
+            graph_mode = str(params.get("graph_mode") or "")
+            for value in values:
+                _validate_graph_item(dict(value.get("data_json") or {}), cfg, graph_mode)
+        return [dict(value) for value in values]
+    if ref == "graph-quality-validator":
+        graph_mode = str(params.get("graph_mode") or "")
+        report = evaluate_graph_quality([dict(value.get("data_json") or {}) for value in values], cfg, graph_mode)
+        if report.get("hard_fail"):
+            problems = []
+            if report.get("literal_as_entity_count"): problems.append("语义图谱出现字面值实体")
+            if report.get("invalid_entity_type_count"): problems.append("非法实体类型")
+            if report.get("invalid_relation_type_count"): problems.append("非法关系类型")
+            if report.get("missing_evidence_count"): problems.append("缺少 Evidence")
+            raise ValueError("图谱质量门禁未通过：" + "；".join(problems or ["质量不达标"]))
+        return [{**value, "graph_quality": report} for value in values]
+    if ref in {"source-binding", "knowledge-diff", "deduplicate", "prompted-refiner"}:
         # Candidate-only operators deliberately never mutate published items.
         if ref == "deduplicate":
             unique: dict[str, dict[str, Any]] = {}
@@ -597,7 +1054,9 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     raise ValueError(f"Runner 没有批准的算子 Adapter：{ref}")
 
 
-def execute_job(store: V7Store, objects, job_id: str) -> dict:
+def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
+    if lease_owner:
+        store.assert_work_lease("knowledge", job_id, lease_owner)
     with store.sessions() as session:
         job = session.get(KnowledgeJob, job_id)
         if not job:
@@ -613,6 +1072,7 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
     outputs: dict[str, list[dict[str, Any]]] = {}
     artifact_ids: dict[str, list[str]] = {}
     changes: dict[str, dict[str, int]] = {}
+    committed_sinks: set[str] = set()
     sink_errors: dict[str, str] = {}
     node_errors: dict[str, str] = {}
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -622,6 +1082,7 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
     try:
         definition = store.template_definition_for_job(job_id)
         type_contracts = store.type_contracts_for_job(job_id)
+        graph_config = _graph_config_from_contracts(type_contracts)
         incoming = _incoming(definition)
         root_documents = _documents_for_versions(objects, versions_list, sources, flow_run["id"], created_parser_keys)
         sink_nodes: list[dict[str, Any]] = []
@@ -647,7 +1108,8 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                 values = _run_operator(ref, dict(node.get("params") or {}), input_values,
                                         root_documents=root_documents, sources=sources, versions=versions,
                                         type_contracts=type_contracts, job_id=job_id, store=store,
-                                        retry_scope=retry_scope, generation=generation)
+                                        retry_scope=retry_scope, generation=generation,
+                                        graph_config=graph_config, sink_libraries=sink_libraries)
             except Exception as exc:
                 node_errors[node_id] = str(exc); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc))
@@ -662,7 +1124,10 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
             if values:
                 values = [{**value, "_artifact_type": artifact_type} for value in values]
                 outputs[node_id] = values
-            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, values)
+            artifact_values = values
+            if ref == "document-parser":
+                artifact_values = [{key: value for key, value in item.items() if key not in {"_parser_artifacts", "_faq_table_rows"}} for item in values]
+            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values)
             if ref == "document-parser":
                 persisted_parser_keys.update(created_parser_keys)
                 outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]
@@ -670,6 +1135,8 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         # failed chunk stays out of a Sink's replacement range, so successful
         # neighbouring chunks can publish without erasing it.
         for node in sink_nodes:
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             node_id = node["id"]
             source_nodes = incoming.get(node_id, [])
             input_values = [value for source_id in source_nodes for value in outputs.get(source_id, [])]
@@ -686,6 +1153,7 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                     changes[output_key] = store.apply_knowledge_output(
                         job_id, output_key, input_values, successful_chunks=successful,
                     )
+                    committed_sinks.add(output_key)
                 else:
                     changes[output_key] = {"ADD": 0, "UPDATE": 0, "INACTIVE": 0, "UNCHANGED": 0}
                 outputs[node_id] = [{"_artifact_type": f"knowledge_item:{output_key}", "knowledge_type": knowledge_type, "graph_mode": node.get("graph_mode"), "change": changes[output_key]}]
@@ -698,11 +1166,13 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         for knowledge_type in missing_generation:
             sink_errors[knowledge_type] = "流程没有执行该知识类型的生成节点"
         successful_chunks = [entry for outcome in generation.values() for entry in outcome["successful"]]
-        if not successful_chunks:
+        if not successful_chunks or not committed_sinks:
             detail = "; ".join(f"{kind}: {error}" for kind, error in sink_errors.items())
             if not detail:
-                detail = "所有知识生成分块均失败"
+                detail = "所有知识生成分块均失败" if not successful_chunks else "所有 Knowledge Sink 均未成功提交"
             store.finish_flow_run(flow_run["id"], detail)
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             store.mark_job_failed(job_id, detail)
             return {"id": job_id, "status": "failed", "flow_run_id": flow_run["id"], "changes": changes, "sink_errors": sink_errors}
         warnings = [{"knowledge_type": kind, "source_version_id": item["source_version_id"], "source_chunk_id": item["source_chunk_id"], "chunk_index": item["chunk_index"], "error": item["error"]} for kind, outcome in generation.items() for item in outcome["failed"]]
@@ -712,6 +1182,8 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
         # older missing chunk be withdrawn.  A failure in any target type keeps
         # the whole source-version history, including on a failed-only retry.
         if not warnings:
+            if lease_owner:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
             cleanup_source_versions = store.completed_source_versions_for_cleanup(
                 job_id, set(sink_libraries), current_source_chunks,
             )
@@ -724,10 +1196,22 @@ def execute_job(store: V7Store, objects, job_id: str) -> dict:
                     )
         store.finish_flow_run(flow_run["id"], "部分分块生成失败" if warnings else None,
                               status="completed_with_warnings" if warnings else "completed")
+        if lease_owner:
+            store.assert_work_lease("knowledge", job_id, lease_owner)
         store.complete_job(job_id, warnings=warnings)
-        vector_jobs = {library_id: store.create_vector_sync_jobs(library_id) for library_id in sink_libraries.values()}
+        vector_jobs = {
+            library_id: store.create_vector_sync_jobs(library_id)
+            for output_key, library_id in sink_libraries.items()
+            if output_key in committed_sinks
+        }
         return {"id": job_id, "status": "completed_with_warnings" if warnings else "completed", "flow_run_id": flow_run["id"], "changes": changes, "warnings": warnings, "vector_sync_jobs": vector_jobs}
     except Exception as exc:
+        if lease_owner:
+            try:
+                store.assert_work_lease("knowledge", job_id, lease_owner)
+            except ValueError:
+                store.finish_flow_run(flow_run["id"], "任务执行租约已失效")
+                raise
         for object_key in created_parser_keys:
             if object_key not in persisted_parser_keys:
                 try:
@@ -769,6 +1253,7 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
     by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
     versions_list = context["versions"]; versions = {item.id: item for item in versions_list}; sources = context["sources"]
     type_contracts = store.type_contracts_for_job(context["job_id"]); catalog = catalog_by_code(); parent_outputs = context["parent_outputs"]
+    graph_config = _graph_config_from_contracts(type_contracts)
     outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
     try:
@@ -800,7 +1285,8 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
             ref = str(node.get("ref")); params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}; params.pop("force_ocr", None)
             try:
                 values = _run_operator(ref, params, input_values, root_documents=root_documents, sources=sources, versions=versions,
-                                       type_contracts=type_contracts, generation=generation)
+                                       type_contracts=type_contracts, generation=generation,
+                                       graph_config=graph_config, sink_libraries=context.get("sink_libraries"))
                 outputs[node_id] = values; item = catalog.get(ref) or {}
                 recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
@@ -834,7 +1320,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         verify(authorization)
         try:
             if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
-            if payload.job_id: return execute_job(store, objects, payload.job_id)
+            if payload.job_id:
+                if not payload.lease_owner:
+                    raise ValueError("知识任务请求缺少 lease_owner")
+                return execute_job(store, objects, payload.job_id, lease_owner=payload.lease_owner)
             raise ValueError("job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 

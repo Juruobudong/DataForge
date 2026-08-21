@@ -1,4 +1,24 @@
-# DataForge 全流程项目计划
+# DataForge 当前实施计划
+
+> 更新日期：2026-08-18
+> 当前主线：Deployment Fork、医院 qa-agent Routing 与离线知识迁移
+
+当前批准边界是“中心多 Deployment 控制面 + 医院 qa-agent 测试/生产 Routing + local 单 Deployment Fork 自治 + 签名离线知识资产迁移”。仓库实现以 `specs/009-deployment-offline-migration/` 为规格、技术计划、任务和测试用例来源，详细事实见 [`wiki/pages/deployment-and-migration.md`](wiki/pages/deployment-and-migration.md)。
+
+当前交付状态：数据模型、兼容 Alembic、InstanceContext、医院/阶段 DeploymentTask 授权、Snapshot v3/Runtime API、生产 Partition delivery/备份、qa-agent dense 客户端、qa-agent/ kg 中央项目幂等种子、五个内置 Collection 跨空卷确定性 ownership token、`.34` 旧随机 marker 的自包含受控 Bash 清理入口、`.dfm`/Ed25519、Planner、Parquet Partition、Worker 检查点导入导出、冲突处理、前端和本地自动测试已实现；真实 MySQL/MinIO、双 Milvus、Embedding、签名密钥和离线介质验收等待部署服务器执行。
+
+固定不变量：
+
+- Routing 只能由 `DeploymentTask + org_code → knowledge_library_id[]` 生成。
+- local 数据库只允许一个绑定 Deployment；其他 Deployment 返回 404。
+- Seed 只允许一次；Update 不修改 local 授权、Routing、org_code 或 local 资产。
+- `.dfm` 离线迁移不连接医院 local Milvus；qa-agent 在线发布只连接固定测试/生产 Milvus，并只同步授权所需 `kl_*` Partition。
+- 顶层 Deployment 表达一家医院或中心运行环境，ProjectDeployment 仅表达 Project 关联；同一医院环境可同时承载 qa-agent 与 kg-for-consultation，但任务、授权、Snapshot、版本和回滚独立。医院代码全局唯一，`org_code` 仅是当前 ProjectDeploymentTask 的路由键；test 默认 `34.34:19531`，医院 production 由管理员填写，`34.36:19531` 仅是 `dataforge-central` 的 production Target，生产切换/发布/回滚分别确认。
+- `.dfm` 使用逐 entry SHA-256 和 Ed25519，不在应用层加密。
+
+---
+
+# 历史计划：DataForge 全流程项目计划
 
 > 版本：v0.5
 > 更新日期：2026-08-03

@@ -46,6 +46,7 @@ class DataFlowEngine:
         dataflow, pipeline_module = self._bootstrap()
         cache_dir = work_dir / "dataflow-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # 通用文档处理流程；标识符（medical_document / MedicalDocumentPipeline）沿用历史命名，不限定医疗领域。
         prefix = "medical_document"
         pipeline = pipeline_module.MedicalDocumentPipeline(
             input_file=input_file,

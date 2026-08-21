@@ -14,10 +14,13 @@ from .models import FlowResult
 from .processing import create_engine
 
 
+# 默认流程面向「文档」而非特定行业；医疗、金融、制造等各行业文档库均可复用。
+# 内部标识符（pipeline id / kind / output_asset_type）保持稳定以兼容历史资产，
+# 对外展示名称与描述统一使用中性措辞。
 DEFAULT_PIPELINE_ID = "medical-document-v1"
 DEFAULT_PIPELINE = {
     "kind": "medical_document",
-    "description": "对医疗文档进行标准化、分段、去重并发布为数据资产。",
+    "description": "对文档进行标准化、分段、去重并发布为数据资产。",
     "parameters": {"chunk_size": 600, "chunk_overlap": 80},
     "operators": ["NormalizeMedicalTextOperator", "ChunkMedicalTextOperator"],
     "output_asset_type": "medical_chunk_collection",
@@ -47,7 +50,7 @@ class DataForge:
     def _seed_defaults(self) -> None:
         self.store.register_pipeline(
             DEFAULT_PIPELINE_ID,
-            "医疗文档标准化处理",
+            "文档标准化处理",
             1,
             "dataflow",
             DEFAULT_PIPELINE,
@@ -167,7 +170,7 @@ class DataForge:
             logical_key = f"{source['id']}:{pipeline_id}:{pipeline['definition']['output_asset_type']}"
             asset, asset_version = self.store.publish_asset(
                 logical_key=logical_key,
-                name=f"{source['name']} / 标准化医疗数据",
+                name=f"{source['name']} / 标准化数据",
                 asset_type=pipeline["definition"]["output_asset_type"],
                 run_id=run_id,
                 source_version_id=source_version_id,

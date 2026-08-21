@@ -7,6 +7,9 @@ import JobListView from '../views/business/JobListView.vue'
 import KnowledgeBaseView from '../views/business/KnowledgeBaseView.vue'
 import KnowledgeLibraryDetailView from '../views/business/KnowledgeLibraryDetailView.vue'
 import ProjectAuthorizationView from '../views/business/ProjectAuthorizationView.vue'
+import InstitutionDeploymentView from '../views/business/InstitutionDeploymentView.vue'
+import LocalInitializationView from '../views/business/LocalInitializationView.vue'
+import ImportTaskDetailView from '../views/business/ImportTaskDetailView.vue'
 import KnowledgeTypesView from '../views/developer/KnowledgeTypesView.vue'
 import PipelineListView from '../views/developer/PipelineListView.vue'
 import TemplateListView from '../views/developer/TemplateListView.vue'
@@ -22,6 +25,13 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/business/knowledge', component: KnowledgeBaseView },
     { path: '/business/knowledge/:libraryId', component: KnowledgeLibraryDetailView, props: true },
     { path: '/business/authorization', component: ProjectAuthorizationView },
+    { path: '/business/migrations', redirect: '/institution-deployments/new' },
+    { path: '/institution-deployments/new', component: InstitutionDeploymentView },
+    { path: '/institution-deployments/drafts/:draftId', component: InstitutionDeploymentView },
+    { path: '/institution-deployments/releases/:releaseId/build', component: InstitutionDeploymentView },
+    { path: '/institution-deployments/releases/:releaseId', component: InstitutionDeploymentView },
+    { path: '/local/initialization', component: LocalInitializationView },
+    { path: '/local/imports/:jobId', component: ImportTaskDetailView },
     { path: '/developer/knowledge-types', component: KnowledgeTypesView },
     { path: '/developer/standard-pipelines', component: PipelineListView },
     { path: '/developer/flow-templates', component: TemplateListView },
