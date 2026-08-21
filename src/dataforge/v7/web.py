@@ -693,8 +693,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/qa-pairs")
-    def qa_pairs(library_id: str):
-        try: return store.list_knowledge_items(library_id, "qa")
+    def qa_pairs(library_id: str, q: str = "", status: Literal["active", "inactive", "all"] = "active",
+                 page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)):
+        try: return store.list_qa_pairs(library_id, keyword=q, status=status, page=page, page_size=page_size)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/graph")

@@ -4216,6 +4216,61 @@ class V7Store:
                 result.append({"id": item.id, "source_knowledge_id": item.source_knowledge_id, "canonical_content": item.canonical_content, "data": item.data_json, "content_hash": item.content_hash, "status": item.status, "source_version_ids": [source.source_version_id for source in sources], "source_count": len(sources), "updated_at": item.updated_at.isoformat()})
             return result
 
+    def list_qa_pairs(self, library_id: str, *, keyword: str = "", status: str = "active",
+                      page: int = 1, page_size: int = 50) -> dict[str, Any]:
+        page, page_size = max(1, page), min(max(1, page_size), 200)
+        if status not in {"active", "inactive", "all"}:
+            raise ValueError("问答知识状态筛选无效")
+        with self.sessions() as session:
+            library = session.get(KnowledgeLibrary, library_id)
+            if not library:
+                raise ValueError("知识库不存在")
+            if library.knowledge_type != "qa":
+                raise ValueError("知识库类型不匹配")
+
+            source_counts = (
+                select(
+                    KnowledgeItemSource.knowledge_item_id.label("knowledge_item_id"),
+                    func.count(KnowledgeItemSource.id).label("source_count"),
+                )
+                .group_by(KnowledgeItemSource.knowledge_item_id)
+                .subquery()
+            )
+            query = (
+                select(KnowledgeItem, func.coalesce(source_counts.c.source_count, 0))
+                .outerjoin(source_counts, source_counts.c.knowledge_item_id == KnowledgeItem.id)
+                .where(KnowledgeItem.knowledge_library_id == library_id)
+            )
+            normalized_keyword = keyword.strip()
+            if normalized_keyword:
+                question = KnowledgeItem.data_json["question"].as_string()
+                answer = KnowledgeItem.data_json["answer"].as_string()
+                query = query.where(or_(question.contains(normalized_keyword), answer.contains(normalized_keyword)))
+            if status != "all":
+                query = query.where(KnowledgeItem.status == status)
+
+            total = int(session.scalar(select(func.count()).select_from(query.subquery())) or 0)
+            rows = session.execute(
+                query.order_by(KnowledgeItem.updated_at.desc(), KnowledgeItem.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ).all()
+            return {
+                "items": [{
+                    "id": item.id,
+                    "source_knowledge_id": item.source_knowledge_id,
+                    "canonical_content": item.canonical_content,
+                    "data": item.data_json,
+                    "content_hash": item.content_hash,
+                    "status": item.status,
+                    "source_count": int(source_count or 0),
+                    "updated_at": item.updated_at.isoformat(),
+                } for item, source_count in rows],
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+            }
+
     def list_changes(self, library_id: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
             query = select(KnowledgeChange).order_by(KnowledgeChange.created_at.desc())

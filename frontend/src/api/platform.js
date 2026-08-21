@@ -43,7 +43,7 @@ export const api = {
   deletionJobs: libraryId => request(`/api/knowledge-libraries/${libraryId}/deletion-jobs`),
   retryDeletion: jobId => request(`/api/knowledge-library-deletion-jobs/${jobId}/retry`, { method: 'POST' }),
   knowledgeItems: libraryId => request(`/api/knowledge-libraries/${libraryId}/items`),
-  qaPairs: libraryId => request(`/api/knowledge-libraries/${libraryId}/qa-pairs`),
+  qaPairs: (libraryId, params = {}) => request(`/api/knowledge-libraries/${libraryId}/qa-pairs?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== '' && value !== null && value !== undefined)).toString()}`),
   graph: libraryId => request(`/api/knowledge-libraries/${libraryId}/graph`),
   graphOverview: libraryId => request(`/api/knowledge-libraries/${libraryId}/graph/overview`),
   changes: libraryId => request(`/api/knowledge-libraries/${libraryId}/changes`),
