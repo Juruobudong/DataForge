@@ -16,7 +16,8 @@ from ..config import Settings
 from .models import KnowledgeAssetVersion, KnowledgeJob, ManagedCollection, VectorSyncJob
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
-from .vector import OpenAILikeEmbeddingProvider, V7Milvus
+from .servings import ServingManager
+from .vector import V7Milvus
 
 
 COMPONENTS = ("mysql", "minio", "disk", "worker", "runner", "mineru", "llm", "embedding", "milvus")
@@ -144,13 +145,17 @@ class ComponentCheckService:
 
     def _embedding(self, _: str) -> dict[str, Any]:
         def action():
-            base = os.getenv("EMBEDDING_API_BASE", "").strip()
-            if not base:
+            manager = ServingManager(self.store.sessions, self.settings.config_encryption_key)
+            default = next((item for item in manager.list("embedding") if item["is_default"]), None)
+            if not default or not default["base_url"]:
                 return "not_configured", "Embedding 未配置", {}
-            dimension = int(os.getenv("EMBEDDING_DIM", "768"))
-            provider = OpenAILikeEmbeddingProvider(base, os.getenv("EMBEDDING_API_KEY", "fake"), 1)
-            provider.embed(["DataForge health probe"], model=os.getenv("EMBEDDING_MODEL", "bce-embedding-base"), dimension=dimension)
-            return "healthy", "Embedding 单条向量与维度校验通过", {"dimension": dimension, "model": os.getenv("EMBEDDING_MODEL", "bce-embedding-base")}
+            result = manager.test("embedding", default["id"])
+            if result["last_check_status"] != "healthy":
+                raise RuntimeError(result["last_check_error"] or result["last_check_status"])
+            return "healthy", "Embedding 单条向量与维度校验通过", {
+                "dimension": result["last_observed_dimension"], "model": result["model_name"],
+                "serving_code": result["serving_code"],
+            }
         result = self._timed(action)
         if result["status"] == "healthy" and (result["latency_ms"] or 0) > 2000:
             result["status"], result["summary"] = "degraded", "Embedding 可用但延迟超过 2 秒"

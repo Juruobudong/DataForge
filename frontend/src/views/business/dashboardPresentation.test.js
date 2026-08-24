@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { publicationRows, runtimeCards } from './dashboardPresentation.js'
 
@@ -25,4 +26,13 @@ test('local publication presentation exposes waiting and conflict states', () =>
   assert.deepEqual(rows.filter(item => item.count).map(item => [item.label, item.count]), [
     ['等待恢复', 2], ['待处理冲突', 1], ['失败', 1],
   ])
+})
+
+test('dashboard places system components directly after knowledge assets', () => {
+  const template = readFileSync(new URL('./DashboardView.vue', import.meta.url), 'utf8')
+  const runtimeIndex = template.indexOf('<h3>运行概览</h3>')
+  const assetsIndex = template.indexOf('<h3>知识资产概览</h3>')
+  const componentsIndex = template.indexOf('<h3>系统组件</h3>')
+  const lowerPanelIndex = template.indexOf('class="dashboard-lower-grid"')
+  assert.ok(runtimeIndex < assetsIndex && assetsIndex < componentsIndex && componentsIndex < lowerPanelIndex)
 })

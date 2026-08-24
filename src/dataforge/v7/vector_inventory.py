@@ -125,7 +125,7 @@ class MilvusInventoryService:
             return "GC_ELIGIBLE", []
         return "HISTORY", []
 
-    def _build(self) -> list[dict[str, Any]]:
+    def _build(self, *, only_managed: bool = False) -> list[dict[str, Any]]:
         if not self.milvus:
             raise RuntimeError("DATAFORGE_MILVUS_URI 未配置")
         metadata = self.store.vector_inventory_metadata()
@@ -135,8 +135,9 @@ class MilvusInventoryService:
         expected_names = set(managed_by_name)
         expected_names.update(item["collection_name"] for item in assets)
         actual_names = set(self.milvus.list_collections())
+        collection_names = set(managed_by_name) if only_managed else actual_names | expected_names
         rows: list[dict[str, Any]] = []
-        for collection_name in sorted(actual_names | expected_names):
+        for collection_name in sorted(collection_names):
             managed = managed_by_name.get(collection_name)
             actual = self.milvus.inspect_collection(collection_name) if collection_name in actual_names else {
                 "collection_name": collection_name, "exists": False, "partitions": [], "entity_count": 0,
@@ -271,9 +272,10 @@ class MilvusInventoryService:
         }
 
     def collections(self, *, q: str = "", knowledge_type: str = "", status: str = "",
-                    only_anomaly: bool = False, only_unused: bool = False) -> list[dict[str, Any]]:
+                    only_anomaly: bool = False, only_unused: bool = False,
+                    only_managed: bool = False) -> list[dict[str, Any]]:
         try:
-            rows = self._build()
+            rows = self._build(only_managed=only_managed)
         except Exception as exc:
             raise RuntimeError(self._safe_error(exc)) from exc
         needle = q.strip().casefold()

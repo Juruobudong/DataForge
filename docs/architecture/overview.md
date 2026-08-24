@@ -1,6 +1,6 @@
 # DataForge 当前架构概览
 
-> 当前状态：已实现架构，更新于 2026-08-22。
+> 当前状态：仓库已实现，更新于 2026-08-24；真实 `.34` 审核生产链路待部署验收。
 > 本目录只描述当前系统事实；完成度与外部环境验收状态以 [`V7-CAPABILITY-MATRIX.md`](../../V7-CAPABILITY-MATRIX.md) 为准，设计原因以 [`docs/adr/`](../adr/ADR-001-single-current-knowledge.md) 为准。
 
 ## 系统定位
@@ -25,7 +25,8 @@ PC 浏览器
       └─ RoutingSnapshot volume：按 Project、Deployment、阶段原子发布
 ```
 
-- API 与 Worker 负责治理、排队和外部存储协调；Runner 执行受控知识流程。
+- API 与 Worker 负责治理、审核、排队和外部存储协调；Runner 先执行独立 Source Preparation，批准后再执行受控知识流程。
+- SourceChunk 是强制人工 Gate。上传只自动 Parse/Clean/Chunk；全部活动块批准并冻结 Review Snapshot 后，才允许 LLM/Operator、Knowledge Sink、Embedding、Milvus、Ready 和 Routing。
 - 知识处理和 Vector Sync 通过知识库工作租约互斥；不同知识库可并行，多输出任务原子取得全部目标库租约。
 - PDF 固定经 MinerU 3.4.4 `pipeline + auto + ch` 解析；一次性强制 OCR 只允许管理员对 PDF 派生调试 Run 使用。
 - DataFlow 调试台已经实现为 V7 自有的运行诊断页面，提供 Runtime DAG、事件、Node/Artifact Inspector、派生执行与 Sink Diff；它不是 DataFlow WebUI 或通用 Studio。
@@ -35,7 +36,7 @@ PC 浏览器
 
 - MySQL 与 MinIO 使用 `dataforge` 名称，只接受空环境或已有 V7 schema 的常规 Alembic 升级。
 - V7 常规流程不读取、迁移或自动清理 DataForge V2 数据、旧 MinIO 对象、legacy/external Milvus Collection。
-- Source 是逻辑文件，替换创建不可变 SourceVersion；正式 SourceChunk、Evidence、Artifact 与 Flow Run 保留执行溯源。
+- Source 是逻辑文件，替换创建不可变 SourceVersion；SourceChunk Revision 与 Review Snapshot 冻结人工批准输入，Evidence、AssetVersion、Artifact 与 Flow Run 保留端到端溯源。
 - KnowledgeLibrary 是逻辑当前态；正式向量资产是不可变 `KnowledgeAssetVersion`，物理 Partition 为 `kl_<knowledge_library_id>__v<asset_version_no>`。
 - 发布的 RoutingSnapshot 只引用通过校验的 Ready AssetVersion，不对运行中的 Partition 执行 reset 或 upsert。
 - 删除知识库只清理其 V7 Partition；整库删除是独立治理流程，仅适用于 ownership 与引用门禁全部通过的 DataForge 受管 Collection。

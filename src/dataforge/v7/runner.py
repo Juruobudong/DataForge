@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from openai import APITimeoutError
 from pydantic import BaseModel
@@ -29,12 +30,12 @@ from .graph_literal import classify_object, detect_literal
 from .graph_prompt import entity_prompt_for, relation_prompt_for
 from .graph_quality import evaluate_graph_quality
 from .graph_schema import GraphExtractionConfig, normalize_graph_config
-from .llm_serving import DEFAULT_LLM_SERVING_ID, get_llm_serving_registry
+from .llm_serving import DEFAULT_LLM_SERVING_ID, configure_llm_serving_registry, get_llm_serving_registry
 from .models import KnowledgeJob, Source, SourceVersion
 from .parser_runtime import content_list_pages, parse_with_mineru
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
-from .faq import FAQ_TYPE_CODE, normalize_faq_rows, parse_table_rows
+from .faq import FAQ_FILENAME_PATTERN, FAQ_TYPE_CODE, normalize_faq_rows, parse_table_rows
 
 
 logger = logging.getLogger("dataforge.v7.runner")
@@ -42,6 +43,7 @@ logger = logging.getLogger("dataforge.v7.runner")
 
 class RunRequest(BaseModel):
     job_id: str | None = None
+    source_preparation_job_id: str | None = None
     flow_run_id: str | None = None
     lease_owner: str | None = None
 
@@ -142,7 +144,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
 
 def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], root_documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Execute a deterministic, side-effect-free operator approximation for developer preview."""
-    if ref == "document-parser":
+    if ref in {"document-parser", "reviewed-source-chunk-input"}:
         return [dict(value) for value in root_documents]
     if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
         result = []
@@ -252,7 +254,8 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
     filename, text = SAMPLE_DOCUMENTS[sample_id]
     compiled = compiled_definition or definition
     root_documents = [{"source_id": "preview-source", "source_version_id": "preview-version", "filename": filename,
-                       "text": text, "parser_strategy": "preview", "runtime_profile": "controlled_in_memory",
+                       "text": text, "content": text, "source_chunk_id": "preview-reviewed-chunk", "chunk_index": 0,
+                       "parser_strategy": "preview", "runtime_profile": "controlled_in_memory",
                        "parser_adapter": "preview", "anchor": {"file": filename, "page": None, "section": None}}]
     nodes = list(compiled.get("nodes") or [])
     incoming = _incoming(compiled)
@@ -262,7 +265,7 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
     for node in nodes:
         node_id = str(node["id"]); source_nodes = incoming.get(node_id, [])
         values = [value for source_id in source_nodes for value in outputs.get(source_id, [])]
-        if node.get("kind") == "operator" and str(node.get("ref")) == "document-parser" and not source_nodes:
+        if node.get("kind") == "operator" and str(node.get("ref")) in {"document-parser", "reviewed-source-chunk-input"} and not source_nodes:
             values = [dict(value) for value in root_documents]
         failed_upstream = [source_id for source_id in source_nodes if source_id in failures]
         if failed_upstream:
@@ -303,7 +306,9 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
         top_level_runs[node_id] = {"status": status, "inputs": _merge_preview_ports([expanded_runs.get(item, {}).get("inputs", {}) for item in entries]),
                                    "outputs": {"output": _preview_port(output_values)},
                                    "error": "；".join(errors) or None, "internal_trace": internal_trace}
-    chunk_values = [value for node_id, values in outputs.items() if node_id.endswith("::chunk") for value in values]
+    reviewed_root_ids = {str(node["id"]) for node in nodes if node.get("ref") == "reviewed-source-chunk-input"}
+    chunk_values = [value for node_id, values in outputs.items()
+                    if node_id.endswith("::chunk") or node_id in reviewed_root_ids for value in values]
     sink_totals = {str(node.get("output_key") or node.get("knowledge_type")): expanded_runs.get(str(node["id"]), {}).get("inputs", {}).get("input", {}).get("total", 0)
                    for node in nodes if node.get("kind") == "knowledge_sink"}
     return {"sample_id": sample_id, "filename": filename, "preview_mode": "controlled_in_memory",
@@ -527,7 +532,8 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
         else:
             text = _extract_text(source.original_filename, payload)
             profile = "native"
-        faq_table_rows = parse_table_rows(source.original_filename, payload) if suffix in {".csv", ".xlsx"} else []
+        faq_table_rows = parse_table_rows(source.original_filename, payload) \
+            if FAQ_FILENAME_PATTERN.fullmatch(Path(source.original_filename).name) else []
         documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
                           "parser_adapter": select_parser_adapter(source.original_filename, profile),
@@ -862,6 +868,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     library_id = str((sink_libraries or {}).get(_graph_output_key(params)) or "")
     if ref == "document-parser":
         return root_documents
+    if ref == "reviewed-source-chunk-input":
+        return [dict(value) for value in root_documents]
     if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
         result = []
         mode = select_runtime_mode(len(values))
@@ -1075,7 +1083,65 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     raise ValueError(f"Runner 没有批准的算子 Adapter：{ref}")
 
 
+def execute_source_preparation(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
+    context = store.source_preparation_context(job_id)
+    job, version, source = context["job"], context["version"], context["source"]
+    if job.status not in {"queued", "running"}:
+        return {"id": job.id, "status": job.status, "idempotent": True}
+    run = store.start_source_preparation_flow_run(job_id)
+    created_parser_keys: list[str] = []
+    persisted_parser_keys: set[str] = set()
+    try:
+        versions = {version.id: version}; sources = {source.id: source}
+        documents = _documents_for_versions(objects, [version], sources, run["id"], created_parser_keys)
+        store.record_document_irs(run["id"], documents)
+        parser_ids = store.record_flow_node(
+            run["id"], "parse::parser", [], [{**item, "_artifact_type": "document_ir"} for item in documents],
+            operator_code="document-parser",
+        )
+        persisted_parser_keys.update(created_parser_keys)
+        documents = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in documents]
+        cleaned = documents
+        last_ids = parser_ids
+        for node_id, ref in (
+            ("clean::null", "null-filter"), ("clean::language", "language-filter"),
+            ("clean::clean", "text-cleaner"), ("clean::space", "whitespace-cleaner"),
+            ("clean::normalize", "text-normalizer"),
+        ):
+            cleaned = _run_operator(ref, {}, cleaned, root_documents=documents, sources=sources, versions=versions,
+                                    type_contracts={})
+            last_ids = store.record_flow_node(run["id"], node_id, last_ids, cleaned, operator_code=ref)
+        if any(item.get("_faq_table_rows") for item in documents):
+            chunk_values = _run_operator("faq-table-row-builder", {}, cleaned, root_documents=documents,
+                                         sources=sources, versions=versions, type_contracts={})
+            chunk_values = [{**item, "anchor": {**dict(item.get("anchor") or {}), "faq": dict(item.get("faq") or {})}}
+                            for item in chunk_values]
+            chunk_ids = store.record_flow_node(run["id"], "chunk::faq-rows", last_ids, chunk_values,
+                                               operator_code="faq-table-row-builder")
+        else:
+            chunk_values = _run_operator("semantic-chunker", {}, cleaned, root_documents=documents,
+                                         sources=sources, versions=versions, type_contracts={})
+            chunk_ids = store.record_flow_node(run["id"], "chunk::chunk", last_ids, chunk_values,
+                                               operator_code="semantic-chunker")
+        formal = _run_operator("source-chunk-builder", {}, chunk_values, root_documents=documents,
+                               sources=sources, versions=versions, type_contracts={})
+        store.record_source_chunks(run["id"], formal)
+        store.record_flow_node(run["id"], "chunk::source-chunks", chunk_ids, formal,
+                               operator_code="source-chunk-builder")
+        store.finish_flow_run(run["id"], status="completed")
+        return {**store.finish_source_preparation(job_id), "flow_run_id": run["id"]}
+    except Exception as exc:
+        store.finish_flow_run(run["id"], str(exc), status="failed")
+        result = store.finish_source_preparation(job_id, str(exc))
+        for object_key in created_parser_keys:
+            if object_key not in persisted_parser_keys:
+                try: objects.delete_key(object_key)
+                except Exception: logger.exception("清理 Source Preparation Parser Artifact 失败")
+        return {**result, "flow_run_id": run["id"]}
+
+
 def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
+    configure_llm_serving_registry(store.sessions, os.getenv("DATAFORGE_CONFIG_ENCRYPTION_KEY"))
     if lease_owner:
         store.assert_work_lease("knowledge", job_id, lease_owner)
     with store.sessions() as session:
@@ -1105,7 +1171,8 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         type_contracts = store.type_contracts_for_job(job_id)
         graph_config = _graph_config_from_contracts(type_contracts)
         incoming = _incoming(definition)
-        root_documents = _documents_for_versions(objects, versions_list, sources, flow_run["id"], created_parser_keys)
+        root_documents = store.reviewed_chunks_for_job(job_id)
+        current_source_chunks = [dict(value) for value in root_documents]
         sink_nodes: list[dict[str, Any]] = []
         for node in definition.get("nodes", []):
             if store.is_job_cancelled(job_id):
@@ -1147,7 +1214,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 outputs[node_id] = values
             artifact_values = values
             if ref == "document-parser":
-                artifact_values = [{key: value for key, value in item.items() if key not in {"_parser_artifacts", "_faq_table_rows"}} for item in values]
+                artifact_values = [{key: value for key, value in item.items() if key != "_faq_table_rows"} for item in values]
             artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values)
             if ref == "document-parser":
                 persisted_parser_keys.update(created_parser_keys)
@@ -1327,9 +1394,10 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
 
 def create_app(settings: Settings | None = None, *, check_schema: bool = True) -> FastAPI:
     resolved = settings or Settings.load(); resolved.ensure_directories()
-    _initialize_llm_servings()
     store = V7Store(resolved.platform_database_url)
     if check_schema: store.assert_schema_current()
+    configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
+    _initialize_llm_servings()
     objects = _objects(resolved); app = FastAPI(title="DataForge V7 Runner", version="7.0.0")
     active_requests: set[str] = set()
     active_lock = threading.RLock()
@@ -1365,16 +1433,22 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/internal/jobs", status_code=202)
     def run(payload: RunRequest, authorization: str | None = Header(None)):
         verify(authorization)
-        request_id = payload.job_id or payload.flow_run_id or "invalid"
+        request_id = payload.job_id or payload.source_preparation_job_id or payload.flow_run_id or "invalid"
         with active_lock:
             active_requests.add(request_id)
         try:
             if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
+            if payload.source_preparation_job_id:
+                if not payload.lease_owner:
+                    raise ValueError("Source Preparation 请求缺少 lease_owner")
+                return execute_source_preparation(
+                    store, objects, payload.source_preparation_job_id, lease_owner=payload.lease_owner,
+                )
             if payload.job_id:
                 if not payload.lease_owner:
                     raise ValueError("知识任务请求缺少 lease_owner")
                 return execute_job(store, objects, payload.job_id, lease_owner=payload.lease_owner)
-            raise ValueError("job_id 或 flow_run_id 至少提供一个")
+            raise ValueError("job_id、source_preparation_job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             with active_lock:

@@ -8,6 +8,7 @@ const indexes = ref([])
 const managedCollections = ref([])
 const deletionJobs = ref({})
 const quality = ref([])
+const embeddingServings = ref([])
 const error = ref('')
 const result = ref(null)
 
@@ -29,9 +30,9 @@ const typeForm = ref({
 })
 const indexForm = ref({
   code: '', knowledge_type: 'text', collection_mode: 'attach', collection_name: '',
-  reuse_managed_collection_id: '', embedding_code: 'bce_base_768_v1',
-  embedding_model: 'bce-embedding-base', dimension: 768, metric_type: 'COSINE',
-  endpoint_ref: 'EMBEDDING_API_BASE', fields: JSON.stringify(standardFields, null, 2),
+  reuse_managed_collection_id: '', embedding_serving_id: 'bce_base_768', embedding_input: 'canonical_content',
+  embedding_code: '', embedding_model: '', dimension: 0, metric_type: 'COSINE', endpoint_ref: null,
+  fields: JSON.stringify(standardFields, null, 2),
   storage_schema: JSON.stringify(standardStorage, null, 2),
 })
 
@@ -39,6 +40,7 @@ const manualProfiles = computed(() => indexes.value.filter(item => item.origin =
 const managedProfiles = computed(() => indexes.value.filter(item => item.revisions?.[0]?.collection_policy === 'managed'))
 const externalProfiles = computed(() => indexes.value.filter(item => item.revisions?.[0]?.collection_policy === 'external'))
 const reusableCollections = computed(() => managedCollections.value.filter(item => item.status === 'ready'))
+const selectedEmbeddingServing = computed(() => embeddingServings.value.find(item => item.serving_code === indexForm.value.embedding_serving_id))
 
 watch(() => typeForm.value.code, (code, previous) => {
   const oldDefault = defaultCollectionName(previous)
@@ -50,8 +52,8 @@ watch(() => typeForm.value.code, (code, previous) => {
 async function load() {
   error.value = ''
   try {
-    const [nextTypes, vectorIndexes, qualityProfiles] = await Promise.all([
-      api.knowledgeTypes(), api.vectorIndexes(), api.qualityProfiles(),
+    const [nextTypes, vectorIndexes, qualityProfiles, servingRows] = await Promise.all([
+      api.knowledgeTypes(), api.vectorIndexes(), api.qualityProfiles(), api.embeddingServings(),
     ])
     types.value = nextTypes
     indexes.value = vectorIndexes.profiles
@@ -61,6 +63,10 @@ async function load() {
     ]))
     deletionJobs.value = Object.fromEntries(jobs)
     quality.value = qualityProfiles
+    embeddingServings.value = servingRows
+    if (!embeddingServings.value.some(item => item.serving_code === indexForm.value.embedding_serving_id && item.is_enabled)) {
+      indexForm.value.embedding_serving_id = embeddingServings.value.find(item => item.is_default && item.is_enabled)?.serving_code || ''
+    }
     if (!typeForm.value.quality_profile_revision_id) {
       typeForm.value.quality_profile_revision_id = qualityProfiles.flatMap(item => item.revisions).find(item => item.status === 'published')?.id || ''
     }
@@ -199,11 +205,11 @@ async function retryCollectionDelete(job) {
         <label v-if="indexForm.collection_mode === 'create'">或复用兼容受管 Collection
           <select v-model="indexForm.reuse_managed_collection_id"><option value="">不复用（默认独立）</option><option v-for="item in reusableCollections" :key="item.id" :value="item.id">{{ item.collection_name }}</option></select>
         </label>
-        <input v-model="indexForm.embedding_code" required placeholder="Embedding 编码">
-        <input v-model="indexForm.embedding_model" required placeholder="Embedding 模型">
-        <input v-model.number="indexForm.dimension" min="1" type="number" required>
+        <label>Embedding 服务<select v-model="indexForm.embedding_serving_id" required><option v-for="item in embeddingServings.filter(row => row.is_enabled)" :key="item.id" :value="item.serving_code">{{ item.is_default ? '★ ' : '' }}{{ item.name }} · {{ item.dimension }} 维</option></select></label>
+        <label>Model<input :value="selectedEmbeddingServing?.model_name || '—'" disabled></label>
+        <label>Dimension<input :value="selectedEmbeddingServing?.dimension || '—'" disabled></label>
         <input v-model="indexForm.metric_type" required placeholder="度量类型">
-        <input v-model="indexForm.endpoint_ref" placeholder="Embedding endpoint 引用">
+        <label>Embedding Input<select v-model="indexForm.embedding_input"><option value="canonical_content">canonical_content</option><option value="question">question</option><option value="question_answer">question + answer</option></select></label>
         <label>字段映射<textarea v-model="indexForm.fields" rows="6" /></label>
         <label v-if="indexForm.collection_mode === 'create'">物理 Storage Schema<textarea v-model="indexForm.storage_schema" rows="8" /></label>
         <p v-else class="muted">external Collection 只校验和解绑，DataForge 不会创建或删除整个 Collection。</p>
@@ -227,9 +233,9 @@ async function retryCollectionDelete(job) {
 
     <section class="panel">
       <h3>Profile</h3>
-      <table><thead><tr><th>编码</th><th>来源</th><th>Collection</th><th>策略</th><th>状态</th><th>操作</th></tr></thead>
+      <table><thead><tr><th>编码</th><th>来源</th><th>Embedding 服务</th><th>向量契约</th><th>Collection</th><th>策略</th><th>状态</th><th>操作</th></tr></thead>
         <tbody><tr v-for="index in [...managedProfiles, ...externalProfiles]" :key="index.id">
-          <td>{{ index.code }}</td><td>{{ index.origin }}</td><td>{{ index.collection_name }}</td><td>{{ index.revisions?.[0]?.collection_policy }}</td><td>{{ index.status }}</td>
+          <td>{{ index.code }}</td><td>{{ index.origin }}</td><td>{{ index.embedding_serving?.name || index.embedding_serving_id || '待绑定' }}<br><small>{{ index.embedding_serving?.model_name }}</small></td><td><template v-if="index.embedding_serving"><div>Serving {{ index.vector_contract?.embedding_serving_dimension ?? index.embedding_serving.dimension }}</div><div>Profile {{ index.vector_contract?.index_profile_dimension ?? index.dimension }}</div><div>Storage {{ managedCollections.find(item => item.id === index.managed_collection_id)?.storage_contract?.dimension || '—' }}</div><div>Milvus {{ index.vector_contract?.milvus_collection_dimension ?? '待连接' }}</div><span :class="['badge', index.vector_contract?.compatible ? 'green' : 'red']">{{ index.vector_contract?.compatible ? '✓ 维度一致' : '× 维度不一致' }}</span></template><span v-else>—</span></td><td>{{ index.collection_name }}</td><td>{{ index.revisions?.[0]?.collection_policy }}</td><td>{{ index.status }}</td>
           <td><button @click="indexAction(index, 'validate')">校验</button><button v-if="index.status !== 'active' && index.status !== 'archived'" class="primary" @click="indexAction(index, 'publish')">发布</button><button v-if="index.origin === 'manual' && index.status !== 'archived'" @click="indexAction(index, 'archive')">归档/解绑</button></td>
         </tr></tbody>
       </table>

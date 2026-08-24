@@ -6,10 +6,17 @@ import json
 import os
 import sqlite3
 import tempfile
+from collections.abc import Mapping, Sequence, Set
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Protocol
+
+from openai import OpenAI
+
+from ..config import Settings
+from .servings import EmbeddingServingRegistry, ServingManager
 
 from .store import V7Store
 
@@ -28,30 +35,53 @@ class CollectionValidationError(ValueError):
         self.observed = observed
 
 
+def _plain_milvus_metadata(value: Any) -> Any:
+    """Convert pymilvus/protobuf metadata into stable JSON-compatible values."""
+    if isinstance(value, Enum):
+        return value.name
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _plain_milvus_metadata(item) for key, item in value.items()}
+    if isinstance(value, Set):
+        normalized = [_plain_milvus_metadata(item) for item in value]
+        return sorted(normalized, key=lambda item: str(item))
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_plain_milvus_metadata(item) for item in value]
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
 class EmbeddingProvider(Protocol):
     def embed(self, inputs: list[str], *, model: str, dimension: int) -> list[list[float]]: ...
 
 
 class OpenAILikeEmbeddingProvider:
     """QA Agent-compatible OpenAILikeEmbedding boundary for V7 profiles."""
-    def __init__(self, api_base: str, api_key: str, batch_size: int, *, embedding_factory=None):
-        if embedding_factory is None:
-            try:
-                from llama_index.embeddings.openai_like import OpenAILikeEmbedding
-            except ImportError as exc:
-                raise RuntimeError("未安装 llama-index-embeddings-openai-like") from exc
-            embedding_factory = OpenAILikeEmbedding
+    def __init__(self, api_base: str, api_key: str, batch_size: int, *, embedding_factory=None,
+                 timeout_seconds: float = 120, max_retries: int = 2, client_factory=OpenAI):
         self.api_base, self.api_key, self.batch_size = api_base, api_key, batch_size
         self._factory = embedding_factory
+        self._client_factory = client_factory
+        self.timeout_seconds, self.max_retries = timeout_seconds, max_retries
 
     def embed(self, inputs: list[str], *, model: str, dimension: int) -> list[list[float]]:
-        provider = self._factory(
-            model_name=model,
-            api_base=self.api_base,
-            api_key=self.api_key,
-            embed_batch_size=self.batch_size,
-        )
-        values = provider.get_text_embedding_batch(inputs)
+        if self._factory is not None:
+            provider = self._factory(
+                model_name=model, api_base=self.api_base, api_key=self.api_key,
+                embed_batch_size=self.batch_size,
+            )
+            values = provider.get_text_embedding_batch(inputs)
+        else:
+            client = self._client_factory(
+                base_url=self.api_base, api_key=self.api_key,
+                timeout=self.timeout_seconds, max_retries=self.max_retries,
+            )
+            values = []
+            for offset in range(0, len(inputs), self.batch_size):
+                response = client.embeddings.create(model=model, input=inputs[offset:offset + self.batch_size])
+                values.extend([list(item.embedding) for item in sorted(response.data, key=lambda item: item.index)])
         if len(values) != len(inputs) or any(len(vector) != dimension for vector in values):
             raise RuntimeError(f"Embedding 服务没有返回 {len(inputs)} 个 {dimension} 维向量")
         return values
@@ -93,9 +123,13 @@ class V7Milvus:
         client = self.client()
         if not client.has_collection(collection_name=collection_name):
             return {"collection_name": collection_name, "exists": False, "partitions": [], "entity_count": 0}
-        description = dict(client.describe_collection(collection_name=collection_name) or {})
+        description = _plain_milvus_metadata(
+            dict(client.describe_collection(collection_name=collection_name) or {})
+        )
         indexes = [
-            dict(client.describe_index(collection_name=collection_name, index_name=name) or {})
+            _plain_milvus_metadata(
+                dict(client.describe_index(collection_name=collection_name, index_name=name) or {})
+            )
             for name in client.list_indexes(collection_name=collection_name)
         ]
         stats = dict(client.get_collection_stats(collection_name=collection_name) or {})
@@ -479,32 +513,32 @@ def vector_id(profile_code: str, knowledge_library_id: str, source_knowledge_id:
 
 
 class VectorSyncService:
-    def __init__(self, store: V7Store, *, milvus: V7Milvus | None = None, embeddings: EmbeddingProvider | None = None):
+    def __init__(self, store: V7Store, *, milvus: V7Milvus | None = None,
+                 embeddings: EmbeddingProvider | None = None,
+                 embedding_registry: EmbeddingServingRegistry | None = None):
         self.store = store
         self.milvus = milvus
         self.embeddings = embeddings
+        self.embedding_registry = embedding_registry
 
     @classmethod
     def from_environment(cls, store: V7Store) -> "VectorSyncService":
         uri = os.getenv("DATAFORGE_MILVUS_URI")
-        api_base = os.getenv("EMBEDDING_API_BASE")
-        if not uri or not api_base:
+        if not uri:
             return cls(store)
-        try:
-            batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
-        except ValueError as exc:
-            raise ValueError("EMBEDDING_BATCH_SIZE 必须是整数") from exc
-        if batch_size <= 0:
-            raise ValueError("EMBEDDING_BATCH_SIZE 必须为正整数")
         capacity_limit = int(os.getenv("DATAFORGE_COLLECTION_CAPACITY_LIMIT", "0")) or None
         threshold = float(os.getenv("DATAFORGE_COLLECTION_CAPACITY_THRESHOLD", "0.8"))
-        return cls(store, milvus=V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"), capacity_limit=capacity_limit, capacity_threshold=threshold), embeddings=OpenAILikeEmbeddingProvider(api_base, os.getenv("EMBEDDING_API_KEY", "fake"), batch_size))
+        settings = Settings.load()
+        registry = EmbeddingServingRegistry(ServingManager(store.sessions, settings.config_encryption_key))
+        return cls(store,
+                   milvus=V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"), capacity_limit=capacity_limit, capacity_threshold=threshold),
+                   embedding_registry=registry)
 
     @staticmethod
-    def _input(profile_code: str, item) -> str:
-        if profile_code == "qa-question":
+    def _input(embedding_input: str, item) -> str:
+        if embedding_input == "question":
             return str((item.data_json or {}).get("question", ""))
-        if profile_code == "qa-full":
+        if embedding_input == "question_answer":
             data = item.data_json or {}
             return f"{data.get('question', '')}\n{data.get('answer', '')}".strip()
         return item.canonical_content
@@ -536,21 +570,34 @@ class VectorSyncService:
         if lease_owner:
             self.store.assert_work_lease("vector_sync", sync_job_id, lease_owner)
         context = self.store.vector_sync_context(sync_job_id)
-        if not self.milvus or not self.embeddings:
-            return self.store.finish_vector_sync(sync_job_id, [], "未配置 DATAFORGE_MILVUS_URI 或 EMBEDDING_API_BASE，不能标记 Vector Ready")
         job, library, profile, embedding, items = context["job"], context["library"], context["profile"], context["embedding"], context["items"]
         asset = context.get("asset_version")
+        provider = self.embeddings
+        serving_config = None
+        if self.embedding_registry and profile.embedding_serving_id:
+            try:
+                provider, serving_config = self.embedding_registry.provider(profile.embedding_serving_id, healthy=True)
+            except ValueError as exc:
+                return self.store.finish_vector_sync(sync_job_id, [], str(exc))
+        if not self.milvus or not provider:
+            return self.store.finish_vector_sync(sync_job_id, [], "未配置 DATAFORGE_MILVUS_URI 或可用 Embedding Serving，不能标记 Vector Ready")
         partition_name = asset.partition_name if asset else library.partition_name
         try:
-            self.milvus.validate_collection(profile.collection_name, profile.fields_json, embedding.dimension)
+            expected_dimension = asset.embedding_dimension if asset and asset.embedding_dimension else embedding.dimension
+            model_name = asset.embedding_model if asset and asset.embedding_model else embedding.model
+            if serving_config and serving_config.dimension != expected_dimension:
+                raise ValueError("Embedding Serving 与 AssetVersion 冻结维度不一致")
+            if context.get("storage_contract") and context["storage_contract"].dimension != expected_dimension:
+                raise ValueError("Storage Contract 与 AssetVersion 冻结维度不一致")
+            self.milvus.validate_collection(profile.collection_name, profile.fields_json, expected_dimension)
             # Only an unpublished candidate may be rebuilt on retry.  Never
             # reset or drop the stable/ready Partition used by a RouteVersion.
             if asset and asset.status != "ready" and hasattr(self.milvus, "partition_exists") \
                     and self.milvus.partition_exists(profile.collection_name, partition_name):
                 self.milvus.drop_partition(profile.collection_name, partition_name)
             self.milvus.ensure_partition(profile.collection_name, partition_name)
-            inputs = [self._input(profile.code, item) for item in items]
-            vectors = self.embeddings.embed(inputs, model=embedding.model, dimension=embedding.dimension)
+            inputs = [self._input(profile.embedding_input, item) for item in items]
+            vectors = provider.embed(inputs, model=model_name, dimension=expected_dimension)
             rows = []
             states = []
             for item, vector in zip(items, vectors, strict=True):

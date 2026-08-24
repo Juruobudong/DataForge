@@ -85,6 +85,9 @@ class FlowCompiler:
         schema_version = int(definition.get("schema_version", 2))
         if schema_version not in {2, 3}:
             raise FlowValidationError("仅支持 Flow DSL schema_version=2 或 3")
+        purpose = str(definition.get("purpose") or "knowledge")
+        if purpose not in {"knowledge", "source_preparation"}:
+            raise FlowValidationError("Flow purpose 必须是 knowledge 或 source_preparation")
         nodes, edges = self._expand(definition)
         by_id = {node["id"]: node for node in nodes}
         incoming: dict[str, list[str]] = defaultdict(list)
@@ -112,7 +115,7 @@ class FlowCompiler:
             raise FlowValidationError("Flow 不允许孤立节点：" + ", ".join(sorted(isolated)))
         non_sink_terminals = [node_id for node_id, node in by_id.items()
                               if not outgoing[node_id] and node.get("kind") != "knowledge_sink"]
-        if non_sink_terminals:
+        if purpose == "knowledge" and non_sink_terminals:
             raise FlowValidationError("Flow 的所有终点必须是 Knowledge Sink：" + ", ".join(sorted(non_sink_terminals)))
         queue = deque(sorted(node_id for node_id in by_id if not incoming[node_id]))
         ordered: list[str] = []
@@ -156,9 +159,9 @@ class FlowCompiler:
             port_spec = (item.get("input_ports") or {}).get("input") or {"artifact_type": item["input"], "cardinality": "one"}
             expected = port_spec.get("artifact_type", item["input"])
             cardinality = port_spec.get("cardinality", "one")
-            if expected == "source_file":
+            if expected in {"source_file", "approved_source_chunks"}:
                 if source_types:
-                    raise FlowValidationError(f"{code} 只能作为 SourceFile 根节点")
+                    raise FlowValidationError(f"{code} 只能作为 Flow 根节点")
             elif not source_types or cardinality == "one" and len(source_types) != 1 or any(not _type_matches(source_type, expected) for source_type in source_types):
                 raise FlowValidationError(f"节点 {node_id} 输入 Artifact Type 不兼容，需要 {expected}")
             params = node.get("params")
@@ -199,8 +202,22 @@ class FlowCompiler:
                     raise FlowValidationError(f"节点 {node_id} 无法从输入推导候选知识类型")
             outputs[node_id] = output
             dependencies.append({"kind": "operator", "code": code, "version": item.get("version", 1), "adapter": item["adapter_code"]})
-        if not sink_types:
-            raise FlowValidationError("Flow 至少需要一个 Knowledge Sink")
-        compiled = {"schema_version": 3, "nodes": [by_id[node_id] for node_id in ordered], "edges": edges, "sink_types": sink_types}
+        root_refs = {str(by_id[node_id].get("ref") or "") for node_id in ordered if not incoming[node_id]}
+        node_refs = {str(node.get("ref") or "") for node in by_id.values() if node.get("kind") == "operator"}
+        if purpose == "knowledge":
+            if not sink_types:
+                raise FlowValidationError("Flow 至少需要一个 Knowledge Sink")
+            if root_refs != {"reviewed-source-chunk-input"}:
+                raise FlowValidationError("知识流程必须且只能从 Reviewed SourceChunk Input 开始")
+            if {"document-parser", "source-chunk-builder"} & node_refs:
+                raise FlowValidationError("知识流程不得重新解析或构建 SourceChunk")
+        else:
+            if sink_types:
+                raise FlowValidationError("Source Preparation 不允许 Knowledge Sink")
+            if root_refs != {"document-parser"}:
+                raise FlowValidationError("Source Preparation 必须从 Document Parser 开始")
+            if len(non_sink_terminals) != 1 or outputs.get(non_sink_terminals[0]) != "source_chunk_set":
+                raise FlowValidationError("Source Preparation 必须且只能以 SourceChunk 结束")
+        compiled = {"schema_version": 3, "purpose": purpose, "nodes": [by_id[node_id] for node_id in ordered], "edges": edges, "sink_types": sink_types}
         checksum = hashlib.sha256(json.dumps(compiled, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         return {"compiled_definition": compiled, "dependencies": dependencies, "checksum": checksum}

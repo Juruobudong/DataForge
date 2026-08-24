@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -73,6 +73,9 @@ class SourceVersion(Timestamped, Base):
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     extraction_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preparation_status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    current_review_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class DocumentIR(Timestamped, Base):
@@ -94,7 +97,7 @@ class DocumentIR(Timestamped, Base):
 class SourceChunk(Timestamped, Base):
     """A formal source chunk retained independently from execution artifacts."""
     __tablename__ = "source_chunks"
-    __table_args__ = (UniqueConstraint("source_version_id", "flow_run_id", "chunk_index", name="uq_source_chunk_version_run_index"),)
+    __table_args__ = (UniqueConstraint("source_version_id", "source_chunk_id", name="uq_source_chunk_version_logical_id"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
     flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
@@ -104,6 +107,88 @@ class SourceChunk(Timestamped, Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    current_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(32), default="pending_review", nullable=False, index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SourceChunkRevision(Timestamped, Base):
+    """Immutable human-review revision for one logical SourceChunk."""
+    __tablename__ = "source_chunk_revisions"
+    __table_args__ = (UniqueConstraint("source_chunk_id", "revision_no", name="uq_source_chunk_revision"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("source_chunks.id"), nullable=False, index=True)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    operation: Mapped[str] = mapped_column(String(32), default="prepared", nullable=False, index=True)
+    parent_chunk_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), default="system", nullable=False)
+
+
+class SourceReviewSnapshot(Timestamped, Base):
+    """Immutable, ordered approval boundary for one SourceVersion."""
+    __tablename__ = "source_review_snapshots"
+    __table_args__ = (
+        UniqueConstraint("source_version_id", "review_no", name="uq_source_review_number"),
+        UniqueConstraint("source_version_id", "content_digest", name="uq_source_review_digest"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    review_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    reviewed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="approved", nullable=False, index=True)
+
+
+class SourceReviewSnapshotChunk(Timestamped, Base):
+    __tablename__ = "source_review_snapshot_chunks"
+    __table_args__ = (
+        UniqueConstraint("source_review_snapshot_id", "ordinal", name="uq_source_review_chunk_ordinal"),
+        UniqueConstraint("source_review_snapshot_id", "source_chunk_revision_id", name="uq_source_review_chunk_revision"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    )
+    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("source_chunks.id"), nullable=False, index=True)
+    source_chunk_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("source_chunk_revisions.id"), nullable=False, index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class SourcePreparationJob(Timestamped, Base):
+    __tablename__ = "source_preparation_jobs"
+    __table_args__ = (UniqueConstraint("source_version_id", "preparation_revision", name="uq_source_preparation_revision"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    preparation_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class KnowledgeDispatch(Timestamped, Base):
+    __tablename__ = "knowledge_dispatches"
+    __table_args__ = (UniqueConstraint("source_review_snapshot_id", name="uq_knowledge_dispatch_snapshot"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DocumentLibraryMember(Timestamped, Base):
@@ -140,11 +225,17 @@ class DocumentLibraryTemplateOutput(Timestamped, Base):
 class DocumentLibraryProcessingRecord(Timestamped, Base):
     """Successful processing is recorded per binding, source version and template revision."""
     __tablename__ = "document_library_processing_records"
-    __table_args__ = (UniqueConstraint("document_library_template_binding_id", "source_version_id", "knowledge_flow_template_revision_id", name="uq_doc_processing_revision"),)
+    __table_args__ = (UniqueConstraint(
+        "document_library_template_binding_id", "source_version_id", "knowledge_flow_template_revision_id",
+        "source_review_snapshot_id", name="uq_doc_processing_review_revision",
+    ),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_library_template_binding_id: Mapped[str] = mapped_column(ForeignKey("document_library_template_bindings.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
     knowledge_flow_template_revision_id: Mapped[str] = mapped_column(ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True)
+    source_review_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=True, index=True
+    )
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
 
 
@@ -190,6 +281,8 @@ class KnowledgeFlowTemplate(Timestamped, Base):
     definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), default="knowledge", nullable=False, index=True)
+    needs_review_upgrade: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
 
 
 class KnowledgeFlowTemplateRevision(Timestamped, Base):
@@ -202,6 +295,7 @@ class KnowledgeFlowTemplateRevision(Timestamped, Base):
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    purpose: Mapped[str] = mapped_column(String(32), default="knowledge", nullable=False, index=True)
 
 
 class KnowledgeLibrary(Timestamped, Base):
@@ -248,6 +342,12 @@ class KnowledgeItemSource(Timestamped, Base):
     knowledge_item_id: Mapped[str] = mapped_column(ForeignKey("knowledge_items.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
     source_chunk_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    source_chunk_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_chunk_revisions.id"), nullable=True, index=True
+    )
+    source_review_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=True, index=True
+    )
     source_anchor: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
     anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     evidence_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -284,6 +384,18 @@ class KnowledgeJob(Timestamped, Base):
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class KnowledgeJobReviewInput(Timestamped, Base):
+    __tablename__ = "knowledge_job_review_inputs"
+    __table_args__ = (UniqueConstraint("knowledge_job_id", "source_version_id", name="uq_job_review_source_version"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    source_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    )
+    review_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
 
 
 class KnowledgeLibraryWorkLease(Timestamped, Base):
@@ -530,9 +642,19 @@ class FlowExecutionSnapshot(Timestamped, Base):
 
 class FlowRun(Timestamped, Base):
     __tablename__ = "flow_runs"
-    __table_args__ = (UniqueConstraint("parent_flow_run_id", "idempotency_key", name="uq_derived_run_request"),)
+    __table_args__ = (
+        UniqueConstraint("parent_flow_run_id", "idempotency_key", name="uq_derived_run_request"),
+        CheckConstraint(
+            "(knowledge_job_id IS NOT NULL AND source_preparation_job_id IS NULL) OR "
+            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NOT NULL)",
+            name="ck_flow_run_single_owner",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
+    knowledge_job_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=True, index=True)
+    source_preparation_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_preparation_jobs.id"), nullable=True, index=True
+    )
     execution_snapshot_id: Mapped[str] = mapped_column(ForeignKey("flow_execution_snapshots.id"), nullable=False, index=True)
     parent_flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
     run_mode: Mapped[str] = mapped_column(String(32), default="full", nullable=False, index=True)
@@ -636,6 +758,53 @@ class ArtifactLineage(Timestamped, Base):
     child_artifact_id: Mapped[str] = mapped_column(ForeignKey("artifacts.id"), nullable=False, index=True)
 
 
+class ModelServing(Timestamped, Base):
+    __tablename__ = "model_servings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    serving_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    serving_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_configured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    credential_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    max_tokens: Mapped[int] = mapped_column(Integer, default=16384, nullable=False)
+    disable_thinking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    last_check_status: Mapped[str] = mapped_column(String(64), default="pending_configuration", nullable=False)
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class EmbeddingServing(Timestamped, Base):
+    __tablename__ = "embedding_servings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    serving_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    batch_size: Mapped[int] = mapped_column(Integer, default=32, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_configured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    credential_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    last_check_status: Mapped[str] = mapped_column(String(64), default="pending_configuration", nullable=False)
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_observed_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class EmbeddingProfile(Timestamped, Base):
     __tablename__ = "embedding_profiles"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -654,6 +823,8 @@ class KnowledgeIndexProfile(Timestamped, Base):
     knowledge_type: Mapped[str] = mapped_column(String(32), nullable=False)
     collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
     embedding_profile_id: Mapped[str] = mapped_column(ForeignKey("embedding_profiles.id"), nullable=False)
+    embedding_serving_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    embedding_input: Mapped[str] = mapped_column(String(32), default="canonical_content", nullable=False)
     fields_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     origin: Mapped[str] = mapped_column(String(32), default="manual", nullable=False, index=True)
     owner_knowledge_type_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_types.id"), nullable=True, index=True)
@@ -670,6 +841,8 @@ class KnowledgeIndexProfileRevision(Timestamped, Base):
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
     embedding_profile_id: Mapped[str] = mapped_column(ForeignKey("embedding_profiles.id"), nullable=False)
+    embedding_serving_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    embedding_input: Mapped[str] = mapped_column(String(32), default="canonical_content", nullable=False)
     fields_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     storage_contract_revision_id: Mapped[str | None] = mapped_column(ForeignKey("storage_contract_revisions.id"), nullable=True, index=True)
     collection_policy: Mapped[str] = mapped_column(String(32), default="external", nullable=False)
@@ -768,11 +941,16 @@ class KnowledgeAssetVersion(Timestamped, Base):
     storage_contract_revision_id: Mapped[str | None] = mapped_column(
         ForeignKey("storage_contract_revisions.id"), nullable=True, index=True
     )
+    embedding_serving_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    embedding_dimension: Mapped[int | None] = mapped_column(Integer, nullable=True)
     collection_name: Mapped[str] = mapped_column(String(255), nullable=False)
     partition_name: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="building", nullable=False, index=True)
     item_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    review_snapshot_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    review_gate_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     source_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source_migration_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

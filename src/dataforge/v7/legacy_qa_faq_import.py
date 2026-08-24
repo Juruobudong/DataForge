@@ -480,8 +480,10 @@ def _wait_vector_ready(store: V7Store, library_id: str, deadline: float) -> list
 
 
 def import_documents(store: V7Store, objects, connect_uri: str, rows_by_org: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
-    if not os.getenv("EMBEDDING_API_BASE", "").strip():
-        raise ValueError("未配置 EMBEDDING_API_BASE")
+    from .servings import EmbeddingServingRegistry, ServingManager
+    EmbeddingServingRegistry(ServingManager(
+        store.sessions, Settings.load().config_encryption_key,
+    )).require(healthy=True)
     timeout_seconds = max(60, int(os.getenv("DATAFORGE_QA_FAQ_IMPORT_TIMEOUT_SECONDS", "3600")))
     reports: list[dict[str, Any]] = []
     for org_code in EXPECTED_PARTITIONS:

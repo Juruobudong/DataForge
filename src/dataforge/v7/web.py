@@ -26,11 +26,15 @@ from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
 from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
+from .llm_serving import configure_llm_serving_registry
+from .servings import ServingManager
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
 from .migration.verifier import ActivationPreflightVerifier
 from .store import (
+    ReviewGateError,
     V7Store,
+    new_id,
 )
 from .vector import V7Milvus, VectorSyncService
 from .vector_inventory import INVENTORY_STATUSES, MilvusInventoryService
@@ -53,6 +57,30 @@ class SourceImportPreflightRequest(BaseModel):
 
 class SelectedDocumentSourcesRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
+
+
+class SourceChunkUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    content: str
+    expected_revision_no: int = Field(ge=1)
+
+
+class SourceChunkSplitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parts: list[str] = Field(min_length=2)
+    expected_revision_no: int = Field(ge=1)
+
+
+class SourceChunkMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chunk_ids: list[str] = Field(min_length=2)
+    expected_revisions: dict[str, int]
+
+
+class SourceChunkReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["approved", "rejected"]
+    expected_revision_no: int = Field(ge=1)
 
 
 class DocumentTemplateBatchBindingRequest(BaseModel):
@@ -154,9 +182,11 @@ class IndexProfileRequest(BaseModel):
     reuse_managed_collection_id: str | None = None
     storage_schema: dict | None = None
     index_spec: dict = Field(default_factory=lambda: {"index_type": "AUTOINDEX"})
-    embedding_code: str
+    embedding_serving_id: str | None = None
+    embedding_input: Literal["canonical_content", "question", "question_answer"] = "canonical_content"
+    embedding_code: str = ""
     embedding_model: str = ""
-    dimension: int
+    dimension: int = 0
     metric_type: str = "COSINE"
     endpoint_ref: str | None = None
     fields: dict
@@ -314,6 +344,66 @@ class ComponentCheckRequest(BaseModel):
     components: list[str] = Field(min_length=1)
 
 
+class ModelServingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    serving_code: str
+    name: str
+    serving_type: Literal["openai-compatible-chat"] = "openai-compatible-chat"
+    model_name: str
+    base_url: str = ""
+    api_key: str = ""
+    timeout_seconds: int = 120
+    max_retries: int = 2
+    max_tokens: int = 16384
+    disable_thinking: bool = True
+    is_enabled: bool = True
+
+
+class ModelServingPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = None
+    serving_type: Literal["openai-compatible-chat"] | None = None
+    model_name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_credential: bool = False
+    timeout_seconds: int | None = None
+    max_retries: int | None = None
+    max_tokens: int | None = None
+    disable_thinking: bool | None = None
+    is_enabled: bool | None = None
+
+
+class EmbeddingServingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    serving_code: str
+    name: str
+    provider_type: Literal["openai-compatible-embedding"] = "openai-compatible-embedding"
+    model_name: str
+    base_url: str = ""
+    api_key: str = ""
+    dimension: int
+    batch_size: int = 32
+    timeout_seconds: int = 120
+    max_retries: int = 2
+    is_enabled: bool = True
+
+
+class EmbeddingServingPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = None
+    provider_type: Literal["openai-compatible-embedding"] | None = None
+    model_name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_credential: bool = False
+    dimension: int | None = None
+    batch_size: int | None = None
+    timeout_seconds: int | None = None
+    max_retries: int | None = None
+    is_enabled: bool | None = None
+
+
 def _objects(settings: Settings):
     if settings.minio_endpoint and settings.minio_access_key and settings.minio_secret_key:
         return MinioObjectStore(settings.minio_endpoint, settings.minio_access_key, settings.minio_secret_key, settings.minio_bucket)
@@ -322,6 +412,10 @@ def _objects(settings: Settings):
 
 def _error(exc: ValueError) -> HTTPException:
     return HTTPException(status_code=422, detail=str(exc))
+
+
+def _review_error(exc: ReviewGateError) -> HTTPException:
+    return HTTPException(status_code=409, detail=exc.payload())
 
 
 async def _read_upload(upload: UploadFile) -> bytes:
@@ -337,7 +431,8 @@ async def _read_upload(upload: UploadFile) -> bytes:
 
 def create_app(settings: Settings | None = None, *, check_schema: bool = True) -> FastAPI:
     resolved = settings or Settings.load(); resolved.ensure_directories()
-    store = V7Store(resolved.platform_database_url)
+    store = V7Store(resolved.platform_database_url, enforce_serving_health=True,
+                    config_encryption_key=resolved.config_encryption_key)
     if check_schema:
         store.assert_schema_current()
     instance = InstanceContext.load(store, resolved)
@@ -345,9 +440,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     component_checks = ComponentCheckService(store, resolved, objects)
     component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
     local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
+    serving_manager = ServingManager(store.sessions, resolved.config_encryption_key)
+    configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
     app.state.store, app.state.objects, app.state.instance = store, objects, instance
     app.state.local_milvus_config = local_milvus_config
+    app.state.serving_manager = serving_manager
     app.state.routing_publications = set()
     app.state.routing_publications_lock = threading.RLock()
 
@@ -467,6 +565,82 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if current: session.delete(current)
         response.delete_cookie(SESSION_COOKIE, path="/")
 
+    @app.get("/api/model-servings")
+    def model_servings(): return serving_manager.list("model")
+
+    @app.post("/api/model-servings", status_code=201)
+    def create_model_serving(payload: ModelServingRequest):
+        try: return serving_manager.create("model", new_id("modelserving"), payload.model_dump())
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/model-servings/{serving_id}")
+    def model_serving(serving_id: str):
+        try: return serving_manager.get("model", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/model-servings/{serving_id}")
+    def patch_model_serving(serving_id: str, payload: ModelServingPatch):
+        try: return serving_manager.update("model", serving_id, payload.model_dump(exclude_none=True))
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/model-servings/{serving_id}")
+    def delete_model_serving(serving_id: str):
+        try: return serving_manager.delete("model", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/model-servings/{serving_id}/test")
+    def test_model_serving(serving_id: str):
+        try: return serving_manager.test("model", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/model-servings/{serving_id}/set-default")
+    def default_model_serving(serving_id: str):
+        try: return serving_manager.set_default("model", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/model-servings/{serving_id}/references")
+    def model_serving_references(serving_id: str):
+        try: return serving_manager.references("model", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/embedding-servings")
+    def embedding_servings(): return serving_manager.list("embedding")
+
+    @app.post("/api/embedding-servings", status_code=201)
+    def create_embedding_serving(payload: EmbeddingServingRequest):
+        try: return serving_manager.create("embedding", new_id("embeddingserving"), payload.model_dump())
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/embedding-servings/{serving_id}")
+    def embedding_serving(serving_id: str):
+        try: return serving_manager.get("embedding", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/embedding-servings/{serving_id}")
+    def patch_embedding_serving(serving_id: str, payload: EmbeddingServingPatch):
+        try: return serving_manager.update("embedding", serving_id, payload.model_dump(exclude_none=True))
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/embedding-servings/{serving_id}")
+    def delete_embedding_serving(serving_id: str):
+        try: return serving_manager.delete("embedding", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/embedding-servings/{serving_id}/test")
+    def test_embedding_serving(serving_id: str):
+        try: return serving_manager.test("embedding", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/embedding-servings/{serving_id}/set-default")
+    def default_embedding_serving(serving_id: str):
+        try: return serving_manager.set_default("embedding", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/embedding-servings/{serving_id}/references")
+    def embedding_serving_references(serving_id: str):
+        try: return serving_manager.references("embedding", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/document-libraries")
     def document_libraries(keyword: str = "", status: str | None = None):
         return store.list_document_libraries(keyword, status)
@@ -516,11 +690,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/document-libraries/{library_id}/process", status_code=202)
     def process_document_library(library_id: str):
         try: return {"jobs": store.process_document_library(library_id)}
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/document-libraries/{library_id}/process-selected", status_code=202)
     def process_selected_document_sources(library_id: str, payload: SelectedDocumentSourcesRequest):
         try: return {"jobs": store.process_selected_document_sources(library_id, payload.source_ids)}
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/document-libraries/{library_id}/sources/import-preflight")
@@ -674,6 +850,58 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.source_detail(source_id, version_id, flow_run_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/source-versions/{source_version_id}/review")
+    def source_review(source_version_id: str):
+        try: return store.source_review_detail(source_version_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/source-versions/{source_version_id}/review/approve")
+    def approve_source_review(source_version_id: str):
+        try: return store.approve_source_version(source_version_id)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-versions/{source_version_id}/preparation/retry", status_code=202)
+    def retry_source_preparation(source_version_id: str):
+        try: return store.retry_source_preparation(source_version_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/source-chunks/{chunk_id}")
+    def update_source_chunk(chunk_id: str, payload: SourceChunkUpdateRequest):
+        try: return store.update_source_chunk(chunk_id, payload.content, payload.expected_revision_no)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-chunks/{chunk_id}/split")
+    def split_source_chunk(chunk_id: str, payload: SourceChunkSplitRequest):
+        try: return store.split_source_chunk(chunk_id, payload.parts, payload.expected_revision_no)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-chunks/merge")
+    def merge_source_chunks(payload: SourceChunkMergeRequest):
+        try: return store.merge_source_chunks(payload.chunk_ids, payload.expected_revisions)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/source-chunks/{chunk_id}")
+    def delete_source_chunk(chunk_id: str, expected_revision_no: int = Query(ge=1)):
+        try: return store.delete_source_chunk(chunk_id, expected_revision_no)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-chunks/{chunk_id}/review")
+    def review_source_chunk(chunk_id: str, payload: SourceChunkReviewRequest):
+        try: return store.review_source_chunk(chunk_id, payload.status, payload.expected_revision_no)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-chunks/{chunk_id}/reopen")
+    def reopen_source_chunk(chunk_id: str):
+        try: return store.reopen_source_chunk(chunk_id)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/sources/{source_id}/versions/{version_id}/download")
     def download_source(source_id: str, version_id: str):
         try: version = store.source_version_for_download(source_id, version_id)
@@ -797,6 +1025,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/knowledge-jobs", status_code=202)
     def create_knowledge_job(payload: KnowledgeJobRequest):
         try: return store.create_knowledge_job(payload.source_version_ids, payload.output_library_ids, payload.knowledge_flow_template_id)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/knowledge-jobs/batch-actions")
@@ -859,7 +1088,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/developer/standard-pipelines")
     def standard_pipelines():
-        return [{"code": "common", "steps": ["Document Parse", "Document Clean", "Knowledge Chunk", "Production", "Knowledge Publish"]}]
+        return [{"code": "common", "steps": [
+            "Source Preparation", "SourceChunk 人工审核 Gate", "Knowledge Flow",
+            "Knowledge Sink", "Embedding", "Milvus", "Ready / Routing",
+        ]}]
 
     @app.get("/api/developer/operator-catalog")
     def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",
@@ -1036,7 +1268,28 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/developer/vector-indexes")
-    def vector_indexes(): return {"profiles": store.list_index_profiles(), "managed_collections": store.list_managed_collections(), "capacity": VectorSyncService.from_environment(store).capacity_report()}
+    def vector_indexes():
+        profiles = store.list_index_profiles()
+        observed = {}
+        try:
+            observed = {item["collection_name"]: item for item in MilvusInventoryService.from_environment(store).collections()}
+        except Exception:
+            observed = {}
+        for profile in profiles:
+            collection = observed.get(profile["collection_name"]) or {}
+            serving_dimension = (profile.get("embedding_serving") or {}).get("dimension")
+            profile_dimension = profile.get("dimension")
+            collection_dimension = collection.get("dimension")
+            profile["vector_contract"] = {
+                "embedding_serving_dimension": serving_dimension,
+                "index_profile_dimension": profile_dimension,
+                "milvus_collection_dimension": collection_dimension,
+                "compatible": serving_dimension == profile_dimension and (
+                    collection_dimension is None or collection_dimension == profile_dimension
+                ),
+            }
+        return {"profiles": profiles, "managed_collections": store.list_managed_collections(),
+                "capacity": VectorSyncService.from_environment(store).capacity_report()}
 
     @app.get("/api/vector-storage/overview")
     def vector_storage_overview():
@@ -1049,6 +1302,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         status: str = "",
         only_anomaly: bool = False,
         only_unused: bool = False,
+        only_managed: bool = False,
     ):
         if status and status not in INVENTORY_STATUSES:
             raise HTTPException(status_code=422, detail="向量库存状态筛选无效")
@@ -1059,6 +1313,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return service.collections(
                 q=q, knowledge_type=knowledge_type, status=status,
                 only_anomaly=only_anomaly, only_unused=only_unused,
+                only_managed=only_managed,
             )
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"Milvus 库存读取失败：{exc}") from exc
@@ -1157,8 +1412,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return store.create_index_profile(payload.code, payload.knowledge_type, payload.collection_name, payload.embedding_code,
                                               payload.embedding_model, payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
                                               collection_policy=policy, collection_mode=payload.collection_mode,
-                                              storage_schema=payload.storage_schema, index_spec=payload.index_spec,
-                                              reuse_managed_collection_id=payload.reuse_managed_collection_id)
+                                               storage_schema=payload.storage_schema, index_spec=payload.index_spec,
+                                               reuse_managed_collection_id=payload.reuse_managed_collection_id,
+                                               embedding_serving_id=payload.embedding_serving_id,
+                                               embedding_input=payload.embedding_input)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/index-profiles/{profile_id}/revisions", status_code=201)
@@ -1171,8 +1428,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return store.revise_index_profile(profile_id, payload.collection_name, payload.embedding_code, payload.embedding_model,
                                               payload.dimension, payload.metric_type, payload.endpoint_ref, payload.fields,
                                               collection_policy=policy, storage_schema=payload.storage_schema,
-                                              index_spec=payload.index_spec,
-                                              reuse_managed_collection_id=payload.reuse_managed_collection_id)
+                                               index_spec=payload.index_spec,
+                                               reuse_managed_collection_id=payload.reuse_managed_collection_id,
+                                               embedding_serving_id=payload.embedding_serving_id,
+                                               embedding_input=payload.embedding_input)
         except ValueError as exc: raise _error(exc) from exc
 
     def index_validator(collection_name: str, fields: dict, dimension: int) -> None:
@@ -1211,6 +1470,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/knowledge-libraries/{library_id}/vector-sync-jobs", status_code=202)
     def create_vector_sync_jobs(library_id: str):
         try: return store.create_vector_sync_jobs(library_id)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/vector-sync-jobs")

@@ -13,9 +13,10 @@ export const LOCAL_BUSINESS_MENU_ITEM = {
 }
 
 export const DEVELOPER_MENU_REGISTRY = [
+  { key: 'model-services', label: '模型服务', caption: '大模型与 Embedding', icon: '✦', to: '/developer/model-services' },
   { key: 'knowledge-types', label: '知识类型', caption: '当前启用与扩展', icon: '◇', to: '/developer/knowledge-types' },
   { key: 'standard-pipelines', label: '标准流程', caption: '公共前置处理', icon: '⇢', to: '/developer/standard-pipelines' },
-  { key: 'flow-templates', label: '模板', caption: '单产出 / 多产出', icon: '▦', to: '/developer/flow-templates' },
+  { key: 'flow-templates', label: '知识流程模板', caption: '单产出 / 多产出', icon: '▦', to: '/developer/flow-templates' },
   { key: 'dataflow-debug', label: 'DataFlow 调试台', caption: 'V7 运行诊断（只读）', icon: '◎', to: '/developer/dataflow-debug' },
 ]
 

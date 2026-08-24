@@ -21,6 +21,7 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "text-normalizer": "规范字符、标点与文本格式",
     "semantic-chunker": "按语义边界将文档切分为文本块",
     "source-chunk-builder": "生成可追溯的正式来源文本块",
+    "reviewed-source-chunk-input": "读取人工审核快照中冻结的来源文本块",
     "faq-table-row-builder": "将单机构 FAQ 表格逐行规范为来源切片",
     "faq-record-mapper": "将规范 FAQ 行确定性映射为专用知识",
     "deduplicate": "移除重复的候选知识",
@@ -61,6 +62,7 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "document-parser": "文档解析器", "document-ir-normalizer": "文档结构规范器", "null-filter": "空内容过滤器",
     "language-filter": "语言过滤器", "text-cleaner": "文本清洗器", "whitespace-cleaner": "空白清理器",
     "text-normalizer": "文本规范器", "semantic-chunker": "语义切片器", "source-chunk-builder": "来源切片构建器",
+    "reviewed-source-chunk-input": "已审核来源切片",
     "deduplicate": "候选去重器", "prompt-generator": "提示词生成器", "qa-generator": "问答生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
     "triple-builder": "三元组构建器", "entity-normalizer": "实体规范器", "semantic-relation-builder": "语义关系构建器",
@@ -159,6 +161,7 @@ def _entry(code: str, name: str, category: str, source: str, target: str, adapte
 
 
 CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
+    _entry("reviewed-source-chunk-input", "Reviewed SourceChunk Input", "文档", "approved_source_chunks", "source_chunk_set", "reviewed_source_chunk_input"),
     _entry("document-parser", "Document Parser", "文档", "source_file", "document_ir", "document_parser", upstream=["DataForgeNativeParser", "MinerUPipelineHTTPAdapter"]),
     _entry("document-ir-normalizer", "Document IR Normalizer", "文档", "document_ir", "document_ir", "document_ir_normalizer"),
     _entry("null-filter", "Null Filter", "清洗", "document_ir", "document_ir", "content_null_filter", upstream=["ContentNullFilter"]),
@@ -227,11 +230,9 @@ def subflow_seeds() -> tuple[dict[str, Any], ...]:
 
 def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = [
-        {"id": "parse", "kind": "subflow", "ref": "document-parse"},
-        {"id": "clean", "kind": "subflow", "ref": "document-clean"},
-        {"id": "chunk", "kind": "subflow", "ref": "knowledge-chunk"},
+        {"id": "reviewed-input", "kind": "operator", "ref": "reviewed-source-chunk-input"},
     ]
-    edges: list[list[str]] = [["parse", "clean"], ["clean", "chunk"]]
+    edges: list[list[str]] = []
     generators = {"text": "prompt-generator", "qa": "qa-generator", "graph": "graph-extractor"}
     for raw_kind in output_types:
         kind = "graph:triple" if raw_kind == "graph" else raw_kind
@@ -250,7 +251,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
                 {"id": f"literals-{kind}", "kind": "operator", "ref": "literal-detector", "params": {"knowledge_type": "graph", "graph_mode": mode}},
                 {"id": f"relations-{kind}", "kind": "operator", "ref": "relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
             ]
-            graph_edges = [["chunk", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"relations-{kind}"], [f"relations-{kind}", generator]]
+            graph_edges = [["reviewed-input", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"relations-{kind}"], [f"relations-{kind}", generator]]
             generator_ref = "triple-builder"
         elif kind == "graph:semantic":
             graph_prefix = [
@@ -260,7 +261,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
                 {"id": f"relations-{kind}", "kind": "operator", "ref": "relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
                 {"id": f"build-{kind}", "kind": "operator", "ref": "semantic-relation-builder", "params": {"knowledge_type": "graph", "graph_mode": mode}},
             ]
-            graph_edges = [["chunk", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"normalize-{kind}"], [f"normalize-{kind}", f"relations-{kind}"], [f"relations-{kind}", f"build-{kind}"], [f"build-{kind}", generator]]
+            graph_edges = [["reviewed-input", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"normalize-{kind}"], [f"normalize-{kind}", f"relations-{kind}"], [f"relations-{kind}", f"build-{kind}"], [f"build-{kind}", generator]]
             generator_ref = "evidence-binder"
         if generator_ref in {"prompt-generator", "structured-knowledge-generator"}:
             generator_params["prompt_template_revision_id"] = "promptrev_default"
@@ -277,11 +278,29 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             {"id": diff, "kind": "operator", "ref": "knowledge-diff", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": sink, "kind": "knowledge_sink", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
         ))
-        edges.extend(graph_edges or [["chunk", generator]])
+        edges.extend(graph_edges or [["reviewed-input", generator]])
         edges.extend((
             [generator, evaluator], [evaluator, quality_filter],
             [quality_filter, binding], [binding, validator], [validator, quality], [quality, diff], [diff, sink],
         ))
-    return {"schema_version": 3, "nodes": nodes, "edges": [
+    return {"schema_version": 3, "purpose": "knowledge", "nodes": nodes, "edges": [
         {"source": edge[0], "source_port": "output", "target": edge[1], "target_port": "input"} for edge in edges
     ], "graph_config": {"entity_types": [], "relation_types": []}, "ui": {"positions": {}}}
+
+
+def preparation_flow_definition() -> dict[str, Any]:
+    """Hidden system flow that stops after formal SourceChunk production."""
+    return {
+        "schema_version": 3,
+        "purpose": "source_preparation",
+        "nodes": [
+            {"id": "parse", "kind": "subflow", "ref": "document-parse"},
+            {"id": "clean", "kind": "subflow", "ref": "document-clean"},
+            {"id": "chunk", "kind": "subflow", "ref": "knowledge-chunk"},
+        ],
+        "edges": [
+            {"source": "parse", "source_port": "output", "target": "clean", "target_port": "input"},
+            {"source": "clean", "source_port": "output", "target": "chunk", "target_port": "input"},
+        ],
+        "ui": {"positions": {}},
+    }

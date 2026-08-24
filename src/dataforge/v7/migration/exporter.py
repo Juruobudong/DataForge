@@ -22,7 +22,8 @@ from ..models import (
     KnowledgeFlowTemplate, KnowledgeFlowTemplateRevision, KnowledgeLibrary, KnowledgeType,
     KnowledgeTypeIndexBinding, KnowledgeTypeModeRevision, KnowledgeTypeRevision,
     OperatorDefinition, OperatorVersion, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
-    ProjectOrgRouteLibrary, ProjectRouteVersion, ProjectTask, Source, SourceChunk, SourceVersion,
+    ProjectOrgRouteLibrary, ProjectRouteVersion, ProjectTask, Source, SourceChunk, SourceChunkRevision,
+    SourceReviewSnapshot, SourceReviewSnapshotChunk, SourceVersion,
     PromptTemplate, PromptTemplateRevision, QualityProfile, QualityProfileRevision,
     StorageContract, StorageContractRevision,
 )
@@ -266,6 +267,16 @@ class MigrationExporter:
             metadata["knowledge_items"] = items
             metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeItemSource).where(
                 KnowledgeItemSource.knowledge_item_id.in_([item.id for item in items])))) if items else []
+            chunk_ids = [item.id for item in metadata["source_chunks"]]
+            review_snapshot_ids = {item.source_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.source_review_snapshot_id}
+            metadata["source_chunk_revisions"] = list(session.scalars(select(SourceChunkRevision).where(
+                SourceChunkRevision.source_chunk_id.in_(chunk_ids)))) if chunk_ids else []
+            metadata["source_review_snapshots"] = list(session.scalars(select(SourceReviewSnapshot).where(
+                SourceReviewSnapshot.id.in_(review_snapshot_ids), SourceReviewSnapshot.status == "approved"))) if review_snapshot_ids else []
+            metadata["source_review_snapshot_chunks"] = list(session.scalars(select(SourceReviewSnapshotChunk).where(
+                SourceReviewSnapshotChunk.source_review_snapshot_id.in_(review_snapshot_ids),
+                SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
+            ))) if review_snapshot_ids and chunk_ids else []
             for name, values in metadata.items(): builder.add_bytes(f"metadata/{name}.jsonl", jsonl(values))
             for version in metadata["source_versions"]:
                 target = work / "objects" / version.id
@@ -323,6 +334,16 @@ class MigrationExporter:
             metadata["knowledge_items"] = items
             metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeItemSource).where(
                 KnowledgeItemSource.knowledge_item_id.in_([item.id for item in items])))) if items else []
+            chunk_ids = [item.id for item in metadata["source_chunks"]]
+            review_snapshot_ids = {item.source_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.source_review_snapshot_id}
+            metadata["source_chunk_revisions"] = list(session.scalars(select(SourceChunkRevision).where(
+                SourceChunkRevision.source_chunk_id.in_(chunk_ids)))) if chunk_ids else []
+            metadata["source_review_snapshots"] = list(session.scalars(select(SourceReviewSnapshot).where(
+                SourceReviewSnapshot.id.in_(review_snapshot_ids), SourceReviewSnapshot.status == "approved"))) if review_snapshot_ids else []
+            metadata["source_review_snapshot_chunks"] = list(session.scalars(select(SourceReviewSnapshotChunk).where(
+                SourceReviewSnapshotChunk.source_review_snapshot_id.in_(review_snapshot_ids),
+                SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
+            ))) if review_snapshot_ids and chunk_ids else []
             self._add_runtime_closure(session, metadata, plan)
             for name, values in metadata.items():
                 payload = jsonl_payloads(values) if values and isinstance(values[0], dict) else jsonl(values)

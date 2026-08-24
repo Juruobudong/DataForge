@@ -321,25 +321,20 @@ def upsert_candidates(store: "V7Store", spec: LegacyCollectionSpec, candidates: 
 
 def run_vector_sync(store: "V7Store", library_id: str, uri: str) -> list[dict[str, Any]]:
     from .provisioning import ManagedCollectionProvisioner
-    from .vector import OpenAILikeEmbeddingProvider, V7Milvus, VectorSyncService
+    from dataforge.config import Settings
+    from .servings import EmbeddingServingRegistry, ServingManager
+    from .vector import V7Milvus, VectorSyncService
 
     library, profiles = store.index_profiles_for_library(library_id)
     milvus = V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"))
     provisioner = ManagedCollectionProvisioner(store, milvus)
     for profile in profiles:
         provisioner.ensure_collection_for_profile(profile.revision_id)
-    api_base = os.getenv("EMBEDDING_API_BASE", "").strip()
-    if not api_base:
-        raise RuntimeError("未配置 EMBEDDING_API_BASE，不能为旧知识重新生成 embedding")
-    batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
-    if batch_size <= 0:
-        raise ValueError("EMBEDDING_BATCH_SIZE 必须为正整数")
+    registry = EmbeddingServingRegistry(ServingManager(
+        store.sessions, Settings.load().config_encryption_key,
+    ))
     service = VectorSyncService(
-        store,
-        milvus=milvus,
-        embeddings=OpenAILikeEmbeddingProvider(
-            api_base, os.getenv("EMBEDDING_API_KEY", "fake"), batch_size,
-        ),
+        store, milvus=milvus, embedding_registry=registry,
     )
     results = [service.run(job["id"]) for job in store.create_vector_sync_jobs(library.id)]
     if not results or any(result.get("status") != "ready" for result in results):

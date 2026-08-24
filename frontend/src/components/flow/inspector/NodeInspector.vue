@@ -1,16 +1,24 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { hasEditableParameters } from '../flowModel.js'
+import ServingSelector from './ServingSelector.vue'
 const props = defineProps({ node: Object, issue: Object, sampleResult: Object })
 const emit = defineEmits(['apply-parameters'])
-const tab = ref('parameters'), text = ref('{}')
+const tab = ref('parameters'), text = ref('{}'), params = ref({})
 const parseError = ref('')
-watch(() => props.node, node => { text.value = JSON.stringify(node?.data.definition.params || {}, null, 2); parseError.value = '' }, { immediate: true })
+watch(() => props.node, node => { params.value = { ...(node?.data.definition.params || {}) }; text.value = JSON.stringify(params.value, null, 2); parseError.value = '' }, { immediate: true })
 const documentParser = computed(() => props.node?.data.meta.code === 'document-parser')
 const editable = computed(() => hasEditableParameters(props.node))
 const nodeRun = computed(() => props.node ? props.sampleResult?.node_runs?.[props.node.id] || null : null)
+const parameterSchema = computed(() => props.node?.data.meta.parameterSchema || {})
+const hasServing = computed(() => Boolean(parameterSchema.value.properties?.llm_serving))
+const scalarParameters = computed(() => Object.entries(parameterSchema.value.properties || {}).filter(([name, spec]) => name !== 'llm_serving' && ['string', 'integer', 'number', 'boolean'].includes(spec.type)))
 const format = value => JSON.stringify(value, null, 2)
-function apply() { try { const value = JSON.parse(text.value || '{}'); if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(); parseError.value = ''; emit('apply-parameters', value) } catch { parseError.value = '参数必须是有效的 JSON 对象' } }
+function syncText() { text.value = JSON.stringify(params.value, null, 2) }
+function updateServing(value) { if (value) params.value.llm_serving = value; else delete params.value.llm_serving; syncText() }
+function updateScalar(name, spec, event) { const raw = event.target.type === 'checkbox' ? event.target.checked : event.target.value; params.value[name] = spec.type === 'integer' || spec.type === 'number' ? Number(raw) : raw; syncText() }
+function applyStructured() { parseError.value = ''; emit('apply-parameters', { ...params.value }) }
+function apply() { try { const value = JSON.parse(text.value || '{}'); if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(); params.value = value; parseError.value = ''; emit('apply-parameters', value) } catch { parseError.value = '参数必须是有效的 JSON 对象' } }
 </script>
 <template>
   <aside class="node-inspector">
@@ -20,7 +28,17 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
       <nav><button :class="{ active: tab==='parameters' }" @click="tab='parameters'">参数</button><button :class="{ active: tab==='ports' }" @click="tab='ports'">输入输出</button><button :class="{ active: tab==='schema' }" @click="tab='schema'">Schema</button><button :class="{ active: tab==='result' }" @click="tab='result'">运行结果</button></nav>
       <section v-if="tab==='parameters'" class="inspector-body">
         <div v-if="documentParser" class="fixed-parser"><h4>PDF 自动解析</h4><dl><div><dt>Backend</dt><dd>pipeline</dd></div><div><dt>Parse method</dt><dd>auto</dd></div></dl><p class="muted">扫描件判断与 OCR 由 MinerU 内部处理，当前不开放节点参数。</p></div>
-        <template v-else><label>节点参数 JSON<textarea v-model="text" rows="16" :disabled="!editable" spellcheck="false" /></label><p v-if="!editable" class="muted">该节点参数由已发布资产定义，只读。</p><p v-if="parseError" class="inline-error">{{ parseError }}</p><button v-if="editable" class="primary apply" @click="apply">应用参数</button></template>
+        <template v-else>
+          <ServingSelector v-if="hasServing" :model-value="params.llm_serving || ''" :disabled="!editable" @update:model-value="updateServing" />
+          <label v-for="([name, spec]) in scalarParameters" :key="name">{{ spec.title || name }}
+            <input v-if="spec.type==='boolean'" type="checkbox" :checked="Boolean(params[name])" :disabled="!editable" @change="updateScalar(name,spec,$event)">
+            <textarea v-else-if="spec.type==='string' && (name.includes('prompt') || (spec.description || '').length > 80)" :value="params[name] ?? ''" rows="5" :disabled="!editable" @input="updateScalar(name,spec,$event)" />
+            <input v-else :type="spec.type==='string' ? 'text' : 'number'" :value="params[name] ?? ''" :disabled="!editable" @input="updateScalar(name,spec,$event)">
+          </label>
+          <button v-if="editable && (hasServing || scalarParameters.length)" class="primary apply" @click="applyStructured">应用常用参数</button>
+          <details class="advanced"><summary>高级配置（JSON）</summary><label>节点参数 JSON<textarea v-model="text" rows="14" :disabled="!editable" spellcheck="false" /></label><button v-if="editable" class="apply" @click="apply">应用 JSON</button></details>
+          <p v-if="!editable" class="muted">该节点参数由已发布资产定义，只读。</p><p v-if="parseError" class="inline-error">{{ parseError }}</p>
+        </template>
       </section>
       <section v-else-if="tab==='ports'" class="inspector-body io-body">
         <h4>INPUT</h4>
@@ -43,4 +61,5 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
 <style scoped>
 .inspector-body h5{margin:9px 0 5px;color:#69778b;font-size:8px}.inspector-body pre{max-height:180px;overflow:auto;padding:8px;border:1px solid #edf0f4;border-radius:7px;background:#f8fafc;white-space:pre-wrap;word-break:break-word}.port-block+.port-block{margin-top:12px}.preview-meta{display:block;margin-top:4px;color:#7d8ba0;font-size:7px}.io-body details,.result-body details{margin-top:12px}.io-body summary,.result-body summary{cursor:pointer;color:#2f6fed;font-size:8px;font-weight:800}.io-body details pre,.result-body details pre{margin-top:6px}.run-status{display:inline-block;margin:0;padding:4px 7px;border-radius:999px;background:#eaf7f1;color:#1d8c65;font-size:8px;font-weight:850}.run-status.failed,.run-status.skipped{background:#fff0f0;color:#c94a4a}
 .fixed-parser{padding:12px;border:1px solid #d9e5ff;border-radius:9px;background:#f6f9ff}.fixed-parser h4{margin:0 0 10px;color:#2f6fed}.fixed-parser dl{margin:0}.fixed-parser dl div{display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-top:1px solid #e5edfb}.fixed-parser dt{color:#69778b;font-size:8px}.fixed-parser dd{margin:0;color:#24364f;font:9px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:800}
+.advanced{margin-top:12px}.advanced summary{cursor:pointer;color:#2f6fed;font-size:8px;font-weight:800}.advanced label{margin-top:8px}
 </style>

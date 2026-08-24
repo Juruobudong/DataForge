@@ -11,9 +11,12 @@ from typing import Any
 import yaml
 from openai import OpenAI
 
+from .servings import DatabaseLLMServingRegistry, ServingManager
+
 
 DEFAULT_LLM_SERVING_ID = "qwen3_32b"
 _SERVING_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_database_registry: DatabaseLLMServingRegistry | None = None
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,19 @@ def _load_registry_cached(path: str) -> LLMServingRegistry:
     return _parse_registry(Path(path))
 
 
-def get_llm_serving_registry(path: str | Path | None = None) -> LLMServingRegistry:
+def configure_llm_serving_registry(sessions, encryption_key: str | None, *, client_factory=OpenAI):
+    """Install the process-local DB registry used by Flow compilation and Runner calls."""
+    global _database_registry
+    _database_registry = DatabaseLLMServingRegistry(
+        ServingManager(sessions, encryption_key, client_factory=client_factory)
+    )
+    return _database_registry
+
+
+def get_llm_serving_registry(path: str | Path | None = None):
     """Load one registry by resolved path; connection clients stay process-local."""
+    if path is not None or os.getenv("DATAFORGE_LLM_SERVINGS_PATH"):
+        return _load_registry_cached(str(_config_path(path)))
+    if path is None and _database_registry is not None:
+        return _database_registry
     return _load_registry_cached(str(_config_path(path)))

@@ -43,7 +43,7 @@ conda activate sun
 uv run --extra web dataforge-runner
 ```
 
-运行前需要按 [`compose.yaml`](compose.yaml) 中同名环境变量配置数据库、对象存储、Runner、Embedding、Model Serving、Milvus、Routing 与迁移目录。机构 local 保存 Milvus 密码或 Token 时，必须设置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）。
+运行前需要按 [`compose.yaml`](compose.yaml) 配置数据库、对象存储、Runner、Milvus、Routing 与迁移目录。中心环境在 `.env.docker` 通过 `DATAFORGE_DEFAULT_LLM_BASE_URL/MODEL/MAX_TOKENS`、`LOCAL_LLM_API_KEY` 和 `EMBEDDING_API_BASE/API_KEY/MODEL/DIM/BATCH_SIZE` 初始化两个默认 Serving；这些变量只由 migrate 首次读取，数据库记录存在后改由“模型服务”页面维护且 Seed 不覆盖。保存非占位 API Key 或 local Milvus 凭据时，必须设置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）。
 
 ## 启动前端
 

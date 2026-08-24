@@ -197,7 +197,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
             <header><b>自定义流程</b><small>{{ templateGroups.custom.length }} 项</small></header>
             <div v-if="templateGroups.custom.length" class="template-list">
               <button v-for="item in templateGroups.custom" :key="item.id" :class="{ active:selected?.id===item.id }" @click="edit(item)">
-                <span class="template-card-title"><b>{{ item.name }}</b></span>
+                <span class="template-card-title"><b>{{ item.name }}</b><span v-if="item.needs_review_upgrade" class="upgrade-tag">需升级审核入口</span></span>
                 <small v-if="outputSummary(item)" class="output-summary">{{ outputSummary(item) }}</small>
                 <small class="template-meta">{{ item.code }} · r{{ item.revision || '-' }}<template v-if="item.is_default"> · 默认</template></small>
               </button>
@@ -232,6 +232,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
 <style scoped>
 .template-page-head p,.template-list small,.template-settings>label,.template-settings legend,.template-settings fieldset label,.selection-state,.validation-panel>div span,.subflow-grid small,.subflow-grid p,.secondary-filters label { font-size: var(--font-technical); }
 .dsl-badge,.save-state { font-size: var(--font-technical); }
+.upgrade-tag { padding: 2px 6px; border: 1px solid #efcf91; border-radius: 999px; color: #986316; background: #fff7e7; font-size: var(--font-technical); font-weight: 800; }
 .template-page-head { gap: 28px; }
 .template-settings { gap: 12px; padding: 16px; }
 .flow-toolbar { min-height: 54px; padding: 9px 12px; }

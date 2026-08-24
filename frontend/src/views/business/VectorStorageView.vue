@@ -3,14 +3,14 @@ import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '../../api/platform'
 import {
-  formatInventoryCount, knowledgeTypeLabel, sortCollections, sortPartitions,
+  defaultVectorStorageFilters, formatInventoryCount, knowledgeTypeLabel, sortCollections, sortPartitions,
   vectorStatusClass, vectorStatusLabel,
 } from './vectorStorageModel'
 
 const router = useRouter()
 const overview = ref(null), collections = ref([]), collectionDetails = reactive({})
 const expanded = ref(new Set()), loading = ref(false), error = ref(''), notice = ref('')
-const filters = reactive({ q: '', knowledge_type: '', status: '', only_anomaly: false, only_unused: false })
+const filters = reactive(defaultVectorStorageFilters())
 const selectedPartition = ref(null), drawer = ref(null), drawerClose = ref(null), returnFocus = ref(null)
 const gcPlan = ref(null), gcOpen = ref(false), gcConfirmed = ref(false)
 const sortedCollections = computed(() => sortCollections(collections.value))
@@ -118,6 +118,7 @@ onMounted(refresh)
         <label>搜索<input v-model="filters.q" placeholder="Collection / Partition / 知识库" @keyup.enter="loadCollections"></label>
         <label>知识类型<select v-model="filters.knowledge_type" @change="loadCollections"><option value="">全部</option><option value="text">文本</option><option value="qa">问答</option><option value="graph:triple">三元组图谱</option><option value="graph:semantic">语义图谱</option></select></label>
         <label>状态<select v-model="filters.status" @change="loadCollections"><option value="">全部</option><option v-for="value in ['USING','PENDING','HISTORY','GC_ELIGIBLE','INCONSISTENT','UNMANAGED']" :key="value" :value="value">{{ vectorStatusLabel(value) }}</option></select></label>
+        <label class="check"><input v-model="filters.only_managed" type="checkbox" @change="loadCollections">只看已托管</label>
         <label class="check"><input v-model="filters.only_anomaly" type="checkbox" @change="loadCollections">只看异常</label>
         <label class="check"><input v-model="filters.only_unused" type="checkbox" @change="loadCollections">只看未使用</label>
         <button @click="loadCollections">查询</button>
@@ -150,5 +151,5 @@ onMounted(refresh)
 </template>
 
 <style scoped>
-.vector-storage-page{display:grid;gap:18px}.vector-overview{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px}.vector-overview>div{display:grid;gap:7px;padding:12px;border-radius:10px;background:var(--panel-muted)}.vector-overview small{color:var(--muted)}.vector-overview b{font-size:18px}.vector-overview code{font-size:12px}.vector-filters{display:grid;grid-template-columns:minmax(260px,2fr) repeat(2,minmax(150px,1fr)) auto auto auto;align-items:end;gap:10px}.vector-filters label{display:grid;gap:6px;color:var(--muted);font-size:12px}.vector-filters .check{display:flex;align-items:center;align-self:center;gap:6px;color:var(--text)}.vector-collection-table{min-width:1080px}.expand-button{width:30px;min-height:30px;padding:0}.partition-container>td{padding:12px;background:#f8faff}.partition-table{min-width:960px}.text-link{padding:0;border:0;background:transparent;color:var(--blue);font-weight:750}.drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.vector-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(590px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.vector-drawer>header{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}.vector-drawer h3{margin:4px 0 0}.route-reference{display:grid;gap:4px;padding:10px 0;border-top:1px solid var(--border)}.route-reference:first-of-type{border-top:0}.route-reference span,.route-reference small{color:var(--muted)}.gc-dialog{width:min(680px,calc(100vw - 40px));max-height:80vh;overflow:auto}.gc-list{display:grid;gap:5px;max-height:280px;overflow:auto;margin:14px 0;padding:12px;background:var(--panel-muted)}@media(max-width:1500px){.vector-overview{grid-template-columns:repeat(4,minmax(0,1fr))}.vector-filters{grid-template-columns:2fr 1fr 1fr}}
+.vector-storage-page{display:grid;gap:18px}.vector-overview{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px}.vector-overview>div{display:grid;gap:7px;padding:12px;border-radius:10px;background:var(--panel-muted)}.vector-overview small{color:var(--muted)}.vector-overview b{font-size:18px}.vector-overview code{font-size:12px}.vector-filters{display:grid;grid-template-columns:minmax(260px,2fr) repeat(2,minmax(150px,1fr)) repeat(4,auto);align-items:end;gap:10px}.vector-filters label{display:grid;gap:6px;color:var(--muted);font-size:12px}.vector-filters .check{display:flex;align-items:center;align-self:center;gap:6px;color:var(--text)}.vector-collection-table{min-width:1080px}.expand-button{width:30px;min-height:30px;padding:0}.partition-container>td{padding:12px;background:#f8faff}.partition-table{min-width:960px}.text-link{padding:0;border:0;background:transparent;color:var(--blue);font-weight:750}.drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.vector-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(590px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.vector-drawer>header{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}.vector-drawer h3{margin:4px 0 0}.route-reference{display:grid;gap:4px;padding:10px 0;border-top:1px solid var(--border)}.route-reference:first-of-type{border-top:0}.route-reference span,.route-reference small{color:var(--muted)}.gc-dialog{width:min(680px,calc(100vw - 40px));max-height:80vh;overflow:auto}.gc-list{display:grid;gap:5px;max-height:280px;overflow:auto;margin:14px 0;padding:12px;background:var(--panel-muted)}@media(max-width:1500px){.vector-overview{grid-template-columns:repeat(4,minmax(0,1fr))}.vector-filters{grid-template-columns:2fr 1fr 1fr}}
 </style>

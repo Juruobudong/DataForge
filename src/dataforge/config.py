@@ -47,6 +47,7 @@ class Settings:
     runner_timeout_seconds: float = 1860.0
     knowledge_job_concurrency: int = 3
     vector_sync_concurrency: int = 2
+    source_preparation_concurrency: int = 2
     derived_runs_enabled: bool = False
     derived_run_commit_enabled: bool = False
     instance_mode: str = "central"
@@ -86,6 +87,7 @@ class Settings:
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
             knowledge_job_concurrency=_positive_int_environment("DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY", 3),
             vector_sync_concurrency=_positive_int_environment("DATAFORGE_VECTOR_SYNC_CONCURRENCY", 2),
+            source_preparation_concurrency=_positive_int_environment("DATAFORGE_SOURCE_PREPARATION_CONCURRENCY", 2),
             derived_runs_enabled=os.getenv("DATAFORGE_DERIVED_RUNS_ENABLED", "0") == "1",
             derived_run_commit_enabled=os.getenv("DATAFORGE_DERIVED_RUN_COMMIT_ENABLED", "0") == "1",
             instance_mode=os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower(),

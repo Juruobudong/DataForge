@@ -16,10 +16,12 @@ const productionSteps = computed(() => {
   const values = overview.value?.production || {}
   return [
     { label: '文档库', value: `${values.document_library_count || 0} 个文档库`, to: '/business/documents' },
+    { label: '人工审核 Gate', value: 'SourceChunk 批准后放行', to: '/business/documents' },
     { label: '知识流程模板', value: `${values.active_template_binding_count || 0} 个模板绑定`, to: '/developer/flow-templates' },
-    { label: '处理任务', value: `${values.active_job_count || 0} 个待处理任务`, to: '/business/jobs' },
+    { label: 'LLM / Operator', value: `${values.active_job_count || 0} 个待处理任务`, to: '/business/jobs' },
     { label: 'Knowledge Sink', value: `${(values.knowledge_item_count || 0).toLocaleString()} 条知识`, to: '/business/knowledge' },
-    { label: '向量同步', value: `${values.vector_ready_count || 0} / ${values.vector_library_count || 0} Vector Ready`, to: '/business/knowledge' },
+    { label: 'Embedding / Milvus', value: `${values.vector_ready_count || 0} / ${values.vector_library_count || 0} 已同步`, to: '/business/vector-storage' },
+    { label: 'Ready / Routing', value: '项目发布', to: '/business/authorization' },
   ]
 })
 async function load() { try { overview.value = await api.dashboardOverview(); error.value = '' } catch (e) { error.value = e.message } finally { loading.value = false } }
@@ -43,12 +45,12 @@ onUnmounted(() => { if (pollTimer) window.clearTimeout(pollTimer) })
   <p v-if="error" class="error">{{ error }}</p><p v-else-if="loading" class="loading">正在加载运行概览…</p>
   <template v-else-if="overview">
     <section class="dashboard-section"><div class="section-heading"><h3>运行概览</h3><p>只显示当前需要关注的运行状态。</p></div><div class="runtime-grid"><article v-for="card in runCards" :key="card.key" class="overview-card"><span>{{ card.label }}</span><b>{{ card.value }}</b><i :class="['status-dot', card.tone]"></i></article></div></section>
+    <section class="dashboard-section"><div class="section-heading"><h3>知识资产概览</h3><p>固定知识类型统一使用“知识库数量 · 知识条数”口径。</p></div><div class="asset-grid"><button v-for="asset in overview.knowledge_assets" :key="asset.key" class="asset-card" @click="openKnowledgeType(asset.key)"><span class="asset-icon">{{ asset.icon }}</span><span><b>{{ asset.label }}</b><small>{{ asset.library_count }} 个知识库 · {{ asset.knowledge_item_count.toLocaleString() }} 条知识</small></span><span>→</span></button></div></section>
     <section class="dashboard-section"><div class="section-heading component-heading"><div><h3>系统组件</h3><p>Worker/Runner 自动心跳；其他组件仅在点击检查后执行真实探针。</p></div><div class="component-actions"><button @click="selectAll">全选</button><button @click="selected=[]">取消全选</button><button class="primary" :disabled="!selected.length || checking" @click="startCheck()">{{ checking ? '检查中…' : '检查选中项' }}</button></div></div>
       <div class="component-grid"><article v-for="item in components" :key="item.component" class="component-card"><label><input v-model="selected" type="checkbox" :value="item.component">{{ item.label }}</label><span :class="['badge', componentTone(item.status)]">{{ item.status }}</span><b>{{ item.summary }}</b><small>{{ item.latency_ms != null ? `${item.latency_ms} ms · ` : '' }}{{ componentAge(item) }}</small><button :disabled="checking" @click="startCheck([item.component])">仅检查此项</button></article></div>
       <div v-if="checkRun" class="check-progress"><b>本次检查：{{ checkRun.status }}</b><span v-for="item in checkRun.results" :key="item.component">{{ item.component }}：{{ item.status }}</span></div>
       <div v-if="overview.observability?.diagnoses?.length" class="diagnosis-list"><div v-for="item in overview.observability.diagnoses" :key="item.component"><b>{{ item.message }}</b><span>受影响任务 {{ item.affected_jobs }} 个</span></div></div>
     </section>
-    <section class="dashboard-section"><div class="section-heading"><h3>知识资产概览</h3><p>固定知识类型统一使用“知识库数量 · 知识条数”口径。</p></div><div class="asset-grid"><button v-for="asset in overview.knowledge_assets" :key="asset.key" class="asset-card" @click="openKnowledgeType(asset.key)"><span class="asset-icon">{{ asset.icon }}</span><span><b>{{ asset.label }}</b><small>{{ asset.library_count }} 个知识库 · {{ asset.knowledge_item_count.toLocaleString() }} 条知识</small></span><span>→</span></button></div></section>
     <div class="dashboard-lower-grid"><section class="panel"><h3>知识生产主链</h3><div class="production-flow"><template v-for="(step,index) in productionSteps" :key="step.label"><button class="production-node" @click="router.push(step.to)"><b>{{ step.label }}</b><small>{{ step.value }}</small></button><span v-if="index<productionSteps.length-1" class="flow-arrow">→</span></template></div></section><section class="panel"><h3>{{ overview.publication.mode === 'import' ? '机构导入状态' : '机构发布状态' }}</h3><div class="publication-list"><div v-for="row in releaseRows" :key="row.status"><span><i :class="['status-dot', row.tone]"></i>{{ row.label }}</span><b>{{ row.count }}</b></div></div></section></div>
   </template>
 </section></template>

@@ -16,6 +16,7 @@ import PipelineListView from '../views/developer/PipelineListView.vue'
 import TemplateListView from '../views/developer/TemplateListView.vue'
 import DataFlowDebugView from '../views/developer/DataFlowDebugView.vue'
 import SubgraphView from '../views/developer/SubgraphView.vue'
+import ModelServicesView from '../views/developer/ModelServicesView.vue'
 
 const routes = [{ path: '/', redirect: '/business/dashboard' }, {
   path: '/', component: WorkspaceLayout, children: [
@@ -34,6 +35,7 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/institution-deployments/releases/:releaseId', component: InstitutionDeploymentView },
     { path: '/local/initialization', component: LocalInitializationView },
     { path: '/local/imports/:jobId', component: ImportTaskDetailView },
+    { path: '/developer/model-services', component: ModelServicesView },
     { path: '/developer/knowledge-types', component: KnowledgeTypesView },
     { path: '/developer/standard-pipelines', component: PipelineListView },
     { path: '/developer/flow-templates', component: TemplateListView },

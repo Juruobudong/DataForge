@@ -12,6 +12,10 @@ export const KNOWLEDGE_TYPE_LABELS = {
   text: '文本', qa: '问答', 'graph:triple': '三元组图谱', 'graph:semantic': '语义图谱',
 }
 
+export function defaultVectorStorageFilters() {
+  return { q: '', knowledge_type: '', status: '', only_anomaly: false, only_unused: false, only_managed: true }
+}
+
 export function vectorStatusLabel(value) { return VECTOR_STATUS_LABELS[value] || value || '—' }
 export function vectorStatusClass(value) { return VECTOR_STATUS_CLASSES[value] || '' }
 export function knowledgeTypeLabel(value) { return KNOWLEDGE_TYPE_LABELS[value] || value || '未知' }

@@ -2,9 +2,15 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  countDifference, formatInventoryCount, knowledgeTypeLabel, routingReferenceSummary,
+  countDifference, defaultVectorStorageFilters, formatInventoryCount, knowledgeTypeLabel, routingReferenceSummary,
   sortCollections, sortPartitions, vectorStatusLabel,
 } from './vectorStorageModel.js'
+
+test('向量库存首次加载默认只查询已托管 Collection', () => {
+  assert.deepEqual(defaultVectorStorageFilters(), {
+    q: '', knowledge_type: '', status: '', only_anomaly: false, only_unused: false, only_managed: true,
+  })
+})
 
 test('向量库存状态和知识类型使用统一中文标签', () => {
   assert.equal(vectorStatusLabel('GC_ELIGIBLE'), '可清理')
