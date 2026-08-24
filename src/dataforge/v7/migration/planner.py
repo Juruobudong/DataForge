@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -30,6 +31,7 @@ from ..models import (
     InstitutionReleaseSnapshot,
     ProjectTask,
     Source, SourceVersion,
+    StorageContractRevision,
 )
 from ..store import V7Store
 from .dependency import resolve_dependencies
@@ -174,6 +176,9 @@ class InstitutionReleasePlanner:
             ).order_by(InstitutionReleaseDraftProject.created_at)))
             projects: list[dict[str, Any]] = []
             asset_ids: set[str] = set()
+            required_by_projects: dict[str, list[dict[str, str]]] = defaultdict(list)
+            project_required_refs = 0
+            extra_asset_ids: set[str] = set()
             if draft.package_kind in {"deployment_seed", "institution_release"}:
                 if not project_links:
                     raise ValueError("Seed/Institution Release 至少选择一个项目版本")
@@ -191,12 +196,19 @@ class InstitutionReleasePlanner:
                     if not route_assets:
                         raise ValueError(f"项目 {project.name} 的 frozen RouteVersion 没有 AssetVersion")
                     asset_ids.update(item.knowledge_asset_version_id for item in route_assets)
+                    project_required_refs += len(route_assets)
+                    project_ref = {"project_id": project.id, "project_name": project.name}
+                    for item in route_assets:
+                        if project_ref not in required_by_projects[item.knowledge_asset_version_id]:
+                            required_by_projects[item.knowledge_asset_version_id].append(project_ref)
                     projects.append({
                         "project": {"id": project.id, "code": project.code, "name": project.name},
                         "project_deployment_id": binding.id,
                         "route_version_id": route.id, "route_version": route.version_no,
                         "route_checksum": route.checksum, "route_snapshot": route.snapshot_json,
                     })
+                extra_asset_ids = set((draft.selection_json or {}).get("extra_asset_version_ids") or [])
+                asset_ids.update(extra_asset_ids)
             else:
                 selected = list(dict.fromkeys((draft.selection_json or {}).get("knowledge_library_ids") or []))
                 if not selected:
@@ -213,26 +225,112 @@ class InstitutionReleasePlanner:
                     asset_ids.update(item.id for item in latest_by_profile.values())
 
             assets = list(session.scalars(select(KnowledgeAssetVersion).where(
-                KnowledgeAssetVersion.id.in_(asset_ids), KnowledgeAssetVersion.status == "ready",
+                KnowledgeAssetVersion.id.in_(asset_ids),
             ))) if asset_ids else []
-            if {item.id for item in assets} != asset_ids:
-                raise ValueError("发布引用的 AssetVersion 已失效")
+            assets_by_id = {item.id: item for item in assets}
+            checks: list[dict[str, Any]] = []
+
+            def block(code: str, subject: dict[str, Any], expected: Any, observed: Any,
+                      message: str) -> None:
+                checks.append({"code": code, "status": "blocked", "subject": subject,
+                               "expected": expected, "observed": observed, "message": message})
+
+            missing_ids = sorted(asset_ids - set(assets_by_id))
+            for asset_id in missing_ids:
+                if asset_id in required_by_projects:
+                    block("RELEASE.PROJECT.ASSET_MISSING", {"asset_version_id": asset_id,
+                          "required_by_projects": required_by_projects[asset_id]}, "AssetVersion exists",
+                          "missing", "项目冻结版本引用的 AssetVersion 不存在")
+                else:
+                    block("RELEASE.ASSET.NOT_READY", {"asset_version_id": asset_id}, "ready",
+                          "missing", "额外选择的 AssetVersion 不存在")
+            for asset in assets:
+                if asset.status != "ready":
+                    block("RELEASE.ASSET.NOT_READY", {"asset_version_id": asset.id}, "ready",
+                          asset.status, "AssetVersion 尚未 Ready")
             library_ids = sorted({item.knowledge_library_id for item in assets})
             libraries = {item.id: item for item in session.scalars(select(KnowledgeLibrary).where(
-                KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
+                KnowledgeLibrary.id.in_(library_ids),
             ))}
-            if set(libraries) != set(library_ids):
-                raise ValueError("发布引用的知识库不存在或不可用")
+            for library_id in library_ids:
+                library = libraries.get(library_id)
+                if not library or library.status != "active":
+                    block("RELEASE.LIBRARY.NOT_ACTIVE", {"knowledge_library_id": library_id},
+                          "active", library.status if library else "missing", "知识库不存在或不可用")
             # A logical library may be shared by projects only when its selected
             # physical contract is identical.  Multiple profiles remain legal
             # only for an asset-only Knowledge Update.
             if draft.package_kind != "knowledge_update":
                 for library_id in library_ids:
-                    contracts = {(item.index_profile_revision_id, item.storage_contract_revision_id,
-                                  item.collection_name, item.partition_name)
-                                 for item in assets if item.knowledge_library_id == library_id}
-                    if len(contracts) != 1:
-                        raise ValueError(f"知识库 {library_id} 在多项目中引用了不同 AssetVersion/Contract")
+                    versions = sorted({item.id for item in assets if item.knowledge_library_id == library_id})
+                    if len(versions) > 1:
+                        block("RELEASE.LIBRARY.ASSET_VERSION_CONFLICT",
+                              {"knowledge_library_id": library_id}, "one AssetVersion", versions,
+                              "同一知识库引用了不同 AssetVersion")
+
+                profile_ids = {item.index_profile_revision_id for item in assets}
+                contract_ids = {item.storage_contract_revision_id for item in assets
+                                if item.storage_contract_revision_id}
+                profiles = {item.id: item for item in session.scalars(
+                    select(KnowledgeIndexProfileRevision).where(
+                        KnowledgeIndexProfileRevision.id.in_(profile_ids)))
+                } if profile_ids else {}
+                contracts = {item.id: item for item in session.scalars(
+                    select(StorageContractRevision).where(StorageContractRevision.id.in_(contract_ids)))
+                } if contract_ids else {}
+                by_collection: dict[str, list[KnowledgeAssetVersion]] = defaultdict(list)
+                by_partition: dict[tuple[str, str], list[KnowledgeAssetVersion]] = defaultdict(list)
+                for asset in assets:
+                    by_collection[asset.collection_name].append(asset)
+                    by_partition[(asset.collection_name, asset.partition_name)].append(asset)
+                for collection_name, values in by_collection.items():
+                    signatures: dict[str, dict[str, Any]] = {}
+                    for asset in values:
+                        profile = profiles.get(asset.index_profile_revision_id)
+                        contract = contracts.get(asset.storage_contract_revision_id)
+                        signature = {
+                            "storage_contract_revision_id": asset.storage_contract_revision_id,
+                            "storage_spec_hash": contract.storage_spec_hash if contract else None,
+                            "schema": contract.schema_json if contract else None,
+                            "dimension": contract.dimension if contract else None,
+                            "metric_type": contract.metric_type if contract else None,
+                            "index": contract.index_json if contract else None,
+                            "index_profile_revision_id": asset.index_profile_revision_id,
+                            "field_mapping": profile.fields_json if profile else None,
+                        }
+                        signatures[json.dumps(signature, sort_keys=True, separators=(",", ":"))] = signature
+                    if len(signatures) > 1 or any(value.get("storage_spec_hash") is None or
+                                                  value.get("field_mapping") is None
+                                                  for value in signatures.values()):
+                        block("RELEASE.COLLECTION.CONTRACT_CONFLICT",
+                              {"collection_name": collection_name}, "one compatible contract",
+                              list(signatures.values()), "同一 Collection 引用了不兼容的物理合同")
+                for (collection_name, partition_name), values in by_partition.items():
+                    identities = {(item.id, item.content_digest) for item in values}
+                    if len(identities) > 1:
+                        block("RELEASE.PARTITION.CONTENT_CONFLICT",
+                              {"collection_name": collection_name, "partition_name": partition_name},
+                              "one AssetVersion and digest",
+                              [{"asset_version_id": item.id, "content_digest": item.content_digest}
+                               for item in values], "同一物理 Partition 对应了不同内容")
+
+            blocked_codes = {item["code"] for item in checks if item["status"] == "blocked"}
+            pass_checks = (
+                ("RELEASE.PROJECT.ASSET_COMPLETE", "项目资产闭包完整",
+                 {"RELEASE.PROJECT.ASSET_MISSING"}),
+                ("RELEASE.ASSET.READY", "AssetVersion 全部 Ready", {"RELEASE.ASSET.NOT_READY"}),
+                ("RELEASE.LIBRARY.ACTIVE", "KnowledgeLibrary 全部 Active", {"RELEASE.LIBRARY.NOT_ACTIVE"}),
+                ("RELEASE.LIBRARY.VERSION_UNIQUE", "逻辑知识库版本唯一",
+                 {"RELEASE.LIBRARY.ASSET_VERSION_CONFLICT"}),
+                ("RELEASE.COLLECTION.CONTRACT_COMPATIBLE", "Collection Contract 一致",
+                 {"RELEASE.COLLECTION.CONTRACT_CONFLICT"}),
+                ("RELEASE.PARTITION.CONTENT_UNIQUE", "Partition 内容无冲突",
+                 {"RELEASE.PARTITION.CONTENT_CONFLICT"}),
+            )
+            for code, message, failures in pass_checks:
+                if not (blocked_codes & failures):
+                    checks.append({"code": code, "status": "passed", "subject": {},
+                                   "expected": True, "observed": True, "message": message})
             include_full = (draft.package_kind in {"deployment_seed", "institution_release"} or
                             bool((draft.selection_json or {}).get("include_full_document_library")))
             dependencies = resolve_dependencies(session, library_ids,
@@ -274,15 +372,20 @@ class InstitutionReleasePlanner:
             }
             collections: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for asset in sorted(assets, key=lambda item: (item.collection_name, item.partition_name)):
+                library = libraries.get(asset.knowledge_library_id)
                 collections[asset.collection_name].append({
                     "knowledge_library_id": asset.knowledge_library_id,
-                    "knowledge_library_name": libraries[asset.knowledge_library_id].name,
+                    "knowledge_library_name": library.name if library else asset.knowledge_library_id,
                     "asset_version_id": asset.id, "asset_version_no": asset.version_no,
                     "index_profile_id": asset.index_profile_id,
                     "index_profile_revision_id": asset.index_profile_revision_id,
                     "storage_contract_revision_id": asset.storage_contract_revision_id,
                     "collection_name": asset.collection_name, "partition_name": asset.partition_name,
                     "item_count": asset.item_count, "content_digest": asset.content_digest,
+                    "status": asset.status,
+                    "required_by_projects": required_by_projects.get(asset.id, []),
+                    "selected_manually": asset.id in extra_asset_ids,
+                    "locked": bool(required_by_projects.get(asset.id)),
                 })
             base = session.get(InstitutionReleaseSnapshot, draft.base_release_id) if draft.base_release_id else None
             if draft.base_release_id and (not base or base.target_deployment_id != deployment.id):
@@ -329,6 +432,8 @@ class InstitutionReleasePlanner:
             object_size = session.scalar(select(func.sum(SourceVersion.size_bytes)).where(
                 SourceVersion.id.in_(dependencies.source_version_ids)
             )) if dependencies.source_version_ids else 0
+            blocked = sum(item["status"] == "blocked" for item in checks)
+            passed = sum(item["status"] == "passed" for item in checks)
             return {
                 "package_kind": draft.package_kind,
                 "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
@@ -341,6 +446,14 @@ class InstitutionReleasePlanner:
                 "asset_versions": [item for values in collections.values() for item in values],
                 "libraries": [item for values in collections.values() for item in values],
                 "collections": dict(collections),
+                "selection_summary": {
+                    "project_required_refs": project_required_refs,
+                    "manual_refs": len(extra_asset_ids),
+                    "raw_refs": project_required_refs + len(extra_asset_ids),
+                    "duplicates_removed": max(0, project_required_refs + len(extra_asset_ids) - len(asset_ids)),
+                    "resolved_assets": len(asset_ids),
+                },
+                "preflight": {"passed": passed, "warnings": 0, "blocked": blocked, "checks": checks},
                 "dependencies": {
                     "document_library_ids": list(dependencies.document_library_ids),
                     "source_ids": list(dependencies.source_ids),
@@ -369,3 +482,39 @@ class InstitutionReleasePlanner:
                            "vector_item_count": sum(int(item.item_count or 0) for item in assets)},
                 "milvus_override_reason": draft.milvus_override_reason,
             }
+
+    def asset_options(self, draft_id: str) -> dict[str, Any]:
+        plan = self.plan(draft_id)
+        selected_rows = {item["asset_version_id"]: dict(item) for item in plan["asset_versions"]}
+        with self.store.sessions() as session:
+            draft = session.get(InstitutionReleaseDraft, draft_id)
+            if not draft:
+                raise ValueError("机构发布草稿不存在")
+            if draft.package_kind != "knowledge_update":
+                latest: dict[tuple[str, str], tuple[KnowledgeAssetVersion, KnowledgeLibrary]] = {}
+                rows = session.execute(select(KnowledgeAssetVersion, KnowledgeLibrary).join(
+                    KnowledgeLibrary, KnowledgeLibrary.id == KnowledgeAssetVersion.knowledge_library_id,
+                ).where(KnowledgeAssetVersion.status == "ready", KnowledgeLibrary.status == "active").order_by(
+                    KnowledgeAssetVersion.version_no.desc())).all()
+                for asset, library in rows:
+                    latest.setdefault((asset.knowledge_library_id, asset.index_profile_id), (asset, library))
+                for asset, library in latest.values():
+                    selected_rows.setdefault(asset.id, {
+                        "asset_version_id": asset.id, "asset_version_no": asset.version_no,
+                        "knowledge_library_id": asset.knowledge_library_id,
+                        "knowledge_library_name": library.name,
+                        "collection_name": asset.collection_name, "partition_name": asset.partition_name,
+                        "item_count": asset.item_count, "content_digest": asset.content_digest,
+                        "status": asset.status, "required_by_projects": [],
+                        "selected_manually": False, "locked": False,
+                    })
+        collections: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in selected_rows.values():
+            row = dict(item)
+            row["required"] = bool(row.get("locked"))
+            collections[row["collection_name"]].append(row)
+        return {"collections": [{"collection_name": name,
+                                  "assets": sorted(values, key=lambda item: (
+                                      not item.get("locked"), item.get("knowledge_library_name", ""),
+                                      item.get("asset_version_no", 0)))}
+                                 for name, values in sorted(collections.items())]}

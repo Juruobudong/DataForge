@@ -298,6 +298,44 @@ class KnowledgeLibraryWorkLease(Timestamped, Base):
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
 
+class ComponentHeartbeat(Timestamped, Base):
+    """Latest liveness signal for one Worker or Runner process."""
+    __tablename__ = "component_heartbeats"
+    component: Mapped[str] = mapped_column(String(32), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="healthy", nullable=False, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+    version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    current_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class ComponentCheckRun(Timestamped, Base):
+    __tablename__ = "component_check_runs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", nullable=False, index=True)
+    selected_components: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(64), default="admin", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ComponentCheckResult(Timestamped, Base):
+    __tablename__ = "component_check_results"
+    __table_args__ = (UniqueConstraint("check_run_id", "component", name="uq_component_check_run_item"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    check_run_id: Mapped[str] = mapped_column(ForeignKey("component_check_runs.id"), nullable=False, index=True)
+    component: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class KnowledgeChunkGeneration(Timestamped, Base):
     """Latest generation result for one output type and formal source chunk.
 
@@ -739,6 +777,11 @@ class KnowledgeAssetVersion(Timestamped, Base):
     source_migration_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     unreferenced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_verification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_observed_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_observed_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
