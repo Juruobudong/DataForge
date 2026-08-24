@@ -22,3 +22,16 @@ export function routingPublishReadiness(deploymentTasks, authorizations, targetU
   if (!String(targetUri || '').trim()) problems.push('当前阶段尚未配置 Milvus Target')
   return { ready: problems.length === 0, problems }
 }
+
+export function routingValidationView(result) {
+  const checks = Array.isArray(result?.checks) ? result.checks : []
+  const target = result?.target_validation || {}
+  return {
+    available: checks.length > 0,
+    checks,
+    blocked: Number(result?.blocked || checks.filter(item => item.status === 'blocked').length),
+    valid: result?.valid === true,
+    deferred: target.mode === 'deferred_to_local',
+    targetReason: target.reason || '',
+  }
+}

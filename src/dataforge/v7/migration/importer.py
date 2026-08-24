@@ -168,7 +168,7 @@ class MigrationImporter:
                         return waiting
                 elif self.milvus is None:
                     raise ValueError("v1 migration import 缺少 Milvus Target")
-                self._preflight_collections(manifest, selected)
+                self._prepare_collections(manifest, selected)
                 if self._vector_capacity_blocked(manifest, selected):
                     return self._wait(job_id, checkpoint, "waiting_for_vector_capacity")
                 checkpoint["ready_for_vector_import"] = True
@@ -181,6 +181,9 @@ class MigrationImporter:
             if schema_version == 2:
                 self._finish_asset_versions(manifest, selected, id_maps, job_id)
                 checkpoint["assets_ready"] = True
+                if checkpoint.get("active_target_fingerprint"):
+                    checkpoint["prepared_target_fingerprint"] = checkpoint["active_target_fingerprint"]
+                    checkpoint["prepared_target_uri"] = checkpoint.get("active_target_uri")
                 self.store.update_migration_job(job_id, stage="assets_ready", checkpoint=checkpoint)
             self._finish_libraries(selected, id_maps)
             if schema_version == 2 and manifest["package_kind"] != "knowledge_update":
@@ -298,6 +301,8 @@ class MigrationImporter:
             return self._wait(job_id, checkpoint, "waiting_for_milvus_configuration")
         if target.fingerprint != configuration["verified_fingerprint"]:
             return self._wait(job_id, checkpoint, "waiting_for_milvus_verification")
+        checkpoint["active_target_fingerprint"] = target.fingerprint
+        checkpoint["active_target_uri"] = target.uri
         self.milvus = V7Milvus(target.uri, target.token)
         if not hasattr(self.milvus, "uri"):
             setattr(self.milvus, "uri", target.uri)
@@ -398,7 +403,7 @@ class MigrationImporter:
                 id_maps["baselines"][baseline["id"]] = new_id("baseline")
         return selected, id_maps
 
-    def _preflight_collections(self, manifest: dict[str, Any], selected: set[str]) -> None:
+    def _prepare_collections(self, manifest: dict[str, Any], selected: set[str]) -> None:
         if not self.milvus:
             raise ValueError("Milvus Target 尚未配置")
         provisioner = ManagedCollectionProvisioner(self.store, self.milvus)
@@ -936,6 +941,11 @@ class MigrationImporter:
                 value.item_count = int(result["target_count"])
                 value.content_digest = result["target_digest"]
                 value.ready_at = utc_now()
+                value.last_verification_status = "consistent"
+                value.last_verified_at = utc_now()
+                value.last_observed_count = value.item_count
+                value.last_observed_digest = value.content_digest
+                value.last_verification_error = None
 
     def _local_candidate_projects(self, projects: list[dict[str, Any]],
                                   id_maps: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
@@ -1028,6 +1038,8 @@ class MigrationImporter:
         if not self.milvus:
             raise ValueError("Milvus Target 尚未配置")
         schema_version = int(manifest.get("manifest_schema_version") or manifest.get("schema_version", 1))
+        manifest_assets = {str(item.get("id") or item.get("asset_version_id")): item
+                           for item in manifest.get("asset_versions") or []}
         work = self.migration_dir / job_id / "import-vectors"; work.mkdir(parents=True, exist_ok=True)
         for collection, partitions in manifest["collections"].items():
             for part in partitions:
@@ -1048,6 +1060,7 @@ class MigrationImporter:
                 asset_id = None
                 if schema_version == 2:
                     source_asset_id = part.get("asset_version_id") or part.get("id")
+                    source_asset = manifest_assets.get(str(source_asset_id)) or {}
                     asset_id = id_maps.get("asset_versions", {}).get(source_asset_id, source_asset_id)
                     with self.store.sessions() as session:
                         asset = session.get(KnowledgeAssetVersion, asset_id)
@@ -1056,8 +1069,11 @@ class MigrationImporter:
                             if compare_central_digest and verified["digest"] != part["content_revision"]:
                                 raise ValueError(f"已就绪 AssetVersion 摘要不匹配：{asset_id}")
                             self.store.update_migration_item(
-                                job_id, library_id, collection, target_count=verified["count"],
-                                target_digest=verified["digest"], status="verified",
+                                job_id, library_id, collection,
+                                source_count=int(source_asset.get("item_count") or verified["count"]),
+                                source_digest=part.get("content_revision"),
+                                target_count=verified["count"], target_digest=verified["digest"],
+                                status="verified",
                             )
                             continue
                     self._set_import_asset_status(asset_id, "verifying")
@@ -1083,6 +1099,8 @@ class MigrationImporter:
                     raise ValueError(f"Partition 完整性校验失败：{collection}/{target_partition}")
                 self.milvus.load_partition(collection, target_partition)
                 self.store.update_migration_item(job_id, library_id, collection, target_count=verified["count"],
+                    source_count=int((manifest_assets.get(str(part.get("asset_version_id") or part.get("id"))) or {}).get(
+                        "item_count") or result["count"]), source_digest=part.get("content_revision"),
                     target_digest=verified["digest"], status="verified")
 
     def _set_import_asset_status(self, asset_id: str, status: str, error: str | None = None) -> None:

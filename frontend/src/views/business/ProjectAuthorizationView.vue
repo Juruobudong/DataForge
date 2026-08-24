@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../../api/platform'
-import { compatibleProfilesForTask, qaEmbeddingMode, routingPublishReadiness } from './projectPublishingModel'
+import { compatibleProfilesForTask, qaEmbeddingMode, routingPublishReadiness, routingValidationView } from './projectPublishingModel'
 
 const instance = ref(null), projects = ref([]), libraries = ref([]), sharedDeployments = ref([]), knowledgeTypes = ref([]), projectId = ref(''), deploymentId = ref('')
 const deploymentTasks = ref([]), authorizations = ref([]), versions = ref([])
@@ -43,6 +43,7 @@ const selectedIndexProfile = computed(() => compatibleProfiles.value.find(item =
 const selectedQaEmbeddingMode = computed(() => qaEmbeddingMode(selectedIndexProfile.value))
 const selectedDeploymentTask = computed(() => deploymentTasks.value.find(item => item.id === deploymentTaskId.value))
 const publishState = computed(() => routingPublishReadiness(deploymentTasks.value, authorizations.value, currentStageTarget.value))
+const validationView = computed(() => routingValidationView(result.value))
 const availableLibraries = computed(() => {
   const task = selectedDeploymentTask.value
   return libraries.value.filter(library => {
@@ -71,6 +72,7 @@ function chooseBoundDeployment() {
   else if (!deployments.value.some(item => item.id === deploymentId.value)) deploymentId.value = deployments.value[0]?.id || ''
 }
 async function loadDeployment() {
+  result.value = null; preview.value = null
   if (!deploymentId.value) {
     deploymentTasks.value = []; authorizations.value = []; versions.value = []
     return
@@ -159,7 +161,7 @@ async function saveDeployment() {
 async function saveProductionTarget() {
   const sharedId = selectedDeployment.value?.deployment_id
   const uri = productionUri.value.trim()
-  if (!uri || !window.confirm(`确认保存医院生产 Milvus 地址？\n医院：${institutionName.value || selectedDeployment.value?.name}\nDeployment：${deploymentLabel.value}\n目标：${uri}`)) return
+  if (!uri || !window.confirm(`确认保存机构生产 Milvus 地址？\n机构：${institutionName.value || selectedDeployment.value?.name}\nDeployment：${deploymentLabel.value}\n目标：${uri}`)) return
   try {
     await api.putDeploymentTarget(sharedId, 'production', {
       milvus_uri: uri, confirm_production: true, expected_target_uri: uri
@@ -189,8 +191,8 @@ async function bindExistingDeployment() {
     bindDeploymentId.value = ''; await load(); deploymentId.value = binding.id; await loadDeployment()
   } catch (e) { error.value = e.message }
 }
-async function diff() { try { result.value = await api.routingDiff(deploymentId.value, desiredStage.value); tab.value = 'routing' } catch (e) { error.value = e.message } }
-async function validate() { try { result.value = await api.validateRouting(deploymentId.value); tab.value = 'routing' } catch (e) { error.value = e.message } }
+async function diff() { try { error.value = ''; preview.value = null; result.value = null; result.value = await api.routingDiff(deploymentId.value, desiredStage.value); tab.value = 'routing' } catch (e) { result.value = null; error.value = e.message } }
+async function validate() { try { error.value = ''; preview.value = null; result.value = null; result.value = await api.validateRouting(deploymentId.value); tab.value = 'routing' } catch (e) { result.value = null; error.value = e.message } }
 function releaseBody(confirmProduction = false) { return { expected_release_stage: desiredStage.value, expected_target_uri: stageTarget.value, confirm_production: confirmProduction } }
 async function publish() {
   if (!publishState.value.ready) {
@@ -213,7 +215,7 @@ async function publish() {
   if (production && !window.confirm(`确认发布「${institutionName.value}」生产 Routing？\nDeployment：${deploymentLabel.value}\n目标：${stageTarget.value}`)) return
   try { result.value = await api.publishRouting(deploymentId.value, releaseBody(production)); await loadDeployment(); tab.value = 'history' } catch (e) { error.value = e.message }
 }
-async function showVersion(version) { try { preview.value = await api.routeVersion(deploymentId.value, version, desiredStage.value); tab.value = 'routing' } catch (e) { error.value = e.message } }
+async function showVersion(version) { try { result.value = null; preview.value = await api.routeVersion(deploymentId.value, version, desiredStage.value); tab.value = 'routing' } catch (e) { preview.value = null; error.value = e.message } }
 async function rollback(version) {
   const production = desiredStage.value === 'production'
   const message = production ? `确认回滚「${institutionName.value}」生产版本 v${version}？\nDeployment：${deploymentLabel.value}\n目标：${stageTarget.value}` : `恢复测试版本 v${version} 的授权并发布新版本？`
@@ -242,7 +244,7 @@ onMounted(load)
     <nav class="tabs"><button :class="{active:tab==='project'}" @click="tab='project'">项目配置</button><button :class="{active:tab==='tasks'}" @click="tab='tasks'">任务配置</button><button :class="{active:tab==='auth'}" @click="tab='auth'">知识授权</button><button :class="{active:tab==='routing'}" @click="tab='routing'">Routing 发布</button><button :class="{active:tab==='history'}" @click="tab='history'">发布记录</button></nav>
     <section v-if="tab==='project'" class="panel">
       <h3>共享 Deployment</h3>
-      <p>当前 Project 通过 ProjectDeployment 关联到 <code>{{ selectedDeployment?.code }}</code>；医院身份、阶段和 Target 由共享 Deployment 统一维护。</p>
+      <p>当前 Project 通过 ProjectDeployment 关联到 <code>{{ selectedDeployment?.code }}</code>；机构身份、阶段和 Target 由共享 Deployment 统一维护。</p>
       <p v-if="isKgConsultation"><span class="badge amber">kg_for_consultation 仅允许 test Snapshot</span></p>
       <div v-if="selectedDeployment" class="grid2">
         <div><small>测试 Milvus Target</small><p><code>{{ testMilvusTarget || '未配置' }}</code></p></div>
@@ -250,25 +252,25 @@ onMounted(load)
       </div>
       <form v-if="selectedDeployment" class="stack" @submit.prevent="saveDeployment">
         <template v-if="selectedDeployment.scope==='institution'">
-          <label>医院机构名称<input v-model="institutionName" required></label>
-          <label>医院机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"><small v-if="selectedDeployment.institution_code_locked">首次冻结后已锁定；普通编辑接口不再允许修改。</small></label>
+          <label>机构名称<input v-model="institutionName" required></label>
+          <label>机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"><small v-if="selectedDeployment.institution_code_locked">首次冻结后已锁定；普通编辑接口不再允许修改。</small></label>
         </template>
-        <p v-else>中心技术环境不伪造医院身份。</p>
+        <p v-else>中心技术环境不伪造机构身份。</p>
         <label>当前阶段<select v-model="desiredStage"><option value="test">测试</option><option value="production">生产</option></select></label>
         <p>当前目标：<code>{{ stageTarget }}</code></p>
         <button class="primary">保存 Deployment 配置</button>
       </form>
       <form v-if="!local && selectedDeployment?.scope==='institution'" class="stack" @submit.prevent="saveProductionTarget">
-        <h4>医院生产 Target</h4>
+        <h4>机构生产 Target</h4>
         <label>Production Milvus URI<input v-model="productionUri" required placeholder="http://hospital-milvus:19531"></label>
         <button>人工确认并保存生产地址</button>
       </form>
       <form v-if="!local" class="stack" @submit.prevent="createHospitalDeployment">
-        <h4>新增医院 Deployment</h4>
+        <h4>新增机构 Deployment</h4>
         <label>稳定 Deployment code<input v-model="newDeploymentCode" required></label>
         <label>Deployment 名称<input v-model="newDeploymentName" required></label>
-        <label>医院机构名称<input v-model="newInstitutionName" required></label>
-        <label>医院机构代码<input v-model="newInstitutionCode" required></label>
+        <label>机构名称<input v-model="newInstitutionName" required></label>
+        <label>机构代码<input v-model="newInstitutionCode" required></label>
         <p>新建默认使用中心测试 Milvus Target，可在创建后于「共享 Deployment」配置中修改。</p>
         <button>创建并绑定当前 Project</button>
       </form>
@@ -308,7 +310,21 @@ onMounted(load)
       <table v-else><thead><tr><th>任务</th><th>类型</th><th>Profile</th><th>QA 模式</th><th>Top K</th><th>状态</th></tr></thead><tbody><tr v-for="task in deploymentTasks" :key="task.id"><td>{{ task.task?.name }}</td><td>{{ task.task?.knowledge_type }}</td><td>{{ task.index_profile?.code }}</td><td>{{ task.qa_embedding_mode || '—' }}</td><td>{{ task.top_k }}</td><td><span class="badge" :class="task.enabled?'green':'amber'">{{ task.enabled?'启用':'未启用' }}</span></td></tr></tbody></table>
     </section>
     <section v-else-if="tab==='auth'" class="panel"><h3>知识授权</h3><p v-if="!deploymentTasks.some(item=>item.enabled)" class="muted">请先在“任务配置”中创建并启用 Deployment Task。</p><form class="stack" @submit.prevent="saveRoute"><label>Deployment Task<select v-model="deploymentTaskId" required><option value="">选择任务</option><option v-for="task in deploymentTasks.filter(item=>item.enabled)" :key="task.id" :value="task.id">{{ task.task?.name }} / {{ task.index_profile?.code }}</option></select></label><label>org_code<input v-model="orgCode" required :readonly="selectedDeployment?.scope==='institution'"><small>机构项目固定等于只读 institution_code。</small></label><label>机构名称<input v-model="orgName"></label><label>知识库（顺序即优先级）<select v-model="chosen" multiple required><option v-for="library in availableLibraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.origin_type==='central_import'?'中心迁入':'本地创建' }}{{ library.origin_state==='forked'?' · 已本地修改':'' }}</option></select></label><button class="primary" :disabled="!deploymentTaskId">保存授权</button></form><pre v-if="authorizations.length">{{ JSON.stringify(authorizations,null,2) }}</pre></section>
-    <section v-else-if="tab==='routing'" class="panel"><h3>Routing 就绪检查 · {{ desiredStage==='production'?'生产':'测试' }}</h3><p>{{ institutionName || selectedDeployment?.name }} · {{ stageTarget }}</p><p v-if="freezesForInstitution" class="notice">机构项目在智能中心只冻结不可变 RouteVersion，不在此生成包，也不会冒充机构本地激活。</p><p v-if="!publishState.ready" class="muted">发布前还需完成：{{ publishState.problems.join('；') }}</p><div class="actions"><button @click="diff">结构化 Diff</button><button class="success" @click="validate">校验</button><button class="primary" :disabled="!publishState.ready" @click="publish">{{ freezesForInstitution?'冻结项目版本':'发布' }}</button></div><pre v-if="preview">{{ JSON.stringify(preview.snapshot,null,2) }}</pre><pre v-else-if="result">{{ JSON.stringify(result,null,2) }}</pre></section>
+    <section v-else-if="tab==='routing'" class="panel">
+      <h3>Routing 就绪检查 · {{ desiredStage==='production'?'生产':'测试' }}</h3>
+      <p>{{ institutionName || selectedDeployment?.name }} · {{ stageTarget }}</p>
+      <p v-if="freezesForInstitution" class="notice">机构项目在智能中心只冻结不可变 RouteVersion，不在此生成包，也不会冒充机构本地激活。</p>
+      <p v-if="!publishState.ready" class="muted">发布前还需完成：{{ publishState.problems.join('；') }}</p>
+      <div class="actions"><button @click="diff">结构化 Diff</button><button class="success" @click="validate">校验</button><button class="primary" :disabled="!publishState.ready" @click="publish">{{ freezesForInstitution?'冻结项目版本':'发布' }}</button></div>
+      <template v-if="validationView.available">
+        <p v-if="validationView.deferred" class="notice">中心未连接机构 Milvus，实体存在性及 count/digest 将在机构本地 Prepare/Activation Preflight 验证。</p>
+        <div class="metrics"><div><b>{{ validationView.checks.length-validationView.blocked }}</b><span>Passed</span></div><div><b>{{ validationView.blocked }}</b><span>Blocked</span></div></div>
+        <div class="table-wrap"><table><thead><tr><th>检查</th><th>状态</th><th>Collection / Partition / Asset</th><th>Expected</th><th>Observed</th><th>说明</th></tr></thead><tbody><tr v-for="(check,index) in validationView.checks" :key="`${check.code}-${index}`"><td><code>{{ check.code }}</code></td><td><span class="badge" :class="check.status==='passed'?'green':'red'">{{ check.status }}</span></td><td><code>{{ check.subject?.collection_name || '—' }}</code><br><code>{{ check.subject?.partition_name || '—' }}</code><br><small>{{ check.subject?.asset_version_id || check.subject?.knowledge_library_id || '—' }}</small></td><td><code>{{ JSON.stringify(check.expected) }}</code></td><td><code>{{ JSON.stringify(check.observed) }}</code></td><td>{{ check.message }}</td></tr></tbody></table></div>
+        <details><summary>RoutingSnapshot</summary><pre>{{ JSON.stringify(result.snapshot,null,2) }}</pre></details>
+      </template>
+      <pre v-else-if="preview">{{ JSON.stringify(preview.snapshot,null,2) }}</pre>
+      <pre v-else-if="result">{{ JSON.stringify(result,null,2) }}</pre>
+    </section>
     <section v-else class="panel"><h3>{{ desiredStage==='production'?'生产':'测试' }}发布记录</h3><table><thead><tr><th>版本</th><th>阶段</th><th>来源</th><th>状态</th><th>发布时间</th><th>操作</th></tr></thead><tbody><tr v-for="version in versions" :key="version.id"><td>v{{ version.version_no }}</td><td>{{ version.release_stage }}</td><td>{{ version.origin }}</td><td>{{ version.status }}</td><td>{{ version.published_at || '—' }}</td><td><button @click="showVersion(version.version_no)">预览</button><button v-if="version.status==='published'" @click="rollback(version.version_no)">回滚</button></td></tr></tbody></table></section>
     <p v-if="notice" class="muted">{{ notice }}</p>
     <p v-if="error" class="error">{{ error }}</p>

@@ -6,6 +6,7 @@ import DocumentLibraryDetailView from '../views/business/DocumentLibraryDetailVi
 import JobListView from '../views/business/JobListView.vue'
 import KnowledgeBaseView from '../views/business/KnowledgeBaseView.vue'
 import KnowledgeLibraryDetailView from '../views/business/KnowledgeLibraryDetailView.vue'
+import VectorStorageView from '../views/business/VectorStorageView.vue'
 import ProjectAuthorizationView from '../views/business/ProjectAuthorizationView.vue'
 import InstitutionDeploymentView from '../views/business/InstitutionDeploymentView.vue'
 import LocalInitializationView from '../views/business/LocalInitializationView.vue'
@@ -24,6 +25,7 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/business/jobs', component: JobListView },
     { path: '/business/knowledge', component: KnowledgeBaseView },
     { path: '/business/knowledge/:libraryId', component: KnowledgeLibraryDetailView, props: true },
+    { path: '/business/vector-storage', component: VectorStorageView },
     { path: '/business/authorization', component: ProjectAuthorizationView },
     { path: '/business/migrations', redirect: '/institution-deployments/new' },
     { path: '/institution-deployments/new', component: InstitutionDeploymentView },

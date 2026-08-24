@@ -4,8 +4,47 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.uv-cache/
+.uv-task-cache/
 .DS_Store
 frontend/node_modules/
-third_party/dataflow_webui/frontend/node_modules/
-third_party/dataflow_webui/backend/data/
-third_party/dataflow_webui/backend/cache_local/
+frontend/.npm-cache/
+frontend/package-lock.json
+global_llm/
+llm_local.yaml
+llm_providers.py
+tests/
+wiki/
+# 本地环境变量与密钥（含真实凭据，禁止提交）
+# 注意：.gitignore 本身必须纳入版本控制，否则内网资产保护规则无法随仓库共享
+.env
+.env.*
+secrets/
+!secrets/README.md
+.env.docker.example
+docs\Docker构建优化说明.md
+# ===== 本地专用忽略（不提交到仓库）=====
+# 含公司内网资产（具体 IP  与域名），禁止提交
+AGENTS.md
+specs/006-governed-operator-catalog/analysis.md
+scripts/ensure-dataforge-milvus-link.sh
+scripts/verify-milvus-egress.sh
+scripts/ensure-milvus-egress.sh
+llm_servings.yaml
+# 本地 IDE / Agent / 包缓存 / 临时目录（不入库）
+.idea/
+.kilo/
+.pnpm-store/
+.pytest-tmp/
+.devora/
+specs/
+tests/test_v7_platform.py
+
+# 本地 Docker 构建优化说明（内部文档，不提交）
+docs/Docker构建优化说明.md
+# 本地 LLM serving 配置（含内网地址，不提交）
+llm_servings.yaml
+# 内部规格文档（含内网地址，不提交）
+specs/008-knowledge-collection-lifecycle/
+# 前端构建产物（含可能被压缩的内网地址，禁止提交）
+frontend/dist/

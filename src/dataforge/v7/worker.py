@@ -28,6 +28,7 @@ from .vector import (
 
 LOGGER = logging.getLogger(__name__)
 LEASE_RENEW_SECONDS = 60.0
+HEARTBEAT_SECONDS = 15.0
 
 
 @dataclass
@@ -229,8 +230,32 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
     resolved = settings or Settings.load()
     store = V7Store(resolved.platform_database_url)
     store.assert_schema_current()
+    heartbeat_instance = f"worker:{socket.gethostname()}:{os.getpid()}"
+    next_heartbeat = 0.0
+    def heartbeat(active_work: list[ActiveWork]) -> None:
+        nonlocal next_heartbeat
+        now = time.monotonic()
+        if now < next_heartbeat:
+            return
+        write_heartbeat = getattr(store, "upsert_component_heartbeat", None)
+        if write_heartbeat is None:
+            next_heartbeat = now + HEARTBEAT_SECONDS
+            return
+        current = [item.work_id for item in active_work]
+        try:
+            write_heartbeat(
+                "worker", heartbeat_instance, version="7.0.0", worker_id=heartbeat_instance,
+                current_job_id=current[0] if current else None,
+                details={"active_job_ids": current, "active_count": len(current),
+                         "knowledge_concurrency": getattr(resolved, "knowledge_job_concurrency", 3),
+                         "vector_concurrency": getattr(resolved, "vector_sync_concurrency", 2)},
+            )
+        except Exception:
+            LOGGER.exception("Worker 心跳写入失败")
+        next_heartbeat = now + HEARTBEAT_SECONDS
     if not hasattr(store, "claim_job"):
         while stop_event is None or not stop_event.is_set():
+            heartbeat([])
             run_once(resolved, check_schema=False)
             time.sleep(max(poll_seconds, 0.5))
         return
@@ -242,6 +267,7 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
     with ThreadPoolExecutor(max_workers=knowledge_concurrency, thread_name_prefix="knowledge") as knowledge_pool, \
             ThreadPoolExecutor(max_workers=vector_concurrency, thread_name_prefix="vector") as vector_pool:
         while stop_event is None or not stop_event.is_set():
+            heartbeat(active)
             now = time.monotonic()
             remaining: list[ActiveWork] = []
             for work in active:

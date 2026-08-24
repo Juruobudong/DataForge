@@ -11,7 +11,7 @@ import os
 import re
 import secrets
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Iterable
@@ -31,6 +31,9 @@ from .migrations import assert_schema_current
 from .models import (
     AdminSession,
     AuditEvent,
+    ComponentCheckResult,
+    ComponentCheckRun,
+    ComponentHeartbeat,
     DocumentLibrary,
     DocumentLibraryMember,
     DocumentDeletionJob,
@@ -4686,6 +4689,11 @@ class V7Store:
                 asset.item_count = int(asset_count if asset_count is not None else count)
                 asset.content_digest = asset_digest
                 asset.ready_at, asset.unreferenced_at = utc_now(), utc_now()
+                asset.last_verification_status = "consistent"
+                asset.last_verified_at = utc_now()
+                asset.last_observed_count = asset.item_count
+                asset.last_observed_digest = asset.content_digest
+                asset.last_verification_error = None
             self.audit(session, "vector_sync.ready", "vector_sync_job", job.id, {
                 "synced_count": count, "asset_version_id": job.asset_version_id,
                 "asset_digest": asset_digest,
@@ -4749,6 +4757,226 @@ class V7Store:
             for child in value:
                 found.update(V7Store._asset_ids_in_json(child))
         return found
+
+    def vector_inventory_metadata(self) -> dict[str, Any]:
+        """Return the DataForge side of the live Milvus inventory join."""
+        gc_plan = self.knowledge_asset_gc_plan()
+        eligible_ids = {str(item["asset_version_id"]) for item in gc_plan["eligible"]}
+        with self.sessions() as session:
+            libraries = {item.id: item for item in session.scalars(select(KnowledgeLibrary))}
+            profiles = {item.id: item for item in session.scalars(select(KnowledgeIndexProfile))}
+            profile_revisions = {
+                item.id: item for item in session.scalars(select(KnowledgeIndexProfileRevision))
+            }
+            contracts = {
+                item.id: item for item in session.scalars(select(StorageContractRevision))
+            }
+            contract_names = {
+                item.id: item for item in session.scalars(select(StorageContract))
+            }
+            managed_rows = list(session.scalars(select(ManagedCollection)))
+
+            project_rows = {item.id: item for item in session.scalars(select(Project))}
+            deployment_rows = {item.id: item for item in session.scalars(select(Deployment))}
+            project_deployments = {
+                item.id: item for item in session.scalars(select(ProjectDeployment))
+            }
+            route_versions = {
+                item.id: item for item in session.scalars(select(ProjectRouteVersion))
+            }
+            route_refs: dict[str, list[dict[str, Any]]] = {}
+            for link in session.scalars(select(ProjectRouteVersionAsset)):
+                version = route_versions.get(link.project_route_version_id)
+                if not version:
+                    continue
+                project = project_rows.get(version.project_id)
+                project_deployment = project_deployments.get(version.project_deployment_id)
+                deployment = deployment_rows.get(project_deployment.deployment_id) if project_deployment else None
+                matches = []
+                for route in (version.snapshot_json or {}).get("routes", []):
+                    for library_payload in route.get("libraries", []):
+                        if str(library_payload.get("asset_version_id") or "") == link.knowledge_asset_version_id:
+                            matches.append({
+                                "task_code": route.get("task_code"),
+                                "org_code": route.get("org_code"),
+                            })
+                if not matches:
+                    matches = [{"task_code": None, "org_code": None}]
+                for match in matches:
+                    route_refs.setdefault(link.knowledge_asset_version_id, []).append({
+                        "route_version_id": version.id,
+                        "route_version_no": version.version_no,
+                        "route_version_status": version.status,
+                        "release_stage": version.release_stage,
+                        "project_id": project.id if project else version.project_id,
+                        "project_code": project.code if project else None,
+                        "project_name": project.name if project else None,
+                        "project_deployment_id": version.project_deployment_id,
+                        "deployment_id": deployment.id if deployment else None,
+                        "deployment_code": deployment.code if deployment else None,
+                        "deployment_name": deployment.name if deployment else None,
+                        **match,
+                    })
+
+            release_refs: dict[str, list[dict[str, Any]]] = {}
+            for release in session.scalars(select(InstitutionReleaseSnapshot)):
+                for asset_id in self._asset_ids_in_json(release.snapshot_json):
+                    release_refs.setdefault(asset_id, []).append({
+                        "release_id": release.id, "status": release.status,
+                        "package_kind": release.package_kind,
+                        "target_deployment_id": release.target_deployment_id,
+                    })
+            candidate_refs: dict[str, list[dict[str, Any]]] = {}
+            for candidate in session.scalars(select(ImportedRouteCandidate)):
+                asset_ids = self._asset_ids_in_json(candidate.snapshot_json)
+                asset_ids.update(self._asset_ids_in_json(candidate.readiness_json))
+                for asset_id in asset_ids:
+                    candidate_refs.setdefault(asset_id, []).append({
+                        "candidate_id": candidate.id, "status": candidate.status,
+                        "migration_job_id": candidate.migration_job_id,
+                        "project_deployment_id": candidate.project_deployment_id,
+                    })
+            migration_refs: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            migration_rows = session.execute(select(KnowledgeMigrationItem, KnowledgeMigrationJob).join(
+                KnowledgeMigrationJob, KnowledgeMigrationJob.id == KnowledgeMigrationItem.migration_job_id,
+            )).all()
+            for item, job in migration_rows:
+                migration_refs.setdefault((item.collection_name, item.partition_name), []).append({
+                    "migration_job_id": job.id, "direction": job.direction,
+                    "status": job.status, "stage": job.stage,
+                })
+
+            assets = []
+            current_latest: dict[tuple[str, str], int] = {}
+            asset_rows = list(session.scalars(select(KnowledgeAssetVersion).order_by(
+                KnowledgeAssetVersion.knowledge_library_id,
+                KnowledgeAssetVersion.version_no.desc(),
+            )))
+            for asset in asset_rows:
+                profile = profiles.get(asset.index_profile_id)
+                if asset.status == "ready" and profile and profile.current_revision_id == asset.index_profile_revision_id:
+                    key = (asset.knowledge_library_id, asset.index_profile_id)
+                    current_latest[key] = max(current_latest.get(key, 0), int(asset.version_no))
+            for asset in asset_rows:
+                library = libraries.get(asset.knowledge_library_id)
+                profile = profiles.get(asset.index_profile_id)
+                revision = profile_revisions.get(asset.index_profile_revision_id)
+                knowledge_type = None
+                if library:
+                    knowledge_type = f"graph:{library.graph_mode}" if library.knowledge_type == "graph" and library.graph_mode else library.knowledge_type
+                routes = route_refs.get(asset.id, [])
+                assets.append({
+                    "asset_version_id": asset.id,
+                    "knowledge_library_id": asset.knowledge_library_id,
+                    "knowledge_library_name": library.name if library else None,
+                    "knowledge_library_status": library.status if library else None,
+                    "knowledge_type": knowledge_type,
+                    "asset_version_no": asset.version_no,
+                    "asset_status": asset.status,
+                    "asset_error": asset.error,
+                    "index_profile_id": asset.index_profile_id,
+                    "index_profile_code": profile.code if profile else None,
+                    "index_profile_revision_id": asset.index_profile_revision_id,
+                    "current_profile_revision": bool(profile and profile.current_revision_id == asset.index_profile_revision_id),
+                    "latest_current_ready": bool(
+                        profile and profile.current_revision_id == asset.index_profile_revision_id
+                        and asset.status == "ready"
+                        and current_latest.get((asset.knowledge_library_id, asset.index_profile_id)) == asset.version_no
+                    ),
+                    "collection_policy": revision.collection_policy if revision else None,
+                    "storage_contract_revision_id": asset.storage_contract_revision_id,
+                    "collection_name": asset.collection_name,
+                    "partition_name": asset.partition_name,
+                    "expected_count": int(asset.item_count),
+                    "expected_digest": asset.content_digest,
+                    "verification": {
+                        "status": asset.last_verification_status,
+                        "verified_at": asset.last_verified_at.isoformat() if asset.last_verified_at else None,
+                        "observed_count": asset.last_observed_count,
+                        "observed_digest": asset.last_observed_digest,
+                        "error": asset.last_verification_error,
+                    },
+                    "routing_refs": routes,
+                    "routing_ref_count": len(routes),
+                    "release_refs": release_refs.get(asset.id, []),
+                    "candidate_refs": candidate_refs.get(asset.id, []),
+                    "migration_refs": migration_refs.get((asset.collection_name, asset.partition_name), []),
+                    "gc_eligible": asset.id in eligible_ids,
+                })
+
+            managed = {}
+            for item in managed_rows:
+                contract = contracts.get(item.storage_contract_revision_id)
+                contract_name = contract_names.get(contract.storage_contract_id) if contract else None
+                managed[item.collection_name] = {
+                    "managed_collection_id": item.id,
+                    "collection_name": item.collection_name,
+                    "registration_status": item.status,
+                    "registration_error": item.error_summary,
+                    "desired_spec_hash": item.desired_spec_hash,
+                    "observed_spec_hash": item.observed_spec_hash,
+                    "expected_description": (
+                        f"dataforge-managed:{item.id}:{item.provisioning_token}:{item.desired_spec_hash}"
+                    ),
+                    "storage_contract": None if not contract else {
+                        "id": contract.id,
+                        "code": contract_name.code if contract_name else None,
+                        "name": contract_name.name if contract_name else None,
+                        "revision": contract.revision_no,
+                        "schema": contract.schema_json,
+                        "index": contract.index_json,
+                        "dimension": contract.dimension,
+                        "metric_type": contract.metric_type,
+                        "storage_spec_hash": contract.storage_spec_hash,
+                    },
+                }
+            return {
+                "managed_collections": managed,
+                "assets": assets,
+                "gc": gc_plan,
+            }
+
+    def vector_partition_metadata(self, collection_name: str, partition_name: str) -> dict[str, Any] | None:
+        metadata = self.vector_inventory_metadata()
+        return next((item for item in metadata["assets"] if
+                     item["collection_name"] == collection_name and item["partition_name"] == partition_name), None)
+
+    def asset_version_references(self, asset_version_id: str) -> dict[str, Any]:
+        metadata = self.vector_inventory_metadata()
+        asset = next((item for item in metadata["assets"] if item["asset_version_id"] == asset_version_id), None)
+        if not asset:
+            raise ValueError("AssetVersion 不存在")
+        return {
+            "routing": asset["routing_refs"], "releases": asset["release_refs"],
+            "candidates": asset["candidate_refs"], "migrations": asset["migration_refs"],
+            "gc_eligible": asset["gc_eligible"],
+        }
+
+    def record_vector_partition_verification(self, asset_version_id: str, *, status: str,
+                                             observed_count: int | None = None,
+                                             observed_digest: str | None = None,
+                                             error: str | None = None) -> dict[str, Any]:
+        if status not in {"consistent", "inconsistent", "error"}:
+            raise ValueError("Partition 校验状态无效")
+        with self.sessions.begin() as session:
+            asset = session.get(KnowledgeAssetVersion, asset_version_id, with_for_update=True)
+            if not asset:
+                raise ValueError("AssetVersion 不存在")
+            asset.last_verification_status = status
+            asset.last_verified_at = utc_now()
+            asset.last_observed_count = observed_count
+            asset.last_observed_digest = observed_digest
+            asset.last_verification_error = error
+            self.audit(session, "vector_partition.verified", "knowledge_asset_version", asset.id, {
+                "status": status, "observed_count": observed_count,
+                "observed_digest": observed_digest, "error": error,
+            })
+            return {
+                "asset_version_id": asset.id, "status": status,
+                "verified_at": asset.last_verified_at.isoformat(),
+                "observed_count": observed_count, "observed_digest": observed_digest,
+                "error": error,
+            }
 
     def knowledge_asset_gc_plan(self, *, retention_days: int = 30, minimum_versions: int = 2) -> dict[str, Any]:
         if retention_days < 1 or minimum_versions < 1:
@@ -5392,13 +5620,13 @@ class V7Store:
         if scope not in {"central", "institution"}:
             raise ValueError("Deployment scope 只允许 central 或 institution")
         if scope == "institution" and (not normalized_institution or not normalized_institution_code):
-            raise ValueError("医院 Deployment 必须填写医院机构名称和机构代码")
+            raise ValueError("机构 Deployment 必须填写机构名称和机构代码")
         with self.sessions.begin() as session:
             if session.scalar(select(Deployment).where(Deployment.code == normalized_code)):
                 raise ValueError("Deployment 编码已存在")
             if normalized_institution_code and session.scalar(select(Deployment).where(
                     Deployment.institution_code == normalized_institution_code)):
-                raise ValueError("该医院机构代码已有 Deployment")
+                raise ValueError("该机构代码已有 Deployment")
             deployment = Deployment(
                 id=new_id("deployment"), code=normalized_code, name=normalized_name, scope=scope,
                 institution_name=normalized_institution, institution_code=normalized_institution_code,
@@ -5422,7 +5650,7 @@ class V7Store:
             normalized_uri = str(milvus_uri or "").strip()
             if release_stage == "production" and (
                     confirm_production is not True or expected_target_uri != normalized_uri):
-                raise ValueError("配置生产 Target 必须确认完整的医院生产 URI")
+                raise ValueError("配置生产 Target 必须确认完整的机构生产 URI")
             target = self._put_stage_target(session, deployment, release_stage, normalized_uri)
             self.audit(session, "deployment.target_updated", "deployment", deployment.id,
                        {"release_stage": release_stage, "milvus_url": normalized_uri})
@@ -5500,12 +5728,12 @@ class V7Store:
             if "institution_name" in changes and changes["institution_name"] is not None:
                 normalized = str(changes["institution_name"]).strip()
                 if value.scope == "institution" and not normalized:
-                    raise ValueError("医院机构名称不能为空")
+                    raise ValueError("机构名称不能为空")
                 value.institution_name = normalized or None
             if "institution_code" in changes and changes["institution_code"] is not None:
                 normalized_code = str(changes["institution_code"]).strip()
                 if value.scope == "institution" and not normalized_code:
-                    raise ValueError("医院机构代码不能为空")
+                    raise ValueError("机构代码不能为空")
                 if value.institution_code_locked_at and normalized_code != value.institution_code:
                     raise ValueError("机构代码已在首次发布后锁定；请使用专用机构码迁移流程")
                 duplicate = session.scalar(select(Deployment).where(
@@ -5513,7 +5741,7 @@ class V7Store:
                     Deployment.id != value.id,
                 )) if normalized_code else None
                 if duplicate:
-                    raise ValueError("该医院机构代码已有 Deployment")
+                    raise ValueError("该机构代码已有 Deployment")
                 value.institution_code = normalized_code or None
             if "status" in changes and changes["status"] is not None:
                 if changes["status"] not in {"active", "disabled"}:
@@ -5525,14 +5753,14 @@ class V7Store:
                 if requested_stage == "production" and (
                         changes.get("confirm_production") is not True
                         or changes.get("expected_target_uri") != target.milvus_url):
-                    raise ValueError("切换生产必须确认当前医院配置的完整生产 URI")
+                    raise ValueError("切换生产必须确认当前机构配置的完整生产 URI")
                 value.release_stage = requested_stage
                 self.audit(session, "deployment.release_stage_changed", "deployment", value.id,
                            {"release_stage": requested_stage, "milvus_url": target.milvus_url,
                             "institution_name": value.institution_name,
                             "institution_code": value.institution_code})
             if value.scope == "institution" and (not value.institution_name or not value.institution_code):
-                raise ValueError("医院 Deployment 必须填写医院机构名称和机构代码")
+                raise ValueError("机构 Deployment 必须填写机构名称和机构代码")
             session.flush()
             return self._shared_deployment_payload(value, self._deployment_targets(session, value.id))
 
@@ -5731,7 +5959,7 @@ class V7Store:
             if is_qa_agent_project(project):
                 if deployment.scope == "institution" and (
                         not deployment.institution_name or not deployment.institution_code):
-                    raise ValueError("qa-agent Deployment 尚未绑定医院机构名称和机构代码")
+                    raise ValueError("qa-agent Deployment 尚未绑定机构名称和机构代码")
             if project.code == KG_PROJECT_CODE and deployment.release_stage != "test":
                 raise ValueError("kg_for_consultation 当前没有 production RoutingSnapshot")
             task_rows = session.execute(select(ProjectDeploymentTask, ProjectTask).join(
@@ -5807,31 +6035,318 @@ class V7Store:
                     "milvus_target": {"id": target.id, "name": target.name, "milvus_url": target.milvus_url},
                     "tasks": tasks, "routes": flat_routes}
 
-    def validate_routing(self, boundary_id: str, milvus=None) -> dict[str, Any]:
-        snapshot = self.routing_snapshot(boundary_id); problems: list[str] = []
+    def validate_routing(self, boundary_id: str, milvus=None, *,
+                         target_validation_mode: str | None = None,
+                         target_reason: str | None = None) -> dict[str, Any]:
+        """Validate routing configuration and, when allowed, its live Milvus target."""
+        from .vector import CollectionValidationError
+
+        snapshot = self.routing_snapshot(boundary_id)
+        checks: list[dict[str, Any]] = []
+        configuration_issues: list[str] = []
+        physical_targets: list[dict[str, Any]] = []
+
+        def add_check(code: str, passed: bool, *, subject: dict[str, Any] | None = None,
+                      expected: Any = True, observed: Any = True, message: str) -> None:
+            checks.append({
+                "code": code, "status": "passed" if passed else "blocked",
+                "subject": subject or {}, "expected": expected,
+                "observed": observed, "message": message,
+            })
+
         with self.sessions() as session:
-            if not snapshot["routes"]: problems.append("Deployment 没有授权路由")
+            if not snapshot["routes"]:
+                configuration_issues.append("Deployment 没有授权路由")
             for task in snapshot["tasks"]:
-                if not task["index_profile"]: problems.append(f"任务 {task['task_code']} 没有已发布 Index Profile")
+                deployment_task = session.get(ProjectDeploymentTask, task["deployment_task_id"])
+                profile = session.get(
+                    KnowledgeIndexProfile, deployment_task.index_profile_id,
+                ) if deployment_task and deployment_task.index_profile_id else None
+                revision = session.get(
+                    KnowledgeIndexProfileRevision, profile.current_revision_id,
+                ) if profile and profile.current_revision_id else None
+                profile_published = bool(
+                    profile and profile.status in {"active", "published"} and revision
+                    and revision.status == "published"
+                )
+                profile_subject = {
+                    "task_code": task["task_code"],
+                    "index_profile_id": profile.id if profile else None,
+                }
+                add_check(
+                    "INDEX_PROFILE.PUBLISHED" if profile_published else "INDEX_PROFILE.NOT_PUBLISHED",
+                    profile_published, subject=profile_subject,
+                    expected="published",
+                    observed={
+                        "profile_status": profile.status if profile else "missing",
+                        "revision_status": revision.status if revision else "missing",
+                    },
+                    message=(f"任务 {task['task_code']} 的 Index Profile 已发布" if profile_published
+                             else f"任务 {task['task_code']} 没有已发布 Index Profile"),
+                )
+                if not profile_published:
+                    configuration_issues.append(f"任务 {task['task_code']} 没有已发布 Index Profile")
+                if not task["org_routes"]:
+                    configuration_issues.append(f"任务 {task['task_code']} 没有授权路由")
                 for route in task["org_routes"]:
-                    if not route["libraries"]: problems.append(f"任务 {task['task_code']} / {route['org_code']} 没有知识库")
+                    if not route["libraries"]:
+                        configuration_issues.append(
+                            f"任务 {task['task_code']} / {route['org_code']} 没有知识库"
+                        )
                     for info in route["libraries"]:
-                        library = session.get(KnowledgeLibrary, info["knowledge_library_id"])
-                        if not library or library.migration_status != "ready" or not self._library_ready(session, library):
-                            problems.append(f"知识库 {info['knowledge_library_id']} 向量未就绪")
-                            continue
-                        if not info.get("asset_version_id"):
-                            problems.append(f"知识库 {library.id} 没有 Ready AssetVersion")
-                            continue
-                        if milvus:
-                            indexes = info.get("indexes") or []
-                            collection = indexes[0].get("collection_name") if indexes else None
-                            try:
-                                if not collection or not milvus.partition_exists(collection, info["partition_name"]):
-                                    problems.append(f"知识库 {library.id} 的目标 Partition 不存在")
-                            except Exception as exc:
-                                problems.append(f"知识库 {library.id} 的目标 Milvus 校验失败：{exc}")
-        return {"valid": not problems, "problems": problems, "snapshot": snapshot}
+                        library_id = str(info["knowledge_library_id"])
+                        library = session.get(KnowledgeLibrary, library_id)
+                        indexes = info.get("indexes") or []
+                        index = indexes[0] if indexes else (task.get("index_profile") or {})
+                        subject = {
+                            "task_code": task["task_code"], "org_code": route["org_code"],
+                            "knowledge_library_id": library_id,
+                            "asset_version_id": info.get("asset_version_id"),
+                            "collection_name": index.get("collection_name"),
+                            "partition_name": info.get("partition_name"),
+                        }
+                        library_ready = bool(
+                            library and library.migration_status == "ready"
+                            and self._library_ready(session, library)
+                        )
+                        add_check(
+                            "KNOWLEDGE_LIBRARY.READY" if library_ready else "KNOWLEDGE_LIBRARY.NOT_READY",
+                            library_ready, subject=subject, expected="ready",
+                            observed={
+                                "exists": bool(library),
+                                "migration_status": library.migration_status if library else "missing",
+                                "vector_ready": self._library_ready(session, library) if library else False,
+                            },
+                            message=(f"知识库 {library_id} 已 Ready" if library_ready
+                                     else f"知识库 {library_id} 向量未就绪"),
+                        )
+                        if not library_ready:
+                            configuration_issues.append(f"知识库 {library_id} 向量未就绪")
+
+                        asset = session.get(
+                            KnowledgeAssetVersion, info.get("asset_version_id"),
+                        ) if info.get("asset_version_id") else None
+                        latest_asset = asset
+                        if not latest_asset and profile and revision:
+                            latest_asset = session.scalar(select(KnowledgeAssetVersion).where(
+                                KnowledgeAssetVersion.knowledge_library_id == library_id,
+                                KnowledgeAssetVersion.index_profile_id == profile.id,
+                                KnowledgeAssetVersion.index_profile_revision_id == revision.id,
+                            ).order_by(KnowledgeAssetVersion.version_no.desc()))
+                        asset_ready = bool(asset and asset.status == "ready")
+                        add_check(
+                            "ASSET_VERSION.READY" if asset_ready else "ASSET_VERSION.NOT_READY",
+                            asset_ready, subject=subject, expected="ready",
+                            observed={
+                                "asset_version_id": latest_asset.id if latest_asset else None,
+                                "status": latest_asset.status if latest_asset else "missing",
+                            },
+                            message=(f"知识库 {library_id} 的 AssetVersion 已 Ready" if asset_ready
+                                     else f"知识库 {library_id} 没有 Ready AssetVersion"),
+                        )
+                        if not asset_ready:
+                            configuration_issues.append(f"知识库 {library_id} 没有 Ready AssetVersion")
+
+                        fields = index.get("fields") if isinstance(index.get("fields"), dict) else {}
+                        embedding = index.get("embedding") if isinstance(index.get("embedding"), dict) else {}
+                        collection = str(index.get("collection_name") or "").strip()
+                        dimension = embedding.get("dimension")
+                        contract_id = index.get("storage_contract_revision_id")
+                        contract_defined = bool(
+                            collection and fields and fields.get("vector")
+                            and contract_id and isinstance(dimension, int) and dimension > 0
+                        )
+                        add_check(
+                            "COLLECTION.CONTRACT_DEFINED" if contract_defined
+                            else "COLLECTION.CONTRACT_NOT_DEFINED",
+                            contract_defined, subject=subject,
+                            expected={
+                                "collection_name": "non-empty", "fields": "mapped",
+                                "embedding_dimension": "positive integer",
+                                "storage_contract_revision_id": "non-empty",
+                            },
+                            observed={
+                                "collection_name": collection or None,
+                                "fields": fields, "embedding_dimension": dimension,
+                                "storage_contract_revision_id": contract_id,
+                            },
+                            message=(f"Collection Contract 已定义：{collection}" if contract_defined
+                                     else f"知识库 {library_id} 的 Collection Contract 不完整"),
+                        )
+                        if not contract_defined:
+                            configuration_issues.append(
+                                f"知识库 {library_id} 的 Collection Contract 不完整"
+                            )
+
+                        partition = str(info.get("partition_name") or "").strip()
+                        partition_defined = bool(partition and partition.startswith("kl_"))
+                        add_check(
+                            "PARTITION.EXPECTED_DEFINED" if partition_defined
+                            else "PARTITION.EXPECTED_NOT_DEFINED",
+                            partition_defined, subject=subject,
+                            expected="kl_*", observed=partition or None,
+                            message=(f"预期 Partition 已确定：{partition}" if partition_defined
+                                     else f"知识库 {library_id} 的预期 Partition 未确定"),
+                        )
+                        if not partition_defined:
+                            configuration_issues.append(f"知识库 {library_id} 的预期 Partition 未确定")
+                        if asset_ready and contract_defined and partition_defined:
+                            physical_targets.append({
+                                "subject": subject, "collection_name": collection,
+                                "partition_name": partition, "fields": fields,
+                                "dimension": int(dimension),
+                            })
+
+        configuration_ok = not configuration_issues
+        checks.insert(0, {
+            "code": "ROUTING.CONFIG_COMPLETE" if configuration_ok else "ROUTING.CONFIG_INCOMPLETE",
+            "status": "passed" if configuration_ok else "blocked",
+            "subject": {"project_deployment_id": snapshot["project_deployment"]["id"]},
+            "expected": "complete", "observed": configuration_issues or "complete",
+            "message": "Routing 配置完整" if configuration_ok else "Routing 配置不完整",
+        })
+
+        mode = target_validation_mode or ("live" if milvus else "deferred_to_local")
+        target_validation = {
+            "mode": mode, "attempted": False, "reachable": None,
+            "reason": target_reason,
+        }
+
+        def safe_milvus_error(exc: Exception) -> str:
+            message = str(exc)
+            if milvus:
+                for secret in (getattr(milvus, "token", None), getattr(milvus, "uri", None)):
+                    if secret:
+                        message = message.replace(str(secret), "[redacted]")
+            return message
+
+        reachable = False
+        collection_names: set[str] = set()
+        if mode == "live":
+            if not milvus:
+                reason = target_reason or "当前 Deployment 未配置有效的目标 Milvus URI"
+                target_validation.update({"reachable": False, "reason": reason})
+                add_check(
+                    "MILVUS.UNREACHABLE", False, expected="reachable",
+                    observed="target_not_configured", message=reason,
+                )
+            else:
+                target_validation["attempted"] = True
+                try:
+                    collection_names = set(milvus.list_collections())
+                    reachable = True
+                    target_validation["reachable"] = True
+                    add_check(
+                        "MILVUS.REACHABLE", True, expected="reachable",
+                        observed="reachable", message="Milvus Target 可连接",
+                    )
+                except Exception as exc:
+                    reason = safe_milvus_error(exc)
+                    target_validation.update({"reachable": False, "reason": reason})
+                    add_check(
+                        "MILVUS.UNREACHABLE", False, expected="reachable",
+                        observed=reason, message="Milvus Target 连接失败",
+                    )
+        else:
+            target_validation["reason"] = target_reason or (
+                "中心不连接机构现场 Milvus，实体检查延后到机构本地 Prepare/Activation Preflight"
+            )
+
+        if reachable:
+            collection_targets: dict[tuple[str, str, int], dict[str, Any]] = {}
+            partition_targets: dict[tuple[str, str], dict[str, Any]] = {}
+            for target in physical_targets:
+                fields_key = json.dumps(target["fields"], ensure_ascii=False, sort_keys=True)
+                collection_targets.setdefault(
+                    (target["collection_name"], fields_key, target["dimension"]), target,
+                )
+                partition_targets.setdefault(
+                    (target["collection_name"], target["partition_name"]), target,
+                )
+            missing_collections: set[str] = set()
+            for target in collection_targets.values():
+                collection = target["collection_name"]
+                subject = target["subject"]
+                if collection not in collection_names:
+                    missing_collections.add(collection)
+                    add_check(
+                        "COLLECTION.NOT_FOUND", False, subject=subject,
+                        expected={"exists": True}, observed={"exists": False},
+                        message=f"Milvus Collection {collection} 不存在",
+                    )
+                    continue
+                add_check(
+                    "COLLECTION.FOUND", True, subject=subject,
+                    expected={"exists": True}, observed={"exists": True},
+                    message=f"Milvus Collection {collection} 已创建",
+                )
+                try:
+                    report = milvus.validate_collection(
+                        collection, target["fields"], target["dimension"],
+                    )
+                    add_check(
+                        "COLLECTION.FIELD_MATCHED", True, subject=subject,
+                        expected={"required_fields": sorted(str(value) for value in target["fields"].values())},
+                        observed={"fields": report["fields"]},
+                        message="Collection 字段与 Index Profile 映射匹配",
+                    )
+                    add_check(
+                        "COLLECTION.DIMENSION_MATCHED", True, subject=subject,
+                        expected=target["dimension"], observed=report["dimension"],
+                        message=f"Collection 向量维度匹配：{target['dimension']}",
+                    )
+                except CollectionValidationError as exc:
+                    if exc.code == "COLLECTION.NOT_FOUND":
+                        missing_collections.add(collection)
+                    elif exc.code == "COLLECTION.DIMENSION_MISMATCH":
+                        required_fields = sorted(str(value) for value in target["fields"].values())
+                        add_check(
+                            "COLLECTION.FIELD_MATCHED", True, subject=subject,
+                            expected={"required_fields": required_fields},
+                            observed={"fields": required_fields},
+                            message="Collection 字段与 Index Profile 映射匹配",
+                        )
+                    add_check(
+                        exc.code, False, subject=subject,
+                        expected=exc.expected, observed=exc.observed, message=str(exc),
+                    )
+                except Exception as exc:
+                    reason = safe_milvus_error(exc)
+                    target_validation.update({"reachable": False, "reason": reason})
+                    add_check(
+                        "MILVUS.UNREACHABLE", False, subject=subject,
+                        expected="reachable", observed=reason,
+                        message="Milvus Target 校验过程中连接失败",
+                    )
+            for target in partition_targets.values():
+                collection, partition = target["collection_name"], target["partition_name"]
+                if collection in missing_collections:
+                    continue
+                try:
+                    exists = bool(milvus.partition_exists(collection, partition))
+                    add_check(
+                        "PARTITION.FOUND" if exists else "PARTITION.NOT_FOUND",
+                        exists, subject=target["subject"],
+                        expected={"exists": True}, observed={"exists": exists},
+                        message=(f"Milvus Partition {partition} 已创建" if exists
+                                 else f"Milvus Partition {partition} 不存在"),
+                    )
+                except Exception as exc:
+                    reason = safe_milvus_error(exc)
+                    target_validation.update({"reachable": False, "reason": reason})
+                    add_check(
+                        "MILVUS.UNREACHABLE", False, subject=target["subject"],
+                        expected="reachable", observed=reason,
+                        message="Milvus Target 校验过程中连接失败",
+                    )
+
+        blocked = sum(item["status"] == "blocked" for item in checks)
+        problems = [item["message"] for item in checks if item["status"] == "blocked"]
+        return {
+            "valid": blocked == 0, "blocked": blocked,
+            "target_validation": target_validation,
+            "checks": checks, "problems": problems, "snapshot": snapshot,
+        }
 
     def routing_diff(self, boundary_id: str, release_stage: str | None = None) -> dict[str, Any]:
         current = self.routing_snapshot(boundary_id)
@@ -6036,6 +6551,7 @@ class V7Store:
     def create_institution_release_draft(self, target_deployment_id: str, package_kind: str,
                                          *, route_version_ids: list[str] | None = None,
                                          knowledge_library_ids: list[str] | None = None,
+                                         extra_asset_version_ids: list[str] | None = None,
                                          base_release_id: str | None = None,
                                          include_full_document_library: bool = False) -> dict[str, Any]:
         if package_kind not in {"deployment_seed", "institution_release", "knowledge_update"}:
@@ -6046,8 +6562,9 @@ class V7Store:
                 raise ValueError("机构发布目标必须是 institution Deployment")
             route_ids = list(dict.fromkeys(route_version_ids or []))
             library_ids = list(dict.fromkeys(knowledge_library_ids or []))
+            extra_asset_ids = list(dict.fromkeys(extra_asset_version_ids or []))
             if package_kind == "knowledge_update":
-                if route_ids or not library_ids:
+                if route_ids or extra_asset_ids or not library_ids:
                     raise ValueError("Knowledge Update 只允许选择知识库")
             elif not route_ids:
                 raise ValueError("Seed/Institution Release 至少选择一个 frozen RouteVersion")
@@ -6067,6 +6584,7 @@ class V7Store:
                 id=new_id("reldraft"), target_deployment_id=deployment.id,
                 package_kind=package_kind, base_release_id=base_release_id,
                 selection_json={"route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                                "extra_asset_version_ids": extra_asset_ids,
                                 "include_full_document_library": bool(include_full_document_library)},
             )
             session.add(draft); session.flush()
@@ -6078,7 +6596,8 @@ class V7Store:
                 ))
             self.audit(session, "institution_release.draft_created", "institution_release_draft", draft.id,
                        {"package_kind": package_kind, "target_deployment_id": deployment.id,
-                        "route_version_ids": route_ids, "knowledge_library_ids": library_ids})
+                         "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                         "extra_asset_version_ids": extra_asset_ids})
             return self._institution_release_draft_payload(session, draft)
 
     @staticmethod
@@ -6105,6 +6624,7 @@ class V7Store:
 
     def update_institution_release_draft(self, draft_id: str, *, route_version_ids: list[str] | None = None,
                                          knowledge_library_ids: list[str] | None = None,
+                                         extra_asset_version_ids: list[str] | None = None,
                                          base_release_id: str | None = None,
                                          include_full_document_library: bool | None = None,
                                          milvus_override: dict[str, Any] | None = None,
@@ -6118,8 +6638,10 @@ class V7Store:
                                            else current.get("route_version_ids") or []))
             library_ids = list(dict.fromkeys(knowledge_library_ids if knowledge_library_ids is not None
                                              else current.get("knowledge_library_ids") or []))
+            extra_asset_ids = list(dict.fromkeys(extra_asset_version_ids if extra_asset_version_ids is not None
+                                                 else current.get("extra_asset_version_ids") or []))
             if draft.package_kind == "knowledge_update":
-                if route_ids or not library_ids:
+                if route_ids or extra_asset_ids or not library_ids:
                     raise ValueError("Knowledge Update 只允许选择知识库")
             elif not route_ids:
                 raise ValueError("Seed/Institution Release 至少选择一个 frozen RouteVersion")
@@ -6154,6 +6676,7 @@ class V7Store:
                 ))
             draft.selection_json = {
                 "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                "extra_asset_version_ids": extra_asset_ids,
                 "include_full_document_library": bool(
                     current.get("include_full_document_library", False)
                     if include_full_document_library is None else include_full_document_library
@@ -6168,6 +6691,8 @@ class V7Store:
             return self._institution_release_draft_payload(session, draft)
 
     def freeze_institution_release_snapshot(self, draft_id: str, snapshot: dict[str, Any]) -> dict[str, Any]:
+        if int((snapshot.get("preflight") or {}).get("blocked") or 0) > 0:
+            raise ValueError("机构 Release 存在阻断项，禁止冻结")
         encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         digest = hashlib.sha256(encoded).hexdigest()
         with self.sessions.begin() as session:
@@ -6508,6 +7033,132 @@ class V7Store:
                 job.checkpoint_json = checkpoint
             job.status, job.error, job.finished_at = "queued", None, None
             return self._migration_job_payload(job)
+
+    @staticmethod
+    def _observation_age(value: datetime | None, now: datetime | None = None) -> float | None:
+        if value is None:
+            return None
+        current = now or utc_now()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return max(0.0, (current - value).total_seconds())
+
+    def upsert_component_heartbeat(self, component: str, instance_id: str, *, status: str = "healthy",
+                                   version: str | None = None, worker_id: str | None = None,
+                                   current_job_id: str | None = None, details: dict | None = None) -> None:
+        with self.sessions.begin() as session:
+            row = session.get(ComponentHeartbeat, {"component": component, "instance_id": instance_id})
+            if row is None:
+                row = ComponentHeartbeat(component=component, instance_id=instance_id)
+                session.add(row)
+            row.status, row.last_seen_at = status, utc_now()
+            row.version, row.worker_id, row.current_job_id = version, worker_id, current_job_id
+            row.details_json = dict(details or {})
+
+    def list_component_heartbeats(self, component: str | None = None) -> list[dict[str, Any]]:
+        with self.sessions() as session:
+            statement = select(ComponentHeartbeat)
+            if component:
+                statement = statement.where(ComponentHeartbeat.component == component)
+            rows = list(session.scalars(statement.order_by(ComponentHeartbeat.component, ComponentHeartbeat.instance_id)))
+            return [{
+                "component": row.component, "instance_id": row.instance_id, "status": row.status,
+                "last_seen_at": row.last_seen_at.isoformat(), "age_seconds": self._observation_age(row.last_seen_at),
+                "stale": bool((self._observation_age(row.last_seen_at) or 0) > 45),
+                "version": row.version, "worker_id": row.worker_id, "current_job_id": row.current_job_id,
+                "details": dict(row.details_json or {}),
+            } for row in rows]
+
+    def interrupt_component_checks(self) -> int:
+        with self.sessions.begin() as session:
+            rows = list(session.scalars(select(ComponentCheckRun).where(ComponentCheckRun.status == "running")))
+            for row in rows:
+                row.status, row.completed_at, row.error_code = "failed", utc_now(), "interrupted"
+            return len(rows)
+
+    @staticmethod
+    def _component_check_payload(run: ComponentCheckRun, results: list[ComponentCheckResult]) -> dict[str, Any]:
+        return {
+            "id": run.id, "status": run.status, "selected_components": list(run.selected_components or []),
+            "requested_by": run.requested_by, "started_at": run.started_at.isoformat(),
+            "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+            "error_code": run.error_code,
+            "results": [{
+                "component": row.component, "status": row.status, "latency_ms": row.latency_ms,
+                "summary": row.summary, "error_code": row.error_code, "details": dict(row.details_json or {}),
+                "checked_at": row.checked_at.isoformat() if row.checked_at else None,
+            } for row in sorted(results, key=lambda item: list(run.selected_components or []).index(item.component))],
+        }
+
+    def start_component_check(self, components: list[str], requested_by: str = "admin") -> tuple[dict[str, Any], bool]:
+        with self.sessions.begin() as session:
+            active = session.scalar(select(ComponentCheckRun).where(ComponentCheckRun.status == "running")
+                                    .order_by(ComponentCheckRun.started_at).limit(1).with_for_update())
+            if active:
+                results = list(session.scalars(select(ComponentCheckResult).where(ComponentCheckResult.check_run_id == active.id)))
+                return self._component_check_payload(active, results), False
+            run = ComponentCheckRun(id=new_id("check"), status="running", selected_components=list(components),
+                                    requested_by=requested_by, started_at=utc_now())
+            session.add(run)
+            session.flush()
+            for component in components:
+                session.add(ComponentCheckResult(id=new_id("checkitem"), check_run_id=run.id,
+                                                 component=component, status="unknown", summary="等待检查"))
+            session.flush()
+            results = list(session.scalars(select(ComponentCheckResult).where(ComponentCheckResult.check_run_id == run.id)))
+            return self._component_check_payload(run, results), True
+
+    def record_component_check_result(self, run_id: str, component: str, *, status: str, latency_ms: int | None,
+                                      summary: str, error_code: str | None = None,
+                                      details: dict | None = None) -> None:
+        with self.sessions.begin() as session:
+            row = session.scalar(select(ComponentCheckResult).where(
+                ComponentCheckResult.check_run_id == run_id, ComponentCheckResult.component == component,
+            ).with_for_update())
+            if not row:
+                raise ValueError("组件检查明细不存在")
+            row.status, row.latency_ms, row.summary = status, latency_ms, summary[:500]
+            row.error_code, row.details_json, row.checked_at = error_code, dict(details or {}), utc_now()
+
+    def finish_component_check(self, run_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            run = session.get(ComponentCheckRun, run_id, with_for_update=True)
+            if not run:
+                raise ValueError("组件检查不存在")
+            results = list(session.scalars(select(ComponentCheckResult).where(ComponentCheckResult.check_run_id == run.id)))
+            statuses = {row.status for row in results}
+            run.status = "completed" if statuses <= {"healthy", "not_configured"} else "completed_with_warnings"
+            run.completed_at = utc_now()
+            return self._component_check_payload(run, results)
+
+    def get_component_check(self, run_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            run = session.get(ComponentCheckRun, run_id)
+            if not run:
+                raise ValueError("组件检查不存在")
+            results = list(session.scalars(select(ComponentCheckResult).where(ComponentCheckResult.check_run_id == run.id)))
+            return self._component_check_payload(run, results)
+
+    def latest_component_results(self) -> dict[str, dict[str, Any]]:
+        with self.sessions() as session:
+            rows = list(session.scalars(select(ComponentCheckResult).where(ComponentCheckResult.checked_at.is_not(None))
+                                        .order_by(ComponentCheckResult.checked_at.desc())))
+            latest: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if row.component in latest:
+                    continue
+                age = self._observation_age(row.checked_at)
+                stale = bool(age is not None and age > 900)
+                latest[row.component] = {
+                    "status": "unknown" if stale else row.status, "last_status": row.status,
+                    "stale": stale, "age_seconds": age, "latency_ms": row.latency_ms,
+                    "summary": row.summary, "error_code": row.error_code,
+                    "checked_at": row.checked_at.isoformat() if row.checked_at else None,
+                    "details": dict(row.details_json or {}),
+                }
+            return latest
 
     def close(self) -> None:
         self.engine.dispose()

@@ -5,8 +5,8 @@ import logging
 import json
 import os
 import secrets
-import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
@@ -19,6 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from ..config import Settings
 from .auth import SESSION_COOKIE, verify_admin_password
 from .models import AdminSession, Deployment, utc_now
+from .observability import COMPONENTS, ComponentCheckService, components_snapshot
 from .runner import preview_template_definition
 from .routing import AtomicRoutingPublisher
 from .routing_delivery import RoutingDeliveryService
@@ -27,10 +28,12 @@ from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
+from .migration.verifier import ActivationPreflightVerifier
 from .store import (
     V7Store,
 )
 from .vector import V7Milvus, VectorSyncService
+from .vector_inventory import INVENTORY_STATUSES, MilvusInventoryService
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
@@ -269,6 +272,7 @@ class InstitutionReleaseDraftRequest(BaseModel):
     package_kind: Literal["deployment_seed", "institution_release", "knowledge_update"]
     route_version_ids: list[str] = Field(default_factory=list)
     knowledge_library_ids: list[str] = Field(default_factory=list)
+    extra_asset_version_ids: list[str] = Field(default_factory=list)
     base_release_id: str | None = None
     include_full_document_library: bool = False
 
@@ -277,6 +281,7 @@ class InstitutionReleaseDraftPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     route_version_ids: list[str] | None = None
     knowledge_library_ids: list[str] | None = None
+    extra_asset_version_ids: list[str] | None = None
     base_release_id: str | None = None
     include_full_document_library: bool | None = None
     milvus_override: dict | None = None
@@ -302,6 +307,11 @@ class KnowledgeAssetGcRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     execute: bool = False
     confirmation: str | None = None
+
+
+class ComponentCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    components: list[str] = Field(min_length=1)
 
 
 def _objects(settings: Settings):
@@ -332,6 +342,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         store.assert_schema_current()
     instance = InstanceContext.load(store, resolved)
     objects = _objects(resolved)
+    component_checks = ComponentCheckService(store, resolved, objects)
+    component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
     local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
     app.state.store, app.state.objects, app.state.instance = store, objects, instance
@@ -339,9 +351,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     app.state.routing_publications = set()
     app.state.routing_publications_lock = threading.RLock()
 
+    @app.on_event("startup")
+    def reconcile_component_checks() -> None:
+        store.interrupt_component_checks()
+
+    @app.on_event("shutdown")
+    def shutdown_component_checks() -> None:
+        component_check_executor.shutdown(wait=False, cancel_futures=True)
+
     @app.middleware("http")
     async def require_admin(request: Request, call_next):
-        open_paths = {"/api/health", "/api/auth/status", "/api/auth/login"}
+        open_paths = {"/api/health", "/api/health/live", "/api/health/ready", "/api/auth/status", "/api/auth/login"}
         runtime_path = request.url.path.startswith("/api/runtime/routing/")
         if resolved.authentication_enabled and request.url.path.startswith("/api/") and request.url.path not in open_paths and not runtime_path:
             token = request.cookies.get(SESSION_COOKIE)
@@ -366,35 +386,42 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/health")
     def health():
-        components: dict[str, dict] = {}
+        return {"platform": "v7", **components_snapshot(store, detailed=False)}
+
+    @app.get("/api/health/live")
+    def health_live():
+        return {"status": "healthy", "platform": "v7"}
+
+    @app.get("/api/health/ready")
+    def health_ready():
         try:
             with store.engine.connect() as connection:
                 connection.exec_driver_sql("SELECT 1")
-            components["mysql"] = {"status": "ok", "kind": "mysql" if resolved.database_url else "sqlite-dev"}
-        except SQLAlchemyError as exc:
-            components["mysql"] = {"status": "failed", "error": str(exc)}
-        components["minio"] = {
-            "status": "configured" if resolved.minio_endpoint else "local-dev",
-            "endpoint_configured": bool(resolved.minio_endpoint),
-        }
-        configurations = {item["slot"]: item for item in local_milvus_config.list(app.state.instance.id)} \
-            if app.state.instance.mode == "local" else {}
-        current_target = configurations.get("current_target")
-        components["milvus"] = {
-            "status": current_target["status"] if current_target else
-                      ("environment" if os.getenv("DATAFORGE_MILVUS_URI") else "not_configured"),
-            "target": current_target,
-        }
-        components["worker"] = {"status": "unknown", "detail": "当前 schema 尚无 Worker heartbeat，不伪造在线"}
-        components["runner"] = {"status": "configured_unverified" if resolved.runner_url else "not_configured"}
-        components["parser"] = {"status": "unknown", "detail": "由 Runner 执行实际解析健康检查"}
-        components["embedding"] = {"status": "configured_unverified", "detail": "实际向量任务验证 Profile endpoint"}
-        components["llm"] = {"status": "optional", "configured": bool(os.getenv("DATAFORGE_LLM_BASE_URL"))}
-        usage = shutil.disk_usage(resolved.state_dir)
-        components["disk"] = {"status": "ok" if usage.free > 1024 ** 3 else "warning",
-                              "total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
-        failed = any(item["status"] == "failed" for item in components.values())
-        return {"status": "failed" if failed else "ok", "platform": "v7", "components": components}
+            return {"status": "healthy", "platform": "v7"}
+        except SQLAlchemyError:
+            return JSONResponse(status_code=503, content={"status": "unavailable", "platform": "v7"})
+
+    @app.get("/api/observability/components")
+    def observability_components():
+        return {"available_components": list(COMPONENTS), **components_snapshot(store, detailed=True)}
+
+    @app.post("/api/observability/check-runs", status_code=202)
+    def create_component_check(payload: ComponentCheckRequest):
+        try:
+            components = component_checks.validate_components(payload.components)
+            run, created = store.start_component_check(components)
+            if created:
+                component_check_executor.submit(component_checks.run, run["id"], components)
+            return {**run, "created": created}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/observability/check-runs/{run_id}")
+    def component_check_run(run_id: str):
+        try:
+            return store.get_component_check(run_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/instance")
     def instance_info():
@@ -446,7 +473,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/dashboard/overview")
     def dashboard_overview():
-        return store.dashboard_overview(app.state.instance.mode)
+        result = store.dashboard_overview(app.state.instance.mode)
+        result["observability"] = components_snapshot(store, detailed=False)
+        return result
 
     @app.post("/api/document-libraries", status_code=201)
     def create_document_library(payload: DocumentLibraryRequest):
@@ -1009,6 +1038,82 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/vector-indexes")
     def vector_indexes(): return {"profiles": store.list_index_profiles(), "managed_collections": store.list_managed_collections(), "capacity": VectorSyncService.from_environment(store).capacity_report()}
 
+    @app.get("/api/vector-storage/overview")
+    def vector_storage_overview():
+        return MilvusInventoryService.from_environment(store).overview()
+
+    @app.get("/api/vector-storage/collections")
+    def vector_storage_collections(
+        q: str = "",
+        knowledge_type: str = "",
+        status: str = "",
+        only_anomaly: bool = False,
+        only_unused: bool = False,
+    ):
+        if status and status not in INVENTORY_STATUSES:
+            raise HTTPException(status_code=422, detail="向量库存状态筛选无效")
+        service = MilvusInventoryService.from_environment(store)
+        if not service.milvus:
+            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+        try:
+            return service.collections(
+                q=q, knowledge_type=knowledge_type, status=status,
+                only_anomaly=only_anomaly, only_unused=only_unused,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus 库存读取失败：{exc}") from exc
+
+    @app.get("/api/vector-storage/collections/{collection_name}")
+    def vector_storage_collection(collection_name: str):
+        service = MilvusInventoryService.from_environment(store)
+        if not service.milvus:
+            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+        try:
+            return service.collection_detail(collection_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus Collection 读取失败：{exc}") from exc
+
+    @app.get("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}")
+    def vector_storage_partition(collection_name: str, partition_name: str):
+        service = MilvusInventoryService.from_environment(store)
+        if not service.milvus:
+            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+        try:
+            return service.partition_detail(collection_name, partition_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus Partition 读取失败：{exc}") from exc
+
+    @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/verify")
+    def verify_vector_storage_partition(collection_name: str, partition_name: str):
+        try:
+            return MilvusInventoryService.from_environment(store).verify_partition(collection_name, partition_name)
+        except ValueError as exc:
+            raise _error(exc) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus Partition 校验失败：{exc}") from exc
+
+    @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/load")
+    def load_vector_storage_partition(collection_name: str, partition_name: str):
+        try:
+            return MilvusInventoryService.from_environment(store).load_partition(collection_name, partition_name)
+        except ValueError as exc:
+            raise _error(exc) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus Partition 加载失败：{exc}") from exc
+
+    @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/release")
+    def release_vector_storage_partition(collection_name: str, partition_name: str):
+        try:
+            return MilvusInventoryService.from_environment(store).release_partition(collection_name, partition_name)
+        except ValueError as exc:
+            raise _error(exc) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"Milvus Partition 释放失败：{exc}") from exc
+
     @app.get("/api/developer/managed-collections")
     def managed_collections(): return store.list_managed_collections()
 
@@ -1337,11 +1442,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             else "DATAFORGE_TEST_MILVUS_TOKEN"
         )
         token = os.getenv(stage_token_name) or os.getenv("DATAFORGE_MILVUS_TOKEN")
-        check = store.validate_routing(deployment_id, V7Milvus(uri, token) if uri else None)
-        if should_connect and not uri:
-            check["problems"].append("当前 Deployment 需要目标验证，但未配置有效的目标 Milvus URI")
-            check["valid"] = False
-        return check
+        if should_connect:
+            return store.validate_routing(
+                deployment_id, V7Milvus(uri, token) if uri else None,
+                target_validation_mode="live",
+                target_reason=(None if uri else
+                               "当前 Deployment 需要目标验证，但未配置有效的目标 Milvus URI"),
+            )
+        return store.validate_routing(
+            deployment_id, target_validation_mode="deferred_to_local",
+            target_reason=("中心不连接机构现场 Milvus，实体检查延后到机构本地 "
+                           "Prepare/Activation Preflight"),
+        )
 
     @app.post("/api/project-deployments/{deployment_id}/routing/validate")
     def validate_deployment_routing(deployment_id: str):
@@ -1392,7 +1504,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if deployment["release_stage"] == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
-                raise ValueError("生产发布必须再次确认当前医院配置的完整生产 URI")
+                raise ValueError("生产发布必须再次确认当前机构配置的完整生产 URI")
             if payload.expected_target_uri and payload.expected_target_uri != expected_uri:
                 raise ValueError("发布目标与 release_stage 不一致")
             candidate_check = store.validate_routing(deployment_id)
@@ -1430,7 +1542,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if deployment["release_stage"] == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
-                raise ValueError("生产回滚必须再次确认当前医院配置的完整生产 URI")
+                raise ValueError("生产回滚必须再次确认当前机构配置的完整生产 URI")
             previous = store.published_route_version(deployment_id, version_no, deployment["release_stage"])
             store.restore_authorizations(deployment_id, previous.snapshot_json)
             check = _validate_target_routing(deployment_id)
@@ -1459,7 +1571,23 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 continue
         return visible
 
-    def _activate_route_candidate(candidate_id: str):
+    def _activation_preflight(job_id: str):
+        return ActivationPreflightVerifier(
+            store, local_milvus_config, app.state.instance,
+        ).run(job_id)
+
+    def _candidate(candidate_id: str):
+        candidate = next((item for item in store.list_imported_route_candidates()
+                          if item["id"] == candidate_id), None)
+        if not candidate:
+            raise ValueError("候选路由不存在")
+        return candidate
+
+    def _activate_route_candidate(candidate_id: str, *, preflight: dict | None = None):
+        candidate = _candidate(candidate_id)
+        preflight = preflight or _activation_preflight(candidate["migration_job_id"])
+        if not preflight.get("ready"):
+            raise ValueError("Activation Preflight 存在阻断项，禁止激活")
         started = store.start_route_candidate_activation(candidate_id)
         app.state.instance.require_deployment(store, started["project_deployment_id"])
         if started.get("idempotent"):
@@ -1494,13 +1622,47 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if app.state.instance.mode != "local":
             raise HTTPException(status_code=403, detail="只有机构本地可以批量激活候选路由")
         results = []
+        preflights: dict[str, dict] = {}
         for candidate_id in payload.candidate_ids:
             try:
+                candidate = _candidate(candidate_id)
+                if candidate["migration_job_id"] not in preflights:
+                    preflights[candidate["migration_job_id"]] = _activation_preflight(
+                        candidate["migration_job_id"])
+                preflight = preflights[candidate["migration_job_id"]]
                 results.append({"candidate_id": candidate_id, "ok": True,
-                                "result": _activate_route_candidate(candidate_id)})
+                                "result": _activate_route_candidate(candidate_id, preflight=preflight)})
             except Exception as exc:
                 results.append({"candidate_id": candidate_id, "ok": False, "error": str(exc)})
         return {"atomic": False, "results": results}
+
+    @app.post("/api/migrations/{job_id}/activation-preflight")
+    def migration_activation_preflight(job_id: str):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以执行激活检查")
+        try:
+            return _activation_preflight(job_id)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
+    @app.post("/api/migrations/{job_id}/activate-ready")
+    def activate_migration_ready_routes(job_id: str):
+        if app.state.instance.mode != "local":
+            raise HTTPException(status_code=403, detail="只有机构本地可以批量激活候选路由")
+        try:
+            preflight = _activation_preflight(job_id)
+            if not preflight.get("ready"):
+                raise ValueError("Activation Preflight 存在阻断项，禁止激活")
+            results = []
+            for candidate in preflight["candidates"]:
+                try:
+                    results.append({"candidate_id": candidate["id"], "ok": True,
+                                    "result": _activate_route_candidate(candidate["id"], preflight=preflight)})
+                except Exception as exc:
+                    results.append({"candidate_id": candidate["id"], "ok": False, "error": str(exc)})
+            return {"atomic": False, "preflight": preflight, "results": results}
+        except ValueError as exc:
+            raise _error(exc) from exc
 
     @app.get("/api/runtime/routing/{project_code}/{deployment_code}/{release_stage}")
     def runtime_routing(project_code: str, deployment_code: str,
@@ -1529,6 +1691,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 payload.target_deployment_id, payload.package_kind,
                 route_version_ids=payload.route_version_ids,
                 knowledge_library_ids=payload.knowledge_library_ids,
+                extra_asset_version_ids=payload.extra_asset_version_ids,
                 base_release_id=payload.base_release_id,
                 include_full_document_library=payload.include_full_document_library,
             )
@@ -1562,12 +1725,23 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc:
             raise _error(exc) from exc
 
+    @app.get("/api/institution-deployments/drafts/{draft_id}/asset-options")
+    def institution_release_asset_options(draft_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以查看机构发布资产")
+        try:
+            return InstitutionReleasePlanner(store).asset_options(draft_id)
+        except ValueError as exc:
+            raise _error(exc) from exc
+
     @app.post("/api/institution-deployments/drafts/{draft_id}/freeze", status_code=201)
     def freeze_institution_release(draft_id: str):
         if app.state.instance.mode != "central":
             raise HTTPException(status_code=403, detail="只有智能中心可以冻结机构发布")
         try:
             plan = InstitutionReleasePlanner(store).plan(draft_id)
+            if int((plan.get("preflight") or {}).get("blocked") or 0) > 0:
+                raise ValueError("机构 Release 存在阻断项，禁止冻结")
             return store.freeze_institution_release_snapshot(draft_id, plan)
         except ValueError as exc:
             raise _error(exc) from exc
@@ -1711,8 +1885,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 raise ValueError("本地实例已经初始化，禁止第二次导入 deployment_seed")
             if manifest["package_kind"] == "knowledge_update" and not app.state.instance.bound_deployment_id:
                 raise ValueError("未初始化的 local 实例不能导入 knowledge_update")
+            manifest_assets = {str(item.get("id") or item.get("asset_version_id")): item
+                               for item in manifest.get("asset_versions") or []}
             items = [{"knowledge_library_id": part["knowledge_library_id"], "collection_name": collection,
-                      "partition_name": part["partition_name"], "source_digest": part.get("content_revision"), "detail": part}
+                      "partition_name": part["partition_name"],
+                      "source_count": int((manifest_assets.get(str(part.get("asset_version_id") or part.get("id"))) or {}).get("item_count") or 0),
+                      "source_digest": part.get("content_revision"), "detail": part}
                      for collection, partitions in manifest["collections"].items() for part in partitions]
             status = "inspected"
             conflicts = {}
@@ -1728,7 +1906,14 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 package_id=manifest["package_id"], project_id=project_payload.get("id"),
                 project_deployment_id=(manifest.get("project_deployment") or {}).get("id"), package_path=str(target),
                 package_sha256=digest.hexdigest(), status=status, stage="verified",
-                checkpoint={"verified": True, "upload_size": size}, signature_status="verified", items=items)
+                checkpoint={"verified": True, "upload_size": size, "package_admission": {
+                    "signature": "verified", "checksum": "verified",
+                    "manifest_schema_version": manifest.get("manifest_schema_version") or manifest.get("schema_version"),
+                    "package_kind": manifest.get("package_kind"), "package_id": manifest.get("package_id"),
+                    "release_id": manifest.get("release_id"), "base_release_id": manifest.get("base_release_id"),
+                    "deployment": manifest.get("deployment") or {},
+                    "project_count": len(manifest.get("projects") or []),
+                }}, signature_status="verified", items=items)
             if created.get("package_path") != str(target):
                 target.unlink(missing_ok=True)
                 target_dir.rmdir()

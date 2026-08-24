@@ -521,8 +521,13 @@ class MigrationExporter:
 
     def _add_vectors(self, builder: MigrationPackageBuilder, plan: dict[str, Any], work: Path, job_id: str) -> dict[str, str]:
         revisions: dict[str, str] = {}
+        physical_partitions: set[tuple[str, str]] = set()
         for collection_name, items in plan["collections"].items():
             for item in items:
+                physical_key = (collection_name, item["partition_name"])
+                if physical_key in physical_partitions:
+                    raise ValueError(f"Frozen Release Snapshot 包含重复 Partition：{collection_name}/{item['partition_name']}")
+                physical_partitions.add(physical_key)
                 output = work / "vectors" / collection_name / f'{item["partition_name"]}.parquet'
                 before = self.milvus.verify_partition(collection_name, item["partition_name"])
                 result = self.milvus.export_partition(collection_name, item["partition_name"], output, batch_size=1000)

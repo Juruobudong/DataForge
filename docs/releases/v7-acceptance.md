@@ -59,6 +59,10 @@
 | 28 | 在共享受管 Collection 的两个知识库写入、搜索、发布路由并删除其中一个库 | 全程使用不同 `kl_*` Partition；另一个库的数据、搜索和路由不受影响 | 待填写 |
 | 29 | 对仍有引用、客户 Partition 或被篡改 marker 的受管 Collection 申请删除 | 预检和 Worker 二次预检均拒绝，Milvus 未收到 `drop_collection` | 待填写 |
 | 30 | 归档无引用 Profile 后删除 DataForge-owned 演练 Collection，并测试缺失与失败重试 | 明确确认后异步删除并登记 `deleted`；缺失幂等完成；失败原因可见且可重试 | 待填写 |
+| 31 | 在工作台分别检查 MySQL/MinIO/disk/Worker/Runner，再全选九项 | 单项、多选、全选均产生一个持久 run；逐项独立完成；未点击前无外部探针调用 | 待填写 |
+| 32 | 停止 Worker 与 Runner，等待 45 秒后刷新，再恢复服务 | 对应 heartbeat 变 stale/unavailable；queued 任务显示带证据的可能原因；恢复后新心跳转绿 | 待填写 |
+| 33 | 分别注入 MinerU、LLM、Embedding、Milvus 故障并手动检查 | 真实最小探针失败、错误脱敏、其他选中项继续完成；业务任务状态不被检查器改变 | 待填写 |
+| 34 | 匿名读取 `/api/health`，管理员读取组件详单，等待检查结果超过 15 分钟 | 匿名无 endpoint/实例/任务/错误原文；管理员可见详单；过期结果保留 last_status 但聚合为 unknown | 待填写 |
 
 ## 结论
 

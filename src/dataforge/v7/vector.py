@@ -18,6 +18,16 @@ class ManagedCollectionIncompatible(ValueError):
     """A same-name Milvus collection exists but violates its frozen contract."""
 
 
+class CollectionValidationError(ValueError):
+    """Structured mismatch raised by the validate-only Collection path."""
+
+    def __init__(self, code: str, message: str, *, expected: Any, observed: Any):
+        super().__init__(message)
+        self.code = code
+        self.expected = expected
+        self.observed = observed
+
+
 class EmbeddingProvider(Protocol):
     def embed(self, inputs: list[str], *, model: str, dimension: int) -> list[list[float]]: ...
 
@@ -74,12 +84,59 @@ class V7Milvus:
             self._client = MilvusClient(**options)
         return self._client
 
+    def list_collections(self) -> list[str]:
+        """List the current Milvus collections without inferring ownership."""
+        return sorted(str(name) for name in self.client().list_collections())
+
+    def inspect_collection(self, collection_name: str) -> dict[str, Any]:
+        """Return live collection metadata without scanning entity payloads."""
+        client = self.client()
+        if not client.has_collection(collection_name=collection_name):
+            return {"collection_name": collection_name, "exists": False, "partitions": [], "entity_count": 0}
+        description = dict(client.describe_collection(collection_name=collection_name) or {})
+        indexes = [
+            dict(client.describe_index(collection_name=collection_name, index_name=name) or {})
+            for name in client.list_indexes(collection_name=collection_name)
+        ]
+        stats = dict(client.get_collection_stats(collection_name=collection_name) or {})
+        return {
+            "collection_name": collection_name,
+            "exists": True,
+            "description": str(description.get("description") or ""),
+            "schema": description,
+            "indexes": indexes,
+            "partitions": sorted(str(name) for name in client.list_partitions(collection_name=collection_name)),
+            "entity_count": int(stats.get("row_count") or stats.get("num_entities") or 0),
+        }
+
+    def inspect_partition(self, collection_name: str, partition_name: str, *,
+                          deep_verify: bool = False) -> dict[str, Any]:
+        """Inspect one partition; only the explicit deep path reads all rows."""
+        client = self.client()
+        if not client.has_collection(collection_name=collection_name) or not client.has_partition(
+                collection_name=collection_name, partition_name=partition_name):
+            return {
+                "collection_name": collection_name, "partition_name": partition_name,
+                "exists": False, "entity_count": 0,
+            }
+        stats = dict(client.get_partition_stats(
+            collection_name=collection_name, partition_name=partition_name,
+        ) or {})
+        result: dict[str, Any] = {
+            "collection_name": collection_name, "partition_name": partition_name,
+            "exists": True,
+            "entity_count": int(stats.get("row_count") or stats.get("num_entities") or 0),
+        }
+        if deep_verify:
+            result["verification"] = self.verify_partition(collection_name, partition_name)
+        return result
+
     @staticmethod
     def _assert_v7_partition(partition_name: str) -> None:
         if not partition_name.startswith("kl_"):
             raise ValueError("拒绝访问非 V7 知识库 Partition")
 
-    def validate_collection(self, collection_name: str, fields: dict[str, Any], dimension: int) -> None:
+    def validate_collection(self, collection_name: str, fields: dict[str, Any], dimension: int) -> dict[str, Any]:
         """Reject a missing or incompatible administrator-selected Collection.
 
         This method is the validate-only path for an external Collection.
@@ -87,19 +144,32 @@ class V7Milvus:
         """
         client = self.client()
         if not client.has_collection(collection_name=collection_name):
-            raise ValueError(f"Milvus Collection {collection_name} 不存在")
+            raise CollectionValidationError(
+                "COLLECTION.NOT_FOUND", f"Milvus Collection {collection_name} 不存在",
+                expected={"exists": True}, observed={"exists": False},
+            )
         description = client.describe_collection(collection_name=collection_name)
         schema_fields = description.get("fields", []) if isinstance(description, dict) else []
         names = {str(item.get("name")) for item in schema_fields if isinstance(item, dict)}
         required = {str(value) for value in fields.values()}
-        if names and not required.issubset(names):
-            raise ValueError("Milvus Collection 缺少 Index Profile 映射字段")
+        if not required.issubset(names):
+            raise CollectionValidationError(
+                "COLLECTION.FIELD_MISMATCH", "Milvus Collection 缺少 Index Profile 映射字段",
+                expected={"required_fields": sorted(required)},
+                observed={"fields": sorted(names), "missing_fields": sorted(required - names)},
+            )
         vector_name = str(fields["vector"])
         vector_field = next((item for item in schema_fields if isinstance(item, dict) and item.get("name") == vector_name), None)
-        params = vector_field.get("params", {}) if isinstance(vector_field, dict) else {}
+        params = (vector_field.get("params") or vector_field.get("type_params") or {}) \
+            if isinstance(vector_field, dict) else {}
         actual_dimension = params.get("dim") if isinstance(params, dict) else None
-        if actual_dimension is not None and int(actual_dimension) != dimension:
-            raise ValueError(f"Milvus 向量维度为 {actual_dimension}，与 Embedding 配置 {dimension} 不兼容")
+        if actual_dimension is None or int(actual_dimension) != dimension:
+            raise CollectionValidationError(
+                "COLLECTION.DIMENSION_MISMATCH",
+                f"Milvus 向量维度为 {actual_dimension}，与 Embedding 配置 {dimension} 不兼容",
+                expected=dimension, observed=actual_dimension,
+            )
+        return {"fields": sorted(names), "dimension": int(actual_dimension)}
 
     def ensure_managed_collection(self, collection_name: str, schema_spec: dict[str, Any], dimension: int,
                                   metric_type: str, index_spec: dict[str, Any], description: str) -> str:

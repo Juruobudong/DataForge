@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260821_task_concurrency"
+CURRENT_SCHEMA_REVISION = "20260824_component_observe"
 
 
 def _config(database_url: str) -> Config:

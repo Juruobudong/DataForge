@@ -1,42 +1,91 @@
-# DataForge V7 文档知识生产平台
+# DataForge V7
 
-DataForge V7 从新上传的 PDF、CSV、Markdown、DOC、DOCX、TXT 生成稳定的文本（文）、问答（问）和图谱（图）知识库。知识库保存单一当前态；来源版本、任务和变更历史承担溯源与审计。
+DataForge V7 是医疗文档知识生产与发布平台。本文件只提供开发、运行和验证入口；系统事实见 [Architecture](docs/architecture/overview.md)，能力完成度见 [Capability Matrix](V7-CAPABILITY-MATRIX.md)。
 
-## 数据边界
+## 环境要求
 
-- V7 使用名为 `dataforge` 的 MySQL 数据库和 MinIO bucket；部署目标必须是空库或已有 V7 schema。
-- 常规流程不迁移、不读取、不兼容旧数据或旧 MinIO 对象；唯一受控例外是用户显式执行 `scripts/migrate-qa-agent-faq-test.sh`，它只读 `.34/faq` 并将规范文件写为新的 V7 Source，绝不修改旧 Collection。
-- DataForge 管理内置与已发布扩展类型声明的受管 Collection；qa_agent FAQ 使用 `dataforge_qa_agent_faq`。正式知识资产使用不可变的 `kl_<knowledge_library_id>__v<asset_version_no>` Partition，逻辑知识库与 `org_code` 都不是可反复清空的物理 Partition。
-- `dataforge-migrate --upgrade-platform` 通过 Alembic 初始化空库或升级已有 V7 schema，并写入 V7 种子。
-- 不存在自动删除旧 MinIO、legacy/external Milvus Collection 或旧 FAQ Partition 的代码。
-- qa_agent FAQ 手工文件使用 `faq-{org_code}.csv|xlsx` 命名；机构由文件名补入知识数据，文件中的可选机构列必须与文件名一致。
+- 后端统一使用 Conda 环境 `sun`；所有 Python、`uv`、`pytest` 和 `dataforge-*` 命令都必须先执行 `conda activate sun`。
+- 前端使用 Node.js 与 npm。
+- 本地没有 Docker；Compose 只在部署服务器使用。本地后端需配置可用的 MySQL、MinIO，以及按测试范围需要的 Milvus、Embedding、Model Serving 和 MinerU。
 
-## 运行架构
-
-`frontend → dataforge-api → MySQL / MinIO`；`dataforge-worker` 通过租约调度，`dataforge-runner` 执行固定的受控知识流程。智能中心冻结单项目 RouteVersion，再把同一机构的多个项目与共享 AssetVersion 组成签名 `.dfm`；机构本地可在缺少 Milvus 时先导入元数据/对象，验证候选目标后继续向量导入并逐项目激活原子 `RoutingSnapshot`。
-
-## 开发与部署
+## 安装后端依赖
 
 ```powershell
 conda activate sun
 uv sync --extra web
+```
+
+## 初始化或升级 V7 Schema
+
+目标必须是空数据库或已有 V7 schema；命令会执行 Alembic 升级并写入 V7 种子。
+
+```powershell
+conda activate sun
 uv run --extra web dataforge-migrate --upgrade-platform
+```
+
+## 启动后端进程
+
+根据开发场景分别启动 API、Worker 与 Runner：
+
+```powershell
+conda activate sun
 uv run --extra web dataforge-web
+```
+
+```powershell
+conda activate sun
+uv run --extra web dataforge-worker
+```
+
+```powershell
+conda activate sun
+uv run --extra web dataforge-runner
+```
+
+运行前需要按 [`compose.yaml`](compose.yaml) 中同名环境变量配置数据库、对象存储、Runner、Embedding、Model Serving、Milvus、Routing 与迁移目录。机构 local 保存 Milvus 密码或 Token 时，必须设置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）。
+
+## 启动前端
+
+```powershell
+cd frontend
+npm ci
+npm run dev
+```
+
+生产构建：
+
+```powershell
 cd frontend
 npm run build
 ```
 
-Compose 始终使用 `dataforge`，并要求 MySQL 数据库为空或已是 V7 schema。迁移服务通过常规 Alembic 升级并写入种子；旧 Milvus 资源与旧 MinIO 对象保持不变。
+## 验证
 
-## 核心接口
+后端测试按范围选择测试文件，仍须在 `sun` 中执行：
 
-- `POST /api/document-libraries/{id}/sources/upload`：批量上传新文件。
-- `POST /api/knowledge-jobs`：把模板输出显式绑定到长期知识库。
-- `POST /api/knowledge-libraries/{id}/vector-sync-jobs`：创建 V7 向量同步任务。
-- `POST /api/project-deployments/{id}/routing/freeze`：冻结机构项目 RouteVersion，不生成包。
-- `/api/institution-deployments/*`：机构多项目 Seed、Institution Release 与不改路由的 Knowledge Update 草稿/差异/冻结/构建。
-- `/api/migrations/*`、`/api/imported-route-candidates/*`：验签导入、等待恢复、逐项目或非原子批量激活。
+```powershell
+conda activate sun
+uv run --extra web pytest tests/test_v7_platform.py
+```
 
-机构本地保存 Milvus 密码或 Token 时必须配置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）；凭据用 AES-256-GCM 入库，HTTP 响应不返回原值。
+前端测试与构建：
 
-更完整的实现、边界与运维说明见 [Wiki](wiki/index.md)。
+```powershell
+cd frontend
+npm test
+npm run build
+```
+
+真实部署、GPU OCR、Milvus、Embedding、Routing 和离线迁移的验收范围及当前状态见 [`V7-CAPABILITY-MATRIX.md`](V7-CAPABILITY-MATRIX.md) 与 [`docs/releases/v7-acceptance.md`](docs/releases/v7-acceptance.md)。部署服务器的空卷重建顺序及生产保护规则见 [`wiki/pages/operations-and-testing.md`](wiki/pages/operations-and-testing.md) 和 [`AGENTS.md`](AGENTS.md)。
+
+## 文档入口
+
+| 需要了解 | 入口 |
+| --- | --- |
+| 当前架构 | [`docs/architecture/`](docs/architecture/overview.md) |
+| 当前完成度 | [`V7-CAPABILITY-MATRIX.md`](V7-CAPABILITY-MATRIX.md) |
+| 设计理由 | [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md) |
+| 功能规格与任务 | [`specs/`](specs/) |
+| 项目 Wiki | [`wiki/index.md`](wiki/index.md) |
+| 历史方案 | [`docs/archive/`](docs/archive/old-plan.md) |

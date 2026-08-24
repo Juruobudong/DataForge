@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,26 @@ class RunRequest(BaseModel):
     job_id: str | None = None
     flow_run_id: str | None = None
     lease_owner: str | None = None
+
+
+def _diagnostic_pdf() -> bytes:
+    """Build a valid one-page PDF without adding a runtime PDF dependency."""
+    stream = b"BT /F1 12 Tf 20 100 Td (DataForge health) Tj ET"
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Resources<</Font<</F1 4 0 R>>>>/Contents 5 0 R>>",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+        b"<</Length %d>>stream\n" % len(stream) + stream + b"\nendstream",
+    ]
+    payload = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for index, body in enumerate(objects, 1):
+        offsets.append(len(payload)); payload.extend(f"{index} 0 obj\n".encode()); payload.extend(body); payload.extend(b"\nendobj\n")
+    xref = len(payload); payload.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
+    for offset in offsets[1:]: payload.extend(f"{offset:010d} 00000 n \n".encode())
+    payload.extend(f"trailer<</Root 1 0 R/Size {len(objects)+1}>>\nstartxref\n{xref}\n%%EOF\n".encode())
+    return bytes(payload)
 
 
 def _objects(settings: Settings):
@@ -1310,6 +1331,32 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     store = V7Store(resolved.platform_database_url)
     if check_schema: store.assert_schema_current()
     objects = _objects(resolved); app = FastAPI(title="DataForge V7 Runner", version="7.0.0")
+    active_requests: set[str] = set()
+    active_lock = threading.RLock()
+    heartbeat_stop = threading.Event()
+    instance_id = f"runner:{os.getenv('HOSTNAME') or 'local'}:{os.getpid()}"
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.is_set():
+            with active_lock:
+                current = sorted(active_requests)
+            try:
+                store.upsert_component_heartbeat(
+                    "runner", instance_id, version="7.0.0", current_job_id=current[0] if current else None,
+                    details={"active_request_ids": current, "active_count": len(current)},
+                )
+            except Exception:
+                logger.exception("Runner 心跳写入失败")
+            heartbeat_stop.wait(15.0)
+
+    @app.on_event("startup")
+    def start_heartbeat() -> None:
+        heartbeat_stop.clear()
+        threading.Thread(target=heartbeat_loop, name="runner-heartbeat", daemon=True).start()
+
+    @app.on_event("shutdown")
+    def stop_heartbeat() -> None:
+        heartbeat_stop.set()
 
     def verify(authorization: str | None) -> None:
         expected = f"Bearer {resolved.runner_service_token}" if resolved.runner_service_token else None
@@ -1318,6 +1365,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/internal/jobs", status_code=202)
     def run(payload: RunRequest, authorization: str | None = Header(None)):
         verify(authorization)
+        request_id = payload.job_id or payload.flow_run_id or "invalid"
+        with active_lock:
+            active_requests.add(request_id)
         try:
             if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
             if payload.job_id:
@@ -1326,11 +1376,48 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 return execute_job(store, objects, payload.job_id, lease_owner=payload.lease_owner)
             raise ValueError("job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            with active_lock:
+                active_requests.discard(request_id)
 
     @app.get("/internal/runtime")
     def runtime_status(authorization: str | None = Header(None)):
         verify(authorization)
         return runtime
+
+    @app.get("/internal/health")
+    def health(authorization: str | None = Header(None)):
+        verify(authorization)
+        with store.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+        with active_lock:
+            current = sorted(active_requests)
+        registry = _initialize_llm_servings()
+        return {"status": "healthy", "version": "7.0.0", "active_request_ids": current,
+                "serving_ids": sorted(registry.serving_ids)}
+
+    @app.post("/internal/diagnostics/{component}")
+    def diagnostics(component: str, authorization: str | None = Header(None)):
+        verify(authorization)
+        if component == "runner":
+            return health(authorization)
+        if component == "llm":
+            started = time.monotonic()
+            value = _llm_json('只返回 {"ok": true}', system="你是健康检查器，只返回 JSON。")
+            if value.get("ok") is not True:
+                raise HTTPException(status_code=503, detail="LLM 探针响应无效")
+            return {"status": "healthy", "serving_id": DEFAULT_LLM_SERVING_ID,
+                    "latency_ms": round((time.monotonic() - started) * 1000)}
+        if component == "mineru":
+            base_url = os.getenv("DATAFORGE_MINERU_URL", "http://mineru-api:8000").rstrip("/")
+            response = httpx.get(f"{base_url}/health", timeout=5.0)
+            response.raise_for_status()
+            health_payload = dict(response.json())
+            # One-page, in-memory PDF; no Source, Artifact or object-store write is created.
+            parsed = parse_with_mineru(filename="dataforge-health.pdf", payload=_diagnostic_pdf())
+            return {"status": "healthy", "version": parsed.version, "backend": parsed.backend,
+                    "health": health_payload, "model_inference_verified": True}
+        raise HTTPException(status_code=404, detail="不支持的 Runner 诊断组件")
     return app
 
 
