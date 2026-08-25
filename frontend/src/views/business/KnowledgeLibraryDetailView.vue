@@ -10,6 +10,7 @@ import {
 const route = useRoute(), router = useRouter()
 const library = ref(null), items = ref([]), changes = ref([]), vector = ref(null), sources = ref([])
 const deletion = ref(null), deletionJobs = ref([]), tab = ref('content'), error = ref(''), loading = ref(false)
+const schemaFacets = ref(null), schemaFacetsLoading = ref(false)
 const qaListing = ref({ items: [], total: 0, page: 1, page_size: 50 })
 const qaSearch = ref(''), qaSearchDraft = ref(''), qaStatus = ref('active'), qaPage = ref(1)
 const qaLoading = ref(false), qaError = ref('')
@@ -80,11 +81,20 @@ async function load() {
     tab.value = 'content'
     deletion.value = null
     sources.value = []
+    schemaFacets.value = null; schemaFacetsLoading.value = false
   } catch (err) {
     error.value = err.message
   } finally {
     loading.value = false
   }
+}
+
+async function loadSchemaFacets() {
+  if (!isGraph.value || schemaFacets.value) return
+  schemaFacetsLoading.value = true
+  try { schemaFacets.value = await api.graphTypeFacets(libraryId.value) }
+  catch { schemaFacets.value = null }
+  finally { schemaFacetsLoading.value = false }
 }
 
 async function applyQaFilters(changes = {}) {
@@ -168,6 +178,7 @@ function sourceAnchor(source) {
 }
 
 watch(libraryId, load, { immediate: true })
+watch(tab, value => { if (value === 'schema') loadSchemaFacets() })
 watch(
   () => [route.query.q, route.query.status, route.query.page],
   async () => {
@@ -263,9 +274,48 @@ watch(
       </template>
       <div v-else-if="tab === 'diff'" class="change-list"><article v-for="change in changes" :key="change.id"><b>{{ change.change_type }}</b><p>{{ change.before?.content || change.before_hash || '—' }} → {{ change.after?.content || change.after_hash || '—' }}</p></article><p v-if="!changes.length" class="empty-group">暂无变更记录。</p></div>
       <div v-else-if="tab === 'vector'" class="panel"><p>Vector Ready：<b>{{ vector?.ready ? '已就绪' : '未就绪' }}</b></p><pre>{{ JSON.stringify(vector?.record_states || {}, null, 2) }}</pre></div>
-      <div v-else-if="tab === 'sources'" class="source-list"><article v-for="source in sources" :key="source.id"><b>{{ source.source.original_filename || source.source.name }}</b><small>{{ source.anchor.label || source.anchor.file || '来源锚点' }}</small><p>{{ source.evidence_text }}</p></article><p v-if="!sources.length" class="empty-group">从知识内容中选择“查看来源”后会在这里显示 Evidence。</p></div>
+      <div v-else-if="tab === 'sources'">
+        <button class="back-link" @click="tab = 'content'">← 返回知识内容</button>
+        <div class="source-list"><article v-for="source in sources" :key="source.id"><b>{{ source.source.original_filename || source.source.name }}</b><small>{{ source.anchor.label || source.anchor.file || '来源锚点' }}</small><p>{{ source.evidence_text }}</p></article><p v-if="!sources.length" class="empty-group">从知识内容中选择“查看来源”后会在这里显示 Evidence。</p></div>
+      </div>
       <GraphBrowser v-else-if="tab === 'graph'" :library-id="library.id" />
-      <div v-else-if="tab === 'schema'" class="panel schema-panel"><h3>图谱 Schema（只读）</h3><p class="muted">Schema 由知识流程定义，正式产出时固化到知识库；此处仅查看，不可编辑。</p><p v-if="library.source_template_revision_id">来源模板 Revision：<code>{{ library.source_template_revision_id }}</code></p><p v-if="library.graph_schema_hash">Schema Hash：<code>{{ library.graph_schema_hash }}</code></p><template v-if="library.graph_schema_snapshot"><h4>实体类型</h4><ul v-if="library.graph_schema_snapshot.entity_types?.length"><li v-for="e in library.graph_schema_snapshot.entity_types" :key="e.code"><b>{{ e.label }}</b><code>{{ e.code }}</code><span v-if="e.description"> · {{ e.description }}</span></li></ul><p v-else class="muted">未定义实体类型。</p><h4>关系类型</h4><ul v-if="library.graph_schema_snapshot.relation_types?.length"><li v-for="r in library.graph_schema_snapshot.relation_types" :key="r.code"><b>{{ r.label }}</b><code>{{ r.code }}</code><span>（{{ (r.source_types || []).join('、') || '任意' }} → {{ (r.target_types || []).join('、') || '任意' }}）</span></li></ul><p v-else class="muted">未定义关系类型。</p></template><p v-else class="muted">该知识库尚无图谱 Schema 快照（尚未正式产出）。</p></div>
+      <div v-else-if="tab === 'schema'" class="panel schema-panel">
+        <h3>图谱 Schema（只读）</h3>
+        <p class="muted">Schema 由知识流程定义，正式产出时固化到知识库；此处仅查看，不可编辑。</p>
+        <p v-if="library.source_template_revision_id">来源模板 Revision：<code>{{ library.source_template_revision_id }}</code></p>
+        <p v-if="library.graph_schema_hash">Schema Hash：<code>{{ library.graph_schema_hash }}</code></p>
+
+        <h4>Schema 定义（来自知识流程）</h4>
+        <template v-if="library.graph_schema_snapshot">
+          <p class="schema-sub">实体类型</p>
+          <ul v-if="library.graph_schema_snapshot.entity_types?.length">
+            <li v-for="e in library.graph_schema_snapshot.entity_types" :key="e.code"><b>{{ e.label }}</b><code>{{ e.code }}</code><span v-if="e.description"> · {{ e.description }}</span></li>
+          </ul>
+          <p v-else class="muted">未定义实体类型（不约束）。</p>
+          <p class="schema-sub">关系类型</p>
+          <ul v-if="library.graph_schema_snapshot.relation_types?.length">
+            <li v-for="r in library.graph_schema_snapshot.relation_types" :key="r.code"><b>{{ r.label }}</b><code>{{ r.code }}</code><span>（{{ (r.source_types || []).join('、') || '任意' }} → {{ (r.target_types || []).join('、') || '任意' }}）</span></li>
+          </ul>
+          <p v-else class="muted">未定义关系类型（不约束）。</p>
+        </template>
+        <p v-else class="muted">该知识库尚无图谱 Schema 快照（尚未正式产出）。</p>
+
+        <h4>实际抽取类型（来自图谱数据）</h4>
+        <p v-if="schemaFacetsLoading" class="muted">正在加载实际抽取类型…</p>
+        <p v-else-if="!schemaFacets" class="muted">实际抽取类型暂不可用。</p>
+        <template v-else>
+          <p class="schema-sub">实体类型</p>
+          <ul v-if="schemaFacets.entity_types?.length">
+            <li v-for="t in schemaFacets.entity_types" :key="t.code"><b>{{ t.label }}</b><code>{{ t.code }}</code><span class="schema-count">{{ t.count }}</span></li>
+          </ul>
+          <p v-else class="muted">尚未抽取到实体类型。</p>
+          <p class="schema-sub">关系类型</p>
+          <ul v-if="schemaFacets.relation_types?.length">
+            <li v-for="t in schemaFacets.relation_types" :key="t.code"><b>{{ t.label }}</b><code>{{ t.code }}</code><span class="schema-count">{{ t.count }}</span></li>
+          </ul>
+          <p v-else class="muted">尚未抽取到关系类型。</p>
+        </template>
+      </div>
       <section v-if="deletion" class="deletion-panel"><h3>删除检查</h3><p>{{ deletion.deletable ? '当前知识库可删除。' : '当前知识库仍被引用，暂不能删除。' }}</p><pre>{{ JSON.stringify(deletion, null, 2) }}</pre><button v-if="deletion.deletable" class="danger" @click="remove">确认异步删除</button></section>
       <section v-if="deletionJobs.length" class="deletion-panel"><h3>删除任务</h3><div v-for="job in deletionJobs" :key="job.id" class="deletion-job"><span>{{ job.status }}</span><small>{{ job.error || job.id }}</small><button v-if="job.status === 'failed'" @click="retryDeletion(job)">重试</button></div></section>
     </template>
@@ -298,7 +348,7 @@ watch(
 </template>
 
 <style scoped>
-.back-link{margin-bottom:18px;border:0;color:var(--blue);background:transparent;padding:0;font-size:14px}.detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.detail-head h2{margin:6px 0 0;font-size:26px}.detail-type{color:var(--blue);font-size:14px;font-weight:800}.technical-id{min-height:0;margin-top:8px;padding:0;border:0;color:var(--muted);background:transparent;font-size:12px;font-weight:600}.detail-metrics{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:18px 0;color:var(--muted);font-size:14px}.detail-metrics b{color:var(--text);font-size:18px}.change-list,.source-list{display:grid;gap:10px}.change-list article,.source-list article,.deletion-panel{padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.change-list p,.source-list p{margin:8px 0 0;line-height:1.65}.source-list b,.source-list small{display:block}.source-list small{margin-top:5px;color:var(--muted);font-size:13px}.deletion-panel{margin-top:18px}.deletion-panel h3{margin:0;font-size:16px}.deletion-panel pre{max-height:240px;margin:12px 0}.deletion-job{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}.deletion-job small{overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.empty-cell,.loading{color:var(--muted);text-align:center}.schema-panel h3{margin:0;font-size:16px}.schema-panel h4{margin:16px 0 6px;font-size:14px}.schema-panel ul{list-style:none;margin:0;padding:0}.schema-panel li{padding:7px 0;border-top:1px solid var(--border)}.schema-panel li b{margin-right:8px}.schema-panel code{font-size:12px;color:var(--muted)}
+.back-link{margin-bottom:18px;border:0;color:var(--blue);background:transparent;padding:0;font-size:14px}.detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.detail-head h2{margin:6px 0 0;font-size:26px}.detail-type{color:var(--blue);font-size:14px;font-weight:800}.technical-id{min-height:0;margin-top:8px;padding:0;border:0;color:var(--muted);background:transparent;font-size:12px;font-weight:600}.detail-metrics{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:18px 0;color:var(--muted);font-size:14px}.detail-metrics b{color:var(--text);font-size:18px}.change-list,.source-list{display:grid;gap:10px}.change-list article,.source-list article,.deletion-panel{padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.change-list p,.source-list p{margin:8px 0 0;line-height:1.65}.source-list b,.source-list small{display:block}.source-list small{margin-top:5px;color:var(--muted);font-size:13px}.deletion-panel{margin-top:18px}.deletion-panel h3{margin:0;font-size:16px}.deletion-panel pre{max-height:240px;margin:12px 0}.deletion-job{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}.deletion-job small{overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.empty-cell,.loading{color:var(--muted);text-align:center}.schema-panel h3{margin:0;font-size:16px}.schema-panel h4{margin:16px 0 6px;font-size:14px}.schema-panel ul{list-style:none;margin:0;padding:0}.schema-panel li{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border)}.schema-panel li b{margin-right:8px}.schema-panel code{font-size:12px;color:var(--muted)}.schema-panel .schema-sub{margin:10px 0 4px;color:var(--muted);font-size:12px;font-weight:700}.schema-panel .schema-count{margin-left:auto;color:var(--muted);font-size:12px}
 .qa-content{display:grid;gap:12px}.qa-toolbar{display:flex;align-items:flex-end;justify-content:space-between;gap:20px}.qa-toolbar h3{margin:0;color:var(--text);font-size:20px}.qa-toolbar h3 span{color:var(--blue)}.qa-toolbar p{margin:5px 0 0;color:var(--muted);font-size:13px}.qa-filters{display:grid;grid-template-columns:minmax(280px,420px) 130px auto;align-items:center;margin:0}.qa-filters input,.qa-filters select{width:100%;min-width:0}.qa-table-wrap{border-radius:12px}.qa-table{min-width:920px;table-layout:fixed}.qa-question-col{width:33%}.qa-answer-col{width:41%}.qa-status-col{width:8%}.qa-time-col{width:11%}.qa-action-col{width:7%}.qa-table th{height:38px;padding:0 10px;white-space:nowrap}.qa-table td{height:42px;min-height:42px;padding:0 10px}.qa-row{cursor:pointer}.qa-row:hover td,.qa-row:focus td{background:#f6f9ff}.qa-row:focus{outline:0}.qa-row:focus-visible td:first-child{box-shadow:inset 3px 0 var(--blue)}.qa-cell{overflow:hidden;color:var(--text);font-weight:700;text-overflow:ellipsis;white-space:nowrap}.qa-cell.qa-answer{color:#59677a;font-weight:500}.qa-time{color:var(--muted);font-size:12px;white-space:nowrap}.qa-table td:last-child button{min-height:30px;padding:0 9px;white-space:nowrap}.qa-pagination{display:flex;align-items:center;justify-content:space-between;color:var(--muted);font-size:13px}.qa-pagination>div{display:flex;gap:7px}.qa-pagination button{min-height:34px}
 .drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.qa-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(560px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.qa-drawer>header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 22px;border-bottom:1px solid var(--border)}.qa-drawer>header small{color:var(--blue);font-weight:800}.qa-drawer>header h3{margin:4px 0 0;font-size:20px}.drawer-body{display:grid;align-content:start;gap:14px;overflow-y:auto;padding:18px 22px 28px;background:var(--bg)}.drawer-section{padding:17px;border:1px solid var(--border);border-radius:12px;background:#fff}.drawer-section h4{margin:0 0 12px;font-size:15px}.qa-full-content span{display:block;color:var(--blue);font-size:12px;font-weight:850}.qa-full-content p{margin:6px 0 18px;color:var(--text);font-size:15px;line-height:1.75;white-space:pre-wrap}.qa-full-content p:last-child{margin-bottom:0}.drawer-section dl{display:grid;gap:9px;margin:0}.drawer-section dl>div{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px;padding-top:9px;border-top:1px solid #edf0f4}.drawer-section dl>div:first-child{padding-top:0;border-top:0}.drawer-section dt{color:var(--muted);font-size:13px}.drawer-section dd{min-width:0;margin:0;color:#46546a;font-size:13px}.drawer-section code{display:block;overflow-wrap:anywhere;font-size:12px}.drawer-source-list{display:grid;gap:10px}.drawer-source-list article{padding:12px;border:1px solid #e5eaf1;border-radius:9px;background:var(--panel-muted)}.drawer-source-list article>div{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.drawer-source-list b{color:var(--text)}.drawer-source-list span{flex:0 0 auto;color:var(--muted);font-size:12px}.drawer-source-list p{margin:9px 0 0;color:#59677a;font-size:13px;line-height:1.65}.drawer-section .error{margin:0}
 @media(max-width:1100px){.qa-toolbar{align-items:stretch;flex-direction:column}.qa-filters{grid-template-columns:minmax(240px,1fr) 130px auto}}@media(max-width:900px){.detail-head{display:grid}.detail-metrics{align-items:flex-start}}

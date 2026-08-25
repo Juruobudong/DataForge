@@ -13,9 +13,11 @@ const files = computed(() => listing.value.items || [])
 const hasActiveBinding = computed(() => bindings.value.some(item => item.status === 'active'))
 const hasResultCleanupInProgress = computed(() => bindings.value.some(binding =>
   binding.outputs?.some(output => output.state === 'deleting')))
+const activeTemplateIds = computed(() => new Set(bindings.value.filter(item => item.status === 'active').map(item => item.template.id)))
+const publishedTemplates = computed(() => templates.value.filter(item =>
+  item.status === 'active' && (item.published_revision != null || item.revision_status === 'published')))
 const availableTemplates = computed(() => {
-  const activeIds = new Set(bindings.value.filter(item => item.status === 'active').map(item => item.template.id))
-  return templates.value.filter(item => item.status === 'active' && item.revision_status === 'published' && !activeIds.has(item.id))
+  return publishedTemplates.value.filter(item => !activeTemplateIds.value.has(item.id))
 })
 const allTemplatesSelected = computed(() => availableTemplates.value.length > 0 &&
   availableTemplates.value.every(item => templateIds.value.includes(item.id)))
@@ -147,9 +149,9 @@ onMounted(load)
         <details class="template-multiselect">
           <summary>{{ templateIds.length ? `已选择 ${templateIds.length} 个模板` : '选择已发布模板' }}</summary>
           <div class="template-options">
-            <label v-if="availableTemplates.length" class="template-select-all"><input type="checkbox" :checked="allTemplatesSelected" :indeterminate="someTemplatesSelected" aria-label="全选可绑定模板" @change="toggleAllTemplates"> <span>全选</span></label>
-            <label v-for="item in availableTemplates" :key="item.id"><input v-model="templateIds" type="checkbox" :value="item.id"> <span>{{ item.name }} · r{{ item.revision }}</span></label>
-            <p v-if="!availableTemplates.length">没有可绑定的已发布模板。</p>
+            <label v-if="availableTemplates.length" class="template-select-all"><input type="checkbox" :checked="allTemplatesSelected" :indeterminate="someTemplatesSelected" aria-label="全选可绑定模板" @change="toggleAllTemplates"> <span>全选未绑定模板</span></label>
+            <label v-for="item in publishedTemplates" :key="item.id" :class="{ bound: activeTemplateIds.has(item.id) }"><input v-model="templateIds" type="checkbox" :value="item.id" :disabled="activeTemplateIds.has(item.id)"> <span>{{ item.name }} · r{{ item.published_revision ?? item.revision }}<template v-if="activeTemplateIds.has(item.id)"> · 已绑定</template></span></label>
+            <p v-if="!publishedTemplates.length">没有可绑定的已发布模板。</p>
           </div>
         </details>
         <button :disabled="!templateIds.length || bindingTemplates">{{ bindingTemplates ? '绑定中…' : '绑定所选模板' }}</button>
@@ -169,6 +171,8 @@ onMounted(load)
 .template-options { position: absolute; z-index: 8; display: grid; width: 100%; max-height: 260px; gap: 4px; overflow: auto; margin-top: 4px; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: #fff; box-shadow: var(--shadow); }
 .template-options label { display: flex; gap: 8px; align-items: center; min-height: 40px; padding: 8px; border-radius: 7px; color: #405069; font-size: var(--font-assist); cursor: pointer; }
 .template-options label:hover { background: var(--blue-soft); }
+.template-options label.bound { color: var(--muted); cursor: default; }
+.template-options label.bound:hover { background: transparent; }
 .template-options .template-select-all { border-bottom: 1px solid var(--border); border-radius: 0; font-weight: 600; }
 .template-options p { margin: 8px; color: var(--muted); font-size: var(--font-assist); }
 .source-row { cursor: pointer; }

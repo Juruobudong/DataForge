@@ -47,15 +47,8 @@ dataforge-kg-legacy-import = "dataforge.v7.legacy_kg_import:main"
 dataforge-qa-faq-legacy-import = "dataforge.v7.legacy_qa_faq_import:main"
 dataforge-drop-stale-test-collections = "dataforge.v7.stale_collection_cleanup:main"
 
-[tool.setuptools]
-packages = [
-  "dataforge",
-  "dataforge.v7",
-  "dataforge.v7.migration",
-]
-
-[tool.setuptools.package-dir]
-dataforge = "src/dataforge"
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

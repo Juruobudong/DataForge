@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, hasEditableParameters, makeCanvasNode, removeElements, resolveNodeMetadata, serializeDefinition, validateFlow } from './flowModel.js'
+import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, removeElements, resolveNodeMetadata, serializeDefinition, validateFlow } from './flowModel.js'
 import { ref } from 'vue'
 import { useFlowHistory } from './composables/useFlowHistory.js'
 
@@ -101,4 +101,31 @@ test('history records graph transactions and supports undo and redo', () => {
   history.remember(); nodes.value.push(node('b', 'split'))
   history.undo(); assert.equal(nodes.value.length, 1); assert.equal(history.canRedo.value, true)
   history.redo(); assert.equal(nodes.value.length, 2); assert.equal(history.canUndo.value, true)
+})
+
+test('capability-first grouping surfaces common capabilities and folds the rest by category', () => {
+  const catalog = [
+    { code: 'qa-generator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'prompt-generator', name: 'Prompt Generator', display_name_zh: '提示词生成器', category: '知识生成', exposure: 'canvas', enabled: true, version: 4 },
+    { code: 'graph-extractor', name: 'Graph Extractor', display_name_zh: '图谱抽取器', category: '知识生成', exposure: 'canvas', enabled: true, version: 4 },
+    { code: 'quality-evaluator', name: 'Evaluator', display_name_zh: '知识质量评估器', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'source-binding', name: 'Source Binding', display_name_zh: '来源绑定器', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'internal-op', name: 'Internal', display_name_zh: '内部算子', category: 'Runtime', exposure: 'internal', enabled: true, version: 3 },
+    { code: 'disabled-op', name: 'Disabled', display_name_zh: '禁用算子', category: '知识生成', exposure: 'canvas', enabled: false, version: 3 },
+  ]
+  const result = groupOperatorCapabilities(catalog)
+  assert.deepEqual(result.common.map(item => item._label), ['问答生成', '文本生成', '实体关系抽取', '质量检查'])
+  assert.ok(result.common.every(item => item.version >= 3))
+  assert.deepEqual(Object.keys(Object.fromEntries(result.groups)), ['质量治理'])
+  assert.deepEqual(result.groups[0][1].map(item => item.code), ['source-binding'])
+  assert.ok(result.groups[0][1].every(item => !result.common.some(c => c.code === item.code)))
+})
+
+test('capability-first grouping filters by query and excludes internal operators', () => {
+  const catalog = [
+    { code: 'qa-generator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true },
+    { code: 'source-binding', name: 'Source Binding', display_name_zh: '来源绑定器', category: '质量治理', exposure: 'canvas', enabled: true },
+  ]
+  assert.deepEqual(groupOperatorCapabilities(catalog, undefined, '来源').groups[0][1].map(item => item.code), ['source-binding'])
+  assert.deepEqual(groupOperatorCapabilities(catalog, undefined, '来源').common, [])
 })

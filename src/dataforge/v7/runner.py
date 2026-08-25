@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from ..config import Settings
 from .catalog import catalog_by_code, normalize_chunker_params
+from .operators import OperatorExecutionContext, build_builtin_registry
 from .graph_literal import classify_object, detect_literal
 from .graph_prompt import entity_prompt_for, relation_prompt_for
 from .graph_quality import evaluate_graph_quality
@@ -1385,6 +1386,23 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     raise ValueError(f"Runner 没有批准的算子 Adapter：{ref}")
 
 
+def _builtin_dispatch(ref: str, params: dict[str, Any], inputs: list[dict[str, Any]], runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bridge the version-pinned OperatorExecutor contract onto the legacy operator table."""
+    return _run_operator(
+        ref, dict(params or {}), list(inputs),
+        root_documents=runtime["root_documents"],
+        sources=runtime["sources"],
+        versions=runtime["versions"],
+        type_contracts=runtime["type_contracts"],
+        job_id=runtime.get("job_id"),
+        store=runtime.get("store"),
+        retry_scope=runtime.get("retry_scope"),
+        generation=runtime.get("generation"),
+        graph_config=runtime.get("graph_config"),
+        sink_libraries=runtime.get("sink_libraries"),
+    )
+
+
 def execute_source_preparation(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
     context = store.source_preparation_context(job_id)
     job, version, source = context["job"], context["version"], context["source"]
@@ -1477,6 +1495,14 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         incoming = _incoming(definition)
         root_documents = store.reviewed_chunks_for_job(job_id)
         current_source_chunks = [dict(value) for value in root_documents]
+        catalog = catalog_by_code()
+        registry = build_builtin_registry(_builtin_dispatch, catalog)
+        runtime = {
+            "root_documents": root_documents, "sources": sources, "versions": versions,
+            "type_contracts": type_contracts, "job_id": job_id, "store": store,
+            "retry_scope": retry_scope, "generation": generation,
+            "graph_config": graph_config, "sink_libraries": sink_libraries,
+        }
         sink_nodes: list[dict[str, Any]] = []
         for node in definition.get("nodes", []):
             if store.is_job_cancelled(job_id):
@@ -1490,21 +1516,24 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 sink_nodes.append(node)
                 continue
             ref = str(node.get("ref"))
+            operator_version = int(node.get("operator_version") or catalog.get(ref, {}).get("version", 1))
+            resolved_params = dict(node.get("params") or {})
             failed_upstream = [source_id for source_id in source_nodes if source_id in node_errors]
             if failed_upstream:
                 message = "上游节点失败，已跳过：" + "、".join(failed_upstream)
                 node_errors[node_id] = message; outputs[node_id] = []
-                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=message)
+                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=message, operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
             try:
-                values = _run_operator(ref, dict(node.get("params") or {}), input_values,
-                                        root_documents=root_documents, sources=sources, versions=versions,
-                                        type_contracts=type_contracts, job_id=job_id, store=store,
-                                        retry_scope=retry_scope, generation=generation,
-                                        graph_config=graph_config, sink_libraries=sink_libraries)
+                executor = registry.resolve(ref, operator_version)
+                result = executor.execute(
+                    inputs=input_values, params=resolved_params,
+                    context=OperatorExecutionContext(flow_run_id=flow_run["id"], node_id=node_id, runtime=runtime),
+                )
+                values = result.outputs
             except Exception as exc:
                 node_errors[node_id] = str(exc); outputs[node_id] = []
-                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc))
+                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
             if ref == "document-parser":
                 store.record_document_irs(flow_run["id"], values)
@@ -1519,7 +1548,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
             artifact_values = values
             if ref == "document-parser":
                 artifact_values = [{key: value for key, value in item.items() if key != "_faq_table_rows"} for item in values]
-            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values)
+            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values, operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
             if ref == "document-parser":
                 persisted_parser_keys.update(created_parser_keys)
                 outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]
@@ -1682,12 +1711,12 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                 outputs[node_id] = values; item = catalog.get(ref) or {}
                 recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
-                                                               operator_version=int(item.get("version", 1)), resolved_parameters=params,
+                                                               operator_version=int(node.get("operator_version") or item.get("version", 1)), resolved_parameters=params,
                                                                metrics={"input_records": len(input_values), "output_records": len(values)})
             except Exception as exc:
                 failed.add(node_id); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=str(exc), operator_code=ref,
-                                                               operator_version=int((catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params)
+                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params)
         if previews:
             store.finish_flow_run(flow_run_id, status="awaiting_commit"); return {"id": flow_run_id, "status": "awaiting_commit", "previews": previews}
         status = "failed" if context["start_node_id"] in failed else "completed"

@@ -196,6 +196,8 @@ class FlowCompiler:
                 params["llm_serving"] = serving_id
                 dependencies.append({"kind": "llm_serving", "id": serving_id})
             node["params"] = params
+            node["operator_version"] = item.get("version", 1)
+            node["adapter_code"] = item["adapter_code"]
             output_spec = (item.get("output_ports") or {}).get("output") or {"artifact_type": item["output"]}
             output = str(output_spec.get("artifact_type", item["output"]))
             knowledge_type = str(params.get("knowledge_type", ""))

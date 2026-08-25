@@ -1,0 +1,258 @@
+"""Standard-config authoring compiler layered on top of the typed FlowCompiler.
+
+The two authoring modes (``standard`` / ``advanced``) differ only in *how a flow
+is edited*, never in *how it executes*.  Both collapse to the same Flow DSL v3
+which the existing :class:`~dataforge.v7.flow.FlowCompiler` compiles into a
+topologically ordered Operator DAG.
+
+``standard`` stores a stage config (not a DAG) in ``definition_json``; the
+:class:`ManagedFlowCompiler` materializes that stage config into a real Flow DSL
+using :func:`~dataforge.v7.catalog.builtin_flow_definition` as the single source
+of truth, then injects user config and stage metadata onto the nodes.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from .catalog import builtin_flow_definition
+from .flow import FlowCompiler, FlowValidationError
+
+
+_EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": False}
+_LLM_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"llm_serving": {"type": "string", "description": "已配置的 Model Serving ID"}},
+    "additionalProperties": False,
+}
+_GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "llm_serving": {"type": "string", "description": "已配置的 Model Serving ID"},
+        "entity_types": {"type": "array", "items": {"type": "string"}, "description": "允许抽取的实体类型 code 列表"},
+        "relation_types": {"type": "array", "items": {"type": "string"}, "description": "允许抽取的关系类型 code 列表"},
+    },
+    "additionalProperties": False,
+}
+
+
+@dataclass(frozen=True)
+class ManagedStageDefinition:
+    code: str
+    name: str
+    locked: bool = True
+    configurable: bool = False
+    replaceable: bool = False
+    input_contract: str = ""
+    output_contract: str = ""
+    config_schema: dict[str, Any] = field(default_factory=lambda: dict(_EMPTY_SCHEMA))
+    operator_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManagedFlowDefinition:
+    code: str
+    name: str
+    output_types: tuple[str, ...]
+    stages: tuple[ManagedStageDefinition, ...]
+
+
+_INPUT_STAGE = ManagedStageDefinition(code="input", name="已审核文档输入", locked=True,
+                                      operator_refs=("reviewed-source-chunk-input",))
+_QUALITY_STAGE = ManagedStageDefinition(code="quality", name="质量治理", locked=True,
+                                        operator_refs=("quality-evaluator", "quality-filter", "schema-validator", "graph-quality-validator"))
+_BINDING_STAGE = ManagedStageDefinition(code="binding", name="来源绑定", locked=True,
+                                        operator_refs=("source-binding",))
+_SUBMIT_STAGE = ManagedStageDefinition(code="submit", name="知识提交", locked=True,
+                                       operator_refs=("knowledge-diff",))
+
+
+def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA, operator_refs: tuple[str, ...]) -> ManagedStageDefinition:
+    return ManagedStageDefinition(code="generation", name=name, configurable=True, replaceable=True,
+                                  config_schema=config_schema, operator_refs=operator_refs)
+
+
+_STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
+    ManagedFlowDefinition(code="standard-text", name="文本知识", output_types=("text",), stages=(
+        _INPUT_STAGE, _generation("文本生成", operator_refs=("prompt-generator",)),
+        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+    )),
+    ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
+        _INPUT_STAGE, _generation("问答生成", operator_refs=("qa-generator",)),
+        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+    )),
+    ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
+        _INPUT_STAGE,
+        _generation("实体关系抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
+                    operator_refs=("entity-extractor", "literal-detector", "relation-extractor", "triple-builder")),
+        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+    )),
+    ManagedFlowDefinition(code="standard-graph-semantic", name="语义图谱", output_types=("graph:semantic",), stages=(
+        _INPUT_STAGE,
+        _generation("语义图谱抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
+                    operator_refs=("entity-extractor", "literal-detector", "entity-normalizer",
+                                   "relation-extractor", "semantic-relation-builder", "evidence-binder")),
+        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+    )),
+    ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph"), stages=(
+        _INPUT_STAGE,
+        _generation("多产出生成", config_schema=_GRAPH_CONFIG_SCHEMA,
+                    operator_refs=("prompt-generator", "qa-generator", "entity-extractor", "literal-detector",
+                                   "relation-extractor", "triple-builder")),
+        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+    )),
+)
+
+
+class ManagedFlowCatalog:
+    """Registry of the five built-in standard templates."""
+
+    def __init__(self, definitions: tuple[ManagedFlowDefinition, ...] = _STANDARD_FLOWS):
+        self._by_code = {definition.code: definition for definition in definitions}
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        return tuple(self._by_code)
+
+    def get(self, code: str) -> ManagedFlowDefinition:
+        definition = self._by_code.get(code)
+        if not definition:
+            raise ValueError(f"未知的标准模板：{code}")
+        return definition
+
+    def list_definitions(self) -> list[dict[str, Any]]:
+        values = []
+        for definition in self._by_code.values():
+            values.append({
+                "code": definition.code,
+                "name": definition.name,
+                "output_types": list(definition.output_types),
+                "stages": [{
+                    "code": stage.code, "name": stage.name,
+                    "locked": stage.locked, "replaceable": stage.replaceable,
+                    "config_schema": stage.config_schema if stage.configurable else None,
+                } for stage in definition.stages],
+            })
+        return values
+
+    def default_stage_config(self, code: str) -> dict[str, Any]:
+        definition = self.get(code)
+        return {"schema_version": 1, "template_code": definition.code, "stages": {}}
+
+    def normalize_config(self, code: str, definition: dict[str, Any]) -> dict[str, Any]:
+        """Validate and normalize a stage config for persistence (editor state)."""
+        flow_definition = self.get(code)
+        value = dict(definition or {})
+        stages = value.get("stages")
+        if stages is None:
+            stages = {}
+        if not isinstance(stages, dict):
+            raise ValueError("标准配置的 stages 必须是对象")
+        allowed = {stage.code for stage in flow_definition.stages}
+        for stage_code, stage_value in stages.items():
+            if stage_code not in allowed:
+                raise ValueError(f"未知的流程阶段：{stage_code}")
+            if stage_value is None:
+                continue
+            if not isinstance(stage_value, dict):
+                raise ValueError(f"阶段 {stage_code} 的配置必须是对象")
+            config = stage_value.get("config")
+            if config is not None and not isinstance(config, dict):
+                raise ValueError(f"阶段 {stage_code} 的 config 必须是对象")
+            stage = next(item for item in flow_definition.stages if item.code == stage_code)
+            self._validate_config(stage, config or {})
+        return {"schema_version": 1, "template_code": flow_definition.code, "stages": stages}
+
+    @staticmethod
+    def _validate_config(stage: ManagedStageDefinition, config: dict[str, Any]) -> None:
+        properties = (stage.config_schema.get("properties") or {}) if stage.configurable else {}
+        for key, config_value in config.items():
+            if key not in properties:
+                raise ValueError(f"阶段 {stage.name} 不接受参数：{key}")
+            spec = properties[key]
+            expected = spec.get("type")
+            if expected == "string" and not isinstance(config_value, str):
+                raise ValueError(f"阶段 {stage.name} 参数 {key} 必须是字符串")
+            if expected == "array" and (not isinstance(config_value, list) or any(not isinstance(item, str) for item in config_value)):
+                raise ValueError(f"阶段 {stage.name} 参数 {key} 必须是字符串数组")
+
+
+class ManagedFlowCompiler:
+    """Materialize a standard stage config into Flow DSL v3."""
+
+    def __init__(self, catalog: ManagedFlowCatalog | None = None):
+        self.catalog = catalog or ManagedFlowCatalog()
+
+    def materialize(self, definition: dict[str, Any], output_types: list[str]) -> dict[str, Any]:
+        template_code = (definition or {}).get("template_code")
+        if not template_code:
+            raise FlowValidationError("标准配置缺少 template_code")
+        flow_definition = self.catalog.get(template_code)
+        normalized = self.catalog.normalize_config(template_code, definition)
+        stages_config = normalized.get("stages") or {}
+        baseline = builtin_flow_definition(list(output_types))
+        stage_by_code = {stage.code: stage for stage in flow_definition.stages}
+        stage_by_ref: dict[str, ManagedStageDefinition] = {}
+        for stage in flow_definition.stages:
+            for ref in stage.operator_refs:
+                stage_by_ref[ref] = stage
+        for node in baseline.get("nodes", []):
+            stage = stage_by_ref.get(node.get("ref")) or (stage_by_code.get("submit") if node.get("kind") == "knowledge_sink" else None)
+            if stage:
+                node["stage_id"] = stage.code
+                node["stage_code"] = stage.code
+                node["stage_label"] = stage.name
+        for stage_code, stage in stage_by_code.items():
+            stage_value = stages_config.get(stage_code)
+            if not isinstance(stage_value, dict):
+                continue
+            self._apply_config(baseline, stage, stage_value.get("config") or {})
+        return baseline
+
+    def _apply_config(self, baseline: dict[str, Any], stage: ManagedStageDefinition, config: dict[str, Any]) -> None:
+        if not config:
+            return
+        for node in baseline.get("nodes", []):
+            if node.get("kind") != "operator":
+                continue
+            ref = node.get("ref")
+            if ref not in stage.operator_refs:
+                continue
+            params = node.setdefault("params", {})
+            if "llm_serving" in config and "llm_serving" in params:
+                params["llm_serving"] = config["llm_serving"]
+            if ref == "entity-extractor" and "entity_types" in config:
+                params["entity_types"] = list(config["entity_types"])
+            if ref == "relation-extractor" and "relation_types" in config:
+                params["relation_types"] = list(config["relation_types"])
+        if "entity_types" in config or "relation_types" in config:
+            graph_config = baseline.setdefault("graph_config", {})
+            if "entity_types" in config:
+                graph_config["entity_types"] = list(config["entity_types"])
+            if "relation_types" in config:
+                graph_config["relation_types"] = list(config["relation_types"])
+
+
+class FlowAuthoringCompiler:
+    """Single compile entry point for both authoring modes."""
+
+    def __init__(self, catalog: ManagedFlowCatalog | None = None):
+        self.catalog = catalog or ManagedFlowCatalog()
+        self.managed = ManagedFlowCompiler(self.catalog)
+
+    def materialize(self, definition: dict[str, Any], output_types: list[str]) -> dict[str, Any]:
+        return self.managed.materialize(definition, output_types)
+
+    def compile(self, flow_compiler: FlowCompiler, *, authoring_mode: str, definition: dict[str, Any],
+                output_types: list[str]) -> dict[str, Any]:
+        if authoring_mode == "standard":
+            flow_dsl = self.managed.materialize(definition, output_types)
+        elif authoring_mode == "advanced":
+            flow_dsl = dict(definition or {})
+        else:
+            raise FlowValidationError(f"未知的流程编辑模式：{authoring_mode}")
+        return flow_compiler.compile(flow_dsl)
+
+
+MANAGED_FLOW_CATALOG = ManagedFlowCatalog()
+FLOW_AUTHORING_COMPILER = FlowAuthoringCompiler(MANAGED_FLOW_CATALOG)

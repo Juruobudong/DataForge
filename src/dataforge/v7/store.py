@@ -30,6 +30,7 @@ from .catalog import (
     normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
+from .flow_authoring import FLOW_AUTHORING_COMPILER, MANAGED_FLOW_CATALOG
 from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
 from .graph_literal import detect_literal
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
@@ -427,10 +428,11 @@ class V7Store:
                 session.add(profile)
             for code, name, output_types in V7_TEMPLATE_SEEDS:
                 template = session.scalar(select(KnowledgeFlowTemplate).where(KnowledgeFlowTemplate.code == code))
+                stage_config = MANAGED_FLOW_CATALOG.default_stage_config(code)
                 if not template:
                     template = KnowledgeFlowTemplate(
                         id=f"flow_{code}", code=code, name=name, output_types=output_types,
-                        definition_json=builtin_flow_definition(output_types),
+                        definition_json=stage_config, authoring_mode="standard", managed_template_code=code,
                         status="active", is_default=code != "standard-multi", purpose="knowledge",
                     )
                     session.add(template)
@@ -438,13 +440,21 @@ class V7Store:
                 else:
                     if template.name == V7_TEMPLATE_LEGACY_NAMES[code]:
                         template.name = name
-                    template.definition_json = builtin_flow_definition(output_types)
+                    template.definition_json = stage_config
+                    template.authoring_mode, template.managed_template_code = "standard", code
                     template.purpose, template.needs_review_upgrade = "knowledge", False
-                if not session.scalar(select(KnowledgeFlowTemplateRevision).where(KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id)):
+                revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                    KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id))
+                if not revision:
                     session.add(KnowledgeFlowTemplateRevision(
                         id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
-                        definition_json=template.definition_json, status="published", published_at=utc_now(), purpose="knowledge",
+                        definition_json=stage_config, authoring_mode="standard", managed_template_code=code,
+                        status="published", published_at=utc_now(), purpose="knowledge",
                     ))
+                else:
+                    revision.definition_json = stage_config
+                    revision.authoring_mode, revision.managed_template_code = "standard", code
+                    revision.purpose = "knowledge"
             # ``graph`` has long normalized to ``graph:triple``.  Move active
             # document bindings to the canonical template before archiving the
             # redundant row, while keeping historical revisions and jobs.
@@ -536,10 +546,13 @@ class V7Store:
             session.flush()
             for template in session.scalars(select(KnowledgeFlowTemplate)):
                 if template.purpose == "knowledge":
-                    has_reviewed_root = any(
-                        node.get("ref") == "reviewed-source-chunk-input"
-                        for node in (template.definition_json or {}).get("nodes", [])
-                    )
+                    if template.authoring_mode == "standard":
+                        has_reviewed_root = True
+                    else:
+                        has_reviewed_root = any(
+                            node.get("ref") == "reviewed-source-chunk-input"
+                            for node in (template.definition_json or {}).get("nodes", [])
+                        )
                     template.needs_review_upgrade = not has_reviewed_root
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                     KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
@@ -549,6 +562,7 @@ class V7Store:
                     seed_registry_path = resolve_llm_serving_config_path()
                     self._create_execution_snapshot(
                         session, revision, template.output_types,
+                        authoring_mode=revision.authoring_mode,
                         llm_registry=get_llm_serving_registry(seed_registry_path),
                     )
 
@@ -3628,6 +3642,19 @@ class V7Store:
                     "references": references, "active_job_references": active_job_references,
                     "template_binding_references": binding_references}
 
+    def knowledge_library_deletion_preflight(self, library_ids: list[str]) -> dict[str, Any]:
+        if not library_ids:
+            raise ValueError("未选择知识库")
+        results = []
+        for lid in dict.fromkeys(library_ids):
+            try:
+                results.append(self.knowledge_library_delete_check(lid))
+            except ValueError as exc:
+                results.append({"knowledge_library_id": lid, "deletable": False, "error": str(exc),
+                                "references": [], "active_job_references": [], "template_binding_references": []})
+        return {"deletable": all(r.get("deletable") for r in results),
+                "library_count": len(results), "results": results}
+
     def request_knowledge_library_deletion(self, library_id: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
             library = session.scalar(select(KnowledgeLibrary).where(KnowledgeLibrary.id == library_id).with_for_update())
@@ -3667,6 +3694,58 @@ class V7Store:
                 "job_id": job.id, "retained_template_binding_ids": [binding.id for binding in bindings],
             })
             return {"id": job.id, "knowledge_library_id": library.id, "status": job.status}
+
+    def request_knowledge_library_deletions(self, library_ids: list[str]) -> dict[str, Any]:
+        if not library_ids:
+            raise ValueError("未选择知识库")
+        targets = list(dict.fromkeys(library_ids))
+        with self.sessions.begin() as session:
+            libraries = session.scalars(select(KnowledgeLibrary).where(
+                KnowledgeLibrary.id.in_(targets)).with_for_update()).all()
+            by_id = {lib.id: lib for lib in libraries}
+            blocked = []
+            for lid in targets:
+                lib = by_id.get(lid)
+                if not lib:
+                    blocked.append((lid, "知识库不存在")); continue
+                if lib.status == "deleted":
+                    blocked.append((lib.name or lid, "知识库已经删除")); continue
+                refs = session.scalar(select(func.count()).select_from(ProjectOrgRouteLibrary).where(
+                    ProjectOrgRouteLibrary.knowledge_library_id == lid)) or 0
+                if refs:
+                    blocked.append((lib.name or lid, "仍被项目路由引用")); continue
+                if self._active_jobs_for_library(session, lid):
+                    blocked.append((lib.name or lid, "仍有排队或运行中的处理任务")); continue
+            if blocked:
+                names = "、".join(name for name, _ in blocked)
+                raise ValueError(f"以下知识库暂不能删除（{names}），请取消勾选后再试")
+            results = []
+            for lid in targets:
+                lib = by_id[lid]
+                queued = session.scalar(select(KnowledgeLibraryDeletionJob).where(
+                    KnowledgeLibraryDeletionJob.knowledge_library_id == lid,
+                    KnowledgeLibraryDeletionJob.status.in_(("queued", "running", "failed")),
+                ).order_by(KnowledgeLibraryDeletionJob.created_at.desc()))
+                if queued:
+                    results.append({"id": queued.id, "knowledge_library_id": lid,
+                                    "status": queued.status, "idempotent": True}); continue
+                bindings = session.scalars(select(DocumentLibraryTemplateBinding).join(
+                    DocumentLibraryTemplateOutput,
+                    DocumentLibraryTemplateOutput.document_library_template_binding_id == DocumentLibraryTemplateBinding.id,
+                ).where(
+                    DocumentLibraryTemplateOutput.knowledge_library_id == lid,
+                    DocumentLibraryTemplateBinding.status == "active",
+                ).with_for_update()).all()
+                for binding in bindings:
+                    binding.last_successful_revision_id = None
+                lib.status = "deleting"
+                job = KnowledgeLibraryDeletionJob(id=new_id("kldel"), knowledge_library_id=lid)
+                session.add(job)
+                self.audit(session, "knowledge_library.deletion_queued", "knowledge_library", lid, {
+                    "job_id": job.id, "retained_template_binding_ids": [b.id for b in bindings],
+                })
+                results.append({"id": job.id, "knowledge_library_id": lid, "status": job.status})
+        return {"deleted_count": sum(1 for r in results if not r.get("idempotent")), "results": results}
 
     def list_library_deletion_jobs(self, library_id: str) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -3761,8 +3840,12 @@ class V7Store:
         return {code: value for code, value in rows}
 
     def _compile_template_definition(self, session: Session, definition: dict[str, Any], output_types: list[str],
-                                     *, purpose: str = "knowledge", require_serving_health: bool = False, llm_registry=None) -> dict[str, Any]:
-        normalized = self._normalise_template_definition(definition, output_types)
+                                     *, purpose: str = "knowledge", require_serving_health: bool = False, llm_registry=None,
+                                     authoring_mode: str = "advanced") -> dict[str, Any]:
+        if authoring_mode == "standard":
+            normalized = FLOW_AUTHORING_COMPILER.materialize(definition, output_types)
+        else:
+            normalized = self._normalise_template_definition(definition, output_types)
         normalized["purpose"] = purpose
         try:
             registry = llm_registry or self.llm_serving_registry
@@ -3803,11 +3886,13 @@ class V7Store:
         return hashlib.sha256(f"{revision_id}:{checksum}".encode("utf-8")).hexdigest()
 
     def _create_execution_snapshot(self, session: Session, revision: KnowledgeFlowTemplateRevision, output_types: list[str],
-                                   *, require_serving_health: bool = False, llm_registry=None) -> FlowExecutionSnapshot:
+                                   *, require_serving_health: bool = False, llm_registry=None,
+                                   authoring_mode: str = "advanced") -> FlowExecutionSnapshot:
         compiled = self._compile_template_definition(
             session, revision.definition_json, output_types, purpose=revision.purpose,
             require_serving_health=require_serving_health,
             llm_registry=llm_registry,
+            authoring_mode=authoring_mode,
         )
         snapshot_checksum = self._snapshot_checksum(revision.id, compiled["checksum"])
         snapshot = session.scalar(select(FlowExecutionSnapshot).where(FlowExecutionSnapshot.checksum == snapshot_checksum))
@@ -3851,13 +3936,23 @@ class V7Store:
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                     KnowledgeFlowTemplateRevision.knowledge_flow_template_id == item.id,
                 ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
+                published_revision = revision if revision and revision.status == "published" else session.scalar(
+                    select(KnowledgeFlowTemplateRevision).where(
+                        KnowledgeFlowTemplateRevision.knowledge_flow_template_id == item.id,
+                        KnowledgeFlowTemplateRevision.status == "published",
+                    ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())
+                )
                 values.append({"id": item.id, "code": item.code, "name": item.name,
                                "is_builtin": item.code in V7_BUILTIN_TEMPLATE_CODES, "output_types": item.output_types,
+                               "authoring_mode": item.authoring_mode or "advanced",
+                               "managed_template_code": item.managed_template_code,
                                "definition": revision.definition_json if revision else item.definition_json,
                                "status": item.status, "is_default": item.is_default,
                                "purpose": item.purpose, "needs_review_upgrade": item.needs_review_upgrade,
                                "revision": revision.revision_no if revision else None,
                                "revision_status": revision.status if revision else None,
+                               "published_revision_id": published_revision.id if published_revision else None,
+                               "published_revision": published_revision.revision_no if published_revision else None,
                                "execution_snapshot_id": revision.execution_snapshot_id if revision else None})
             return values
 
@@ -3914,42 +4009,81 @@ class V7Store:
             return {"revision": revision.revision_no, "execution_snapshot_id": snapshot.id,
                     "operator_code": "semantic-chunker", "params": normalized}
 
-    def create_flow_template(self, code: str, name: str, output_types: list[str], definition: dict[str, Any]) -> dict[str, Any]:
+    def create_flow_template(self, code: str, name: str, output_types: list[str], definition: dict[str, Any],
+                             *, authoring_mode: str = "advanced", managed_template_code: str | None = None) -> dict[str, Any]:
         code, name = code.strip(), name.strip()
         if not code or not name or not output_types:
             raise ValueError("模板编码、名称和输出知识类型不合法")
+        if authoring_mode not in {"standard", "advanced"}:
+            raise ValueError("authoring_mode 必须是 standard 或 advanced")
         with self.sessions.begin() as session:
             active_types = self._published_type_revisions(session)
             if {output_contract(value)[0] for value in output_types} - set(active_types):
                 raise ValueError("模板引用了未发布知识类型")
-            definition = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge")["definition"]
+            if authoring_mode == "standard":
+                if not managed_template_code:
+                    raise ValueError("标准配置必须指定 managed_template_code")
+                saved = MANAGED_FLOW_CATALOG.normalize_config(managed_template_code, definition)
+                self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="standard")
+            else:
+                managed_template_code = None
+                saved = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="advanced")["definition"]
             if session.scalar(select(KnowledgeFlowTemplate).where(KnowledgeFlowTemplate.code == code)):
                 raise ValueError("模板编码已存在")
-            template = KnowledgeFlowTemplate(id=new_id("flow"), code=code, name=name, output_types=sorted(set(output_types)), definition_json=definition, status="draft", purpose="knowledge")
+            if session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.name == name, KnowledgeFlowTemplate.status != "archived",
+            )):
+                raise ValueError("模板名称已存在")
+            template = KnowledgeFlowTemplate(id=new_id("flow"), code=code, name=name, output_types=sorted(set(output_types)),
+                                             definition_json=saved, authoring_mode=authoring_mode, managed_template_code=managed_template_code,
+                                             status="draft", purpose="knowledge")
             session.add(template); session.flush()
-            revision = KnowledgeFlowTemplateRevision(id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1, definition_json=definition, status="draft", purpose="knowledge")
+            revision = KnowledgeFlowTemplateRevision(id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
+                                                     definition_json=saved, authoring_mode=authoring_mode, managed_template_code=managed_template_code,
+                                                     status="draft", purpose="knowledge")
             session.add(revision); self.audit(session, "flow_template.created", "knowledge_flow_template", template.id)
             return {"id": template.id, "revision": revision.revision_no, "status": template.status}
 
-    def update_flow_template(self, template_id: str, name: str, output_types: list[str], definition: dict[str, Any]) -> dict[str, Any]:
+    def update_flow_template(self, template_id: str, name: str, output_types: list[str], definition: dict[str, Any],
+                             *, authoring_mode: str | None = None, managed_template_code: str | None = None) -> dict[str, Any]:
         if not name.strip() or not output_types:
             raise ValueError("模板名称或输出知识类型不合法")
         with self.sessions.begin() as session:
-            if {output_contract(value)[0] for value in output_types} - set(self._published_type_revisions(session)):
-                raise ValueError("模板引用了未发布知识类型")
-            definition = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge")["definition"]
             template = session.get(KnowledgeFlowTemplate, template_id)
             if not template or template.status == "archived":
                 raise ValueError("模板不存在或已归档")
+            if session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.name == name.strip(),
+                KnowledgeFlowTemplate.id != template_id,
+                KnowledgeFlowTemplate.status != "archived",
+            )):
+                raise ValueError("模板名称已存在")
+            mode = authoring_mode or template.authoring_mode or "advanced"
+            if mode not in {"standard", "advanced"}:
+                raise ValueError("authoring_mode 必须是 standard 或 advanced")
+            if {output_contract(value)[0] for value in output_types} - set(self._published_type_revisions(session)):
+                raise ValueError("模板引用了未发布知识类型")
+            if mode == "standard":
+                managed_template_code = managed_template_code or template.managed_template_code
+                if not managed_template_code:
+                    raise ValueError("标准配置必须指定 managed_template_code")
+                saved = MANAGED_FLOW_CATALOG.normalize_config(managed_template_code, definition)
+                self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="standard")
+            else:
+                managed_template_code = None
+                saved = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="advanced")["definition"]
             latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                 KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
             ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
-            template.name, template.output_types, template.definition_json = name.strip(), sorted(set(output_types)), definition
+            template.name, template.output_types, template.definition_json = name.strip(), sorted(set(output_types)), saved
+            template.authoring_mode, template.managed_template_code = mode, managed_template_code
             if latest and latest.status == "draft":
-                latest.definition_json = definition
+                latest.definition_json = saved
+                latest.authoring_mode, latest.managed_template_code = mode, managed_template_code
             else:
                 latest = KnowledgeFlowTemplateRevision(id=new_id("flowrev"), knowledge_flow_template_id=template.id,
-                    revision_no=(latest.revision_no if latest else 0) + 1, definition_json=definition, status="draft", purpose="knowledge")
+                    revision_no=(latest.revision_no if latest else 0) + 1, definition_json=saved,
+                    authoring_mode=mode, managed_template_code=managed_template_code, status="draft", purpose="knowledge")
                 session.add(latest)
             self.audit(session, "flow_template.updated", "knowledge_flow_template", template.id, {"revision": latest.revision_no})
             return {"id": template.id, "revision": latest.revision_no, "status": latest.status}
@@ -3964,13 +4098,18 @@ class V7Store:
             ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
             if not latest:
                 raise ValueError("模板没有可发布修订")
-            latest.definition_json = self._compile_template_definition(
+            mode = latest.authoring_mode or template.authoring_mode or "advanced"
+            compiled = self._compile_template_definition(
                 session, latest.definition_json, template.output_types, purpose=template.purpose,
-                require_serving_health=True,
-            )["definition"]
+                require_serving_health=True, authoring_mode=mode,
+            )
+            if mode == "advanced":
+                latest.definition_json = compiled["definition"]
             latest.status, latest.published_at, template.status = "published", utc_now(), "active"
             latest.purpose, template.needs_review_upgrade = template.purpose, False
-            snapshot = self._create_execution_snapshot(session, latest, template.output_types, require_serving_health=True)
+            latest.authoring_mode = mode
+            latest.managed_template_code = template.managed_template_code if mode == "standard" else None
+            snapshot = self._create_execution_snapshot(session, latest, template.output_types, require_serving_health=True, authoring_mode=mode)
             binding_library_ids = list(session.scalars(select(DocumentLibraryTemplateBinding.document_library_id).where(
                 DocumentLibraryTemplateBinding.knowledge_flow_template_id == template.id,
                 DocumentLibraryTemplateBinding.status == "active",
@@ -4018,10 +4157,87 @@ class V7Store:
             ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
             if not revision:
                 raise ValueError("模板没有修订")
-            compiled = self._compile_template_definition(session, revision.definition_json, template.output_types)
-            return {"valid": True, "template_id": template.id, "revision": revision.revision_no,
-                    "definition": compiled["definition"], "compiled_definition": compiled["compiled_definition"],
-                    "checksum": compiled["checksum"]}
+            mode = revision.authoring_mode or template.authoring_mode or "advanced"
+            compiled = self._compile_template_definition(session, revision.definition_json, template.output_types, authoring_mode=mode)
+            result = {"valid": True, "template_id": template.id, "revision": revision.revision_no,
+                      "authoring_mode": mode,
+                      "managed_template_code": revision.managed_template_code or template.managed_template_code,
+                      "definition": compiled["definition"], "compiled_definition": compiled["compiled_definition"],
+                      "checksum": compiled["checksum"]}
+            stages: list[dict[str, Any]] = []
+            managed_code = revision.managed_template_code or template.managed_template_code
+            if mode == "standard" and managed_code:
+                stages = [{"code": stage.code, "name": stage.name, "locked": stage.locked}
+                          for stage in MANAGED_FLOW_CATALOG.get(managed_code).stages]
+            result["stages"] = stages
+            result["issues"] = []
+            return result
+
+    def list_managed_flow_templates(self) -> list[dict[str, Any]]:
+        return MANAGED_FLOW_CATALOG.list_definitions()
+
+    def materialize_managed_flow(self, managed_code: str) -> dict[str, Any]:
+        flow_definition = MANAGED_FLOW_CATALOG.get(managed_code)
+        flow_dsl = FLOW_AUTHORING_COMPILER.materialize(
+            MANAGED_FLOW_CATALOG.default_stage_config(managed_code), list(flow_definition.output_types),
+        )
+        return {
+            "managed_template_code": managed_code,
+            "name": flow_definition.name,
+            "output_types": list(flow_definition.output_types),
+            "definition": flow_dsl,
+        }
+
+    def preview_flow_compilation(self, authoring_mode: str, managed_template_code: str | None,
+                                 output_types: list[str], definition: dict[str, Any]) -> dict[str, Any]:
+        if authoring_mode not in {"standard", "advanced"}:
+            raise ValueError("authoring_mode 必须是 standard 或 advanced")
+        with self.sessions() as session:
+            compiled = self._compile_template_definition(
+                session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode=authoring_mode,
+            )
+            stages: list[dict[str, Any]] = []
+            if authoring_mode == "standard" and managed_template_code:
+                stages = [{"code": stage.code, "name": stage.name, "locked": stage.locked}
+                          for stage in MANAGED_FLOW_CATALOG.get(managed_template_code).stages]
+            return {"valid": True, "authoring_mode": authoring_mode,
+                    "managed_template_code": managed_template_code,
+                    "checksum": compiled["checksum"],
+                    "compiled_definition": compiled["compiled_definition"],
+                    "stages": stages,
+                    "node_count": len(compiled["compiled_definition"].get("nodes", [])),
+                    "edge_count": len(compiled["compiled_definition"].get("edges", [])),
+                    "issues": []}
+
+    def detach_flow_template_to_advanced(self, template_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            template = session.get(KnowledgeFlowTemplate, template_id)
+            if not template or template.status == "archived":
+                raise ValueError("模板不存在或已归档")
+            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
+            if not latest:
+                raise ValueError("模板没有修订")
+            if (latest.authoring_mode or template.authoring_mode or "advanced") != "standard":
+                raise ValueError("只有标准配置可以转为高级编排")
+            managed_code = latest.managed_template_code or template.managed_template_code
+            if not managed_code:
+                raise ValueError("标准配置缺少 managed_template_code")
+            flow_dsl = FLOW_AUTHORING_COMPILER.materialize(latest.definition_json, template.output_types)
+            self._compile_template_definition(session, flow_dsl, template.output_types, purpose="knowledge", authoring_mode="advanced")
+            revision = KnowledgeFlowTemplateRevision(
+                id=new_id("flowrev"), knowledge_flow_template_id=template.id,
+                revision_no=latest.revision_no + 1, definition_json=flow_dsl,
+                authoring_mode="advanced", managed_template_code=None,
+                status="draft", purpose="knowledge",
+            )
+            session.add(revision)
+            template.authoring_mode, template.managed_template_code = "advanced", None
+            template.definition_json = flow_dsl
+            self.audit(session, "flow_template.detached_to_advanced", "knowledge_flow_template", template.id, {"revision": revision.revision_no})
+            return {"id": template.id, "revision": revision.revision_no, "status": "draft",
+                    "authoring_mode": "advanced", "definition": flow_dsl}
 
     def create_knowledge_job(self, source_version_ids: list[str], output_library_ids: dict[str, str], template_id: str,
                              document_library_template_binding_id: str | None = None) -> dict[str, Any]:
@@ -4992,7 +5208,10 @@ class V7Store:
                 node = latest.get(str(definition_node["id"]))
                 runtime_nodes.append({"id": definition_node["id"], "kind": definition_node.get("kind"), "ref": definition_node.get("ref"),
                                       "params": definition_node.get("params") or {}, "origin_path": definition_node.get("origin_path") or str(definition_node["id"]).split("::"),
-                                      "source_subgraph": definition_node.get("source_subgraph"), "status": node.status if node else "reused" if str(definition_node["id"]) in reused_ids else "skipped",
+                                      "source_subgraph": definition_node.get("source_subgraph"),
+                                      "stage_id": definition_node.get("stage_id"), "stage_code": definition_node.get("stage_code"),
+                                      "stage_label": definition_node.get("stage_label"), "operator_version": definition_node.get("operator_version"),
+                                      "status": node.status if node else "reused" if str(definition_node["id"]) in reused_ids else "skipped",
                                       "node_run_id": node.id if node else None})
             runtime_edges = []
             for raw in definition.get("edges", []):
@@ -5845,6 +6064,32 @@ class V7Store:
                 )],
                 "edges": selected_edges[:max(1, min(edge_limit, 160))],
                 "facts": list(facts.values()),
+            }
+
+    def graph_type_facets(self, library_id: str) -> dict[str, Any]:
+        """Actual entity/relation type facets extracted into the graph (full set)."""
+        with self.sessions() as session:
+            nodes, edges, _ = self._graph_projection(session, library_id)
+            entity_facets: dict[str, dict[str, Any]] = {}
+            for node in nodes.values():
+                key = str(node.get("type_code") or node.get("type") or "未分类")
+                facet = entity_facets.setdefault(key, {
+                    "code": key, "label": node.get("type_label") or node.get("type") or key, "count": 0,
+                })
+                facet["count"] += 1
+            relation_facets: dict[str, dict[str, Any]] = {}
+            for edge in edges.values():
+                key = str(edge.get("relation_type") or edge.get("predicate") or "未分类")
+                facet = relation_facets.setdefault(key, {
+                    "code": key,
+                    "label": edge.get("relation_type_label") or edge.get("predicate") or key,
+                    "count": 0,
+                })
+                facet["count"] += 1
+            sort_key = lambda item: (str(item["label"]).casefold(), item["code"])
+            return {
+                "entity_types": sorted(entity_facets.values(), key=sort_key),
+                "relation_types": sorted(relation_facets.values(), key=sort_key),
             }
 
     @staticmethod

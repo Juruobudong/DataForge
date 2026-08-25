@@ -110,6 +110,10 @@ class DocumentDeletionRequest(BaseModel):
     document_library_ids: list[str] = Field(default_factory=list)
 
 
+class KnowledgeLibraryDeletionRequest(BaseModel):
+    library_ids: list[str] = Field(min_length=1)
+
+
 class KnowledgeJobRequest(BaseModel):
     source_version_ids: list[str] = Field(min_length=1)
     output_library_ids: dict[str, str] = Field(min_length=1)
@@ -125,7 +129,16 @@ class FlowTemplateRequest(BaseModel):
     code: str = ""
     name: str
     output_types: list[str] = Field(min_length=1)
+    authoring_mode: Literal["standard", "advanced"] = "advanced"
+    managed_template_code: str | None = None
     definition: dict = Field(default_factory=lambda: {"steps": ["validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate"], "parameters": {"chunk_size": 800}})
+
+
+class FlowCompilerPreviewRequest(BaseModel):
+    authoring_mode: Literal["standard", "advanced"] = "advanced"
+    managed_template_code: str | None = None
+    output_types: list[str] = Field(min_length=1)
+    definition: dict = Field(default_factory=dict)
 
 
 class TemplateSampleRequest(BaseModel):
@@ -991,6 +1004,16 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.request_knowledge_library_deletion(library_id)
         except ValueError as exc: raise _error(exc) from exc
 
+    @app.post("/api/knowledge-libraries/deletions/preflight")
+    def knowledge_library_deletion_preflight(payload: KnowledgeLibraryDeletionRequest):
+        try: return store.knowledge_library_deletion_preflight(payload.library_ids)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge-libraries/deletions", status_code=202)
+    def request_knowledge_library_deletions(payload: KnowledgeLibraryDeletionRequest):
+        try: return store.request_knowledge_library_deletions(payload.library_ids)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/knowledge-libraries/{library_id}/deletion-jobs")
     def library_deletion_jobs(library_id: str): return store.list_library_deletion_jobs(library_id)
 
@@ -1036,6 +1059,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/knowledge-libraries/{library_id}/graph/overview")
     def graph_overview(library_id: str):
         try: return store.graph_overview(library_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/knowledge-libraries/{library_id}/graph/type-facets")
+    def graph_type_facets(library_id: str):
+        try: return store.graph_type_facets(library_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/graph/entities/{entity_id}")
@@ -1236,14 +1264,33 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def flow_templates():
         return store.list_flow_templates()
 
+    @app.get("/api/developer/managed-flow-templates")
+    def managed_flow_templates():
+        return store.list_managed_flow_templates()
+
+    @app.post("/api/developer/managed-flow-templates/{code}/materialize")
+    def materialize_managed_flow(code: str):
+        try: return store.materialize_managed_flow(code)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-compiler/preview")
+    def preview_flow_compilation(payload: FlowCompilerPreviewRequest):
+        try: return store.preview_flow_compilation(payload.authoring_mode, payload.managed_template_code, payload.output_types, payload.definition)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/knowledge-flow-templates/{template_id}/detach-to-advanced")
+    def detach_flow_template_to_advanced(template_id: str):
+        try: return store.detach_flow_template_to_advanced(template_id)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.post("/api/developer/knowledge-flow-templates", status_code=201)
     def create_flow_template(payload: FlowTemplateRequest):
-        try: return store.create_flow_template(payload.code, payload.name, payload.output_types, payload.definition)
+        try: return store.create_flow_template(payload.code, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.put("/api/developer/knowledge-flow-templates/{template_id}")
     def update_flow_template(template_id: str, payload: FlowTemplateRequest):
-        try: return store.update_flow_template(template_id, payload.name, payload.output_types, payload.definition)
+        try: return store.update_flow_template(template_id, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.delete("/api/developer/knowledge-flow-templates/{template_id}")

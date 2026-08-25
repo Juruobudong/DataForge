@@ -309,6 +309,10 @@ class KnowledgeFlowTemplate(Timestamped, Base):
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     purpose: Mapped[str] = mapped_column(String(32), default="knowledge", nullable=False, index=True)
     needs_review_upgrade: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    # 编辑形态：standard（标准配置，definition_json 存 stage config）| advanced（高级编排，definition_json 存 Flow DSL）
+    authoring_mode: Mapped[str] = mapped_column(String(32), default="advanced", nullable=False)
+    # 标准配置绑定的托管模板 code（如 standard-qa），advanced 模式下为 None
+    managed_template_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class KnowledgeFlowTemplateRevision(Timestamped, Base):
@@ -322,6 +326,8 @@ class KnowledgeFlowTemplateRevision(Timestamped, Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     purpose: Mapped[str] = mapped_column(String(32), default="knowledge", nullable=False, index=True)
+    authoring_mode: Mapped[str] = mapped_column(String(32), default="advanced", nullable=False)
+    managed_template_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class KnowledgeLibrary(Timestamped, Base):

@@ -216,3 +216,26 @@ export function removeElements(nodes, edges, nodeIds = [], edgeIds = []) {
 export function cloneGraph(nodes, edges) {
   return cloneValue({ nodes, edges })
 }
+
+// Capability-first 算子呈现：常用能力快捷入口 + 按业务能力分组的算子实现。
+export const COMMON_OPERATOR_CAPABILITIES = [
+  { code: 'qa-generator', label: '问答生成' },
+  { code: 'prompt-generator', label: '文本生成' },
+  { code: 'graph-extractor', label: '实体关系抽取' },
+  { code: 'quality-evaluator', label: '质量检查' },
+]
+
+export function groupOperatorCapabilities(catalog = [], common = COMMON_OPERATOR_CAPABILITIES, query = '') {
+  const commonCodes = new Set(common.map(item => item.code))
+  const match = item => !query || `${item.name} ${item.code} ${item.category} ${item.display_name_zh || ''} ${item.description || ''}`.toLowerCase().includes(query.toLowerCase())
+  const visible = catalog.filter(item => item.exposure === 'canvas' && item.enabled !== false && match(item))
+  const byCode = Object.fromEntries(visible.map(item => [item.code, item]))
+  const commonItems = common.map(entry => byCode[entry.code]).filter(Boolean).map(item => ({ ...item, _label: common.find(entry => entry.code === item.code)?.label }))
+  const rest = visible.filter(item => !commonCodes.has(item.code))
+  const groups = Object.entries(rest.reduce((result, item) => {
+    const category = item.category || '其他'
+    ;(result[category] ||= []).push(item)
+    return result
+  }, {}))
+  return { common: commonItems, groups }
+}
