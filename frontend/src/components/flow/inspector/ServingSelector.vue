@@ -1,7 +1,12 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../../../api/platform'
-import { serviceStatus } from '../../../views/developer/modelServices.js'
+
+const SERVICE_STATUS_LABELS = { pending_configuration: '待配置', not_checked: '未检查', healthy: '正常' }
+function serviceStatus(item) {
+  if (!item?.is_enabled) return { label: '已停用' }
+  return { label: SERVICE_STATUS_LABELS[item?.last_check_status] || '异常' }
+}
 
 const props = defineProps({ modelValue: { type: String, default: '' }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue'])

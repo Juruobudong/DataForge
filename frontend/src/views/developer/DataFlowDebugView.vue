@@ -75,7 +75,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
 
 <template>
   <section class="debug-page">
-    <div class="page-head"><div><h2>DataFlow 调试台</h2><p>围绕不可变 Execution Snapshot 重建 Runtime DAG，诊断真实算子、Artifact 与跨 Run 血缘。</p></div><div class="page-actions"><span class="badge blue">管理员诊断</span><button :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新' }}</button></div></div>
+    <div class="page-head"><div><h2>运行调试</h2><p>围绕不可变 Execution Snapshot 重建 Runtime DAG，诊断真实算子、Artifact 与跨 Run 血缘。</p></div><div class="page-actions"><span class="badge blue">管理员诊断</span><button :disabled="loading" @click="load">{{ loading ? '刷新中…' : '刷新' }}</button></div></div>
     <details class="environment"><summary>环境摘要 · {{ environment.managed_collections?.length || 0 }} Collections / {{ environment.profiles?.length || 0 }} Index Profiles</summary><div class="env-grid"><span v-for="item in environment.managed_collections || []" :key="item.id" class="badge" :class="item.status==='ready'?'green':'amber'">{{ item.collection_name }} · {{ item.status }}</span><span class="badge">协作式取消</span></div></details>
     <div class="workbench">
       <aside class="left-pane">

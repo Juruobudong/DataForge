@@ -1,6 +1,6 @@
 # 知识生命周期
 
-> 当前状态：仓库已实现，更新于 2026-08-24；真实 `.34` 服务链路待部署验收。
+> 当前状态：已实现架构，更新于 2026-08-22。
 
 ## Source Preparation 与 ChunkSet
 
@@ -11,25 +11,21 @@ Source Preparation 将 Parser、Cleaner 与 Chunker 参数冻结在 `FlowExecuti
 ```text
 文档库
   → Source / 不可变 SourceVersion
-  → Source Preparation（Parse / Clean / Chunk）
-  → SourceChunk 人工审核 Gate
-  → 不可变 SourceReviewSnapshot / SourceChunkRevision
-  → 已绑定的已发布知识流程模板
+  → 已发布知识流程模板
   → 不可变 FlowExecutionSnapshot
-  → LLM / Operator → Knowledge Sink
+  → Worker / Runner / Knowledge Sink
   → KnowledgeLibrary 单一当前态 + KnowledgeChange 历史
-  → Embedding → KnowledgeAssetVersion → Milvus
-  → Ready → RouteVersion / RoutingSnapshot
+  → Vector Sync / Ready KnowledgeAssetVersion
+  → RouteVersion / RoutingSnapshot
 ```
 
 ## 文档与处理
 
 1. 文件或文件夹上传到文档库。Source 表示逻辑文件，文件替换产生新的 SourceVersion；`relative_path` 是目录权威，MinIO object key 不是业务目录。
-2. 上传或替换自动创建 SourcePreparationJob。PDF 使用 MinerU Pipeline GPU OCR，DOC/DOCX、CSV/XLSX、Markdown/TXT 使用原生解析；Preparation 只形成 DocumentIR、SourceChunk Revision 和 Artifact 血缘，然后停在待审核。
-3. 审核员可查看原文并修改、拆分、连续合并、删除、通过或拒绝 Chunk。只有全部活动 Chunk 通过，SourceVersion 才成为 `approved` 并冻结不可变 SourceReviewSnapshot；拒绝或空 Chunk 集合都不能运行模板。
-4. 文档库可提前绑定一个或多个已发布模板。绑定表示“审核完成后运行”；批准 Snapshot 后幂等 Dispatch 自动为各绑定创建 Knowledge Job。模板新修订会使已批准当前 Snapshot 重新进入待处理集合。
-5. Knowledge Job 同时固定来源版本、Review Snapshot、结果知识库、模板修订与 `FlowExecutionSnapshot`。Knowledge Flow 只能从 Reviewed SourceChunk Input 开始，不得再次 Parse 或 Chunk。
-6. `Knowledge Sink` 是正式知识唯一写入口，并复验候选 Evidence 属于任务冻结的 Chunk Revision/Snapshot。AssetVersion 保存审核摘要；Vector Sync、Ready 和 Routing 缺少合规审核血缘时拒绝继续。
+2. 文档库绑定一个或多个已发布模板。每个“文档库 × 模板 × 输出类型”固定对应一个自动结果知识库；首次处理全量文件，之后只处理新增或新版本，模板新修订则重跑该绑定的当前文件。
+3. 任务固定来源版本、结果知识库、模板修订与展开后的 `FlowExecutionSnapshot`。Runner 只执行快照中的受控 DAG。
+4. PDF 使用 MinerU Pipeline GPU OCR，DOC/DOCX、CSV/XLSX、Markdown/TXT 使用各自原生解析路径。解析结果形成 Document IR、SourceChunk 和 Artifact 血缘。
+5. `Knowledge Sink` 是正式知识唯一写入口。它对来源、Schema、Canonical、质量、身份与 Diff 做门禁；多 Sink 各自事务隔离，成功分支不会被其他失败分支回滚。
 
 ## 单一当前态
 
@@ -52,7 +48,7 @@ DataFlow 调试台读取既有 Flow Run 的 Runtime DAG、事件和 Artifact。�
 
 ## 向量化、发布与删除
 
-- Vector Sync 只能从带已批准 Evidence 的当前知识创建不可变 AssetVersion；AssetVersion 先冻结审核摘要，再执行 Embedding 与 Milvus 写入，只有 count、digest、load 与冒烟验证通过后才标记 Ready。
+- Vector Sync 从当前知识创建新的不可变 AssetVersion；只有 count、digest、load 与冒烟验证通过后才标记 Ready。
 - Routing 只引用 Ready AssetVersion，查询始终限定到 Snapshot 指定的版本化 Partition。
 - 删除文件先做影响预检并异步清理对象与失效向量；运行任务会阻断删除。
 - 删除知识库时，Draft/已发布路由引用和运行中的 Sink 任务会阻断；门禁通过后只删除该库的 `kl_*` Partition，不删除 Collection。
@@ -61,4 +57,4 @@ DataFlow 调试台读取既有 Flow Run 的 Runtime DAG、事件和 Artifact。�
 
 - 实现：`src/dataforge/v7/runner.py`、`store.py`、`worker.py`、`vector.py`、`routing.py`。
 - 详细事实：[`wiki/pages/core-workflows.md`](../../wiki/pages/core-workflows.md)、[`wiki/pages/domain-model.md`](../../wiki/pages/domain-model.md)。
-- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)、[ADR-005 SourceChunk 人工审核 Gate](../adr/ADR-005-source-chunk-review-gate.md)。
+- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)。

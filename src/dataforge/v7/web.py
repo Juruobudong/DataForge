@@ -590,6 +590,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if current: session.delete(current)
         response.delete_cookie(SESSION_COOKIE, path="/")
 
+    @app.get("/api/serving-categories")
+    def serving_categories():
+        return serving_manager.categories()
+
     @app.get("/api/model-servings")
     def model_servings(): return serving_manager.list("model")
 

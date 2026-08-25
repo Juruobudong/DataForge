@@ -35,6 +35,8 @@ DEFAULT_EMBEDDING_SERVING_ID = "bce_base_768"
 SERVING_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SUPPORTED_LLM_TYPES = {"openai-compatible-chat"}
 SUPPORTED_EMBEDDING_TYPES = {"openai-compatible-embedding"}
+SERVING_CATEGORIES: tuple[str, ...] = ("llm", "embedding", "reranker", "ocr-vision")
+AVAILABLE_SERVING_CATEGORIES: frozenset[str] = frozenset({"llm", "embedding"})
 PLACEHOLDER_KEYS = {"", "EMPTY", "fake"}
 LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +144,7 @@ class ServingManager:
     def _payload(value: ModelServing | EmbeddingServing) -> dict[str, Any]:
         result = {
             "id": value.id, "serving_code": value.serving_code, "name": value.name,
+            "category": "llm" if isinstance(value, ModelServing) else "embedding",
             "model_name": value.model_name, "base_url": value.base_url,
             "credential_configured": bool(value.credential_configured),
             "timeout_seconds": value.timeout_seconds, "max_retries": value.max_retries,
@@ -160,6 +163,11 @@ class ServingManager:
                            "batch_size": value.batch_size,
                            "last_observed_dimension": value.last_observed_dimension})
         return result
+
+    @staticmethod
+    def categories() -> list[dict[str, Any]]:
+        """Return the stable serving categories with availability for frontend tabs."""
+        return [{"key": key, "available": key in AVAILABLE_SERVING_CATEGORIES} for key in SERVING_CATEGORIES]
 
     def list(self, kind: str) -> list[dict[str, Any]]:
         model = self._model(kind)

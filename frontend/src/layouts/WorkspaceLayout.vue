@@ -21,7 +21,7 @@ const currentRegistry = computed(() => developer.value ? DEVELOPER_MENU_REGISTRY
 const current = computed(() => currentRegistry.value.find(item => menuItemActive(item, route.path))?.label || currentRegistry.value[0].label)
 function switchTo(name) {
   workspace.switchTo(name)
-  router.push(name === 'business' ? '/business/dashboard' : '/developer/knowledge-types')
+  router.push(name === 'business' ? '/business/dashboard' : '/developer/model-services')
 }
 function saveMenu(value) {
   menuPreferences.saveBusiness(value.order, value.hidden)

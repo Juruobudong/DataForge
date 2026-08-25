@@ -4,17 +4,16 @@ import { api } from '../../api/platform'
 import DataForgeFlowCanvas from '../../components/flow/DataForgeFlowCanvas.vue'
 import OperatorPalette from '../../components/flow/palette/OperatorPalette.vue'
 import NodeInspector from '../../components/flow/inspector/NodeInspector.vue'
-import OperatorInspector from '../../components/flow/inspector/OperatorInspector.vue'
-import { useRouter } from 'vue-router'
+import KnowledgeTypesView from './KnowledgeTypesView.vue'
+import { useRouter, useRoute } from 'vue-router'
 import { deserializeDefinition, makeCanvasNode, serializeDefinition, validateFlow } from '../../components/flow/flowModel'
 import { useFlowHistory } from '../../components/flow/composables/useFlowHistory'
 import GraphSchemaEditor from '../../components/graph/GraphSchemaEditor.vue'
 import PromptPreview from '../../components/graph/PromptPreview.vue'
 import { groupFlowTemplates, templateOutputSummary } from './templatePresentation'
 
-const tabs = [{ key: 'templates', name: '模板' }, { key: 'catalog', name: '算子目录' }, { key: 'subflows', name: '可复用子图' }]
+const tabs = [{ key: 'templates', name: '模板' }, { key: 'knowledge-types', name: '知识类型' }, { key: 'subflows', name: '可复用子图' }]
 const activeTab = ref('templates'), templates = ref([]), catalog = ref([]), subflows = ref([]), types = ref([])
-const facets = ref({ categories: [], knowledge_types: [], statuses: [] }), catalogQuery = ref(''), catalogCategory = ref(''), catalogKnowledge = ref(''), catalogExposure = ref(''), catalogStatus = ref(''), selectedOperator = ref(null)
 const expandedSubflow = ref(null), miniNodes = ref([]), miniEdges = ref([])
 const selected = ref(null), selectedNode = ref(null), selectedEdge = ref(null), sampleResult = ref(null)
 const result = ref(null), error = ref(''), connectionError = ref(null), issues = ref([]), focusedIssue = ref(null)
@@ -24,6 +23,7 @@ const canvas = ref(null), editor = ref(null)
 const graphConfig = ref({ entity_types: [], relation_types: [], literal_policy: { enabled_datatypes: [] }, unknown_entity_policy: 'reject', unknown_relation_policy: 'reject', prompt: { mode: 'generated', body: null } })
 const graphConfigOpen = ref(false)
 const router = useRouter()
+const route = useRoute()
 const { canUndo, canRedo, remember, undo: historyUndo, redo: historyRedo, clear: clearHistory } = useFlowHistory(nodes, edges)
 
 const hasGraphOutput = computed(() => outputTypes.value.some(value => value.startsWith('graph:')))
@@ -35,7 +35,6 @@ const typeOptions = computed(() => {
 const templateGroups = computed(() => groupFlowTemplates(templates.value))
 const statusLabel = computed(() => !selected.value ? '新建草稿' : dirty.value ? '草稿 · 未保存' : `r${selected.value.revision || '-'} · 已保存`)
 const selectedIssue = computed(() => issues.value.find(issue => issue.nodeId === selectedNode.value?.id || issue.edgeId === selectedEdge.value?.id) || connectionError.value)
-const visibleCatalog = computed(() => catalog.value.filter(item => (!catalogQuery.value || `${item.display_name_zh} ${item.code} ${item.summary}`.toLowerCase().includes(catalogQuery.value.toLowerCase())) && (!catalogCategory.value || item.category === catalogCategory.value) && (!catalogKnowledge.value || item.knowledge_types?.includes(catalogKnowledge.value)) && (!catalogExposure.value || item.exposure === catalogExposure.value) && (!catalogStatus.value || item.status === catalogStatus.value)))
 
 function beforeChange() { remember(); dirty.value = true; focusedIssue.value = null; sampleResult.value = null }
 function undo() { historyUndo(); dirty.value = true; selectedNode.value = null; selectedEdge.value = null }
@@ -121,7 +120,7 @@ function autoLayout() { canvas.value?.autoLayout(); dirty.value = true }
 
 async function load() {
   loading.value = true
-  try { [templates.value, catalog.value, subflows.value, types.value, facets.value] = await Promise.all([api.flowTemplates(), api.operatorCatalog({ include_internal: true }), api.flowSubgraphs(), api.knowledgeTypes(), api.operatorCatalogFacets()]) }
+  try { [templates.value, catalog.value, subflows.value, types.value] = await Promise.all([api.flowTemplates(), api.operatorCatalog({ include_internal: true }), api.flowSubgraphs(), api.knowledgeTypes()]) }
   catch (e) { error.value = e.message }
   finally { loading.value = false }
 }
@@ -166,18 +165,17 @@ function shortcut(event) {
   if (!(event.ctrlKey || event.metaKey)) return
   if (event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? redo() : undo() }
 }
-onMounted(() => { load(); window.addEventListener('keydown', shortcut) })
+onMounted(() => { const tabFromQuery = route.query.tab; if (tabs.some(t => t.key === tabFromQuery)) activeTab.value = tabFromQuery; load(); window.addEventListener('keydown', shortcut) })
 onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
 </script>
 
 <template>
   <section class="template-page">
     <header class="template-page-head">
-      <div><div class="title-row"><h2>知识流程模板</h2><span class="dsl-badge">Flow DSL v3</span></div><p>白名单算子、强类型端口与 Knowledge Sink 构成受控知识生产 DAG。</p></div>
+      <div><div class="title-row"><h2>知识流程</h2><span class="dsl-badge">Flow DSL v3</span></div><p>白名单算子、强类型端口与 Knowledge Sink 构成受控知识生产 DAG。</p></div>
       <div class="header-actions"><span class="save-state" :class="{ dirty }"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">模板设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button :disabled="!selected" @click="action('sample')">样例运行</button><button class="primary" :disabled="!selected" @click="action('publish')">发布快照</button></div>
     </header>
     <div class="page-tabs"><button v-for="tab in tabs" :key="tab.key" :class="{ active: activeTab===tab.key }" @click="activeTab=tab.key">{{ tab.name }}</button></div>
-    <div v-if="activeTab==='catalog'" class="secondary-filters"><label>知识类型<select v-model="catalogKnowledge"><option value="">全部</option><option v-for="item in facets.knowledge_types" :key="item" :value="item">{{ item }}</option></select></label><label>生命周期<select v-model="catalogStatus"><option value="">全部</option><option v-for="item in facets.statuses" :key="item" :value="item">{{ item }}</option></select></label></div>
 
     <template v-if="activeTab==='templates'">
       <section class="template-strip">
@@ -217,7 +215,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
       <section v-if="issues.length" class="validation-panel"><div><h3>画布校验</h3><span>{{ issues.length }} 个问题</span></div><button v-for="(issue,index) in issues" :key="`${issue.code}-${index}`" @click="focusIssue(issue)"><b>{{ issue.code }}</b><span>{{ issue.message }}</span><small>定位 →</small></button></section>
     </template>
 
-    <section v-else-if="activeTab==='catalog'" class="catalog-layout"><div class="panel catalog-list"><div class="panel-head"><div><h3>Operator Catalog</h3><p>业务说明与技术契约分层展示；数量和分类来自 Registry。</p></div><span class="badge blue">{{ visibleCatalog.length }} / {{ catalog.length }}</span></div><div class="catalog-filters"><input v-model="catalogQuery" placeholder="搜索名称、编码或说明"><select v-model="catalogCategory"><option value="">全部分类</option><option v-for="item in facets.categories" :key="item.code" :value="item.name">{{ item.name }} ({{ item.count }})</option></select><select v-model="catalogExposure"><option value="">全部暴露级别</option><option value="canvas">可直接使用</option><option value="controlled">受控使用</option><option value="internal">系统内部</option><option value="disabled">已禁用</option></select></div><button v-for="item in visibleCatalog" :key="item.id" class="operator-row" :class="{active:selectedOperator?.id===item.id}" @click="selectedOperator=item"><div><b>{{ item.display_name_zh || item.name }}</b><small>{{ item.code }} · v{{ item.version }} · {{ item.category }}</small><p>{{ item.summary }}</p></div><span class="badge" :class="item.exposure==='canvas'?'green':'amber'">{{ {canvas:'可直接使用',controlled:'受控使用',internal:'系统内部',disabled:'已禁用'}[item.exposure] }}</span></button></div><OperatorInspector :operator="selectedOperator || visibleCatalog[0]" /></section>
+    <KnowledgeTypesView v-else-if="activeTab==='knowledge-types'" />
     <section v-else class="panel subflow-catalog"><div class="panel-head"><div><h3>可复用子图</h3><p>卡片可原地展开 Mini DAG；完整画布按不可变 revision 查看。</p></div><span class="badge blue">{{ subflows.length }} 项</span></div><div class="subflow-grid"><article v-for="item in subflows" :key="item.id" :class="{expanded:expandedSubflow?.id===item.id}"><button class="subflow-title" @click="expandSubflow(item)"><span>◈</span><div><b>{{ item.name }}</b><small>{{ item.code }} · r{{ item.revision }}</small><p>{{ item.description || '可复用受控子图' }} · {{ item.node_count }} 节点 / {{ item.edge_count }} 连线</p></div></button><div v-if="expandedSubflow?.id===item.id" class="mini-wrap"><DataForgeFlowCanvas v-model:nodes="miniNodes" v-model:edges="miniEdges" mode="mini" height="260" :canvas-id="`mini-${item.id}`" /><button class="primary" @click="openSubflow(item)">打开完整画布</button></div></article></div></section>
     <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result && activeTab==='templates'" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
   </section>

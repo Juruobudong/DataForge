@@ -13,6 +13,7 @@ function graphNeighborQuery(depth, filters = {}, confirmLarge = false) {
 }
 
 export const api = {
+  servingCategories: () => request('/api/serving-categories'),
   modelServings: () => request('/api/model-servings'),
   createModelServing: body => request('/api/model-servings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   patchModelServing: (id, body) => request(`/api/model-servings/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),

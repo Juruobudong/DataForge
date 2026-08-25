@@ -17,7 +17,7 @@ const productionSteps = computed(() => {
   return [
     { label: '文档库', value: `${values.document_library_count || 0} 个文档库`, to: '/business/documents' },
     { label: '人工审核 Gate', value: 'SourceChunk 批准后放行', to: '/business/documents' },
-    { label: '知识流程模板', value: `${values.active_template_binding_count || 0} 个模板绑定`, to: '/developer/flow-templates' },
+    { label: '知识流程', value: `${values.active_template_binding_count || 0} 个模板绑定`, to: '/developer/flow-templates' },
     { label: 'LLM / Operator', value: `${values.active_job_count || 0} 个待处理任务`, to: '/business/jobs' },
     { label: 'Knowledge Sink', value: `${(values.knowledge_item_count || 0).toLocaleString()} 条知识`, to: '/business/knowledge' },
     { label: 'Embedding / Milvus', value: `${values.vector_ready_count || 0} / ${values.vector_library_count || 0} 已同步`, to: '/business/vector-storage' },
