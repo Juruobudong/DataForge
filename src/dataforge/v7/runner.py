@@ -15,6 +15,7 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..config import Settings
-from .catalog import catalog_by_code
+from .catalog import catalog_by_code, normalize_chunker_params
 from .graph_literal import classify_object, detect_literal
 from .graph_prompt import entity_prompt_for, relation_prompt_for
 from .graph_quality import evaluate_graph_quality
@@ -105,9 +106,107 @@ def _extract_text(filename: str, payload: bytes) -> str:
     raise ValueError("不支持的文档类型")
 
 
+def _clean_document_text(text: str, ref: str) -> str:
+    value = text.replace("\r\n", "\n").replace("\r", "\n")
+    if ref == "text-cleaner":
+        value = "".join(char for char in value if char in {"\n", "\t"} or unicodedata.category(char) != "Cc")
+    elif ref == "whitespace-cleaner":
+        value = "\n".join(re.sub(r"[\t \u00a0]+", " ", line).strip() for line in value.split("\n"))
+        value = re.sub(r"\n{3,}", "\n\n", value)
+    elif ref == "text-normalizer":
+        value = unicodedata.normalize("NFKC", value)
+    return value.strip()
+
+
+def _boundary_units(text: str, delimiters: list[str]) -> list[dict[str, Any]]:
+    pattern = "(" + "|".join(re.escape(value) for value in sorted(delimiters, key=len, reverse=True)) + ")"
+    parts = re.split(pattern, text)
+    units: list[dict[str, Any]] = []
+    cursor = 0
+    for index in range(0, len(parts), 2):
+        body = parts[index]
+        delimiter = parts[index + 1] if index + 1 < len(parts) else ""
+        value = body + delimiter
+        if value:
+            units.append({"text": value, "start": cursor, "end": cursor + len(value)})
+            cursor += len(value)
+    return units
+
+
+def split_document_text(text: str, raw_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    params = normalize_chunker_params(raw_params)
+    target = params["chunk_size"]
+    minimum = params["min_chunk_size"]
+    units = _boundary_units(text, params["delimiters"])
+    expanded: list[dict[str, Any]] = []
+    for unit in units:
+        value = unit["text"]
+        if len(value) <= target:
+            expanded.append({**unit, "hard_cut": False})
+            continue
+        for offset in range(0, len(value), target):
+            piece = value[offset:offset + target]
+            expanded.append({"text": piece, "start": unit["start"] + offset,
+                             "end": unit["start"] + offset + len(piece), "hard_cut": True})
+
+    chunks: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    current_size = 0
+    overlap_target = round(target * params["overlap_percent"] / 100)
+
+    def flush() -> None:
+        nonlocal current, current_size
+        if not current:
+            return
+        body = "".join(item["text"] for item in current).strip()
+        if body:
+            heading = next((line.strip() for line in body.splitlines()
+                            if re.match(r"^#{1,6}\s+\S", line.strip())), "")
+            chunks.append({
+                "content": body,
+                "char_start": current[0]["start"],
+                "char_end": current[-1]["end"],
+                "hard_cut": any(item.get("hard_cut") for item in current),
+                "heading_context": heading if params["include_heading"] else "",
+                "overlap_chars": max(0, sum(len(item["text"]) for item in current if item.get("overlap"))),
+            })
+        overlap: list[dict[str, Any]] = []
+        overlap_size = 0
+        if overlap_target:
+            for item in reversed(current):
+                if overlap_size + len(item["text"]) > overlap_target:
+                    break
+                overlap.insert(0, {**item, "overlap": True})
+                overlap_size += len(item["text"])
+                if overlap_size >= overlap_target:
+                    break
+        current = overlap
+        current_size = overlap_size
+
+    for unit in expanded:
+        if current and current_size + len(unit["text"]) > target and current_size >= minimum:
+            flush()
+        current.append(unit)
+        current_size += len(unit["text"])
+        if unit.get("hard_cut") and current_size >= target:
+            flush()
+    flush()
+    if len(chunks) > 1 and len(chunks[-1]["content"]) < minimum:
+        tail = chunks.pop()
+        previous = chunks[-1]
+        previous["content"] = (previous["content"] + "\n" + tail["content"]).strip()
+        previous["char_end"] = tail["char_end"]
+        previous["hard_cut"] = previous["hard_cut"] or tail["hard_cut"]
+    return chunks
+
+
 def _chunks(text: str, size: int = 800) -> list[str]:
-    normalized = re.sub(r"\s+", " ", text).strip()
-    return [normalized[index:index + size] for index in range(0, len(normalized), size) if normalized[index:index + size]]
+    return [item["content"] for item in split_document_text(text, {"chunk_size": size})]
+
+
+def _operator_params(definition: dict[str, Any] | None, ref: str) -> dict[str, Any]:
+    node = next((item for item in (definition or {}).get("nodes", []) if item.get("ref") == ref), None)
+    return dict((node or {}).get("params") or {})
 
 
 SAMPLE_DOCUMENTS = {
@@ -153,21 +252,23 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
             if ref == "null-filter" and not text.strip():
                 continue
             if ref in {"text-cleaner", "whitespace-cleaner", "text-normalizer"}:
-                value["text"] = re.sub(r"\s+", " ", text).strip()
+                value["text"] = _clean_document_text(text, ref)
+                value["page_segments"] = [
+                    {**segment, "text": _clean_document_text(str(segment.get("text", "")), ref)}
+                    for segment in value.get("page_segments") or []
+                ]
             result.append(value)
         return result
     if ref == "semantic-chunker":
-        size = int(params.get("chunk_size", 800))
-        if not 100 <= size <= 4000:
-            raise ValueError("Semantic Chunker 的 chunk_size 必须是 100–4000")
+        params = normalize_chunker_params(params)
         result = []
         for document in values:
-            for index, content in enumerate(_chunks(str(document.get("text", "")), size)):
+            for index, chunk in enumerate(split_document_text(str(document.get("text", "")), params)):
                 result.append({"source_id": document.get("source_id", "preview-source"),
                                "source_version_id": document.get("source_version_id", "preview-version"),
-                               "filename": document.get("filename", "样例文档"), "content": content,
+                               "filename": document.get("filename", "样例文档"), "content": chunk["content"],
                                "chunk_index": index, "runtime_mode": "preview",
-                               "anchor": {**dict(document.get("anchor") or {}), "chunk_index": index}})
+                               "anchor": {**dict(document.get("anchor") or {}), **{key: value for key, value in chunk.items() if key != "content"}, "chunk_index": index}})
         return result
     if ref == "source-chunk-builder":
         return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
@@ -879,31 +980,48 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             value = dict(value)
             if ref in {"text-cleaner", "whitespace-cleaner", "text-normalizer"}:
-                value["text"] = re.sub(r"\s+", " ", text).strip()
+                value["text"] = _clean_document_text(text, ref)
+                value["page_segments"] = [
+                    {**segment, "text": _clean_document_text(str(segment.get("text", "")), ref)}
+                    for segment in value.get("page_segments") or []
+                ]
             if ref == "text-cleaner":
                 value["runtime_mode"] = mode
             result.append(value)
         return result
     if ref == "semantic-chunker":
-        size = int(params.get("chunk_size", 800))
-        if not 100 <= size <= 4000:
-            raise ValueError("Semantic Chunker 的 chunk_size 必须是 100–4000")
+        params = normalize_chunker_params(params)
         result = []; mode = select_runtime_mode(len(values))
         for document in values:
             segments = document.get("page_segments") or [{"text": str(document.get("text", "")), "page": None, "page_index": None}]
+            if not params["preserve_page_boundary"]:
+                segments = [{
+                    "text": "\n\n".join(str(item.get("text", "")) for item in segments),
+                    "page": segments[0].get("page") if len(segments) == 1 else None,
+                    "page_index": segments[0].get("page_index") if len(segments) == 1 else None,
+                    "page_start": segments[0].get("page") if segments else None,
+                    "page_end": segments[-1].get("page") if segments else None,
+                }]
             index = 0
             for segment in segments:
-                for chunk in _chunks(str(segment.get("text", "")), size):
+                for chunk in split_document_text(str(segment.get("text", "")), params):
                     result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
-                                   "filename": document["filename"], "content": chunk, "chunk_index": index,
+                                   "filename": document["filename"], "content": chunk["content"], "chunk_index": index,
                                    "runtime_mode": mode, "anchor": {**document.get("anchor", {}), "page": segment.get("page"),
-                                                                       "page_index": segment.get("page_index"), "chunk_index": index}})
+                                                                       "page_index": segment.get("page_index"),
+                                                                       "page_start": segment.get("page_start"), "page_end": segment.get("page_end"),
+                                                                       **{key: value for key, value in chunk.items() if key != "content"},
+                                                                       "chunk_index": index}})
                     index += 1
         return result
     if ref == "source-chunk-builder":
         # This is the formal provenance boundary.  Any further internal LLM
         # context-window splitting remains an execution artifact only.
-        return [{**value, "source_chunk_id": hashlib.sha256(f"{value['source_version_id']}:{value['chunk_index']}".encode("utf-8")).hexdigest()} for value in values]
+        chunk_set_id = str(params.get("chunk_set_id") or "")
+        if not chunk_set_id:
+            raise ValueError("Source Chunk Builder 缺少 chunk_set_id")
+        return [{**value, "chunk_set_id": chunk_set_id,
+                 "source_chunk_id": hashlib.sha256(f"{chunk_set_id}:{value['chunk_index']}".encode("utf-8")).hexdigest()} for value in values]
     if ref == "faq-table-row-builder":
         documents = [{**value, "table_rows": value.get("_faq_table_rows") or []} for value in values]
         rows = normalize_faq_rows(documents)
@@ -1086,6 +1204,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
 def execute_source_preparation(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
     context = store.source_preparation_context(job_id)
     job, version, source = context["job"], context["version"], context["source"]
+    chunk_set = context["chunk_set"]
+    chunk_params = _operator_params(context.get("definition"), "semantic-chunker")
     if job.status not in {"queued", "running"}:
         return {"id": job.id, "status": job.status, "idempotent": True}
     run = store.start_source_preparation_flow_run(job_id)
@@ -1119,11 +1239,11 @@ def execute_source_preparation(store: V7Store, objects, job_id: str, *, lease_ow
             chunk_ids = store.record_flow_node(run["id"], "chunk::faq-rows", last_ids, chunk_values,
                                                operator_code="faq-table-row-builder")
         else:
-            chunk_values = _run_operator("semantic-chunker", {}, cleaned, root_documents=documents,
+            chunk_values = _run_operator("semantic-chunker", chunk_params, cleaned, root_documents=documents,
                                          sources=sources, versions=versions, type_contracts={})
             chunk_ids = store.record_flow_node(run["id"], "chunk::chunk", last_ids, chunk_values,
                                                operator_code="semantic-chunker")
-        formal = _run_operator("source-chunk-builder", {}, chunk_values, root_documents=documents,
+        formal = _run_operator("source-chunk-builder", {"chunk_set_id": chunk_set.id}, chunk_values, root_documents=documents,
                                sources=sources, versions=versions, type_contracts={})
         store.record_source_chunks(run["id"], formal)
         store.record_flow_node(run["id"], "chunk::source-chunks", chunk_ids, formal,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -35,6 +36,7 @@ SERVING_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SUPPORTED_LLM_TYPES = {"openai-compatible-chat"}
 SUPPORTED_EMBEDDING_TYPES = {"openai-compatible-embedding"}
 PLACEHOLDER_KEYS = {"", "EMPTY", "fake"}
+LOGGER = logging.getLogger(__name__)
 
 
 def _contains_llm_serving(value: Any, serving_code: str) -> bool:
@@ -385,6 +387,33 @@ class ServingManager:
                 value.last_observed_dimension = observed
             session.flush()
             return self._payload(value)
+
+    def check_configured_on_startup(self) -> list[dict[str, Any]]:
+        """Check every enabled, configured Serving once without blocking peers on failure."""
+        results: list[dict[str, Any]] = []
+        for kind in ("model", "embedding"):
+            candidates = [item for item in self.list(kind) if item["is_enabled"] and item["base_url"]]
+            for item in candidates:
+                try:
+                    checked = self.test(kind, item["id"])
+                    results.append({
+                        "kind": kind, "id": checked["id"], "serving_code": checked["serving_code"],
+                        "status": checked["last_check_status"],
+                    })
+                    LOGGER.info(
+                        "Serving startup check completed: kind=%s serving_code=%s status=%s",
+                        kind, checked["serving_code"], checked["last_check_status"],
+                    )
+                except Exception as exc:
+                    LOGGER.exception(
+                        "Serving startup check failed unexpectedly: kind=%s serving_code=%s error_type=%s",
+                        kind, item["serving_code"], type(exc).__name__,
+                    )
+                    results.append({
+                        "kind": kind, "id": item["id"], "serving_code": item["serving_code"],
+                        "status": "check_failed", "error_type": type(exc).__name__,
+                    })
+        return results
 
 
 class DatabaseLLMServingRegistry:

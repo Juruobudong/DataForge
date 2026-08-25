@@ -3,6 +3,7 @@ import WorkspaceLayout from '../layouts/WorkspaceLayout.vue'
 import DashboardView from '../views/business/DashboardView.vue'
 import DocumentManagementView from '../views/business/DocumentManagementView.vue'
 import DocumentLibraryDetailView from '../views/business/DocumentLibraryDetailView.vue'
+import DocumentReviewWorkbenchView from '../views/business/DocumentReviewWorkbenchView.vue'
 import JobListView from '../views/business/JobListView.vue'
 import KnowledgeBaseView from '../views/business/KnowledgeBaseView.vue'
 import KnowledgeLibraryDetailView from '../views/business/KnowledgeLibraryDetailView.vue'
@@ -23,6 +24,7 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/business/dashboard', component: DashboardView },
     { path: '/business/documents', component: DocumentManagementView },
     { path: '/business/documents/:libraryId', component: DocumentLibraryDetailView, props: true },
+    { path: '/business/documents/:libraryId/sources/:sourceId/versions/:versionId/review', component: DocumentReviewWorkbenchView, props: true },
     { path: '/business/jobs', component: JobListView },
     { path: '/business/knowledge', component: KnowledgeBaseView },
     { path: '/business/knowledge/:libraryId', component: KnowledgeLibraryDetailView, props: true },

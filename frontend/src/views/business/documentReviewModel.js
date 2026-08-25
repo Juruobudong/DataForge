@@ -10,3 +10,16 @@ export function canApproveDocument(review = {}) {
   const counts = review.counts || {}
   return review.preparation_status === 'completed' && Number(counts.total || 0) > 0 && Number(counts.rejected || 0) === 0
 }
+
+export function reviewActionLabel(source = {}) {
+  const version = source.version || {}
+  if (version.preparation_status === 'failed') return '查看 / 重试'
+  if (version.preparation_status === 'queued' || version.preparation_status === 'running') return '查看'
+  if (version.review_status === 'approved') return '查看'
+  if (version.review_status === 'in_review') return '继续审核'
+  return '审核'
+}
+
+export function shouldPollPreparation(status = '') {
+  return status === 'queued' || status === 'running'
+}

@@ -83,6 +83,24 @@ class SourceChunkReviewRequest(BaseModel):
     expected_revision_no: int = Field(ge=1)
 
 
+class SourceChunkBatchReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    chunk_ids: list[str] = Field(min_length=1)
+    action: Literal["approve", "reject"]
+    expected_revisions: dict[str, int]
+
+
+class SourceRechunkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    execution_snapshot_id: str | None = None
+
+
+class SourcePreparationChunkerRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_revision: int = Field(ge=1)
+    params: dict
+
+
 class DocumentTemplateBatchBindingRequest(BaseModel):
     knowledge_flow_template_ids: list[str] = Field(min_length=1)
 
@@ -439,6 +457,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     objects = _objects(resolved)
     component_checks = ComponentCheckService(store, resolved, objects)
     component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
+    serving_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="serving-startup-check")
     local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
     serving_manager = ServingManager(store.sessions, resolved.config_encryption_key)
     configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
@@ -446,16 +465,22 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     app.state.store, app.state.objects, app.state.instance = store, objects, instance
     app.state.local_milvus_config = local_milvus_config
     app.state.serving_manager = serving_manager
+    app.state.serving_startup_check_future = None
     app.state.routing_publications = set()
     app.state.routing_publications_lock = threading.RLock()
 
     @app.on_event("startup")
     def reconcile_component_checks() -> None:
         store.interrupt_component_checks()
+        if store.engine.dialect.name != "sqlite":
+            app.state.serving_startup_check_future = serving_check_executor.submit(
+                serving_manager.check_configured_on_startup,
+            )
 
     @app.on_event("shutdown")
     def shutdown_component_checks() -> None:
         component_check_executor.shutdown(wait=False, cancel_futures=True)
+        serving_check_executor.shutdown(wait=False, cancel_futures=True)
 
     @app.middleware("http")
     async def require_admin(request: Request, call_next):
@@ -851,19 +876,34 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/source-versions/{source_version_id}/review")
-    def source_review(source_version_id: str):
-        try: return store.source_review_detail(source_version_id)
+    def source_review(source_version_id: str, chunk_set_id: str | None = None):
+        try: return store.source_review_detail(source_version_id, chunk_set_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/source-versions/{source_version_id}/review/approve")
     def approve_source_review(source_version_id: str):
-        try: return store.approve_source_version(source_version_id)
+        try: return store.approve_source_version(source_version_id, approve_pending=False)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/source-versions/{source_version_id}/preparation/retry", status_code=202)
     def retry_source_preparation(source_version_id: str):
         try: return store.retry_source_preparation(source_version_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-versions/{source_version_id}/preparation/rechunk", status_code=202)
+    def rechunk_source_version(source_version_id: str, payload: SourceRechunkRequest):
+        try: return store.rechunk_source_version(source_version_id, payload.execution_snapshot_id)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/source-versions/{source_version_id}/review/batch")
+    def batch_review_source_chunks(source_version_id: str, payload: SourceChunkBatchReviewRequest):
+        try:
+            return store.batch_review_source_chunks(
+                source_version_id, payload.chunk_ids, payload.action, payload.expected_revisions,
+            )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.patch("/api/source-chunks/{chunk_id}")
@@ -907,6 +947,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: version = store.source_version_for_download(source_id, version_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         return Response(content=objects.get_bytes(version.object_key), media_type=version.mime_type, headers={"Content-Disposition": f'attachment; filename="{version_id}"'})
+
+    @app.get("/api/sources/{source_id}/versions/{version_id}/preview")
+    def preview_source(source_id: str, version_id: str):
+        try: version = store.source_version_for_download(source_id, version_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if version.mime_type != "application/pdf" and not version.object_key.lower().endswith(".pdf"):
+            raise HTTPException(status_code=415, detail="原文件内联预览仅支持 PDF；其他格式请使用 DocumentIR")
+        return Response(content=objects.get_bytes(version.object_key), media_type="application/pdf", headers={
+            "Content-Disposition": f'inline; filename="{version_id}.pdf"',
+            "X-Content-Type-Options": "nosniff",
+        })
 
     @app.post("/api/document-deletions/preflight")
     def document_deletion_preflight(payload: DocumentDeletionRequest):
@@ -1092,6 +1143,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             "Source Preparation", "SourceChunk 人工审核 Gate", "Knowledge Flow",
             "Knowledge Sink", "Embedding", "Milvus", "Ready / Routing",
         ]}]
+
+    @app.get("/api/developer/source-preparation/chunker")
+    def source_preparation_chunker():
+        try: return store.source_preparation_chunker()
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/source-preparation/chunker/revisions")
+    def create_source_preparation_chunker_revision(payload: SourcePreparationChunkerRevisionRequest):
+        try: return store.create_source_preparation_chunker_revision(payload.base_revision, payload.params)
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog")
     def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",

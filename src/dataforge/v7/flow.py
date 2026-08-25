@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Any
 
-from .catalog import catalog_by_code
+from .catalog import catalog_by_code, normalize_chunker_params
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
@@ -61,6 +61,10 @@ class FlowCompiler:
                 raise FlowValidationError("禁止递归子图")
             child = self.subflows[code]
             child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (code,))
+            if code == "knowledge-chunk" and node.get("params"):
+                for child_node in child_nodes:
+                    if child_node.get("ref") == "semantic-chunker":
+                        child_node["params"] = {**dict(child_node.get("params") or {}), **dict(node["params"])}
             entry, exit_node = child.get("entry_node"), child.get("exit_node")
             if not entry or not exit_node:
                 raise FlowValidationError(f"子图 {code} 缺少 entry_node 或 exit_node")
@@ -174,6 +178,11 @@ class FlowCompiler:
                     f"节点 {node_id} 的 Document Parser 当前不接受参数；"
                     "PDF 固定使用 MinerU backend=pipeline、parse_method=auto"
                 )
+            if code == "semantic-chunker":
+                try:
+                    params = normalize_chunker_params(params)
+                except ValueError as exc:
+                    raise FlowValidationError(f"节点 {node_id} 参数非法：{exc}") from exc
             uses_llm = bool((item.get("runtime_requirements") or {}).get("uses_llm"))
             if "llm_serving" in params and not uses_llm:
                 raise FlowValidationError(f"节点 {node_id} 不是 LLM 算子，不能配置 llm_serving")

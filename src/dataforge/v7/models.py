@@ -76,6 +76,8 @@ class SourceVersion(Timestamped, Base):
     preparation_status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
     review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
     current_review_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    active_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    candidate_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class DocumentIR(Timestamped, Base):
@@ -97,9 +99,10 @@ class DocumentIR(Timestamped, Base):
 class SourceChunk(Timestamped, Base):
     """A formal source chunk retained independently from execution artifacts."""
     __tablename__ = "source_chunks"
-    __table_args__ = (UniqueConstraint("source_version_id", "source_chunk_id", name="uq_source_chunk_version_logical_id"),)
+    __table_args__ = (UniqueConstraint("chunk_set_id", "source_chunk_id", name="uq_source_chunk_set_logical_id"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    chunk_set_id: Mapped[str] = mapped_column(ForeignKey("source_chunk_sets.id"), nullable=False, index=True)
     flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
     origin_flow_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     source_chunk_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
@@ -134,10 +137,11 @@ class SourceReviewSnapshot(Timestamped, Base):
     __tablename__ = "source_review_snapshots"
     __table_args__ = (
         UniqueConstraint("source_version_id", "review_no", name="uq_source_review_number"),
-        UniqueConstraint("source_version_id", "content_digest", name="uq_source_review_digest"),
+        UniqueConstraint("chunk_set_id", "content_digest", name="uq_source_review_chunk_set_digest"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    chunk_set_id: Mapped[str] = mapped_column(ForeignKey("source_chunk_sets.id"), nullable=False, index=True)
     review_no: Mapped[int] = mapped_column(Integer, nullable=False)
     content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     reviewed_by: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -175,6 +179,28 @@ class SourcePreparationJob(Timestamped, Base):
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SourceChunkSet(Timestamped, Base):
+    """One immutable preparation result that can be reviewed and promoted."""
+    __tablename__ = "source_chunk_sets"
+    __table_args__ = (
+        UniqueConstraint("source_version_id", "preparation_revision", name="uq_source_chunk_set_preparation"),
+        UniqueConstraint("source_preparation_job_id", name="uq_source_chunk_set_job"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    source_preparation_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("source_preparation_jobs.id"), nullable=True, index=True
+    )
+    flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
+    execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    preparation_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", nullable=False, index=True)
+    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class KnowledgeDispatch(Timestamped, Base):

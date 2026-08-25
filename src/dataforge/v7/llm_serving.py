@@ -68,7 +68,8 @@ class LLMServingRegistry:
         return serving, client
 
 
-def _config_path(path: str | Path | None = None) -> Path:
+def resolve_llm_serving_config_path(path: str | Path | None = None) -> Path:
+    """Resolve the legacy YAML registry from an explicit path or app root."""
     configured = path or os.getenv("DATAFORGE_LLM_SERVINGS_PATH")
     if configured:
         return Path(configured).expanduser().resolve()
@@ -175,7 +176,7 @@ def configure_llm_serving_registry(sessions, encryption_key: str | None, *, clie
 def get_llm_serving_registry(path: str | Path | None = None):
     """Load one registry by resolved path; connection clients stay process-local."""
     if path is not None or os.getenv("DATAFORGE_LLM_SERVINGS_PATH"):
-        return _load_registry_cached(str(_config_path(path)))
+        return _load_registry_cached(str(resolve_llm_serving_config_path(path)))
     if path is None and _database_registry is not None:
         return _database_registry
-    return _load_registry_cached(str(_config_path(path)))
+    return _load_registry_cached(str(resolve_llm_serving_config_path(path)))

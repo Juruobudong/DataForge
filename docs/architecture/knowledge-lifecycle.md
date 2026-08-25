@@ -2,6 +2,10 @@
 
 > 当前状态：仓库已实现，更新于 2026-08-24；真实 `.34` 服务链路待部署验收。
 
+## Source Preparation 与 ChunkSet
+
+Source Preparation 将 Parser、Cleaner 与 Chunker 参数冻结在 `FlowExecutionSnapshot`，并先产生 `candidate` SourceChunkSet。SourceVersion 可以在旧 `active` Set 和批准 Snapshot 继续对外有效时准备、审核新 Candidate。只有全部 Chunk 通过才能创建绑定该 Set 的 SourceReviewSnapshot；Snapshot 创建、Candidate Promote、旧 Active Supersede、指针更新和 KnowledgeDispatch 在同一事务完成。Retry 复用失败任务 Snapshot，Rechunk 使用显式或最新已发布 Preparation Snapshot。
+
 ## 主链路
 
 ```text

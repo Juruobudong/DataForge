@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260824_chunk_review_gate"
+CURRENT_SCHEMA_REVISION = "20260825_source_chunk_sets"
 
 
 def _config(database_url: str) -> Config:

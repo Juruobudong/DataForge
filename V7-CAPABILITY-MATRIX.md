@@ -48,6 +48,7 @@
 | 知识库/项目自动编码与请求拒绝 | `DONE` | 知识库由服务端生成 `KL-YYYYMMDD-UUID4`，项目生成 `PRJ-YYYYMMDD-UUID4`；客户端提交 `code` 被拒绝。 |
 | 文档库模板绑定与自动结果库 | `DONE` | 一个文档库可绑定多个已发布模板；每个输出类型固定一个结果库，首次全量、后续增量、模板新修订全量。 |
 | Source Preparation / Review Snapshot / Knowledge Dispatch | `DONE` | Preparation 与 Knowledge Flow 分离；只有全部活动 Chunk approved 才冻结不可变 Snapshot 并幂等 Dispatch，未审核的整库、选中文件、直接 Job 均服务端拒绝。 |
+| SourceChunkSet / Rechunk / 独立审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote、PDF Preview 与独立 Workbench 已完成本地实现；真实 `.34` E2E 待验收。 |
 | Reviewed Flow 与下游多层 Gate | `DONE` | 知识模板唯一根为 Reviewed SourceChunk Input；Job/Runner/Sink/Evidence/AssetVersion/Vector/Ready/Routing 逐层复验 Snapshot 或 digest，Milvus 写入位于 LLM/Operator、Knowledge Sink 与 Embedding 之后。 |
 | `knowledge_item_sources`、Evidence、结构化锚点 | `DONE` | 返回文档、SourceVersion、锚点、Evidence 与 primary 标识。 |
 | Knowledge Diff 和向量状态 | `DONE` | 新变更有可读 before/after；旧记录兼容 hash。 |

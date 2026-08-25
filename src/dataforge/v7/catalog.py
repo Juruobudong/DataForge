@@ -11,6 +11,36 @@ from typing import Any
 from .llm_serving import DEFAULT_LLM_SERVING_ID
 
 
+DEFAULT_CHUNKER_PARAMS: dict[str, Any] = {
+    "chunk_size": 800,
+    "overlap_percent": 10,
+    "delimiters": ["\n\n", "\n", "。", "！", "？", "；"],
+    "min_chunk_size": 100,
+    "preserve_page_boundary": True,
+    "include_heading": True,
+}
+
+
+def normalize_chunker_params(value: dict[str, Any] | None) -> dict[str, Any]:
+    params = {**DEFAULT_CHUNKER_PARAMS, **dict(value or {})}
+    integer_fields = ("chunk_size", "overlap_percent", "min_chunk_size")
+    if any(not isinstance(params[name], int) or isinstance(params[name], bool) for name in integer_fields):
+        raise ValueError("Chunker 的大小、Overlap 与最小块必须是整数")
+    if not 100 <= params["chunk_size"] <= 4000:
+        raise ValueError("chunk_size 必须是 100–4000")
+    if not 0 <= params["overlap_percent"] <= 50:
+        raise ValueError("overlap_percent 必须是 0–50")
+    if not 1 <= params["min_chunk_size"] <= params["chunk_size"]:
+        raise ValueError("min_chunk_size 必须介于 1 与 chunk_size 之间")
+    delimiters = params.get("delimiters")
+    if not isinstance(delimiters, list) or not delimiters or any(not isinstance(item, str) or not item for item in delimiters):
+        raise ValueError("delimiters 必须是非空字符串数组")
+    if not isinstance(params.get("preserve_page_boundary"), bool) or not isinstance(params.get("include_heading"), bool):
+        raise ValueError("页边界和标题上下文参数必须是布尔值")
+    params["delimiters"] = list(dict.fromkeys(delimiters))
+    return params
+
+
 OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "document-parser": "将源文件解析为统一文档结构",
     "document-ir-normalizer": "统一文档结构与基础元数据",
@@ -61,7 +91,7 @@ OPERATOR_CATEGORIES: tuple[str, ...] = (
 OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "document-parser": "文档解析器", "document-ir-normalizer": "文档结构规范器", "null-filter": "空内容过滤器",
     "language-filter": "语言过滤器", "text-cleaner": "文本清洗器", "whitespace-cleaner": "空白清理器",
-    "text-normalizer": "文本规范器", "semantic-chunker": "语义切片器", "source-chunk-builder": "来源切片构建器",
+    "text-normalizer": "文本规范器", "semantic-chunker": "结构化分块器", "source-chunk-builder": "来源切片构建器",
     "reviewed-source-chunk-input": "已审核来源切片",
     "deduplicate": "候选去重器", "prompt-generator": "提示词生成器", "qa-generator": "问答生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
@@ -169,7 +199,15 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("text-cleaner", "Text Cleaner", "清洗", "document_ir", "document_ir", "knowledge_text_cleaner", upstream=["KBCTextCleaner"]),
     _entry("whitespace-cleaner", "Whitespace Cleaner", "清洗", "document_ir", "document_ir", "whitespace_cleaner", upstream=["RemoveExtraSpacesRefiner"]),
     _entry("text-normalizer", "Text Normalizer", "清洗", "document_ir", "document_ir", "text_normalizer", upstream=["TextNormalizationRefiner"]),
-    _entry("semantic-chunker", "Semantic Chunker", "切片", "document_ir", "chunk_set", "semantic_chunker", upstream=["KBCChunkGenerator"]),
+    _entry("semantic-chunker", "Semantic Chunker", "切片", "document_ir", "chunk_set", "semantic_chunker", upstream=["KBCChunkGenerator"],
+           extra_params={
+               "chunk_size": {"schema": {"type": "integer", "default": 800, "minimum": 100, "maximum": 4000}, "doc": "目标块大小（字符），不是 Token。"},
+               "overlap_percent": {"schema": {"type": "integer", "default": 10, "minimum": 0, "maximum": 50}, "doc": "相邻块按自然边界复用的目标比例。"},
+               "delimiters": {"schema": {"type": "array", "items": {"type": "string"}, "minItems": 1, "default": DEFAULT_CHUNKER_PARAMS["delimiters"]}, "doc": "按优先级排列的自然边界。"},
+               "min_chunk_size": {"schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 4000}, "doc": "允许的最小块大小。"},
+               "preserve_page_boundary": {"schema": {"type": "boolean", "default": True}, "doc": "开启时禁止 Chunk 和 Overlap 跨页。"},
+               "include_heading": {"schema": {"type": "boolean", "default": True}, "doc": "复用 Parser 或 Markdown 明确提供的标题上下文。"},
+           }),
     _entry("source-chunk-builder", "Source Chunk Builder", "治理", "chunk_set", "source_chunk_set", "source_chunk_builder"),
     _entry("faq-table-row-builder", "FAQ Table Row Builder", "清洗", "document_ir", "chunk_set", "faq_table_row_builder"),
     _entry("faq-record-mapper", "FAQ Record Mapper", "知识生成", "source_chunk_set", "candidate:qa-agent-faq", "faq_record_mapper"),
@@ -296,7 +334,7 @@ def preparation_flow_definition() -> dict[str, Any]:
         "nodes": [
             {"id": "parse", "kind": "subflow", "ref": "document-parse"},
             {"id": "clean", "kind": "subflow", "ref": "document-clean"},
-            {"id": "chunk", "kind": "subflow", "ref": "knowledge-chunk"},
+            {"id": "chunk", "kind": "subflow", "ref": "knowledge-chunk", "params": dict(DEFAULT_CHUNKER_PARAMS)},
         ],
         "edges": [
             {"source": "parse", "source_port": "output", "target": "clean", "target_port": "input"},

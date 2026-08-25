@@ -27,13 +27,13 @@ import yaml
 
 from .catalog import (
     CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code,
-    preparation_flow_definition, subflow_seeds,
+    normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
 from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
 from .graph_literal import detect_literal
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
-from .llm_serving import get_llm_serving_registry
+from .llm_serving import get_llm_serving_registry, resolve_llm_serving_config_path
 from .servings import DatabaseLLMServingRegistry, ServingManager
 from .migrations import assert_schema_current
 from .models import (
@@ -113,6 +113,7 @@ from .models import (
     KnowledgeMigrationItem,
     Source,
     SourceChunk,
+    SourceChunkSet,
     SourceChunkRevision,
     SourcePreparationJob,
     SourceReviewSnapshot,
@@ -538,7 +539,7 @@ class V7Store:
                     KnowledgeFlowTemplateRevision.status == "published",
                 ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
                 if revision and not revision.execution_snapshot_id and not template.needs_review_upgrade:
-                    seed_registry_path = Path(os.getenv("DATAFORGE_LLM_SERVINGS_PATH") or Path(__file__).resolve().parents[3] / "llm_servings.yaml")
+                    seed_registry_path = resolve_llm_serving_config_path()
                     self._create_execution_snapshot(
                         session, revision, template.output_types,
                         llm_registry=get_llm_serving_registry(seed_registry_path),
@@ -547,7 +548,7 @@ class V7Store:
     def _seed_model_servings(self, session: Session) -> None:
         qwen = session.scalar(select(ModelServing).where(ModelServing.serving_code == "qwen3_32b"))
         if not qwen:
-            path = Path(os.getenv("DATAFORGE_LLM_SERVINGS_PATH") or Path(__file__).resolve().parents[3] / "llm_servings.yaml")
+            path = resolve_llm_serving_config_path()
             raw: dict[str, Any] = {}
             if path.is_file():
                 try:
@@ -1841,7 +1842,9 @@ class V7Store:
             "metadata": source.metadata_json, "updated_at": source.updated_at.isoformat(),
             "version": None if not version else {"id": version.id, "version_no": version.version_no, "sha256": version.sha256, "size_bytes": version.size_bytes, "mime_type": version.mime_type, "status": version.status, "extraction_status": version.extraction_status, "error": version.extraction_error,
                 "preparation_status": version.preparation_status, "review_status": version.review_status,
-                "current_review_snapshot_id": version.current_review_snapshot_id},
+                "current_review_snapshot_id": version.current_review_snapshot_id,
+                "active_chunk_set_id": version.active_chunk_set_id,
+                "candidate_chunk_set_id": version.candidate_chunk_set_id},
         }
 
     def list_document_libraries(self, keyword: str = "", status: str | None = None) -> list[dict[str, Any]]:
@@ -1939,6 +1942,19 @@ class V7Store:
             session.flush()
             return self._source_payload(source, version)
 
+    @staticmethod
+    def _create_candidate_chunk_set(session: Session, version: SourceVersion,
+                                    job: SourcePreparationJob) -> SourceChunkSet:
+        item = SourceChunkSet(
+            id=new_id("chunkset"), source_version_id=version.id,
+            source_preparation_job_id=job.id, execution_snapshot_id=job.execution_snapshot_id,
+            preparation_revision=job.preparation_revision, status="candidate",
+            chunk_count=0, metrics_json={},
+        )
+        session.add(item); session.flush()
+        version.candidate_chunk_set_id = item.id
+        return item
+
     def _enqueue_source_preparation(self, session: Session, version: SourceVersion) -> SourcePreparationJob:
         existing = session.scalar(select(SourcePreparationJob).where(
             SourcePreparationJob.source_version_id == version.id,
@@ -1964,9 +1980,10 @@ class V7Store:
             execution_snapshot_id=revision.execution_snapshot_id, status="queued",
         )
         version.preparation_status, version.review_status = "queued", "pending"
-        session.add(job)
+        session.add(job); session.flush()
+        chunk_set = self._create_candidate_chunk_set(session, version, job)
         self.audit(session, "source_preparation.queued", "source_preparation_job", job.id,
-                   {"source_version_id": version.id})
+                   {"source_version_id": version.id, "chunk_set_id": chunk_set.id})
         return job
 
     def retry_source_preparation(self, source_version_id: str) -> dict[str, Any]:
@@ -1978,21 +1995,66 @@ class V7Store:
             ).order_by(SourcePreparationJob.preparation_revision.desc()))
             if job and job.status in {"queued", "running"}:
                 return {"id": job.id, "status": job.status, "idempotent": True}
+            if not job or job.status != "failed":
+                raise ValueError("只有失败的 Source Preparation 可以 Retry；成功结果请使用 Rechunk")
             revision = (job.preparation_revision if job else 0) + 1
-            template = session.scalar(select(KnowledgeFlowTemplate).where(KnowledgeFlowTemplate.code == "source-preparation"))
-            flow_revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
-                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
-                KnowledgeFlowTemplateRevision.status == "published",
-            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())) if template else None
-            if not flow_revision or not flow_revision.execution_snapshot_id:
-                raise ValueError("Source Preparation 系统流程未完成初始化")
-            job = SourcePreparationJob(
+            retry = SourcePreparationJob(
                 id=new_id("prep"), source_version_id=version.id, preparation_revision=revision,
-                execution_snapshot_id=flow_revision.execution_snapshot_id, status="queued",
+                execution_snapshot_id=job.execution_snapshot_id, status="queued",
             )
             version.preparation_status, version.review_status = "queued", "pending"
             version.extraction_status, version.extraction_error = "pending", None
-            session.add(job); return {"id": job.id, "status": job.status}
+            session.add(retry); session.flush()
+            chunk_set = self._create_candidate_chunk_set(session, version, retry)
+            return {"id": retry.id, "status": retry.status, "chunk_set_id": chunk_set.id,
+                    "execution_snapshot_id": retry.execution_snapshot_id}
+
+    def rechunk_source_version(self, source_version_id: str, execution_snapshot_id: str | None = None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            version = session.scalar(select(SourceVersion).where(SourceVersion.id == source_version_id).with_for_update())
+            if not version:
+                raise ValueError("文件版本不存在")
+            current_candidate = session.get(SourceChunkSet, version.candidate_chunk_set_id) if version.candidate_chunk_set_id else None
+            if current_candidate:
+                current_job = session.get(SourcePreparationJob, current_candidate.source_preparation_job_id) if current_candidate.source_preparation_job_id else None
+                if current_candidate.status == "candidate" and current_job and current_job.status in {"queued", "running"}:
+                    raise ReviewGateError("CANDIDATE_IN_PROGRESS", "候选分块仍在生成，请等待完成后再重新分块",
+                                          source_version_id=version.id)
+                if current_candidate.status == "candidate":
+                    current_candidate.status = "superseded"
+            template = session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.code == "source-preparation", KnowledgeFlowTemplate.purpose == "source_preparation"
+            ))
+            revisions = select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+                KnowledgeFlowTemplateRevision.status == "published",
+                KnowledgeFlowTemplateRevision.purpose == "source_preparation",
+            ) if template else None
+            flow_revision = None
+            if revisions is not None:
+                if execution_snapshot_id:
+                    flow_revision = session.scalar(revisions.where(
+                        KnowledgeFlowTemplateRevision.execution_snapshot_id == execution_snapshot_id
+                    ))
+                else:
+                    flow_revision = session.scalar(revisions.order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
+            if not flow_revision or not flow_revision.execution_snapshot_id:
+                raise ValueError("Source Preparation ExecutionSnapshot 不存在或未发布")
+            preparation_revision = int(session.scalar(select(func.max(SourcePreparationJob.preparation_revision)).where(
+                SourcePreparationJob.source_version_id == version.id
+            )) or 0) + 1
+            job = SourcePreparationJob(
+                id=new_id("prep"), source_version_id=version.id, preparation_revision=preparation_revision,
+                execution_snapshot_id=flow_revision.execution_snapshot_id, status="queued",
+            )
+            session.add(job); session.flush()
+            chunk_set = self._create_candidate_chunk_set(session, version, job)
+            version.preparation_status, version.review_status = "queued", "pending"
+            version.extraction_status, version.extraction_error = "pending", None
+            self.audit(session, "source_preparation.rechunk_queued", "source_preparation_job", job.id,
+                       {"chunk_set_id": chunk_set.id, "execution_snapshot_id": job.execution_snapshot_id})
+            return {"id": job.id, "status": job.status, "chunk_set_id": chunk_set.id,
+                    "execution_snapshot_id": job.execution_snapshot_id}
 
     def claim_source_preparation_job(self, owner: str) -> SourcePreparationJob | None:
         with self.sessions.begin() as session:
@@ -2023,8 +2085,10 @@ class V7Store:
             version = session.get(SourceVersion, job.source_version_id)
             source = session.get(Source, version.source_id) if version else None
             snapshot = session.get(FlowExecutionSnapshot, job.execution_snapshot_id) if job.execution_snapshot_id else None
-            if not version or not source or not snapshot: raise ValueError("Source Preparation 任务上下文不完整")
-            return {"job": job, "version": version, "source": source, "definition": snapshot.compiled_definition_json}
+            chunk_set = session.scalar(select(SourceChunkSet).where(SourceChunkSet.source_preparation_job_id == job.id))
+            if not version or not source or not snapshot or not chunk_set: raise ValueError("Source Preparation 任务上下文不完整")
+            return {"job": job, "version": version, "source": source, "chunk_set": chunk_set,
+                    "definition": snapshot.compiled_definition_json}
 
     def start_source_preparation_flow_run(self, job_id: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -2035,6 +2099,8 @@ class V7Store:
                 execution_snapshot_id=job.execution_snapshot_id, run_mode="full", requested_by="system",
             )
             session.add(run); session.flush()
+            chunk_set = session.scalar(select(SourceChunkSet).where(SourceChunkSet.source_preparation_job_id == job.id))
+            if chunk_set: chunk_set.flow_run_id = run.id
             return {"id": run.id, "status": run.status}
 
     def finish_source_preparation(self, job_id: str, error: str | None = None) -> dict[str, Any]:
@@ -2042,19 +2108,37 @@ class V7Store:
             job = session.get(SourcePreparationJob, job_id)
             if not job: raise ValueError("Source Preparation 任务不存在")
             version = session.get(SourceVersion, job.source_version_id)
+            chunk_set = session.scalar(select(SourceChunkSet).where(SourceChunkSet.source_preparation_job_id == job.id))
             if error:
                 job.status, job.error = "failed", error
+                if chunk_set: chunk_set.status = "failed"
                 if version:
                     version.preparation_status, version.review_status = "failed", "pending"
                     version.extraction_status, version.extraction_error = "failed", error
             else:
-                chunks = self._active_source_chunks(session, job.source_version_id)
+                chunks = self._chunk_set_chunks(session, chunk_set.id) if chunk_set else []
                 if not chunks:
                     raise ValueError("Source Preparation 未生成可审核文档块")
                 job.status, job.error = "completed", None
                 if version:
                     version.preparation_status, version.review_status = "completed", "pending"
                     version.extraction_status, version.extraction_error = "completed", None
+                if chunk_set:
+                    lengths = sorted(len(item.content) for item in chunks)
+                    percentile = lambda fraction: lengths[min(len(lengths) - 1, round((len(lengths) - 1) * fraction))]
+                    chunk_set.chunk_count = len(chunks)
+                    chunk_set.content_digest = hashlib.sha256(json.dumps(
+                        [{"id": item.source_chunk_id, "hash": item.content_hash} for item in chunks],
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode("utf-8")).hexdigest()
+                    chunk_set.metrics_json = {
+                        "chunk_count": len(chunks), "avg_chars": round(sum(lengths) / len(lengths), 2),
+                        "p50_chars": percentile(0.5), "p95_chars": percentile(0.95),
+                        "min_chars": lengths[0], "max_chars": lengths[-1],
+                        "tiny_chunk_count": sum(1 for value in lengths if value < 100),
+                        "hard_cut_count": sum(1 for item in chunks if (item.anchor_json or {}).get("hard_cut")),
+                        "page_crossing_count": sum(1 for item in chunks if (item.anchor_json or {}).get("page_start") != (item.anchor_json or {}).get("page_end") and (item.anchor_json or {}).get("page_end") is not None),
+                    }
             job.lease_owner, job.lease_expires_at = None, None
             self.audit(session, f"source_preparation.{job.status}", "source_preparation_job", job.id,
                        {"error": error} if error else {})
@@ -2092,7 +2176,12 @@ class V7Store:
                 query = query.where(Source.status == status)
             items = []
             for source in session.scalars(query):
-                items.append(self._source_payload(source, session.get(SourceVersion, source.current_version_id) if source.current_version_id else None))
+                version = session.get(SourceVersion, source.current_version_id) if source.current_version_id else None
+                payload = self._source_payload(source, version)
+                target = self._review_target_chunk_set(session, version) if version else None
+                if payload["version"] is not None:
+                    payload["version"]["chunk_count"] = target.chunk_count if target else 0
+                items.append(payload)
             return items
 
     def document_tree(self, library_id: str) -> dict[str, Any]:
@@ -2138,7 +2227,15 @@ class V7Store:
                 query = query.where(Source.original_filename.ilike(f"%.{file_type.lstrip('.').lower()}"))
             total = int(session.scalar(select(func.count()).select_from(query.subquery())) or 0)
             rows = session.scalars(query.offset((page - 1) * page_size).limit(page_size)).all()
-            return {"items": [self._source_payload(row, session.get(SourceVersion, row.current_version_id) if row.current_version_id else None) for row in rows],
+            items = []
+            for row in rows:
+                version = session.get(SourceVersion, row.current_version_id) if row.current_version_id else None
+                payload = self._source_payload(row, version)
+                target = self._review_target_chunk_set(session, version) if version else None
+                if payload["version"] is not None:
+                    payload["version"]["chunk_count"] = target.chunk_count if target else 0
+                items.append(payload)
+            return {"items": items,
                     "page": page, "page_size": page_size, "total": total}
 
     def source_by_relative_path(self, library_id: str, relative_path: str) -> Source | None:
@@ -2453,16 +2550,49 @@ class V7Store:
             runs = session.scalars(select(FlowRun).where(FlowRun.knowledge_job_id.in_([job.id for job in jobs] or [""])).order_by(FlowRun.created_at.desc())).all()
             active_run = next((run for run in runs if run.id == flow_run_id), None) if flow_run_id else next((run for run in runs if run.status in {"completed", "completed_with_warnings"}), None)
             ir = session.scalar(select(DocumentIR).where(DocumentIR.source_version_id == version.id).order_by(DocumentIR.created_at.desc())) if version else None
-            chunks = session.scalars(select(SourceChunk).where(
-                SourceChunk.source_version_id == version.id,
-                SourceChunk.lifecycle_status == "active",
-            ).order_by(SourceChunk.chunk_index)).all() if version else []
+            active_set = session.get(SourceChunkSet, version.active_chunk_set_id) if version and version.active_chunk_set_id else None
+            candidate_set = session.get(SourceChunkSet, version.candidate_chunk_set_id) if version and version.candidate_chunk_set_id else None
+            review_target = self._review_target_chunk_set(session, version) if version else None
+            chunks = self._chunk_set_chunks(session, review_target.id) if review_target else []
+            preparation = session.scalar(select(SourcePreparationJob).where(
+                SourcePreparationJob.source_version_id == version.id
+            ).order_by(SourcePreparationJob.preparation_revision.desc())) if version else None
+            preparation_run = session.scalar(select(FlowRun).where(
+                FlowRun.source_preparation_job_id == preparation.id
+            ).order_by(FlowRun.created_at.desc())) if preparation else None
+            node_runs = list(session.scalars(select(FlowNodeRun).where(
+                FlowNodeRun.flow_run_id == preparation_run.id
+            ).order_by(FlowNodeRun.started_at))) if preparation_run else []
+            current_node = next((item.node_id for item in node_runs if item.status == "running"), None)
+            snapshot = session.get(FlowExecutionSnapshot, review_target.execution_snapshot_id) if review_target and review_target.execution_snapshot_id else None
+            chunker_node = next((item for item in (snapshot.compiled_definition_json or {}).get("nodes", [])
+                                 if item.get("ref") == "semantic-chunker"), None) if snapshot else None
+            chunker_revision = session.get(KnowledgeFlowTemplateRevision, snapshot.knowledge_flow_template_revision_id) if snapshot else None
             parser_artifacts = session.scalars(select(Artifact).where(
                 Artifact.source_version_id == version.id,
                 Artifact.type_code.like("parser.%"),
             ).order_by(Artifact.created_at.desc())).all() if version else []
             evidence_rows = session.execute(select(KnowledgeItemSource, KnowledgeItem, KnowledgeLibrary).join(KnowledgeItem, KnowledgeItem.id == KnowledgeItemSource.knowledge_item_id).join(KnowledgeLibrary, KnowledgeLibrary.id == KnowledgeItem.knowledge_library_id).where(KnowledgeItemSource.source_version_id == version.id)).all() if version else []
             return {"source": self._source_payload(source, version), "versions": [self._source_payload(source, item)["version"] for item in versions],
+                    "preparation": None if not preparation else {
+                        "job_id": preparation.id, "status": preparation.status,
+                        "preparation_revision": preparation.preparation_revision,
+                        "execution_snapshot_id": preparation.execution_snapshot_id,
+                        "current_node": current_node,
+                        "completed_nodes": sum(1 for item in node_runs if item.status == "completed"),
+                        "total_nodes": len((snapshot.compiled_definition_json or {}).get("nodes", [])) if snapshot else 0,
+                        "error": preparation.error,
+                    },
+                    "chunk_sets": {
+                        "active": self._chunk_set_payload(active_set) if active_set else None,
+                        "candidate": self._chunk_set_payload(candidate_set) if candidate_set else None,
+                        "review_target_id": review_target.id if review_target else None,
+                    },
+                    "chunker": None if not chunker_node else {
+                        "code": "semantic-chunker", "display_name": "结构化分块器",
+                        "revision": chunker_revision.revision_no if chunker_revision else None,
+                        "execution_snapshot_id": snapshot.id, "params": normalize_chunker_params(chunker_node.get("params")),
+                    },
                     "jobs": [self.job_payload(job) for job in jobs], "flow_runs": [{"id": run.id, "status": run.status, "error": run.error, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None} for run in runs],
                     "document_ir": None if not ir else {"id": ir.id, "text": ir.text, "parser_adapter": ir.parser_adapter, "parser_profile": ir.parser_profile, "anchor": ir.anchor_json, "status": ir.status, "error": ir.error},
                     "parser_artifacts": [{"id": item.id, "type": item.type_code, "flow_run_id": item.flow_run_id,
@@ -2498,14 +2628,21 @@ class V7Store:
             touched_versions: set[str] = set()
             for chunk in chunks:
                 version_id, index = str(chunk["source_version_id"]), int(chunk["chunk_index"])
-                if session.scalar(select(SourceChunk.id).where(SourceChunk.source_version_id == version_id, SourceChunk.flow_run_id == flow_run_id, SourceChunk.chunk_index == index)):
+                chunk_set_id = str(chunk.get("chunk_set_id") or "")
+                if not chunk_set_id:
+                    version = session.get(SourceVersion, version_id)
+                    chunk_set_id = str(version.candidate_chunk_set_id if version else "")
+                chunk_set = session.get(SourceChunkSet, chunk_set_id)
+                if not chunk_set or chunk_set.source_version_id != version_id:
+                    raise ValueError("SourceChunk 的 ChunkSet 与 SourceVersion 不匹配")
+                if session.scalar(select(SourceChunk.id).where(SourceChunk.chunk_set_id == chunk_set_id, SourceChunk.chunk_index == index)):
                     continue
                 content = str(chunk.get("content", "")).strip()
                 if not content:
                     continue
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 row = SourceChunk(
-                    id=new_id("sch"), source_version_id=version_id, flow_run_id=flow_run_id,
+                    id=new_id("sch"), source_version_id=version_id, chunk_set_id=chunk_set_id, flow_run_id=flow_run_id,
                     source_chunk_id=str(chunk.get("source_chunk_id", "")), chunk_index=index, content=content,
                     anchor_json=dict(chunk.get("anchor") or {}), content_hash=digest,
                     lifecycle_status="active", review_status="pending_review",
@@ -2522,13 +2659,13 @@ class V7Store:
                 version = session.get(SourceVersion, version_id)
                 if version:
                     version.preparation_status, version.review_status = "completed", "pending"
-                    version.current_review_snapshot_id = None
 
     @staticmethod
     def _source_chunk_payload(session: Session, chunk: SourceChunk) -> dict[str, Any]:
         revision = session.get(SourceChunkRevision, chunk.current_revision_id) if chunk.current_revision_id else None
         return {
-            "id": chunk.id, "source_chunk_id": chunk.source_chunk_id, "chunk_index": chunk.chunk_index,
+            "id": chunk.id, "chunk_set_id": chunk.chunk_set_id,
+            "source_chunk_id": chunk.source_chunk_id, "chunk_index": chunk.chunk_index,
             "content": chunk.content, "content_hash": chunk.content_hash, "anchor": chunk.anchor_json,
             "lifecycle_status": chunk.lifecycle_status, "review_status": chunk.review_status,
             "revision_id": revision.id if revision else None,
@@ -2538,11 +2675,30 @@ class V7Store:
         }
 
     @staticmethod
-    def _active_source_chunks(session: Session, source_version_id: str) -> list[SourceChunk]:
+    def _chunk_set_chunks(session: Session, chunk_set_id: str) -> list[SourceChunk]:
         return list(session.scalars(select(SourceChunk).where(
-            SourceChunk.source_version_id == source_version_id,
+            SourceChunk.chunk_set_id == chunk_set_id,
             SourceChunk.lifecycle_status == "active",
         ).order_by(SourceChunk.chunk_index, SourceChunk.id)))
+
+    @staticmethod
+    def _review_target_chunk_set(session: Session, version: SourceVersion,
+                                 chunk_set_id: str | None = None) -> SourceChunkSet | None:
+        if chunk_set_id:
+            item = session.get(SourceChunkSet, chunk_set_id)
+            if not item or item.source_version_id != version.id:
+                raise ValueError("ChunkSet 不属于当前文件版本")
+            return item
+        candidate = session.get(SourceChunkSet, version.candidate_chunk_set_id) if version.candidate_chunk_set_id else None
+        if candidate and candidate.status == "candidate":
+            return candidate
+        return session.get(SourceChunkSet, version.active_chunk_set_id) if version.active_chunk_set_id else None
+
+    @classmethod
+    def _active_source_chunks(cls, session: Session, source_version_id: str) -> list[SourceChunk]:
+        version = session.get(SourceVersion, source_version_id)
+        target = cls._review_target_chunk_set(session, version) if version else None
+        return cls._chunk_set_chunks(session, target.id) if target else []
 
     @staticmethod
     def _review_counts(chunks: list[SourceChunk]) -> dict[str, int]:
@@ -2563,32 +2719,54 @@ class V7Store:
         return "pending"
 
     def _recompute_source_review(self, session: Session, version: SourceVersion) -> dict[str, int]:
-        counts = self._review_counts(self._active_source_chunks(session, version.id))
+        target = self._review_target_chunk_set(session, version)
+        counts = self._review_counts(self._chunk_set_chunks(session, target.id) if target else [])
         version.review_status = self._aggregate_review_status(counts)
-        if version.review_status != "approved":
+        if target and target.id == version.active_chunk_set_id and version.review_status != "approved":
             version.current_review_snapshot_id = None
         return counts
 
-    def _source_review_payload(self, session: Session, version: SourceVersion) -> dict[str, Any]:
-        chunks = self._active_source_chunks(session, version.id)
+    def _source_review_payload(self, session: Session, version: SourceVersion,
+                               chunk_set_id: str | None = None) -> dict[str, Any]:
+        target = self._review_target_chunk_set(session, version, chunk_set_id)
+        chunks = self._chunk_set_chunks(session, target.id) if target else []
+        review_status = self._aggregate_review_status(self._review_counts(chunks))
         return {
             "source_version_id": version.id,
             "preparation_status": version.preparation_status,
-            "review_status": version.review_status,
+            "review_status": review_status,
             "current_review_snapshot_id": version.current_review_snapshot_id,
+            "chunk_set": self._chunk_set_payload(target) if target else None,
             "counts": self._review_counts(chunks),
             "chunks": [self._source_chunk_payload(session, item) for item in chunks],
         }
 
-    def source_review_detail(self, source_version_id: str) -> dict[str, Any]:
+    def source_review_detail(self, source_version_id: str, chunk_set_id: str | None = None) -> dict[str, Any]:
         with self.sessions() as session:
             version = session.get(SourceVersion, source_version_id)
             if not version:
                 raise ValueError("文件版本不存在")
-            return self._source_review_payload(session, version)
+            return self._source_review_payload(session, version, chunk_set_id)
+
+    @staticmethod
+    def _chunk_set_payload(item: SourceChunkSet) -> dict[str, Any]:
+        return {
+            "id": item.id, "source_version_id": item.source_version_id,
+            "source_preparation_job_id": item.source_preparation_job_id,
+            "flow_run_id": item.flow_run_id, "execution_snapshot_id": item.execution_snapshot_id,
+            "preparation_revision": item.preparation_revision, "status": item.status,
+            "content_digest": item.content_digest, "chunk_count": item.chunk_count,
+            "metrics": dict(item.metrics_json or {}),
+            "activated_at": item.activated_at.isoformat() if item.activated_at else None,
+        }
 
     @staticmethod
     def _require_chunk_revision(session: Session, chunk: SourceChunk, expected_revision_no: int) -> SourceChunkRevision:
+        version = session.get(SourceVersion, chunk.source_version_id)
+        target = V7Store._review_target_chunk_set(session, version) if version else None
+        if not target or target.id != chunk.chunk_set_id:
+            raise ReviewGateError("CHUNK_SET_NOT_REVIEW_TARGET", "该文档块不属于当前审核目标",
+                                  source_version_id=chunk.source_version_id)
         revision = session.get(SourceChunkRevision, chunk.current_revision_id) if chunk.current_revision_id else None
         if not revision:
             raise ValueError("文档块没有当前修订")
@@ -2643,13 +2821,14 @@ class V7Store:
             self._require_chunk_revision(session, chunk, expected_revision_no)
             if chunk.review_status == "approved":
                 raise ReviewGateError("REOPEN_REQUIRED", "已批准文档块必须先重开审核再拆分", source_version_id=chunk.source_version_id)
-            siblings = self._active_source_chunks(session, chunk.source_version_id)
+            siblings = self._chunk_set_chunks(session, chunk.chunk_set_id)
             position = siblings.index(chunk); chunk.lifecycle_status = "deleted"
             created: list[SourceChunk] = []
             offset = 0
             for part in normalized:
                 logical = SourceChunk(
-                    id=new_id("sch"), source_version_id=chunk.source_version_id, flow_run_id=chunk.flow_run_id,
+                    id=new_id("sch"), source_version_id=chunk.source_version_id, chunk_set_id=chunk.chunk_set_id,
+                    flow_run_id=chunk.flow_run_id,
                     origin_flow_run_id=chunk.origin_flow_run_id, source_chunk_id=new_id("sourcechunk"),
                     chunk_index=position + len(created), content=part,
                     anchor_json={**(chunk.anchor_json or {}), "review_char_range": [offset, offset + len(part)]},
@@ -2682,6 +2861,8 @@ class V7Store:
             rows.sort(key=lambda item: item.chunk_index)
             if len({item.source_version_id for item in rows}) != 1:
                 raise ValueError("只能合并同一文件版本的文档块")
+            if len({item.chunk_set_id for item in rows}) != 1:
+                raise ValueError("只能合并同一 ChunkSet 的文档块")
             if [item.chunk_index for item in rows] != list(range(rows[0].chunk_index, rows[-1].chunk_index + 1)):
                 raise ValueError("只能合并连续文档块")
             for item in rows:
@@ -2690,7 +2871,8 @@ class V7Store:
                     raise ReviewGateError("REOPEN_REQUIRED", "已批准文档块必须先重开审核再合并", source_version_id=item.source_version_id)
             content = "\n\n".join(item.content for item in rows)
             merged = SourceChunk(
-                id=new_id("sch"), source_version_id=rows[0].source_version_id, flow_run_id=rows[0].flow_run_id,
+                id=new_id("sch"), source_version_id=rows[0].source_version_id, chunk_set_id=rows[0].chunk_set_id,
+                flow_run_id=rows[0].flow_run_id,
                 source_chunk_id=new_id("sourcechunk"), chunk_index=rows[0].chunk_index, content=content,
                 anchor_json={"source_anchors": [item.anchor_json for item in rows], "review_merged": True},
                 content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(), lifecycle_status="active",
@@ -2704,7 +2886,7 @@ class V7Store:
             )
             session.add(revision); session.flush(); merged.current_revision_id = revision.id
             for item in rows: item.lifecycle_status = "deleted"
-            active = self._active_source_chunks(session, merged.source_version_id)
+            active = self._chunk_set_chunks(session, merged.chunk_set_id)
             for index, item in enumerate(active): item.chunk_index = index
             version = session.get(SourceVersion, merged.source_version_id); assert version
             counts = self._recompute_source_review(session, version)
@@ -2719,7 +2901,7 @@ class V7Store:
             if chunk.review_status == "approved":
                 raise ReviewGateError("REOPEN_REQUIRED", "已批准文档块必须先重开审核再删除", source_version_id=chunk.source_version_id)
             chunk.lifecycle_status = "deleted"
-            active = self._active_source_chunks(session, chunk.source_version_id)
+            active = self._chunk_set_chunks(session, chunk.chunk_set_id)
             for index, item in enumerate(active): item.chunk_index = index
             version = session.get(SourceVersion, chunk.source_version_id); assert version
             counts = self._recompute_source_review(session, version)
@@ -2745,6 +2927,11 @@ class V7Store:
         with self.sessions.begin() as session:
             chunk = session.get(SourceChunk, chunk_id)
             if not chunk or chunk.lifecycle_status != "active": raise ValueError("文档块不存在或已删除")
+            version = session.get(SourceVersion, chunk.source_version_id); assert version
+            target = self._review_target_chunk_set(session, version)
+            if not target or target.id != chunk.chunk_set_id:
+                raise ReviewGateError("CHUNK_SET_NOT_REVIEW_TARGET", "该文档块不属于当前审核目标",
+                                      source_version_id=chunk.source_version_id)
             if chunk.review_status != "approved": raise ValueError("只有已批准文档块可以重开审核")
             active_jobs = [job for job in session.scalars(select(KnowledgeJob).where(
                 KnowledgeJob.status.in_(("queued", "running")),
@@ -2753,13 +2940,15 @@ class V7Store:
                 raise ReviewGateError("ACTIVE_KNOWLEDGE_JOB", "当前文件仍有活动知识任务，请先停止任务再重开审核",
                                       source_version_id=chunk.source_version_id)
             chunk.review_status, chunk.reviewed_by, chunk.reviewed_at = "pending_review", None, None
-            version = session.get(SourceVersion, chunk.source_version_id); assert version
             counts = self._recompute_source_review(session, version)
             self.audit(session, "source_chunk.review_reopened", "source_chunk", chunk.id, {"actor": actor})
             return {**self._source_chunk_payload(session, chunk), "document_review_status": version.review_status, "counts": counts}
 
     def _approve_source_version(self, session: Session, version: SourceVersion, actor: str) -> SourceReviewSnapshot:
-        chunks = self._active_source_chunks(session, version.id); counts = self._review_counts(chunks)
+        chunk_set = self._review_target_chunk_set(session, version)
+        if not chunk_set:
+            raise ReviewGateError("REVIEW_REQUIRED", "当前文档没有可审核的 ChunkSet", source_version_id=version.id)
+        chunks = self._chunk_set_chunks(session, chunk_set.id); counts = self._review_counts(chunks)
         if not chunks or counts["approved"] != counts["total"]:
             message = (f"当前文档存在 {counts['pending_review']} 个待审核文档块，请完成审核后再运行知识流程。"
                        if counts["pending_review"] else
@@ -2770,7 +2959,7 @@ class V7Store:
         material = json.dumps([{"id": item.id, "hash": item.content_hash} for item in revisions], ensure_ascii=False, separators=(",", ":"))
         digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
         snapshot = session.scalar(select(SourceReviewSnapshot).where(
-            SourceReviewSnapshot.source_version_id == version.id,
+            SourceReviewSnapshot.chunk_set_id == chunk_set.id,
             SourceReviewSnapshot.content_digest == digest,
         ))
         if not snapshot:
@@ -2778,7 +2967,7 @@ class V7Store:
                 SourceReviewSnapshot.source_version_id == version.id,
             )) or 0) + 1
             snapshot = SourceReviewSnapshot(
-                id=new_id("review"), source_version_id=version.id, review_no=review_no,
+                id=new_id("review"), source_version_id=version.id, chunk_set_id=chunk_set.id, review_no=review_no,
                 content_digest=digest, reviewed_by=actor, approved_at=utc_now(), status="approved",
             )
             session.add(snapshot); session.flush()
@@ -2788,6 +2977,12 @@ class V7Store:
                     source_chunk_id=chunk.id, source_chunk_revision_id=revision.id,
                     ordinal=ordinal, content_hash=revision.content_hash,
                 ))
+        if chunk_set.id == version.candidate_chunk_set_id:
+            previous = session.get(SourceChunkSet, version.active_chunk_set_id) if version.active_chunk_set_id else None
+            if previous and previous.id != chunk_set.id:
+                previous.status = "superseded"
+            chunk_set.status, chunk_set.activated_at = "active", utc_now()
+            version.active_chunk_set_id, version.candidate_chunk_set_id = chunk_set.id, None
         version.review_status, version.current_review_snapshot_id = "approved", snapshot.id
         self._queue_review_dispatch(session, snapshot.id)
         self.audit(session, "source_version.review_approved", "source_version", version.id,
@@ -2812,6 +3007,36 @@ class V7Store:
             snapshot = self._approve_source_version(session, version, actor)
             return {**self._source_review_payload(session, version),
                     "review_snapshot_id": snapshot.id, "review_digest": snapshot.content_digest}
+
+    def batch_review_source_chunks(self, source_version_id: str, chunk_ids: list[str], action: str,
+                                   expected_revisions: dict[str, int], *, actor: str = "admin") -> dict[str, Any]:
+        if action not in {"approve", "reject"}:
+            raise ValueError("批量审核 action 必须是 approve 或 reject")
+        identifiers = list(dict.fromkeys(str(value) for value in chunk_ids if value))
+        if not identifiers:
+            raise ValueError("批量审核至少选择一个文档块")
+        with self.sessions.begin() as session:
+            version = session.scalar(select(SourceVersion).where(SourceVersion.id == source_version_id).with_for_update())
+            if not version:
+                raise ValueError("文件版本不存在")
+            target = self._review_target_chunk_set(session, version)
+            rows = list(session.scalars(select(SourceChunk).where(SourceChunk.id.in_(identifiers)).with_for_update()))
+            if len(rows) != len(identifiers) or not target or any(
+                item.chunk_set_id != target.id or item.lifecycle_status != "active" for item in rows
+            ):
+                raise ValueError("批量审核包含不属于当前审核目标的文档块")
+            for item in rows:
+                self._require_chunk_revision(session, item, int(expected_revisions.get(item.id, -1)))
+            status = "approved" if action == "approve" else "rejected"
+            reviewed_at = utc_now()
+            for item in rows:
+                item.review_status, item.reviewed_by, item.reviewed_at = status, actor, reviewed_at
+            counts = self._recompute_source_review(session, version)
+            snapshot = self._approve_source_version(session, version, actor) if version.review_status == "approved" else None
+            self.audit(session, f"source_chunk.batch_{action}", "source_version", version.id,
+                       {"chunk_ids": identifiers, "actor": actor})
+            return {**self._source_review_payload(session, version),
+                    "review_snapshot_id": snapshot.id if snapshot else None, "counts": counts}
 
     def mark_source_versions_failed(self, version_ids: list[str], error: str) -> None:
         with self.sessions.begin() as session:
@@ -2966,6 +3191,10 @@ class V7Store:
                 SourceReviewSnapshot.source_version_id.in_(version_ids),
             ))) if version_ids else []
             if version_ids:
+                session.execute(update(SourceVersion).where(SourceVersion.id.in_(version_ids)).values(
+                    active_chunk_set_id=None, candidate_chunk_set_id=None,
+                ))
+            if version_ids:
                 session.execute(delete(KnowledgeItemSource).where(KnowledgeItemSource.source_version_id.in_(version_ids)))
                 session.execute(delete(DocumentLibraryProcessingRecord).where(
                     DocumentLibraryProcessingRecord.source_version_id.in_(version_ids)
@@ -3000,6 +3229,8 @@ class V7Store:
                 (KnowledgeItemSource, KnowledgeItemSource.source_version_id),
             ):
                 session.execute(delete(model).where(column.in_(version_ids)))
+            if version_ids:
+                session.execute(delete(SourceChunkSet).where(SourceChunkSet.source_version_id.in_(version_ids)))
             # SourceChunk and DocumentIR both retain preparation FlowRun lineage,
             # so their rows must be removed before the runs and preparation jobs.
             if preparation_run_ids:
@@ -3614,6 +3845,59 @@ class V7Store:
                                "revision_status": revision.status if revision else None,
                                "execution_snapshot_id": revision.execution_snapshot_id if revision else None})
             return values
+
+    def source_preparation_chunker(self) -> dict[str, Any]:
+        with self.sessions() as session:
+            template = session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.code == "source-preparation",
+                KnowledgeFlowTemplate.purpose == "source_preparation",
+            ))
+            revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+                KnowledgeFlowTemplateRevision.status == "published",
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())) if template else None
+            snapshot = session.get(FlowExecutionSnapshot, revision.execution_snapshot_id) if revision and revision.execution_snapshot_id else None
+            node = next((item for item in (snapshot.compiled_definition_json or {}).get("nodes", [])
+                         if item.get("ref") == "semantic-chunker"), None) if snapshot else None
+            if not template or not revision or not snapshot or not node:
+                raise ValueError("Source Preparation Chunker 尚未发布")
+            return {"revision": revision.revision_no, "execution_snapshot_id": snapshot.id,
+                    "operator_code": "semantic-chunker", "params": normalize_chunker_params(node.get("params"))}
+
+    def create_source_preparation_chunker_revision(self, base_revision: int,
+                                                   params: dict[str, Any]) -> dict[str, Any]:
+        normalized = normalize_chunker_params(params)
+        with self.sessions.begin() as session:
+            template = session.scalar(select(KnowledgeFlowTemplate).where(
+                KnowledgeFlowTemplate.code == "source-preparation",
+                KnowledgeFlowTemplate.purpose == "source_preparation",
+            ).with_for_update())
+            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+                KnowledgeFlowTemplateRevision.status == "published",
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())) if template else None
+            if not template or not latest:
+                raise ValueError("Source Preparation 系统流程未完成初始化")
+            if latest.revision_no != base_revision:
+                raise ReviewGateError("STALE_PREPARATION_REVISION", "Source Preparation 已有新 Revision，请刷新后重试")
+            definition = json.loads(json.dumps(latest.definition_json or preparation_flow_definition(), ensure_ascii=False))
+            node = next((item for item in definition.get("nodes", [])
+                         if item.get("ref") == "knowledge-chunk" or item.get("ref") == "semantic-chunker"), None)
+            if not node:
+                raise ValueError("Source Preparation Definition 缺少 semantic-chunker")
+            node["params"] = normalized
+            revision = KnowledgeFlowTemplateRevision(
+                id=new_id("flowrev"), knowledge_flow_template_id=template.id,
+                revision_no=latest.revision_no + 1, definition_json=definition,
+                purpose="source_preparation", status="published", published_at=utc_now(),
+            )
+            session.add(revision); session.flush()
+            snapshot = self._create_execution_snapshot(session, revision, [])
+            template.definition_json, template.status = definition, "active"
+            self.audit(session, "source_preparation.chunker_revision_published", "knowledge_flow_template", template.id,
+                       {"revision": revision.revision_no, "execution_snapshot_id": snapshot.id})
+            return {"revision": revision.revision_no, "execution_snapshot_id": snapshot.id,
+                    "operator_code": "semantic-chunker", "params": normalized}
 
     def create_flow_template(self, code: str, name: str, output_types: list[str], definition: dict[str, Any]) -> dict[str, Any]:
         code, name = code.strip(), name.strip()
@@ -5007,7 +5291,7 @@ class V7Store:
         tables = (
             FlowRunSinkPreview, FlowRunEvent, FlowNodeArtifactBinding, ArtifactLineage, Artifact, FlowNodeRun,
             KnowledgeItemSource, KnowledgeJobReviewInput, KnowledgeDispatch, SourceReviewSnapshotChunk,
-            SourceChunkRevision, SourceReviewSnapshot, SourceChunk, DocumentIR, FlowRun, SourcePreparationJob,
+            SourceChunkRevision, SourceReviewSnapshot, SourceChunk, SourceChunkSet, DocumentIR, FlowRun, SourcePreparationJob,
             FlowExecutionSnapshot, KnowledgeChunkGeneration,
             VectorDeletionJob, VectorRecordState, VectorSyncJob, KnowledgeChange, KnowledgeItem,
             ProjectOrgRouteLibrary, ProjectOrgRoute, ProjectRouteVersion, ProjectTask, Project,
@@ -5021,6 +5305,7 @@ class V7Store:
         )
         counts: dict[str, int] = {}
         with self.sessions.begin() as session:
+            session.execute(update(SourceVersion).values(active_chunk_set_id=None, candidate_chunk_set_id=None))
             for model in tables:
                 result = session.execute(delete(model))
                 counts[model.__tablename__] = int(result.rowcount or 0)

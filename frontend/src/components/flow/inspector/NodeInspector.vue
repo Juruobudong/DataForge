@@ -5,8 +5,8 @@ import ServingSelector from './ServingSelector.vue'
 const props = defineProps({ node: Object, issue: Object, sampleResult: Object })
 const emit = defineEmits(['apply-parameters'])
 const tab = ref('parameters'), text = ref('{}'), params = ref({})
-const parseError = ref('')
-watch(() => props.node, node => { params.value = { ...(node?.data.definition.params || {}) }; text.value = JSON.stringify(params.value, null, 2); parseError.value = '' }, { immediate: true })
+const parseError = ref(''), advancedOpen = ref(true)
+watch(() => props.node, node => { params.value = { ...(node?.data.definition.params || {}) }; text.value = JSON.stringify(params.value, null, 2); parseError.value = ''; advancedOpen.value = true }, { immediate: true })
 const documentParser = computed(() => props.node?.data.meta.code === 'document-parser')
 const editable = computed(() => hasEditableParameters(props.node))
 const nodeRun = computed(() => props.node ? props.sampleResult?.node_runs?.[props.node.id] || null : null)
@@ -36,7 +36,7 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
             <input v-else :type="spec.type==='string' ? 'text' : 'number'" :value="params[name] ?? ''" :disabled="!editable" @input="updateScalar(name,spec,$event)">
           </label>
           <button v-if="editable && (hasServing || scalarParameters.length)" class="primary apply" @click="applyStructured">应用常用参数</button>
-          <details class="advanced"><summary>高级配置（JSON）</summary><label>节点参数 JSON<textarea v-model="text" rows="14" :disabled="!editable" spellcheck="false" /></label><button v-if="editable" class="apply" @click="apply">应用 JSON</button></details>
+          <details class="advanced" :open="advancedOpen" @toggle="advancedOpen = $event.target.open"><summary>高级配置（JSON）</summary><label>节点参数 JSON<textarea v-model="text" rows="14" :disabled="!editable" spellcheck="false" /></label><button v-if="editable" class="apply" @click="apply">应用 JSON</button></details>
           <p v-if="!editable" class="muted">该节点参数由已发布资产定义，只读。</p><p v-if="parseError" class="inline-error">{{ parseError }}</p>
         </template>
       </section>
