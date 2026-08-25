@@ -1,10 +1,12 @@
 # 知识生命周期
 
-> 当前状态：已实现架构，更新于 2026-08-22。
+> 当前状态：已实现架构，更新于 2026-08-25。
 
 ## Source Preparation 与 ChunkSet
 
 Source Preparation 将 Parser、Cleaner 与 Chunker 参数冻结在 `FlowExecutionSnapshot`，并先产生 `candidate` SourceChunkSet。SourceVersion 可以在旧 `active` Set 和批准 Snapshot 继续对外有效时准备、审核新 Candidate。只有全部 Chunk 通过才能创建绑定该 Set 的 SourceReviewSnapshot；Snapshot 创建、Candidate Promote、旧 Active Supersede、指针更新和 KnowledgeDispatch 在同一事务完成。Retry 复用失败任务 Snapshot，Rechunk 使用显式或最新已发布 Preparation Snapshot。
+
+Parser 同时建立 `SourceAnchorV2`：PDF 从 MinerU 内容块保留页码和 `0~1` bbox，DOCX 按原始顺序保留标题、段落与表格行 Block。Cleaner/Chunker 必须同步传播位置数组；人工编辑不改变来源，Merge 合并位置，无法安全映射的 Split 显式降级为父级来源。旧页级 Anchor 继续兼容，但只有重新分块才会获得 v2 精确位置。
 
 ## 主链路
 
@@ -24,7 +26,7 @@ Source Preparation 将 Parser、Cleaner 与 Chunker 参数冻结在 `FlowExecuti
 1. 文件或文件夹上传到文档库。Source 表示逻辑文件，文件替换产生新的 SourceVersion；`relative_path` 是目录权威，MinIO object key 不是业务目录。
 2. 文档库绑定一个或多个已发布模板。每个“文档库 × 模板 × 输出类型”固定对应一个自动结果知识库；首次处理全量文件，之后只处理新增或新版本，模板新修订则重跑该绑定的当前文件。
 3. 任务固定来源版本、结果知识库、模板修订与展开后的 `FlowExecutionSnapshot`。Runner 只执行快照中的受控 DAG。
-4. PDF 使用 MinerU Pipeline GPU OCR，DOC/DOCX、CSV/XLSX、Markdown/TXT 使用各自原生解析路径。解析结果形成 Document IR、SourceChunk 和 Artifact 血缘。
+4. PDF 使用 MinerU Pipeline GPU OCR 并形成多页 bbox SourceBlock；DOCX 原生解析形成标题、段落和表格行 Block；DOC、CSV/XLSX、Markdown/TXT 继续使用各自原生路径。解析结果形成 Document IR、SourceChunk、SourceAnchor 和 Artifact 血缘。
 5. `Knowledge Sink` 是正式知识唯一写入口。它对来源、Schema、Canonical、质量、身份与 Diff 做门禁；多 Sink 各自事务隔离，成功分支不会被其他失败分支回滚。
 
 ## 单一当前态
@@ -57,4 +59,4 @@ DataFlow 调试台读取既有 Flow Run 的 Runtime DAG、事件和 Artifact。�
 
 - 实现：`src/dataforge/v7/runner.py`、`store.py`、`worker.py`、`vector.py`、`routing.py`。
 - 详细事实：[`wiki/pages/core-workflows.md`](../../wiki/pages/core-workflows.md)、[`wiki/pages/domain-model.md`](../../wiki/pages/domain-model.md)。
-- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)。
+- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)、[ADR-006 ChunkSet 提升](../adr/ADR-006-source-chunk-set-promotion.md)、[ADR-007 SourceAnchor 血缘](../adr/ADR-007-source-anchor-provenance.md)。

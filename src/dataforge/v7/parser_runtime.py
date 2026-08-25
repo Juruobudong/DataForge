@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from .source_anchor import finalize_source_blocks, normalize_pdf_bbox
+
 
 MINERU_VERSION = "3.4.4"
 
@@ -113,22 +115,58 @@ def parse_with_mineru(*, filename: str, payload: bytes, parse_method: str = "aut
     )
 
 
-def content_list_pages(content_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Group MinerU content-list text by its zero-based PDF page index."""
-    grouped: dict[int, list[str]] = {}
-    for item in content_list:
+def _content_item_text(item: dict[str, Any]) -> str:
+    value = next((item.get(key) for key in ("text", "table_body", "equation", "content") if item.get(key)), None)
+    if isinstance(value, dict):
+        value = value.get("text") or value.get("content") or value.get("body") or ""
+    if isinstance(value, list):
+        return "\n".join(str(part).strip() for part in value if str(part).strip())
+    return str(value or "").strip()
+
+
+def content_list_blocks(content_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert MinerU content-list entries into stable, ordered PDF SourceBlocks."""
+    raw_blocks: list[dict[str, Any]] = []
+    page_ordinals: dict[int, int] = {}
+    for source_order, item in enumerate(content_list):
         page_index = item.get("page_idx")
         if not isinstance(page_index, int) or page_index < 0:
             continue
-        value = next((item.get(key) for key in ("text", "table_body", "equation") if item.get(key)), None)
-        if isinstance(value, list):
-            text = "\n".join(str(part).strip() for part in value if str(part).strip())
-        else:
-            text = str(value or "").strip()
-        if text:
-            grouped.setdefault(page_index, []).append(text)
+        text = _content_item_text(item)
+        if not text:
+            continue
+        ordinal = page_ordinals.get(page_index, 0)
+        page_ordinals[page_index] = ordinal + 1
+        item_type = str(item.get("type") or "text").lower()
+        try:
+            heading_level = max(0, int(item.get("text_level") or 0))
+        except (TypeError, ValueError):
+            heading_level = 0
+        raw_blocks.append({
+            "block_id": f"pdf:{page_index}:{ordinal}",
+            "block_type": "heading" if item_type == "text" and heading_level > 0 else item_type,
+            "heading_level": heading_level or None,
+            "page_index": page_index,
+            "page": page_index + 1,
+            "bbox": normalize_pdf_bbox(item.get("bbox")),
+            "text": text,
+            "_source_order": source_order,
+        })
+    raw_blocks.sort(key=lambda block: (int(block["page_index"]), int(block["_source_order"])))
+    for block in raw_blocks:
+        block.pop("_source_order", None)
+    _, blocks = finalize_source_blocks(raw_blocks)
+    return blocks
+
+
+def content_list_pages(content_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group MinerU content-list text by its zero-based PDF page index."""
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for block in content_list_blocks(content_list):
+        grouped.setdefault(int(block["page_index"]), []).append(block)
     return [
-        {"page_index": page_index, "page": page_index + 1, "text": "\n\n".join(parts)}
-        for page_index, parts in sorted(grouped.items())
-        if parts
+        {"page_index": page_index, "page": page_index + 1,
+         "text": "\n\n".join(str(block["text"]) for block in blocks)}
+        for page_index, blocks in sorted(grouped.items())
+        if blocks
     ]

@@ -124,6 +124,13 @@ from .models import (
     VectorSyncJob,
     utc_now,
 )
+from .source_anchor import (
+    api_source_anchor,
+    edited_anchor,
+    merge_source_anchors,
+    sequential_part_ranges,
+    split_source_anchor,
+)
 
 
 V7_TYPE_META = {
@@ -2594,7 +2601,13 @@ class V7Store:
                         "execution_snapshot_id": snapshot.id, "params": normalize_chunker_params(chunker_node.get("params")),
                     },
                     "jobs": [self.job_payload(job) for job in jobs], "flow_runs": [{"id": run.id, "status": run.status, "error": run.error, "created_at": run.created_at.isoformat(), "completed_at": run.completed_at.isoformat() if run.completed_at else None} for run in runs],
-                    "document_ir": None if not ir else {"id": ir.id, "text": ir.text, "parser_adapter": ir.parser_adapter, "parser_profile": ir.parser_profile, "anchor": ir.anchor_json, "status": ir.status, "error": ir.error},
+                    "document_ir": None if not ir else {
+                        "id": ir.id, "text": ir.text, "parser_adapter": ir.parser_adapter,
+                        "parser_profile": ir.parser_profile, "anchor": ir.anchor_json,
+                        "source_type": (ir.anchor_json or {}).get("source_type"),
+                        "blocks": list((ir.anchor_json or {}).get("blocks") or []),
+                        "status": ir.status, "error": ir.error,
+                    },
                     "parser_artifacts": [{"id": item.id, "type": item.type_code, "flow_run_id": item.flow_run_id,
                                           "uri": item.uri, "checksum": item.checksum, "metadata": item.data_json,
                                           "created_at": item.created_at.isoformat()} for item in parser_artifacts],
@@ -2666,7 +2679,8 @@ class V7Store:
         return {
             "id": chunk.id, "chunk_set_id": chunk.chunk_set_id,
             "source_chunk_id": chunk.source_chunk_id, "chunk_index": chunk.chunk_index,
-            "content": chunk.content, "content_hash": chunk.content_hash, "anchor": chunk.anchor_json,
+            "content": chunk.content, "content_hash": chunk.content_hash,
+            "anchor": api_source_anchor(chunk.anchor_json),
             "lifecycle_status": chunk.lifecycle_status, "review_status": chunk.review_status,
             "revision_id": revision.id if revision else None,
             "revision_no": revision.revision_no if revision else 0,
@@ -2804,7 +2818,7 @@ class V7Store:
             if chunk.review_status == "approved":
                 raise ReviewGateError("REOPEN_REQUIRED", "已批准文档块必须先重开审核再修改",
                                       source_version_id=chunk.source_version_id)
-            self._append_chunk_revision(session, chunk, content=normalized, anchor={**(chunk.anchor_json or {}), "review_adjusted": True},
+            self._append_chunk_revision(session, chunk, content=normalized, anchor=edited_anchor(chunk.anchor_json),
                                         operation="edited", parent_chunk_ids=[chunk.id], actor=actor)
             version = session.get(SourceVersion, chunk.source_version_id); assert version
             counts = self._recompute_source_review(session, version)
@@ -2821,17 +2835,18 @@ class V7Store:
             self._require_chunk_revision(session, chunk, expected_revision_no)
             if chunk.review_status == "approved":
                 raise ReviewGateError("REOPEN_REQUIRED", "已批准文档块必须先重开审核再拆分", source_version_id=chunk.source_version_id)
+            child_ranges = sequential_part_ranges(chunk.content, normalized)
             siblings = self._chunk_set_chunks(session, chunk.chunk_set_id)
             position = siblings.index(chunk); chunk.lifecycle_status = "deleted"
             created: list[SourceChunk] = []
-            offset = 0
-            for part in normalized:
+            for child_index, part in enumerate(normalized):
+                child_anchor = split_source_anchor(chunk.anchor_json, child_ranges[child_index] if child_ranges else None)
                 logical = SourceChunk(
                     id=new_id("sch"), source_version_id=chunk.source_version_id, chunk_set_id=chunk.chunk_set_id,
                     flow_run_id=chunk.flow_run_id,
                     origin_flow_run_id=chunk.origin_flow_run_id, source_chunk_id=new_id("sourcechunk"),
                     chunk_index=position + len(created), content=part,
-                    anchor_json={**(chunk.anchor_json or {}), "review_char_range": [offset, offset + len(part)]},
+                    anchor_json=child_anchor,
                     content_hash=hashlib.sha256(part.encode("utf-8")).hexdigest(),
                     lifecycle_status="active", review_status="pending_review",
                 )
@@ -2842,7 +2857,7 @@ class V7Store:
                     parent_chunk_ids=[chunk.id], actor=actor,
                 )
                 session.add(revision); session.flush(); logical.current_revision_id = revision.id
-                created.append(logical); offset += len(part)
+                created.append(logical)
             active = [*siblings[:position], *created, *siblings[position + 1:]]
             for index, item in enumerate(active): item.chunk_index = index
             version = session.get(SourceVersion, chunk.source_version_id); assert version
@@ -2874,7 +2889,7 @@ class V7Store:
                 id=new_id("sch"), source_version_id=rows[0].source_version_id, chunk_set_id=rows[0].chunk_set_id,
                 flow_run_id=rows[0].flow_run_id,
                 source_chunk_id=new_id("sourcechunk"), chunk_index=rows[0].chunk_index, content=content,
-                anchor_json={"source_anchors": [item.anchor_json for item in rows], "review_merged": True},
+                anchor_json=merge_source_anchors([item.anchor_json for item in rows], [item.content for item in rows]),
                 content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(), lifecycle_status="active",
                 review_status="pending_review",
             )

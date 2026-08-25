@@ -21,7 +21,7 @@
 | 范围 | 页面或操作 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | 业务工作区 | 工作台：文档、任务、知识库、Vector Ready、项目统计 | `DONE` | 使用现有列表接口汇总。 |
-| 业务工作区 | 文档管理：目录树、递归上传、SourceChunk 人工审核 Gate、模板绑定与安全删除 | `DONE` | 上传/替换自动 Parse/Clean/Chunk 后停在待审核；双栏工作区支持修改、拆分、连续合并、删除、通过/拒绝/重开，文档批准后自动调度已绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
+| 业务工作区 | 文档管理：目录树、递归上传、SourceChunk 人工审核 Gate、模板绑定与安全删除 | `DONE` | 上传/替换自动 Parse/Clean/Chunk 后停在待审核；双栏工作区支持 PDF.js 多页 bbox、DOCX 结构块证据定位，以及修改、拆分、连续合并、删除、通过/拒绝/重开，文档批准后自动调度已绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
 | 业务工作区 | 处理任务：监控、停止、重试、删除、日志 | `DONE` | 任务只从文档库模板绑定发起；模板和目标知识库名称优先于技术 ID，`completed_with_warnings` 显示失败分块数与日志明细，重试仅执行失败组合；删除不会物理删除已形成的正式知识。 |
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
@@ -48,7 +48,7 @@
 | 知识库/项目自动编码与请求拒绝 | `DONE` | 知识库由服务端生成 `KL-YYYYMMDD-UUID4`，项目生成 `PRJ-YYYYMMDD-UUID4`；客户端提交 `code` 被拒绝。 |
 | 文档库模板绑定与自动结果库 | `DONE` | 一个文档库可绑定多个已发布模板；每个输出类型固定一个结果库，首次全量、后续增量、模板新修订全量。 |
 | Source Preparation / Review Snapshot / Knowledge Dispatch | `DONE` | Preparation 与 Knowledge Flow 分离；只有全部活动 Chunk approved 才冻结不可变 Snapshot 并幂等 Dispatch，未审核的整库、选中文件、直接 Job 均服务端拒绝。 |
-| SourceChunkSet / Rechunk / 独立审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote、PDF Preview 与独立 Workbench 已完成本地实现；真实 `.34` E2E 待验收。 |
+| SourceChunkSet / Rechunk / SourceAnchor 精确审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote、SourceAnchorV2、PDF.js 多页 bbox、DOCX 结构块与独立 Workbench 已完成本地实现；真实 `.34` E2E 待验收。 |
 | Reviewed Flow 与下游多层 Gate | `DONE` | 知识模板唯一根为 Reviewed SourceChunk Input；Job/Runner/Sink/Evidence/AssetVersion/Vector/Ready/Routing 逐层复验 Snapshot 或 digest，Milvus 写入位于 LLM/Operator、Knowledge Sink 与 Embedding 之后。 |
 | `knowledge_item_sources`、Evidence、结构化锚点 | `DONE` | 返回文档、SourceVersion、锚点、Evidence 与 primary 标识。 |
 | Knowledge Diff 和向量状态 | `DONE` | 新变更有可读 before/after；旧记录兼容 hash。 |
@@ -57,7 +57,7 @@
 | 派生 Run 与 Sink 暂存提交 | `DONE` | `node_only/from_node` 复用同快照可重放 Artifact；Sink 默认 `awaiting_commit`，以 checksum、当前态冲突检测和幂等键确认提交。 |
 | Knowledge Sink Schema/来源/质量 Gate | `DONE` | `review` 与失败候选阻断该 Sink；多 Sink 独立事务写入。 |
 | Model Serving 分块生成、失败保留与局部重试 | `DONE` | DB Registry 默认 `qwen3_32b`，新默认策略 120 秒/2 次重试；Flow 发布健康门禁，Snapshot 冻结 code，分块失败隔离不变。 |
-| PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、页级 SourceChunk 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU 验收归 C-01～C-04。 |
+| PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、`0~1` 多位置 SourceAnchor 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU/坐标验收归 C-01～C-04/C-11。 |
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | DB Embedding Registry 默认 BCE 768；Profile/Contract/Milvus 强制维度一致，Vector Sync 按 Profile 动态选 Provider，AssetVersion 冻结血缘。 |
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格默认独立、仅显式选择兼容 ready 登记时复用。旧 `graph` Profile 仅供已有库冻结兼容，不参与受管供应或容量探测；真实供应仍属部署验收。 |
@@ -86,7 +86,7 @@
 | C-08 | 多项目 Seed/Release/Update 真实离线迁移验收 | `CONNECT` | 在 `.34` 空卷环境挂载签名与配置加密密钥，完成双项目 Seed、无 Milvus waiting、candidate 验证/导入、逐项目/非原子激活、Update 路由不变、再发布采用新资产、Tombstone/Fork/失败恢复与 GC dry-run。 |
 | C-09 | 共享机构 Deployment 多 Project 真实验收 | `CONNECT` | 验证机构名称/代码、逐机构 production URI、qa-agent 与 kg-for-consultation 共用 deployment code 但 Snapshot/授权独立、相同 org_code 跨 Project/机构隔离、Routing 分项检查、生产备份恢复、Embedding 契约、dense 召回和 503 fail-closed。 |
 | C-10 | qa_agent FAQ `.34` 导入与文件替换验收 | `CONNECT` | 运行固定 dry-run/execute，证明 12 个文档库/Source/结果库/`kl_*`、MySQL 与目标 Milvus 8,281 条一致、旧 `faq` 完全不变；替换一个测试机构文件验证 ADD/UPDATE/INACTIVE 和新向量。随后单独配置 FAQ Routing 并按 shadow/primary 切换。 |
-| C-11 | SourceChunk 人工审核 Gate 真实链路验收 | `CONNECT` | 用户同步代码并清空测试数据后，在 `.34` 验证 PDF/DOCX/TXT/CSV 只自动准备、批准前无 LLM/Knowledge/Milvus 调用、批准后按绑定自动生成，最终顺序为 Sink → Embedding → AssetVersion/Milvus → Ready；不访问 `.36`。 |
+| C-11 | SourceChunk 人工审核 Gate 真实链路验收 | `CONNECT` | 用户同步代码并清空测试数据后，在 `.34` 验证文本/扫描 PDF、多栏/跨页 bbox、DOCX 标题/表格块、TXT/CSV 只自动准备；批准前无 LLM/Knowledge/Milvus 调用，批准后按绑定自动生成，最终顺序为 Sink → Embedding → AssetVersion/Milvus → Ready；不访问 `.36`。 |
 | C-11 | 向量存储 `.34` 实时库存验收 | `CONNECT` | 对一个精确 DataForge-owned 测试 AssetVersion 核对 overview/list/详情，证明普通刷新无 full scan，执行 verify 与 load/release；GC 只 dry-run，未托管资源保持只读。 |
 
 ## 执行记录

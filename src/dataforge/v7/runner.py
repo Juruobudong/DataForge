@@ -33,7 +33,8 @@ from .graph_quality import evaluate_graph_quality
 from .graph_schema import GraphExtractionConfig, normalize_graph_config
 from .llm_serving import DEFAULT_LLM_SERVING_ID, configure_llm_serving_registry, get_llm_serving_registry
 from .models import KnowledgeJob, Source, SourceVersion
-from .parser_runtime import content_list_pages, parse_with_mineru
+from .parser_runtime import content_list_blocks, parse_with_mineru
+from .source_anchor import finalize_source_blocks, sort_positions
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
 from .faq import FAQ_FILENAME_PATTERN, FAQ_TYPE_CODE, normalize_faq_rows, parse_table_rows
@@ -93,8 +94,8 @@ def _extract_text(filename: str, payload: bytes) -> str:
                     lines.append(" | ".join(values))
         return "\n".join(lines)
     if suffix == ".docx":
-        from docx import Document
-        return "\n".join(paragraph.text for paragraph in Document(io.BytesIO(payload)).paragraphs if paragraph.text.strip())
+        text, _ = _docx_source_blocks(payload)
+        return text
     if suffix == ".doc":
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as handle:
             handle.write(payload); name = handle.name
@@ -104,6 +105,48 @@ def _extract_text(filename: str, payload: bytes) -> str:
         finally:
             Path(name).unlink(missing_ok=True)
     raise ValueError("不支持的文档类型")
+
+
+def _docx_source_blocks(payload: bytes) -> tuple[str, list[dict[str, Any]]]:
+    """Read DOCX paragraphs and table rows in their original document order."""
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(io.BytesIO(payload))
+    raw_blocks: list[dict[str, Any]] = []
+    table_index = 0
+    children = document.iter_inner_content() if hasattr(document, "iter_inner_content") else document.paragraphs
+    for child in children:
+        if isinstance(child, Paragraph):
+            text = child.text.strip()
+            if not text:
+                continue
+            style = str(getattr(getattr(child, "style", None), "name", "") or "")
+            heading = re.search(r"(?:Heading|标题)\s*([1-9])", style, re.I)
+            block_type = "heading" if heading else "paragraph"
+            raw_blocks.append({
+                "block_id": f"docx:{len(raw_blocks)}",
+                "block_type": block_type,
+                "heading_level": int(heading.group(1)) if heading else None,
+                "style": style,
+                "text": text,
+            })
+        elif isinstance(child, Table):
+            for row_index, row in enumerate(child.rows):
+                cells = [cell.text.strip() for cell in row.cells]
+                if not any(cells):
+                    continue
+                raw_blocks.append({
+                    "block_id": f"docx:{len(raw_blocks)}",
+                    "block_type": "table_row",
+                    "table_index": table_index,
+                    "row_index": row_index,
+                    "cells": cells,
+                    "text": " | ".join(cells),
+                })
+            table_index += 1
+    return finalize_source_blocks(raw_blocks)
 
 
 def _clean_document_text(text: str, ref: str) -> str:
@@ -200,6 +243,115 @@ def split_document_text(text: str, raw_params: dict[str, Any] | None = None) -> 
     return chunks
 
 
+def _page_segments_from_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for block in blocks:
+        page_index = block.get("page_index")
+        if isinstance(page_index, int):
+            grouped.setdefault(page_index, []).append(block)
+    return [
+        {"page_index": page_index, "page": page_index + 1,
+         "text": "\n\n".join(str(block.get("text") or "") for block in page_blocks),
+         "source_blocks": page_blocks}
+        for page_index, page_blocks in sorted(grouped.items())
+    ]
+
+
+def _clean_source_blocks(blocks: list[dict[str, Any]], ref: str) -> tuple[str, list[dict[str, Any]]]:
+    cleaned = [{**block, "text": _clean_document_text(str(block.get("text") or ""), ref)} for block in blocks]
+    return finalize_source_blocks(cleaned)
+
+
+def split_document_blocks(document: dict[str, Any], raw_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Split structured parser blocks while carrying SourceAnchorV2 positions."""
+    params = normalize_chunker_params(raw_params)
+    blocks = [dict(block) for block in document.get("source_blocks") or [] if str(block.get("text") or "").strip()]
+    if not blocks:
+        return split_document_text(str(document.get("text") or ""), params)
+    groups: list[list[dict[str, Any]]] = []
+    if params["preserve_page_boundary"] and document.get("source_type") == "pdf":
+        for block in blocks:
+            if not groups or groups[-1][0].get("page_index") != block.get("page_index"):
+                groups.append([])
+            groups[-1].append(block)
+    else:
+        groups = [blocks]
+
+    results: list[dict[str, Any]] = []
+    for group in groups:
+        group_parts: list[str] = []
+        intervals: list[tuple[int, int, dict[str, Any]]] = []
+        cursor = 0
+        for block in group:
+            if group_parts:
+                group_parts.append("\n\n")
+                cursor += 2
+            text = str(block["text"])
+            intervals.append((cursor, cursor + len(text), block))
+            group_parts.append(text)
+            cursor += len(text)
+        group_text = "".join(group_parts)
+        for chunk in split_document_text(group_text, params):
+            raw_start, raw_end = int(chunk["char_start"]), int(chunk["char_end"])
+            raw_value = group_text[raw_start:raw_end]
+            offset = raw_value.find(str(chunk["content"]))
+            effective_start = raw_start + (offset if offset >= 0 else len(raw_value) - len(raw_value.lstrip()))
+            effective_end = effective_start + len(str(chunk["content"]))
+            positions: list[dict[str, Any]] = []
+            document_ranges: list[tuple[int, int]] = []
+            missing_pdf_bbox = False
+            for block_start, block_end, block in intervals:
+                intersection_start = max(block_start, effective_start)
+                intersection_end = min(block_end, effective_end)
+                if intersection_end <= intersection_start:
+                    continue
+                chunk_range = [intersection_start - effective_start, intersection_end - effective_start]
+                global_start = int(block.get("char_start", 0)) + intersection_start - block_start
+                global_end = int(block.get("char_start", 0)) + intersection_end - block_start
+                document_ranges.append((global_start, global_end))
+                if document.get("source_type") == "pdf":
+                    position = {
+                        "kind": "pdf_bbox" if block.get("bbox") else "pdf_page",
+                        "block_id": block["block_id"], "block_index": block.get("block_index"),
+                        "page": block.get("page"), "page_index": block.get("page_index"),
+                        "chunk_range": chunk_range,
+                    }
+                    if block.get("bbox"):
+                        position["bbox"] = list(block["bbox"])
+                    else:
+                        missing_pdf_bbox = True
+                    positions.append(position)
+                elif document.get("source_type") == "docx":
+                    positions.append({
+                        "kind": "docx_block", "block_id": block["block_id"],
+                        "block_type": block.get("block_type", "paragraph"),
+                        "block_index": block.get("block_index"), "chunk_range": chunk_range,
+                    })
+            positions = sort_positions(positions)
+            pages = [int(position["page"]) for position in positions if isinstance(position.get("page"), int)]
+            precision = "block" if positions and any(position.get("kind") != "pdf_page" for position in positions) else (
+                "page" if positions else "unavailable"
+            )
+            anchor: dict[str, Any] = {
+                "anchor_version": 2,
+                "source_version_id": document.get("source_version_id"),
+                "source_type": document.get("source_type"),
+                "precision": precision,
+                "positions": positions,
+                **{key: value for key, value in chunk.items() if key != "content"},
+            }
+            if document_ranges:
+                anchor.update(char_start=min(value[0] for value in document_ranges),
+                              char_end=max(value[1] for value in document_ranges))
+            if pages:
+                anchor.update(page=min(pages), page_index=min(pages) - 1,
+                              page_start=min(pages), page_end=max(pages))
+            if missing_pdf_bbox and any(position.get("kind") == "pdf_bbox" for position in positions):
+                anchor["position_status"] = "partial"
+            results.append({"content": chunk["content"], "anchor": anchor})
+    return results
+
+
 def _chunks(text: str, size: int = 800) -> list[str]:
     return [item["content"] for item in split_document_text(text, {"chunk_size": size})]
 
@@ -253,6 +405,11 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
                 continue
             if ref in {"text-cleaner", "whitespace-cleaner", "text-normalizer"}:
                 value["text"] = _clean_document_text(text, ref)
+                if value.get("source_blocks"):
+                    block_text, source_blocks = _clean_source_blocks(list(value["source_blocks"]), ref)
+                    value["source_blocks"] = source_blocks
+                    if value.get("source_type") == "docx":
+                        value["text"] = block_text
                 value["page_segments"] = [
                     {**segment, "text": _clean_document_text(str(segment.get("text", "")), ref)}
                     for segment in value.get("page_segments") or []
@@ -263,12 +420,14 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
         params = normalize_chunker_params(params)
         result = []
         for document in values:
-            for index, chunk in enumerate(split_document_text(str(document.get("text", "")), params)):
+            chunks = split_document_blocks(document, params) if document.get("source_blocks") else split_document_text(str(document.get("text", "")), params)
+            for index, chunk in enumerate(chunks):
+                anchor = dict(chunk.get("anchor") or {key: value for key, value in chunk.items() if key != "content"})
                 result.append({"source_id": document.get("source_id", "preview-source"),
                                "source_version_id": document.get("source_version_id", "preview-version"),
                                "filename": document.get("filename", "样例文档"), "content": chunk["content"],
                                "chunk_index": index, "runtime_mode": "preview",
-                               "anchor": {**dict(document.get("anchor") or {}), **{key: value for key, value in chunk.items() if key != "content"}, "chunk_index": index}})
+                               "anchor": {**dict(document.get("anchor") or {}), **anchor, "chunk_index": index}})
         return result
     if ref == "source-chunk-builder":
         return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
@@ -612,10 +771,14 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
         suffix = Path(source.original_filename).suffix.lower()
         parser_artifacts: list[dict[str, Any]] = []
         page_segments: list[dict[str, Any]] = []
+        source_blocks: list[dict[str, Any]] = []
+        source_type: str | None = None
         if suffix == ".pdf":
             parsed = parse_with_mineru(filename=source.original_filename, payload=payload, parse_method="ocr" if force_ocr else "auto")
             text = parsed.markdown
-            page_segments = content_list_pages(parsed.content_list)
+            source_blocks = content_list_blocks(parsed.content_list)
+            page_segments = _page_segments_from_blocks(source_blocks)
+            source_type = "pdf"
             encoded_middle = json.dumps(parsed.middle_json, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
             object_key = f"parser-artifacts/{version.id}/{flow_run_id}/mineru-middle.json"
             stored = objects.put_bytes(object_key, encoded_middle, "application/json")
@@ -631,16 +794,24 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
             })
             profile = "pipeline:auto"
         else:
-            text = _extract_text(source.original_filename, payload)
+            if suffix == ".docx":
+                text, source_blocks = _docx_source_blocks(payload)
+                source_type = "docx"
+            else:
+                text = _extract_text(source.original_filename, payload)
             profile = "native"
         faq_table_rows = parse_table_rows(source.original_filename, payload) \
             if FAQ_FILENAME_PATTERN.fullmatch(Path(source.original_filename).name) else []
         documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
                           "parser_adapter": select_parser_adapter(source.original_filename, profile),
-                          "page_segments": page_segments, "_parser_artifacts": parser_artifacts,
+                          "page_segments": page_segments, "source_blocks": source_blocks,
+                          "source_type": source_type, "_parser_artifacts": parser_artifacts,
                           "_faq_table_rows": faq_table_rows,
-                          "anchor": {"file": source.original_filename, "page": None, "section": None}})
+                          "anchor": {"file": source.original_filename, "page": None, "section": None,
+                                     "anchor_version": 2 if source_type else 1,
+                                     "source_version_id": version.id, "source_type": source_type,
+                                     "blocks": source_blocks if source_type else []}})
     return documents
 
 
@@ -981,6 +1152,13 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
             value = dict(value)
             if ref in {"text-cleaner", "whitespace-cleaner", "text-normalizer"}:
                 value["text"] = _clean_document_text(text, ref)
+                if value.get("source_blocks"):
+                    block_text, source_blocks = _clean_source_blocks(list(value["source_blocks"]), ref)
+                    value["source_blocks"] = source_blocks
+                    if value.get("source_type") == "docx":
+                        value["text"] = block_text
+                    if value.get("source_type") == "pdf":
+                        value["page_segments"] = _page_segments_from_blocks(source_blocks)
                 value["page_segments"] = [
                     {**segment, "text": _clean_document_text(str(segment.get("text", "")), ref)}
                     for segment in value.get("page_segments") or []
@@ -993,6 +1171,12 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         params = normalize_chunker_params(params)
         result = []; mode = select_runtime_mode(len(values))
         for document in values:
+            if document.get("source_blocks"):
+                for index, chunk in enumerate(split_document_blocks(document, params)):
+                    result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
+                                   "filename": document["filename"], "content": chunk["content"], "chunk_index": index,
+                                   "runtime_mode": mode, "anchor": {**dict(chunk["anchor"]), "chunk_index": index}})
+                continue
             segments = document.get("page_segments") or [{"text": str(document.get("text", "")), "page": None, "page_index": None}]
             if not params["preserve_page_boundary"]:
                 segments = [{
