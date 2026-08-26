@@ -175,6 +175,7 @@ class InstitutionReleasePlanner:
                 InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
             ).order_by(InstitutionReleaseDraftProject.created_at)))
             projects: list[dict[str, Any]] = []
+            route_stages: set[str] = set()
             asset_ids: set[str] = set()
             required_by_projects: dict[str, list[dict[str, str]]] = defaultdict(list)
             project_required_refs = 0
@@ -190,6 +191,7 @@ class InstitutionReleasePlanner:
                         raise ValueError("机构发布项目不属于目标机构")
                     if not route or route.status != "frozen" or route.project_deployment_id != binding.id:
                         raise ValueError("机构发布只能引用当前机构的 frozen RouteVersion")
+                    route_stages.add(route.release_stage)
                     route_assets = list(session.scalars(select(ProjectRouteVersionAsset).where(
                         ProjectRouteVersionAsset.project_route_version_id == route.id,
                     )))
@@ -223,6 +225,16 @@ class InstitutionReleasePlanner:
                     if not latest_by_profile:
                         raise ValueError(f"知识库 {library_id} 没有 Ready AssetVersion")
                     asset_ids.update(item.id for item in latest_by_profile.values())
+
+            if len(route_stages) > 1:
+                raise ValueError("机构发布不能混合测试环境和生产环境的项目版本")
+            selected_stage = (draft.selection_json or {}).get("release_stage")
+            release_stage = str(selected_stage or (next(iter(route_stages)) if route_stages
+                                                    else deployment.release_stage))
+            if release_stage not in {"test", "production"}:
+                raise ValueError("release_stage 只允许 test 或 production")
+            if route_stages and route_stages != {release_stage}:
+                raise ValueError("机构发布环境与所选 frozen RouteVersion 不一致")
 
             assets = list(session.scalars(select(KnowledgeAssetVersion).where(
                 KnowledgeAssetVersion.id.in_(asset_ids),
@@ -390,6 +402,8 @@ class InstitutionReleasePlanner:
             base = session.get(InstitutionReleaseSnapshot, draft.base_release_id) if draft.base_release_id else None
             if draft.base_release_id and (not base or base.target_deployment_id != deployment.id):
                 raise ValueError("base release 不属于当前目标机构")
+            if base and str((base.snapshot_json or {}).get("deployment", {}).get("release_stage") or release_stage) != release_stage:
+                raise ValueError("base release 与当前发布环境不一致")
             previous_assets = {
                 str(item.get("id")): item for item in ((base.snapshot_json or {}).get("asset_versions") or [])
             } if base else {}
@@ -424,7 +438,7 @@ class InstitutionReleasePlanner:
             target = session.scalar(select(MilvusTarget).join(
                 DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
             ).where(DeploymentTarget.deployment_id == deployment.id,
-                    DeploymentTarget.release_stage == deployment.release_stage,
+                    DeploymentTarget.release_stage == release_stage,
                     DeploymentTarget.target_kind == "milvus"))
             milvus_preset = dict(draft.milvus_override_json or {})
             if not milvus_preset and target:
@@ -439,7 +453,7 @@ class InstitutionReleasePlanner:
                 "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
                                "institution_name": deployment.institution_name,
                                "institution_code": deployment.institution_code, "scope": deployment.scope,
-                               "release_stage": deployment.release_stage,
+                               "release_stage": release_stage,
                                "milvus_preset": milvus_preset or None},
                 "projects": projects,
                 "knowledge_library_ids": library_ids,

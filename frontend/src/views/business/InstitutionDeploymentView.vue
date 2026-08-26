@@ -2,12 +2,12 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
-import { groupedAssetOptions, releaseCanFreeze, releaseSelectionSummary } from './institutionReleaseModel'
+import { frozenRoutesForStage, groupedAssetOptions, releaseCanFreeze, releaseSelectionSummary } from './institutionReleaseModel'
 
 const route = useRoute(), router = useRouter()
 const instance = ref(null), deployments = ref([]), projects = ref([]), libraries = ref([])
 const releases = ref([]), jobs = ref([]), frozenRoutes = ref([])
-const deploymentId = ref(''), packageKind = ref('deployment_seed'), selectedRoutes = ref([]), selectedLibraries = ref([])
+const deploymentId = ref(''), packageKind = ref('deployment_seed'), selectedStage = ref('test'), selectedRoutes = ref([]), selectedLibraries = ref([])
 const extraAssetVersionIds = ref([]), assetOptions = ref({ collections: [] })
 const includeFullDocuments = ref(false)
 const overrideUri = ref(''), overrideReason = ref('')
@@ -38,9 +38,9 @@ async function loadFrozenRoutes() {
     .filter(binding => binding.deployment_id === deploymentId.value)
     .map(binding => ({ project, binding })))
   const rows = await Promise.all(bindings.map(async ({ project, binding }) => ({
-    project, binding, versions: await api.routeVersions(binding.id, binding.release_stage || 'test'),
+    project, binding, versions: await api.routeVersions(binding.id, selectedStage.value),
   })))
-  frozenRoutes.value = rows.flatMap(row => row.versions.filter(version => version.status === 'frozen')
+  frozenRoutes.value = rows.flatMap(row => frozenRoutesForStage(row.versions, selectedStage.value)
     .map(version => ({ ...version, project: row.project, binding: row.binding })))
 }
 async function load() {
@@ -60,6 +60,7 @@ async function load() {
       draft.value = await api.institutionReleaseDraft(route.params.draftId)
       deploymentId.value = draft.value.target_deployment_id
       packageKind.value = draft.value.package_kind
+      selectedStage.value = draft.value.release_stage || draft.value.selection?.release_stage || 'test'
       selectedRoutes.value = draft.value.selection?.route_version_ids || []
       selectedLibraries.value = draft.value.selection?.knowledge_library_ids || []
       extraAssetVersionIds.value = draft.value.selection?.extra_asset_version_ids || []
@@ -82,6 +83,7 @@ async function createDraft() {
     busy.value = true; error.value = ''
     draft.value = await api.createInstitutionReleaseDraft({
       target_deployment_id: deploymentId.value, package_kind: packageKind.value,
+      release_stage: selectedStage.value,
       route_version_ids: updateOnly.value ? [] : selectedRoutes.value,
       knowledge_library_ids: updateOnly.value ? selectedLibraries.value : [], base_release_id: null,
       extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
@@ -90,6 +92,7 @@ async function createDraft() {
     if (overrideUri.value) {
       draft.value = await api.updateInstitutionReleaseDraft(draft.value.id, {
         route_version_ids: updateOnly.value ? [] : selectedRoutes.value,
+        release_stage: selectedStage.value,
         knowledge_library_ids: updateOnly.value ? selectedLibraries.value : [],
         extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
         base_release_id: null, include_full_document_library: includeFullDocuments.value,
@@ -106,6 +109,7 @@ async function saveDraft() {
     busy.value = true
     draft.value = await api.updateInstitutionReleaseDraft(draft.value.id, {
       route_version_ids: updateOnly.value ? [] : selectedRoutes.value,
+      release_stage: selectedStage.value,
       knowledge_library_ids: updateOnly.value ? selectedLibraries.value : [],
       extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
       base_release_id: draft.value.base_release_id,
@@ -149,6 +153,7 @@ async function startImport() {
   catch (e) { error.value = e.message }
 }
 watch(deploymentId, loadFrozenRoutes)
+watch(selectedStage, loadFrozenRoutes)
 watch(packageKind, () => { selectedRoutes.value = []; selectedLibraries.value = []; extraAssetVersionIds.value = []; includeFullDocuments.value = false; plan.value = null; assetOptions.value = { collections: [] } })
 watch([selectedRoutes, selectedLibraries, extraAssetVersionIds, includeFullDocuments, overrideUri, overrideReason], () => {
   if (!draft.value || release.value || (!updateOnly.value && !selectedRoutes.value.length) ||
@@ -170,6 +175,7 @@ onMounted(load)
         <div class="panel-head"><div><h3>发布范围</h3><p>发布工作台不会修改任何项目授权；项目授权必须先在“项目发布”中冻结。</p></div><span class="badge amber">自动保存草稿</span></div>
         <label>目标机构<select v-model="deploymentId"><option v-for="item in institutionDeployments" :key="item.id" :value="item.id">{{ item.institution_name || item.name }} · {{ item.institution_code }}</option></select></label>
         <label>发布模式<select v-model="packageKind"><option value="deployment_seed">首次部署 Seed</option><option value="institution_release">机构多项目发布</option><option value="knowledge_update">知识资产更新</option></select></label>
+        <div class="tabs" role="tablist" aria-label="机构发布环境"><button type="button" role="tab" :aria-selected="selectedStage==='test'" :class="{active:selectedStage==='test'}" @click="selectedStage='test'">测试环境</button><button type="button" role="tab" :aria-selected="selectedStage==='production'" :class="{active:selectedStage==='production'}" @click="selectedStage='production'">生产环境</button></div>
         <p class="notice" v-if="updateOnly">本操作只迁移知识资产，不会改变机构本地任何项目的当前路由。</p>
         <div v-if="!updateOnly" class="card-grid">
           <label v-for="version in frozenRoutes" :key="version.id" class="stat-card"><span><input v-model="selectedRoutes" type="checkbox" :value="version.id"> {{ version.project.name }}</span><b>Route v{{ version.version_no }}</b><small>{{ version.binding.code }} · {{ version.release_stage }}</small></label>
@@ -177,7 +183,7 @@ onMounted(load)
         </div>
         <label v-else>知识库（完整当前快照）<select v-model="selectedLibraries" multiple><option v-for="library in libraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.knowledge_type }}</option></select></label>
         <label v-if="updateOnly"><input v-model="includeFullDocuments" type="checkbox"> 同时携带完整关联文档库与模板运行闭包</label>
-        <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedDeployment?.release_stage]?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
+        <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedStage]?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
         <label v-if="overrideUri">临时覆盖原因<textarea v-model="overrideReason" required rows="2"></textarea></label>
         <div class="actions"><button class="primary" :disabled="busy||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)||(overrideUri&&!overrideReason.trim())" @click="createDraft">创建并检查草稿</button></div>
       </section>

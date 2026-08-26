@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { anchorLabel, anchorNotice, docxBlockIds, pdfHighlights, pdfTargetPages } from './source-review/sourceAnchorModel.js'
+import { scrollTargetWithin, visiblePageNumber } from './source-review/sourcePreviewScroll.js'
 
 test('PDF SourceAnchor keeps ordered cross-page highlights and a readable label', () => {
   const anchor = { anchor_version: 2, precision: 'block', positions: [
@@ -23,4 +24,53 @@ test('DOCX blocks deduplicate and location fallbacks remain explicit', () => {
   assert.match(anchorNotice(anchor), /父 Chunk/)
   assert.match(anchorNotice({ anchor_version: 1, precision: 'page', page: 3 }), /页级定位/)
   assert.match(anchorNotice({ precision: 'unavailable' }), /不可用/)
+})
+
+test('source preview scrolls only its own container and centers an exact highlight', () => {
+  const calls = []
+  const container = {
+    scrollTop: 400, scrollHeight: 2000, clientHeight: 600,
+    getBoundingClientRect: () => ({ top: 100, bottom: 700 }),
+    scrollTo: options => calls.push(options),
+  }
+  const target = {
+    getBoundingClientRect: () => ({ top: 900, bottom: 940, height: 40 }),
+    scrollIntoView: () => assert.fail('target scrollIntoView must not be used'),
+  }
+  assert.equal(scrollTargetWithin(container, target), true)
+  assert.deepEqual(calls, [{ top: 920, behavior: 'smooth' }])
+})
+
+test('page-level source positioning honors sticky offset and clamps both boundaries', () => {
+  const calls = []
+  const container = {
+    scrollTop: 0, scrollHeight: 1800, clientHeight: 600,
+    getBoundingClientRect: () => ({ top: 100, bottom: 700 }),
+    scrollTo: options => calls.push(options),
+  }
+  scrollTargetWithin(container, { getBoundingClientRect: () => ({ top: 80, height: 800 }) }, { align: 'start', offset: 80 })
+  scrollTargetWithin(container, { getBoundingClientRect: () => ({ top: 2200, height: 800 }) }, { align: 'start', offset: 80 })
+  assert.deepEqual(calls.map(item => item.top), [0, 1200])
+})
+
+test('the latest source location request replaces the prior container target', () => {
+  const calls = []
+  const container = {
+    scrollTop: 0, scrollHeight: 3000, clientHeight: 600,
+    getBoundingClientRect: () => ({ top: 0, bottom: 600 }),
+    scrollTo: options => calls.push(options),
+  }
+  scrollTargetWithin(container, { getBoundingClientRect: () => ({ top: 300, height: 40 }) })
+  scrollTargetWithin(container, { getBoundingClientRect: () => ({ top: 1500, height: 40 }) })
+  assert.equal(calls.at(-1).top, 1220)
+})
+
+test('visible PDF page follows the page occupying the viewport center', () => {
+  const container = { clientHeight: 700, getBoundingClientRect: () => ({ top: 100, bottom: 800 }) }
+  const pageElements = new Map([
+    [1, { getBoundingClientRect: () => ({ top: -700, bottom: 50 }) }],
+    [2, { getBoundingClientRect: () => ({ top: 70, bottom: 760 }) }],
+    [3, { getBoundingClientRect: () => ({ top: 780, bottom: 1480 }) }],
+  ])
+  assert.equal(visiblePageNumber(container, pageElements, 1, 50), 2)
 })

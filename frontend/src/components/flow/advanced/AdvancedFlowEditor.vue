@@ -122,7 +122,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
     </div>
     <div ref="editor" class="flow-workspace">
       <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="outputTypes" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
-      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" @before-change="beforeChange" @select-node="selectNode" @select-edge="selectEdge" @connection-error="reportConnectionError" @add-definition="addDefinition" />
+      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" show-technical-code @before-change="beforeChange" @select-node="selectNode" @select-edge="selectEdge" @connection-error="reportConnectionError" @add-definition="addDefinition" />
       <NodeInspector :node="selectedNode" :issue="selectedIssue" :sample-result="sampleResult" @apply-parameters="applyParameters" />
     </div>
     <section v-if="graphConfigOpen && hasGraphOutput" class="graph-config-panel"><GraphSchemaEditor v-model="graphConfig" /><PromptPreview :graph-config="graphConfig" /></section>

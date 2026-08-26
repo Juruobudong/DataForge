@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { hasEditableParameters } from '../flowModel.js'
+import { hasEditableParameters, operatorNodeSubtitle } from '../flowModel.js'
 import ServingSelector from './ServingSelector.vue'
 const props = defineProps({ node: Object, issue: Object, sampleResult: Object })
 const emit = defineEmits(['apply-parameters'])
@@ -10,6 +10,12 @@ watch(() => props.node, node => { params.value = { ...(node?.data.definition.par
 const documentParser = computed(() => props.node?.data.meta.code === 'document-parser')
 const editable = computed(() => hasEditableParameters(props.node))
 const nodeRun = computed(() => props.node ? props.sampleResult?.node_runs?.[props.node.id] || null : null)
+const nodeSubtitle = computed(() => {
+  const meta = props.node?.data.meta
+  if (!meta) return ''
+  if (meta.kind !== 'operator') return meta.code
+  return operatorNodeSubtitle(meta, true)
+})
 const parameterSchema = computed(() => props.node?.data.meta.parameterSchema || {})
 const hasServing = computed(() => Boolean(parameterSchema.value.properties?.llm_serving))
 const scalarParameters = computed(() => Object.entries(parameterSchema.value.properties || {}).filter(([name, spec]) => name !== 'llm_serving' && ['string', 'integer', 'number', 'boolean'].includes(spec.type)))
@@ -24,7 +30,7 @@ function apply() { try { const value = JSON.parse(text.value || '{}'); if (!valu
   <aside class="node-inspector">
     <div class="inspector-title"><div><h3>节点设置</h3><small v-if="node">{{ node.data.meta.kind === 'subflow' ? 'SUBFLOW' : node.data.meta.kind === 'knowledge_sink' ? 'SINK' : 'OPERATOR' }}</small></div><span v-if="node" class="status">{{ node.data.meta.status || 'idle' }}</span></div>
     <template v-if="node">
-      <div class="node-summary"><span class="summary-icon">{{ node.data.meta.kind === 'subflow' ? '◈' : node.data.meta.kind === 'knowledge_sink' ? '✓' : '◇' }}</span><div><b>{{ node.data.meta.name }}</b><small>{{ node.data.meta.code }}</small></div></div>
+      <div class="node-summary"><span class="summary-icon">{{ node.data.meta.kind === 'subflow' ? '◈' : node.data.meta.kind === 'knowledge_sink' ? '✓' : '◇' }}</span><div><b>{{ node.data.meta.name }}</b><small>{{ nodeSubtitle }}</small></div></div>
       <nav><button :class="{ active: tab==='parameters' }" @click="tab='parameters'">参数</button><button :class="{ active: tab==='ports' }" @click="tab='ports'">输入输出</button><button :class="{ active: tab==='schema' }" @click="tab='schema'">Schema</button><button :class="{ active: tab==='result' }" @click="tab='result'">运行结果</button></nav>
       <section v-if="tab==='parameters'" class="inspector-body">
         <div v-if="documentParser" class="fixed-parser"><h4>PDF 自动解析</h4><dl><div><dt>Backend</dt><dd>pipeline</dd></div><div><dt>Parse method</dt><dd>auto</dd></div></dl><p class="muted">扫描件判断与 OCR 由 MinerU 内部处理，当前不开放节点参数。</p></div>

@@ -2,9 +2,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import 'pdfjs-dist/web/pdf_viewer.css'
 import { anchorNotice, pdfHighlights, pdfTargetPages } from './sourceAnchorModel'
+import { scrollTargetWithin, visiblePageNumber } from './sourcePreviewScroll'
 
 const props = defineProps({ url: { type: String, required: true }, anchor: { type: Object, default: () => ({}) } })
-const viewport = ref(null), pages = ref([]), loading = ref(true), error = ref(''), scale = ref(1.15), fit = ref(true)
+const viewport = ref(null), pages = ref([]), loading = ref(true), error = ref(''), scale = ref(1.15), fit = ref(true), currentPage = ref(1)
 const pageElements = new Map(), visiblePages = new Set(), renderPromises = new Map()
 let loadingTask = null, pdf = null, pdfjs = null, observer = null, locateVersion = 0
 
@@ -21,6 +22,17 @@ function setPageElement(number, element) {
   if (!element) { pageElements.delete(number); return }
   pageElements.set(number, element)
   observer?.observe(element)
+}
+
+function stickyOffset() {
+  if (!viewport.value) return 0
+  const toolbar = viewport.value.querySelector('.pdf-toolbar')
+  const noticeElement = viewport.value.querySelector('.anchor-notice')
+  return Number(toolbar?.offsetHeight || 0) + Number(noticeElement?.offsetHeight || 0)
+}
+
+function updateCurrentPage() {
+  currentPage.value = visiblePageNumber(viewport.value, pageElements, currentPage.value, stickyOffset())
 }
 
 async function renderPage(number) {
@@ -52,14 +64,18 @@ async function locateAnchor() {
   if (version !== locateVersion) return
   const firstPage = targetPages.value[0], element = pageElements.get(firstPage)
   const highlight = element?.querySelector('.source-highlight')
-  ;(highlight || element)?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  scrollTargetWithin(viewport.value, highlight || element, {
+    align: highlight ? 'center' : 'start',
+    offset: highlight ? 0 : stickyOffset() + 12,
+    behavior: 'smooth',
+  })
 }
 
 async function load() {
   loading.value = true; error.value = ''; pages.value = []
   try {
     await loadingTask?.destroy(); await pdf?.destroy()
-    loadingTask = null; pdf = null; pageElements.clear(); visiblePages.clear(); renderPromises.clear()
+    loadingTask = null; pdf = null; pageElements.clear(); visiblePages.clear(); renderPromises.clear(); currentPage.value = 1
     pdfjs ||= await import('pdfjs-dist')
     pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
     loadingTask = pdfjs.getDocument({ url: props.url })
@@ -95,6 +111,7 @@ onMounted(() => {
   observer = new IntersectionObserver(entries => entries.forEach(entry => {
     const number = Number(entry.target.dataset.pageNumber)
     if (entry.isIntersecting) { visiblePages.add(number); renderPage(number) } else visiblePages.delete(number)
+    updateCurrentPage()
   }), { root: viewport.value, rootMargin: '500px 0px' })
   load()
 })
@@ -102,9 +119,9 @@ onBeforeUnmount(() => { observer?.disconnect(); loadingTask?.destroy(); pdf?.des
 </script>
 
 <template>
-  <section ref="viewport" class="pdf-viewport">
+  <section ref="viewport" class="pdf-viewport" @scroll.passive="updateCurrentPage">
     <nav class="pdf-toolbar" aria-label="PDF 预览工具栏">
-      <span>{{ pages.length ? `${targetPages[0] || 1} / ${pages.length} 页` : 'PDF' }}</span>
+      <span>{{ pages.length ? `${currentPage} / ${pages.length} 页` : 'PDF' }}</span>
       <div><button type="button" title="缩小" @click="zoom(-.1)">−</button><button type="button" :class="{ active: fit }" @click="fitWidth">适宽</button><button type="button" title="放大" @click="zoom(.1)">＋</button></div>
     </nav>
     <p v-if="notice" class="anchor-notice">{{ notice }}</p>
@@ -124,5 +141,5 @@ onBeforeUnmount(() => { observer?.disconnect(); loadingTask?.destroy(); pdf?.des
 </template>
 
 <style scoped>
-.pdf-viewport{position:relative;height:720px;overflow:auto;background:#edf1f6}.pdf-toolbar{position:sticky;top:0;z-index:12;display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.96)}.pdf-toolbar div{display:flex;gap:5px}.pdf-toolbar button{min-height:34px;padding:5px 10px}.pdf-toolbar button.active{color:var(--blue);background:var(--blue-soft)}.anchor-notice{position:sticky;top:51px;z-index:11;margin:0;padding:7px 12px;border-bottom:1px solid #ead39a;color:#805b0a;background:#fff7dd;font-size:12px}.preview-state{padding:28px;text-align:center;color:var(--muted)}.pdf-pages{display:grid;justify-items:center;gap:18px;padding:20px}.pdf-page{position:relative;flex:none;background:#fff;box-shadow:0 4px 18px rgba(48,61,78,.16)}.pdf-page.targeted{box-shadow:0 0 0 2px #b9cff8,0 4px 18px rgba(48,61,78,.16)}canvas,.textLayer,.highlight-layer{position:absolute;inset:0}.textLayer{z-index:2}.highlight-layer{z-index:3;pointer-events:none}.source-highlight{position:absolute;border:1px solid rgba(47,111,237,.72);border-radius:2px;background:rgba(74,137,255,.25);box-shadow:0 0 0 1px rgba(255,255,255,.35) inset}.source-highlight.primary{background:rgba(255,190,46,.38);border-color:#e3a615}.pdf-page>small{position:absolute;right:7px;bottom:5px;z-index:4;padding:2px 6px;border-radius:9px;color:#fff;background:rgba(31,43,57,.62);font-size:10px}.error{color:var(--red)}
+.pdf-viewport{position:relative;height:100%;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;background:#edf1f6}.pdf-toolbar{position:sticky;top:0;z-index:12;display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.96)}.pdf-toolbar div{display:flex;gap:5px}.pdf-toolbar button{min-height:34px;padding:5px 10px}.pdf-toolbar button.active{color:var(--blue);background:var(--blue-soft)}.anchor-notice{position:sticky;top:51px;z-index:11;margin:0;padding:7px 12px;border-bottom:1px solid #ead39a;color:#805b0a;background:#fff7dd;font-size:12px}.preview-state{padding:28px;text-align:center;color:var(--muted)}.pdf-pages{display:grid;justify-items:center;gap:18px;padding:20px}.pdf-page{position:relative;flex:none;background:#fff;box-shadow:0 4px 18px rgba(48,61,78,.16)}.pdf-page.targeted{box-shadow:0 0 0 2px #b9cff8,0 4px 18px rgba(48,61,78,.16)}canvas,.textLayer,.highlight-layer{position:absolute;inset:0}.textLayer{z-index:2}.highlight-layer{z-index:3;pointer-events:none}.source-highlight{position:absolute;border:1px solid rgba(47,111,237,.72);border-radius:2px;background:rgba(74,137,255,.25);box-shadow:0 0 0 1px rgba(255,255,255,.35) inset}.source-highlight.primary{background:rgba(255,190,46,.38);border-color:#e3a615}.pdf-page>small{position:absolute;right:7px;bottom:5px;z-index:4;padding:2px 6px;border-radius:9px;color:#fff;background:rgba(31,43,57,.62);font-size:10px}.error{color:var(--red)}
 </style>

@@ -1210,7 +1210,9 @@ class MigrationImporter:
         project_deployment_id = control["project_deployment"]["id"]
         deployment_id = control["deployment"]["id"]
         baseline = control.get("route_baseline") or {}
-        generated = self.store.routing_snapshot(project_deployment_id)
+        release_stage = str(baseline.get("release_stage")
+                            or control.get("deployment", {}).get("release_stage") or "test")
+        generated = self.store.routing_snapshot(project_deployment_id, release_stage)
         # Central and local Target identifiers may differ; the authorization/task payload must not.
         comparable_generated = json.loads(json.dumps(generated))
         comparable_baseline = json.loads(json.dumps(baseline))

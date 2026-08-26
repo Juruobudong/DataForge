@@ -1,10 +1,13 @@
 <script setup>
+import { computed } from 'vue'
 import TypedHandle from '../ports/TypedHandle.vue'
-defineProps({ data: { type: Object, required: true }, selected: Boolean })
+import { subflowSubtitle } from '../flowModel.js'
+const props = defineProps({ data: { type: Object, required: true }, selected: Boolean, showTechnicalCode: { type: Boolean, default: false } })
+const subtitle = computed(() => subflowSubtitle(props.data.meta, props.showTechnicalCode))
 </script>
 <template>
   <article class="subflow-node" :class="{ selected }">
-    <header><span class="icon">◈</span><div><em>可复用子图</em><b>{{ data.meta.name }}</b><small>{{ data.meta.code }} · r{{ data.meta.revision || '-' }}</small></div></header>
+    <header><span class="icon">◈</span><div><em>可复用子图</em><b>{{ data.meta.name }}</b><small>{{ subtitle }}</small></div></header>
     <section class="ports"><div><TypedHandle v-for="(spec, port) in data.meta.inputs" :key="port" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="input" /></div><div><TypedHandle v-for="(spec, port) in data.meta.outputs" :key="port" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="output" /></div></section>
     <footer><span>{{ data.meta.internalCount }} 个内部节点</span><span>双击查看定义</span></footer>
   </article>

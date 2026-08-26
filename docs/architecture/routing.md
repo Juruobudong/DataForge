@@ -14,7 +14,7 @@ Project
               → knowledge_library_id[]
 ```
 
-- Deployment 表达机构或中心运行环境，包含阶段与 Milvus Target；ProjectDeployment 表达 Project 关联。
+- Deployment 表达机构或中心发布目标，按 `DeploymentTarget.release_stage` 同时拥有 test/production Milvus Target；ProjectDeployment 表达 Project 关联。`Deployment.release_stage` 只保留 legacy 兼容。
 - 同一 Deployment 可以承载多个 Project，但任务、授权、RouteVersion、Snapshot、版本号和回滚互不共享。
 - `org_code` 属于 ProjectDeploymentTask 授权，只在已绑定的 Project、Deployment 与 Task 内选择知识库；它不能选择环境、阶段或 Milvus Target。
 - 每个授权知识库在冻结前必须通过类型、Profile、Vector Ready 和目标 Partition 校验。
@@ -33,8 +33,9 @@ RouteVersion 按 `(project_deployment_id, release_stage)` 独立编号。冻结�
 - `scope=central` 的中央环境可以在线校验并发布 Routing。
 - `scope=institution` 的机构环境在智能中心只冻结单项目 RouteVersion；机构本地 Routing 通过签名 `.dfm` 导入并激活。
 - Routing Validate 先检查配置、Profile、知识库、AssetVersion 和预期 Contract。central Deployment 与机构本地执行 live Milvus 校验并分别报告 Collection/字段/dimension/Partition；中心到 institution Deployment 返回 `deferred_to_local`，不连接机构现场 Milvus。
-- 阶段切换不隐式发布、不复制另一阶段版本，也不修改授权。
-- test → production、生产发布和生产回滚分别要求目标校验与人工确认；没有已发布生产 Snapshot 的 Project 在生产阶段保持不可用。
+- 每次 Validate/Diff/Freeze/Publish/Rollback/Runtime 请求显式选择环境；切换前端环境 Tab 不写 Deployment、不隐式发布、不复制另一环境版本，也不修改授权。
+- 生产发布和生产回滚分别要求所选 production Target 校验与人工确认；没有已发布 production Snapshot 的 Project 在该环境保持不可用。
+- Institution Release draft 固化环境并只接受同环境 Frozen RouteVersion；Planner 与 `.dfm` 使用对应阶段 Target，禁止混合 test/production。
 - 生产 Partition delivery 只同步候选 Snapshot 实际引用的授权资产，并在原子发布前完成校验与备份。
 
 ## 回滚与失败

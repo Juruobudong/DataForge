@@ -1,11 +1,13 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import TypedHandle from '../ports/TypedHandle.vue'
+import { operatorNodeSubtitle } from '../flowModel.js'
 import { api } from '../../../api/platform'
 import { serviceStatus } from '../../../views/developer/modelServices.js'
-const props = defineProps({ data: { type: Object, required: true }, selected: Boolean })
+const props = defineProps({ data: { type: Object, required: true }, selected: Boolean, showTechnicalCode: { type: Boolean, default: false } })
 const servings = ref([])
 const usesServing = computed(() => Boolean(props.data.meta.parameterSchema?.properties?.llm_serving))
+const headerSubtitle = computed(() => operatorNodeSubtitle(props.data.meta, props.showTechnicalCode))
 const serving = computed(() => {
   const code = props.data.definition.params?.llm_serving
   return servings.value.find(item => item.serving_code === code) || (!code ? servings.value.find(item => item.is_default) : null)
@@ -15,7 +17,7 @@ onMounted(async () => { if (usesServing.value) { try { servings.value = await ap
 
 <template>
   <article class="flow-node operator-node" :class="[`state-${data.meta.status || 'idle'}`, { selected }]">
-    <header><span class="node-icon">◇</span><div><b>{{ data.meta.name }}</b><small>{{ data.meta.code }}</small></div><span class="node-status">{{ data.meta.status === 'success' ? '✓' : data.meta.status === 'failed' ? '!' : '' }}</span></header>
+    <header><span class="node-icon">◇</span><div><b>{{ data.meta.name }}</b><small>{{ headerSubtitle }}</small></div><span class="node-status">{{ data.meta.status === 'success' ? '✓' : data.meta.status === 'failed' ? '!' : '' }}</span></header>
     <section class="ports" :class="{ split: Object.keys(data.meta.inputs).length && Object.keys(data.meta.outputs).length }">
       <div><TypedHandle v-for="(spec, port) in data.meta.inputs" :key="`in-${port}`" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="input" /></div>
       <div><TypedHandle v-for="(spec, port) in data.meta.outputs" :key="`out-${port}`" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="output" /></div>

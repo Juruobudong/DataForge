@@ -4,7 +4,7 @@ import { api } from '../../api/platform'
 import DataForgeFlowCanvas from '../../components/flow/DataForgeFlowCanvas.vue'
 import KnowledgeTypesView from './KnowledgeTypesView.vue'
 import { useRouter, useRoute } from 'vue-router'
-import { deserializeDefinition } from '../../components/flow/flowModel'
+import { deserializeDefinition, subflowPrimaryName, subflowSubtitle } from '../../components/flow/flowModel'
 import FlowModeSwitch from '../../components/flow/authoring/FlowModeSwitch.vue'
 import StandardFlowEditor from '../../components/flow/standard/StandardFlowEditor.vue'
 import AdvancedFlowEditor from '../../components/flow/advanced/AdvancedFlowEditor.vue'
@@ -220,7 +220,7 @@ onMounted(() => { const tabFromQuery = route.query.tab; if (tabs.some(t => t.key
     </template>
 
     <KnowledgeTypesView v-else-if="activeTab==='knowledge-types'" />
-    <section v-else class="panel subflow-catalog"><div class="panel-head"><div><h3>可复用子图</h3><p>卡片可原地展开 Mini DAG；完整画布按不可变 revision 查看。</p></div><span class="badge blue">{{ subflows.length }} 项</span></div><div class="subflow-grid"><article v-for="item in subflows" :key="item.id" :class="{expanded:expandedSubflow?.id===item.id}"><button class="subflow-title" @click="expandSubflow(item)"><span>◈</span><div><b>{{ item.name }}</b><small>{{ item.code }} · r{{ item.revision }}</small><p>{{ item.description || '可复用受控子图' }} · {{ item.node_count }} 节点 / {{ item.edge_count }} 连线</p></div></button><div v-if="expandedSubflow?.id===item.id" class="mini-wrap"><DataForgeFlowCanvas v-model:nodes="miniNodes" v-model:edges="miniEdges" mode="mini" height="260" :canvas-id="`mini-${item.id}`" /><button class="primary" @click="openSubflow(item)">打开完整画布</button></div></article></div></section>
+    <section v-else class="panel subflow-catalog"><div class="panel-head"><div><h3>可复用子图</h3><p>卡片可原地展开 Mini DAG；完整 DAG 按不可变 revision 查看。</p></div><span class="badge blue">{{ subflows.length }} 项</span></div><div class="subflow-grid"><article v-for="item in subflows" :key="item.id" :class="{expanded:expandedSubflow?.id===item.id}"><button class="subflow-title" @click="expandSubflow(item)"><span>◈</span><div><b>{{ subflowPrimaryName(item) }}</b><small v-if="subflowSubtitle(item)">{{ subflowSubtitle(item) }}</small><p>{{ item.description || '可复用受控子图' }} · {{ item.node_count }} 节点 / {{ item.edge_count }} 连线</p></div></button><div v-if="expandedSubflow?.id===item.id" class="mini-wrap"><DataForgeFlowCanvas v-model:nodes="miniNodes" v-model:edges="miniEdges" mode="mini" height="260" :canvas-id="`mini-${item.id}`" /><button class="primary" @click="openSubflow(item)">查看完整 DAG</button></div></article></div></section>
     <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result && activeTab==='templates'" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
   </section>
 </template>
@@ -230,6 +230,11 @@ onMounted(() => { const tabFromQuery = route.query.tab; if (tabs.some(t => t.key
 </style>
 <style scoped>
 .template-page-head p,.template-list small,.template-settings>label,.template-settings legend,.template-settings fieldset label,.selection-state,.subflow-grid small,.subflow-grid p { font-size: var(--font-technical); }
+.subflow-title { display:grid; grid-template-columns:24px minmax(0,1fr); gap:10px; align-items:start; text-align:left; }
+.subflow-title>div { min-width:0; }
+.subflow-title b,.subflow-title small,.subflow-title p { display:block; }
+.subflow-title small { margin-top:3px; color:#7b8798; }
+.subflow-title p { margin:6px 0 0; color:#5d6a7c; }
 .dsl-badge,.save-state { font-size: var(--font-technical); }
 .exit { color:#5a6b85; background:#fff; border-color:#dbe3ef; font-weight:800; }
 .import-draft { margin-top:6px; align-self:start; color:#2f6fed; font-size:8px; font-weight:800; cursor:pointer; }

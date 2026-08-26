@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 
 import {
   compatibleProfilesForTask,
+  movePriority,
+  preferredDeployment,
   qaEmbeddingMode,
   routingPublishReadiness,
   routingValidationView,
@@ -34,15 +36,29 @@ test('QA Profile 自动映射 embedding 模式', () => {
 
 test('发布门禁要求任务、授权和当前阶段 Target', () => {
   assert.deepEqual(routingPublishReadiness([], [], '').problems, [
-    '请先配置并启用 Deployment Task',
-    '请先完成知识授权',
-    '当前阶段尚未配置 Milvus Target',
+    '请先配置并启用运行任务',
+    '请先完成知识范围配置',
+    '当前环境尚未配置 Milvus 服务',
   ])
   assert.equal(routingPublishReadiness(
     [{ enabled: true }],
     [{ enabled: true, knowledge_library_ids: ['library-1'] }],
     'http://milvus:19531',
   ).ready, true)
+})
+
+test('新项目优先选择 DataForge 中心，本地实例选择绑定目标', () => {
+  const deployments = [
+    { id: 'institution-binding', deployment_id: 'institution', scope: 'institution' },
+    { id: 'central-binding', deployment_id: 'central', scope: 'central' },
+  ]
+  assert.equal(preferredDeployment(deployments).id, 'central-binding')
+  assert.equal(preferredDeployment(deployments, 'institution').id, 'institution-binding')
+})
+
+test('知识范围优先级按上下移动后的显式顺序提交', () => {
+  assert.deepEqual(movePriority(['c', 'a', 'b'], 'a', -1), ['a', 'c', 'b'])
+  assert.deepEqual(movePriority(['c', 'a', 'b'], 'c', -1), ['c', 'a', 'b'])
 })
 
 test('Routing 校验分项保留 blocked、Expected/Observed 与 deferred 语义', () => {

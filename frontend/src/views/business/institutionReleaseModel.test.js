@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 
 import {
   activationCanRun,
+  frozenRoutesForStage,
   groupedAssetOptions,
   releaseCanFreeze,
   releaseSelectionSummary,
@@ -16,6 +17,15 @@ test('机构 Release 统计保留原始引用和去重数量', () => {
     projectRequiredRefs: 16, manualRefs: 3, rawRefs: 19,
     duplicatesRemoved: 4, resolvedAssets: 15,
   })
+})
+
+test('机构 Release 只展示当前环境的 Frozen 项目版本', () => {
+  const routes = [
+    { id: 'test', status: 'frozen', release_stage: 'test' },
+    { id: 'prod', status: 'frozen', release_stage: 'production' },
+    { id: 'draft', status: 'draft', release_stage: 'test' },
+  ]
+  assert.deepEqual(frozenRoutesForStage(routes, 'production').map(item => item.id), ['prod'])
 })
 
 test('项目资产保持锁定并展示来源项目', () => {

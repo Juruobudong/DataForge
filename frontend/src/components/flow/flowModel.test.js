@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, removeElements, resolveNodeMetadata, serializeDefinition, validateFlow } from './flowModel.js'
+import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, operatorNodeSubtitle, removeElements, resolveNodeMetadata, serializeDefinition, subflowEnglishName, subflowPrimaryName, subflowSubtitle, validateFlow } from './flowModel.js'
 import { ref } from 'vue'
 import { useFlowHistory } from './composables/useFlowHistory.js'
 
@@ -26,6 +26,41 @@ test('multi-port catalog metadata is preserved and subflow ports resolve from en
   assert.equal(meta.inputs.input.artifact_type, 'source_file')
   assert.equal(meta.outputs.qa.artifact_type, 'candidate:qa')
   assert.deepEqual(meta.inputExample.input, [{ filename: 'guide.md' }])
+})
+
+test('operator metadata separates Chinese display name, English name, and technical code', () => {
+  const bilingual = resolveNodeMetadata({ kind: 'operator', ref: 'null-filter' }, [{
+    code: 'null-filter', name: 'Null Filter', display_name_zh: '空内容过滤器', category: '内容处理',
+  }])
+  assert.equal(bilingual.name, '空内容过滤器')
+  assert.equal(bilingual.englishName, 'Null Filter')
+  assert.equal(bilingual.code, 'null-filter')
+  assert.equal(operatorNodeSubtitle(bilingual), 'Null Filter')
+  assert.equal(operatorNodeSubtitle(bilingual, true), 'Null Filter · null-filter')
+
+  const fallback = resolveNodeMetadata({ kind: 'operator', ref: 'legacy-cleaner' }, [{ code: 'legacy-cleaner', name: 'Legacy Cleaner' }])
+  assert.equal(fallback.name, 'Legacy Cleaner')
+  assert.equal(fallback.englishName, 'Legacy Cleaner')
+  assert.equal(fallback.code, 'legacy-cleaner')
+  assert.equal(operatorNodeSubtitle(fallback), 'legacy-cleaner')
+  assert.equal(operatorNodeSubtitle(fallback, true), 'legacy-cleaner')
+})
+
+test('subflow presentation separates built-in Chinese, English, code, and revision', () => {
+  const builtin = { code: 'document-clean', name: 'Document Clean', display_name_zh: '文档清洗', revision: 1, definition: { nodes: [] } }
+  assert.equal(subflowPrimaryName(builtin), '文档清洗')
+  assert.equal(subflowEnglishName(builtin), 'Document Clean')
+  assert.equal(subflowSubtitle(builtin), 'Document Clean · r1')
+  assert.equal(subflowSubtitle(builtin, true), 'Document Clean · document-clean · r1')
+  const meta = resolveNodeMetadata({ kind: 'subflow', ref: 'document-clean' }, [], [builtin])
+  assert.equal(meta.name, '文档清洗')
+  assert.equal(meta.englishName, 'Document Clean')
+
+  const custom = { code: 'custom-subflow', name: '用户自定义子图', revision: 2 }
+  assert.equal(subflowPrimaryName(custom), '用户自定义子图')
+  assert.equal(subflowEnglishName(custom), '')
+  assert.equal(subflowSubtitle(custom), 'r2')
+  assert.equal(subflowSubtitle(custom, true), 'custom-subflow · r2')
 })
 
 test('Document Parser parameters are read-only while other operators remain editable', () => {

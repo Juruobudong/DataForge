@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
 import dagre from '@dagrejs/dagre'
 import { MarkerType, VueFlow, useVueFlow } from '@vue-flow/core'
 import { Background, BackgroundVariant } from '@vue-flow/background'
@@ -16,12 +16,20 @@ import { useFlowSelection } from './composables/useFlowSelection'
 
 const nodes = defineModel('nodes', { required: true })
 const edges = defineModel('edges', { required: true })
-const props = defineProps({ issue: Object, mode: { type: String, default: 'edit' }, height: { type: [String, Number], default: 720 }, canvasId: { type: String, default: 'dataforge-template-flow' } })
+const props = defineProps({ issue: Object, mode: { type: String, default: 'edit' }, height: { type: [String, Number], default: 720 }, canvasId: { type: String, default: 'dataforge-template-flow' }, showTechnicalCode: { type: Boolean, default: false } })
 const emit = defineEmits(['before-change', 'select-node', 'select-edge', 'connection-error', 'add-definition', 'open-subflow'])
 const editable = computed(() => props.mode === 'edit')
 const compact = computed(() => props.mode === 'mini')
+const canvasHeight = computed(() => {
+  const value = String(props.height).trim()
+  return typeof props.height === 'number' || /^\d+(?:\.\d+)?$/.test(value) ? `${value}px` : value
+})
 const root = ref(null)
 const activeConnection = ref(null)
+const nodesReady = ref(false)
+let fitRequested = false
+let fitFrame = 0
+let disposed = false
 provide('dataforge-active-connection', activeConnection)
 const { fitView, screenToFlowCoordinate, setCenter } = useVueFlow(props.canvasId)
 const { isValidConnection, addTypedEdge } = useFlowConnections(nodes, edges, issue => emit('connection-error', issue))
@@ -71,27 +79,38 @@ function focusElement(issue) {
   const node = nodes.value.find(item => item.id === issue.nodeId)
   if (node) { emit('select-node', node); setCenter(node.position.x + 135, node.position.y + 72, { zoom: 1.15, duration: 300 }) }
 }
-function fit() { nextTick(() => fitView({ padding: .14, duration: 250 })) }
-onMounted(() => { window.addEventListener('keydown', keydown); if (props.mode !== 'edit') nextTick(() => fitView({ padding: compact.value ? .08 : .14 })) })
-onBeforeUnmount(() => window.removeEventListener('keydown', keydown))
+function consumeFitRequest() {
+  if (!fitRequested || !nodesReady.value || !nodes.value.length) return
+  fitRequested = false
+  nextTick(() => {
+    if (disposed) return
+    if (fitFrame) cancelAnimationFrame(fitFrame)
+    fitFrame = requestAnimationFrame(() => fitView({ padding: compact.value ? .08 : .14, duration: 250 }))
+  })
+}
+function fit() { fitRequested = true; consumeFitRequest() }
+function nodesInitialized() { nodesReady.value = true; consumeFitRequest() }
+watch(() => nodes.value.map(node => node.id).join('\u0000'), () => { nodesReady.value = false })
+onMounted(() => { window.addEventListener('keydown', keydown); if (props.mode !== 'edit') fit() })
+onBeforeUnmount(() => { disposed = true; if (fitFrame) cancelAnimationFrame(fitFrame); window.removeEventListener('keydown', keydown) })
 defineExpose({ autoLayout, focusElement, fit, screenToFlowCoordinate })
 </script>
 
 <template>
-  <div ref="root" class="flow-canvas" :class="`mode-${mode}`" :style="{ height: typeof height === 'number' ? `${height}px` : height }" @dragover.prevent @drop="drop">
+  <div ref="root" class="flow-canvas" :class="`mode-${mode}`" :style="{ height: canvasHeight }" @dragover.prevent @drop="drop">
     <VueFlow :id="canvasId" v-model:nodes="nodes" v-model:edges="edges"
       :is-valid-connection="editable ? isValidConnection : () => false"
       :default-edge-options="{ type: 'dataforge', markerEnd: MarkerType.ArrowClosed }"
       :delete-key-code="null" :min-zoom=".25" :max-zoom="2" :snap-to-grid="true" :snap-grid="[10, 10]"
       :nodes-draggable="editable" :nodes-connectable="editable" elements-selectable zoom-on-scroll pan-on-drag :selection-on-drag="editable"
-      @connect="connect" @connect-start="connectStart" @connect-end="connectEnd" @node-click="emit('select-node', $event.node)" @edge-click="emit('select-edge', $event.edge)"
+      @connect="connect" @connect-start="connectStart" @connect-end="connectEnd" @nodes-initialized="nodesInitialized" @node-click="emit('select-node', $event.node)" @edge-click="emit('select-edge', $event.edge)"
       @node-double-click="$event.node.data.meta.kind === 'subflow' && emit('open-subflow', $event.node)"
       @pane-click="emit('select-node', null)" @node-drag-start="editable && emit('before-change')">
       <Background :variant="BackgroundVariant.Dots" :gap="18" :size="1.1" pattern-color="#cad3df" bg-color="#f7f9fc" />
       <Controls v-if="!compact" position="bottom-right" />
       <MiniMap v-if="!compact" position="bottom-left" :pannable="true" :zoomable="true" :node-stroke-width="2" node-color="#dce8fa" mask-color="rgba(238,242,247,.72)" />
-      <template #node-operator="nodeProps"><OperatorNode v-bind="nodeProps" /></template>
-      <template #node-subflow="nodeProps"><SubflowNode v-bind="nodeProps" /></template>
+      <template #node-operator="nodeProps"><OperatorNode v-bind="nodeProps" :show-technical-code="showTechnicalCode" /></template>
+      <template #node-subflow="nodeProps"><SubflowNode v-bind="nodeProps" :show-technical-code="showTechnicalCode" /></template>
       <template #node-knowledge-sink="nodeProps"><KnowledgeSinkNode v-bind="nodeProps" /></template>
       <template #edge-dataforge="edgeProps"><FlowEdge v-bind="edgeProps" /></template>
       <template #connection-line="lineProps"><ConnectionLine v-bind="lineProps" /></template>

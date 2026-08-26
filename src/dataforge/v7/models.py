@@ -1084,6 +1084,7 @@ class Deployment(Timestamped, Base):
     scope: Mapped[str] = mapped_column(String(32), default="institution", nullable=False, index=True)
     institution_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     institution_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # Legacy compatibility field. New routing operations receive release_stage explicitly.
     release_stage: Mapped[str] = mapped_column(String(16), default="test", nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     institution_code_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

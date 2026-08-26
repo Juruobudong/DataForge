@@ -28,3 +28,7 @@ export function groupedAssetOptions(response) {
     })),
   }))
 }
+
+export function frozenRoutesForStage(routes, releaseStage) {
+  return (routes || []).filter(route => route.status === 'frozen' && route.release_stage === releaseStage)
+}

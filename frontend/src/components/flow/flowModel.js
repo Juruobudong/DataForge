@@ -26,6 +26,31 @@ function normalizedPorts(raw, fallback) {
   }]))
 }
 
+export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
+  const englishName = meta.englishName || ''
+  const base = englishName && englishName !== meta.name ? englishName : meta.code || ''
+  return showTechnicalCode && meta.code && meta.code !== base ? `${base} · ${meta.code}` : base
+}
+
+export function subflowPrimaryName(item = {}) {
+  return item.display_name_zh || item.name || item.code || ''
+}
+
+export function subflowEnglishName(item = {}) {
+  const primary = subflowPrimaryName(item)
+  const englishName = item.englishName || (item.display_name_zh ? item.name : '')
+  return englishName && englishName !== primary ? englishName : ''
+}
+
+export function subflowSubtitle(item = {}, showTechnicalCode = false) {
+  const values = []
+  const englishName = subflowEnglishName(item)
+  if (englishName) values.push(englishName)
+  if (showTechnicalCode && item.code && item.code !== englishName) values.push(item.code)
+  if (item.revision != null) values.push(`r${item.revision}`)
+  return values.join(' · ')
+}
+
 export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
   const status = definition.status || 'idle'
   if (definition.kind === 'knowledge_sink') {
@@ -45,7 +70,8 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     const entryItem = entry?.kind === 'operator' ? catalogItem(catalog, entry.ref) : null
     const exitItem = exit?.kind === 'operator' ? catalogItem(catalog, exit.ref) : null
     return {
-      kind: 'subflow', name: subflow?.name || definition.ref, code: definition.ref, category: '可复用子图', status,
+      kind: 'subflow', name: subflowPrimaryName(subflow || { code: definition.ref }),
+      englishName: subflowEnglishName(subflow), code: definition.ref, category: '可复用子图', status,
       known: Boolean(subflow),
       revision: subflow?.revision, internalCount: child.nodes?.length || 0,
       inputs: normalizedPorts(entryItem?.input_ports, DEFAULT_INPUT),
@@ -55,7 +81,8 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
   }
   const item = catalogItem(catalog, definition.ref)
   return {
-    kind: 'operator', name: item?.name || definition.ref, code: definition.ref, category: item?.category || '未知算子', status,
+    kind: 'operator', name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
+    code: definition.ref, category: item?.category || '未知算子', status,
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),
     parameterSchema: item?.parameter_schema || {}, inputExample: item?.input_example || {}, outputExample: item?.output_example || {}, version: item?.version,

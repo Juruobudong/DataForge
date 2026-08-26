@@ -13,6 +13,7 @@ frontend/package-lock.json
 global_llm/
 llm_local.yaml
 llm_providers.py
+build/
 tests/
 wiki/
 # 本地环境变量与密钥（含真实凭据，禁止提交）
@@ -37,6 +38,7 @@ llm_servings.yaml
 .pnpm-store/
 .pytest-tmp/
 .devora/
+.workbuddy/
 specs/
 tests/test_v7_platform.py
 

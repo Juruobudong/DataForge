@@ -105,6 +105,12 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "faq-record-mapper": "FAQ 知识映射器",
 }
 
+SUBFLOW_DISPLAY_NAMES_ZH: dict[str, str] = {
+    "document-parse": "文档解析",
+    "document-clean": "文档清洗",
+    "knowledge-chunk": "知识切分",
+}
+
 
 def _catalog_category(code: str, previous: str) -> tuple[str, str]:
     if code == "document-parser": return "文档输入", "文档解析"
@@ -260,9 +266,9 @@ def catalog_by_code(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...] =
 
 def subflow_seeds() -> tuple[dict[str, Any], ...]:
     return (
-        {"code": "document-parse", "name": "Document Parse", "description": "将源文件解析并规范为统一 DocumentIR。", "definition": {"entry_node": "parser", "exit_node": "normalize", "nodes": [{"id": "parser", "kind": "operator", "ref": "document-parser"}, {"id": "normalize", "kind": "operator", "ref": "document-ir-normalizer"}], "edges": [["parser", "normalize"]]}},
-        {"code": "document-clean", "name": "Document Clean", "description": "过滤、清洗并规范文档正文。", "definition": {"entry_node": "null", "exit_node": "normalize", "nodes": [{"id": "null", "kind": "operator", "ref": "null-filter"}, {"id": "language", "kind": "operator", "ref": "language-filter"}, {"id": "clean", "kind": "operator", "ref": "text-cleaner"}, {"id": "space", "kind": "operator", "ref": "whitespace-cleaner"}, {"id": "normalize", "kind": "operator", "ref": "text-normalizer"}], "edges": [["null", "language"], ["language", "clean"], ["clean", "space"], ["space", "normalize"]]}},
-        {"code": "knowledge-chunk", "name": "Knowledge Chunk", "description": "将 DocumentIR 切分为可追溯的 SourceChunk。", "definition": {"entry_node": "chunk", "exit_node": "source-chunks", "nodes": [{"id": "chunk", "kind": "operator", "ref": "semantic-chunker"}, {"id": "source-chunks", "kind": "operator", "ref": "source-chunk-builder"}], "edges": [["chunk", "source-chunks"]]}},
+        {"code": "document-parse", "name": "Document Parse", "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH["document-parse"], "description": "将源文件解析并规范为统一 DocumentIR。", "definition": {"entry_node": "parser", "exit_node": "normalize", "nodes": [{"id": "parser", "kind": "operator", "ref": "document-parser"}, {"id": "normalize", "kind": "operator", "ref": "document-ir-normalizer"}], "edges": [["parser", "normalize"]]}},
+        {"code": "document-clean", "name": "Document Clean", "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH["document-clean"], "description": "过滤、清洗并规范文档正文。", "definition": {"entry_node": "null", "exit_node": "normalize", "nodes": [{"id": "null", "kind": "operator", "ref": "null-filter"}, {"id": "language", "kind": "operator", "ref": "language-filter"}, {"id": "clean", "kind": "operator", "ref": "text-cleaner"}, {"id": "space", "kind": "operator", "ref": "whitespace-cleaner"}, {"id": "normalize", "kind": "operator", "ref": "text-normalizer"}], "edges": [["null", "language"], ["language", "clean"], ["clean", "space"], ["space", "normalize"]]}},
+        {"code": "knowledge-chunk", "name": "Knowledge Chunk", "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH["knowledge-chunk"], "description": "将 DocumentIR 切分为可追溯的 SourceChunk。", "definition": {"entry_node": "chunk", "exit_node": "source-chunks", "nodes": [{"id": "chunk", "kind": "operator", "ref": "semantic-chunker"}, {"id": "source-chunks", "kind": "operator", "ref": "source-chunk-builder"}], "edges": [["chunk", "source-chunks"]]}},
     )
 
 

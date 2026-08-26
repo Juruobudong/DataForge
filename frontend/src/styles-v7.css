@@ -408,6 +408,15 @@ pre {
 
 .content { width: 100%; min-width: 0; max-width: none; padding: clamp(20px, 1.5vw, 32px) clamp(20px, 1.8vw, 36px) 40px; }
 
+@media (min-width: 901px) {
+  .content:has(.document-review-page) {
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+    padding: 12px 18px 16px;
+  }
+}
+
 .menu-dialog-backdrop {
   position: fixed;
   z-index: 90;

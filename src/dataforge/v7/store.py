@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import yaml
 
 from .catalog import (
-    CATALOG_SEEDS, OPERATOR_CATEGORIES, builtin_flow_definition, catalog_by_code,
+    CATALOG_SEEDS, OPERATOR_CATEGORIES, SUBFLOW_DISPLAY_NAMES_ZH, builtin_flow_definition, catalog_by_code,
     normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
@@ -245,6 +245,14 @@ def new_id(prefix: str) -> str:
 def generated_business_code(prefix: str) -> str:
     """Codes owned by the platform are never accepted from business clients."""
     return f"{prefix}-{utc_now():%Y%m%d}-{uuid.uuid4()}"
+
+
+def institution_deployment_code(institution_code: str) -> str:
+    """Build a stable technical Deployment code from an institution code."""
+    value = re.sub(r"[^a-z0-9]+", "-", str(institution_code or "").strip().lower()).strip("-")
+    if not value:
+        raise ValueError("机构代码无法生成 Deployment Code")
+    return f"inst-{value}"
 
 
 DEFAULT_INDEX_FIELD_MAPPING = {
@@ -602,6 +610,40 @@ class V7Store:
                 qwen.credential_key_version = self.llm_serving_registry.manager.cipher.key_version
                 qwen.credential_configured = True
             session.add(qwen)
+        qwen8b = session.scalar(select(ModelServing).where(ModelServing.serving_code == "qwen3_8b_awq"))
+        if not qwen8b:
+            path = resolve_llm_serving_config_path()
+            raw8b: dict[str, Any] = {}
+            if path.is_file():
+                try:
+                    loaded8b = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                    raw8b = dict((loaded8b.get("servings") or {}).get("qwen3_8b_awq") or {})
+                except (OSError, yaml.YAMLError):
+                    raw8b = {}
+            base_url8b = str(raw8b.get("base_url") or "").strip().rstrip("/") or None
+            model_name8b = str(raw8b.get("model_name") or "Qwen3-8B-AWQ").strip()
+            try:
+                max_tokens8b = int(raw8b.get("max_tokens") or 16384)
+            except ValueError as exc:
+                raise ValueError("qwen3_8b_awq 的 max_tokens 必须是正整数") from exc
+            if max_tokens8b <= 0:
+                raise ValueError("qwen3_8b_awq 的 max_tokens 必须是正整数")
+            qwen8b = ModelServing(
+                id="modelserving_qwen3_8b_awq", serving_code="qwen3_8b_awq", name="Qwen3-8B-AWQ",
+                serving_type="openai-compatible-chat", model_name=model_name8b,
+                base_url=base_url8b, timeout_seconds=120, max_retries=2,
+                max_tokens=max_tokens8b, disable_thinking=True,
+                is_enabled=True, is_default=False,
+                last_check_status="not_checked" if base_url8b else "pending_configuration",
+            )
+            api_key8b = os.getenv(str(raw8b.get("api_key_env") or "LOCAL_LLM_API_KEY"), "").strip()
+            if api_key8b not in {"", "EMPTY", "fake"}:
+                qwen8b.credential_ciphertext = self.llm_serving_registry.manager.cipher.encrypt(
+                    api_key8b, f"dataforge:model-serving:{qwen8b.id}:v1",
+                )
+                qwen8b.credential_key_version = self.llm_serving_registry.manager.cipher.key_version
+                qwen8b.credential_configured = True
+            session.add(qwen8b)
         bce = session.scalar(select(EmbeddingServing).where(EmbeddingServing.serving_code == "bce_base_768"))
         if not bce:
             base_url = os.getenv("EMBEDDING_API_BASE", "").strip().rstrip("/") or None
@@ -670,9 +712,11 @@ class V7Store:
         if not deployment:
             deployment = Deployment(
                 id=CENTRAL_DEPLOYMENT_ID, code=CENTRAL_DEPLOYMENT_CODE,
-                name="DataForge 中心环境", scope="central", release_stage="test", status="active",
+                name="DataForge 中心", scope="central", release_stage="test", status="active",
             )
             session.add(deployment); session.flush()
+        elif deployment.name != "DataForge 中心":
+            deployment.name = "DataForge 中心"
         for stage, (target_id, target_name, target_url) in CENTRAL_STAGE_TARGETS.items():
             target = session.get(MilvusTarget, target_id)
             if not target:
@@ -1749,7 +1793,8 @@ class V7Store:
                                                                              FlowSubgraphRevision.status == "published")
                                           .order_by(FlowSubgraphRevision.revision_no.desc()))
                 definition = revision.definition_json if revision else None
-                values.append({"id": item.id, "code": item.code, "name": item.name, "status": item.status,
+                values.append({"id": item.id, "code": item.code, "name": item.name,
+                               "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH.get(item.code), "status": item.status,
                                "revision": revision.revision_no if revision else None,
                                "revision_status": revision.status if revision else None,
                                "description": revision.description if revision else "",
@@ -1765,7 +1810,8 @@ class V7Store:
                                                                          FlowSubgraphRevision.revision_no == revision_no))
             if not item or not revision: raise ValueError("子图修订不存在")
             definition = revision.definition_json or {}
-            return {"id": item.id, "code": item.code, "name": item.name, "status": item.status,
+            return {"id": item.id, "code": item.code, "name": item.name,
+                    "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH.get(item.code), "status": item.status,
                     "revision_id": revision.id, "revision": revision.revision_no, "revision_status": revision.status,
                     "description": revision.description, "input_contract": revision.input_contract, "output_contract": revision.output_contract,
                     "node_count": len(definition.get("nodes", [])), "edge_count": len(definition.get("edges", [])), "definition": definition}
@@ -7312,6 +7358,22 @@ class V7Store:
             raise ValueError(f"Deployment 尚未配置 {release_stage} Milvus Target")
         return target
 
+    def deployment_stage_target(self, boundary_id: str, release_stage: str) -> dict[str, Any]:
+        """Resolve one explicit stage target from a ProjectDeployment or Deployment id."""
+        with self.sessions() as session:
+            project_deployment = session.get(ProjectDeployment, boundary_id)
+            deployment_id = project_deployment.deployment_id if project_deployment else boundary_id
+            deployment = session.get(Deployment, deployment_id)
+            if not deployment:
+                raise ValueError("Deployment 不存在")
+            target = self._stage_target(session, deployment.id, release_stage)
+            return {
+                "deployment_id": deployment.id,
+                "release_stage": release_stage,
+                "target_kind": "milvus",
+                "milvus_target": self._target_payload(target),
+            }
+
     @staticmethod
     def _put_stage_target(session: Session, deployment: Deployment, release_stage: str,
                           milvus_url: str, *, name: str | None = None) -> MilvusTarget:
@@ -7343,7 +7405,7 @@ class V7Store:
         session.flush()
         return target
 
-    def create_shared_deployment(self, code: str, name: str, *, scope: str = "institution",
+    def create_shared_deployment(self, code: str | None = None, name: str | None = None, *, scope: str = "institution",
                                  institution_name: str | None = None,
                                  institution_code: str | None = None,
                                  test_milvus_uri: str = QA_AGENT_TEST_MILVUS_URL) -> dict[str, Any]:
@@ -7351,18 +7413,25 @@ class V7Store:
         normalized_name = str(name or "").strip()
         normalized_institution = str(institution_name or "").strip() or None
         normalized_institution_code = str(institution_code or "").strip() or None
-        if not normalized_code or not normalized_name:
-            raise ValueError("Deployment 编码和名称不能为空")
         if scope not in {"central", "institution"}:
             raise ValueError("Deployment scope 只允许 central 或 institution")
         if scope == "institution" and (not normalized_institution or not normalized_institution_code):
             raise ValueError("机构 Deployment 必须填写机构名称和机构代码")
+        if scope == "institution":
+            generated_code = institution_deployment_code(normalized_institution_code or "")
+            if normalized_code and normalized_code != generated_code:
+                raise ValueError(f"机构 Deployment code 必须由机构代码生成：{generated_code}")
+            if normalized_name and normalized_name != normalized_institution:
+                raise ValueError("机构 Deployment 名称必须与机构名称一致")
+            normalized_code, normalized_name = generated_code, normalized_institution
+        elif normalized_code != CENTRAL_DEPLOYMENT_CODE or normalized_name != "DataForge 中心":
+            raise ValueError("Central Deployment 只能使用系统内置 DataForge 中心")
         with self.sessions.begin() as session:
-            if session.scalar(select(Deployment).where(Deployment.code == normalized_code)):
-                raise ValueError("Deployment 编码已存在")
             if normalized_institution_code and session.scalar(select(Deployment).where(
                     Deployment.institution_code == normalized_institution_code)):
                 raise ValueError("该机构代码已有 Deployment")
+            if session.scalar(select(Deployment).where(Deployment.code == normalized_code)):
+                raise ValueError("Deployment 编码已存在")
             deployment = Deployment(
                 id=new_id("deployment"), code=normalized_code, name=normalized_name, scope=scope,
                 institution_name=normalized_institution, institution_code=normalized_institution_code,
@@ -7433,7 +7502,9 @@ class V7Store:
             if requested_target and requested_target.milvus_url:
                 test_uri = requested_target.milvus_url
         shared = self.create_shared_deployment(
-            code, name, scope="institution" if institution_code or institution_name else "central",
+            None if institution_code or institution_name else code,
+            None if institution_code or institution_name else name,
+            scope="institution" if institution_code or institution_name else "central",
             institution_name=institution_name, institution_code=institution_code,
             test_milvus_uri=test_uri,
         )
@@ -7621,7 +7692,9 @@ class V7Store:
                 KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
                 KnowledgeLibrary.migration_status == "ready")))
             if len(libraries) != len(set(library_ids)): raise ValueError("授权包含不存在、迁移中或不可用的知识库")
-            for library in libraries:
+            libraries_by_id = {library.id: library for library in libraries}
+            ordered_libraries = [libraries_by_id[library_id] for library_id in library_ids]
+            for library in ordered_libraries:
                 if project_task and project_task.knowledge_type and library.knowledge_type != project_task.knowledge_type:
                     raise ValueError("KnowledgeLibrary 与 ProjectTask 的 Knowledge Type 不匹配")
                 compatible = {item.id for item in self._index_profile_snapshots_for_library(session, library)}
@@ -7639,7 +7712,7 @@ class V7Store:
             for item in session.scalars(select(ProjectOrgRouteLibrary).where(
                     ProjectOrgRouteLibrary.project_org_route_id == route.id)):
                 session.delete(item)
-            for priority, library in enumerate(libraries):
+            for priority, library in enumerate(ordered_libraries):
                 session.add(ProjectOrgRouteLibrary(id=new_id("rl"), project_org_route_id=route.id,
                     knowledge_library_id=library.id, priority=priority, enabled=True))
             route.status = "draft"; self.audit(session, "routing.draft_updated", "project_org_route", route.id, {"library_ids": library_ids})
@@ -7684,21 +7757,21 @@ class V7Store:
             KnowledgeAssetVersion.review_snapshot_digest.is_not(None),
         ).order_by(KnowledgeAssetVersion.version_no.desc()))
 
-    def routing_snapshot(self, boundary_id: str) -> dict[str, Any]:
+    def routing_snapshot(self, boundary_id: str, release_stage: str) -> dict[str, Any]:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
             deployment = session.get(Deployment, project_deployment.deployment_id)
             project = session.get(Project, project_deployment.project_id)
             if not project or not deployment:
                 raise ValueError("ProjectDeployment 的 Project 或 Deployment 不存在")
-            if deployment.release_stage not in {"test", "production"}:
-                raise ValueError("Deployment release_stage 无效")
-            target = self._stage_target(session, deployment.id, deployment.release_stage)
+            if release_stage not in {"test", "production"}:
+                raise ValueError("release_stage 只允许 test 或 production")
+            target = self._stage_target(session, deployment.id, release_stage)
             if is_qa_agent_project(project):
                 if deployment.scope == "institution" and (
                         not deployment.institution_name or not deployment.institution_code):
                     raise ValueError("qa-agent Deployment 尚未绑定机构名称和机构代码")
-            if project.code == KG_PROJECT_CODE and deployment.release_stage != "test":
+            if project.code == KG_PROJECT_CODE and release_stage != "test":
                 raise ValueError("kg_for_consultation 当前没有 production RoutingSnapshot")
             task_rows = session.execute(select(ProjectDeploymentTask, ProjectTask).join(
                 ProjectTask, ProjectTask.id == ProjectDeploymentTask.project_task_id).where(
@@ -7759,13 +7832,13 @@ class V7Store:
                               "qa_embedding_mode": deployment_task.qa_embedding_mode, "top_k": deployment_task.top_k,
                               "index_profile": profile_payload, "org_routes": org_routes})
             return {"schema": "dataforge.routing-snapshot.v7", "schema_version": 3,
-                    "release_stage": deployment.release_stage,
+                    "release_stage": release_stage,
                     "project": {"id": project.id, "code": project.code, "name": project.name},
                     "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
                                     "institution_name": deployment.institution_name,
                                     "institution_code": deployment.institution_code,
                                     "scope": deployment.scope,
-                                    "release_stage": deployment.release_stage},
+                                    "release_stage": release_stage},
                     "project_deployment": {"id": project_deployment.id,
                                            "project_id": project_deployment.project_id,
                                            "deployment_id": project_deployment.deployment_id,
@@ -7773,13 +7846,13 @@ class V7Store:
                     "milvus_target": {"id": target.id, "name": target.name, "milvus_url": target.milvus_url},
                     "tasks": tasks, "routes": flat_routes}
 
-    def validate_routing(self, boundary_id: str, milvus=None, *,
+    def validate_routing(self, boundary_id: str, release_stage: str, milvus=None, *,
                          target_validation_mode: str | None = None,
                          target_reason: str | None = None) -> dict[str, Any]:
         """Validate routing configuration and, when allowed, its live Milvus target."""
         from .vector import CollectionValidationError
 
-        snapshot = self.routing_snapshot(boundary_id)
+        snapshot = self.routing_snapshot(boundary_id, release_stage)
         checks: list[dict[str, Any]] = []
         configuration_issues: list[str] = []
         physical_targets: list[dict[str, Any]] = []
@@ -8087,12 +8160,10 @@ class V7Store:
             "checks": checks, "problems": problems, "snapshot": snapshot,
         }
 
-    def routing_diff(self, boundary_id: str, release_stage: str | None = None) -> dict[str, Any]:
-        current = self.routing_snapshot(boundary_id)
+    def routing_diff(self, boundary_id: str, release_stage: str) -> dict[str, Any]:
+        current = self.routing_snapshot(boundary_id, release_stage)
         deployment_id = current["project_deployment"]["id"]
-        stage = release_stage or current["release_stage"]
-        if stage != current["release_stage"]:
-            raise ValueError("Diff 阶段必须与 Deployment 当前 release_stage 一致")
+        stage = release_stage
         with self.sessions() as session:
             previous = session.scalar(select(ProjectRouteVersion).where(
                 ProjectRouteVersion.project_deployment_id == deployment_id,
@@ -8114,6 +8185,7 @@ class V7Store:
             deployment = session.get(Deployment, project_deployment.deployment_id)
             if not deployment:
                 raise ValueError("Deployment 不存在")
+            # Legacy fallback only. New publishing flows always put release_stage in the snapshot.
             release_stage = str(snapshot.get("release_stage") or deployment.release_stage)
             if release_stage not in {"test", "production"}:
                 raise ValueError("RoutingSnapshot release_stage 无效")
@@ -8152,13 +8224,18 @@ class V7Store:
                                              "release_stage": release_stage})
             return value
 
-    def freeze_route_version(self, boundary_id: str) -> dict[str, Any]:
+    def freeze_route_version(self, boundary_id: str, release_stage: str) -> dict[str, Any]:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
             deployment = session.get(Deployment, project_deployment.deployment_id)
             if not deployment or deployment.scope != "institution":
                 raise ValueError("只有 institution Deployment 可以冻结离线路由版本")
-        check = self.validate_routing(boundary_id)
+        check = self.validate_routing(
+            boundary_id, release_stage,
+            target_validation_mode="deferred_to_local",
+            target_reason=("中心不连接机构现场 Milvus，实体检查延后到机构本地 "
+                           "Prepare/Activation Preflight"),
+        )
         if not check["valid"]:
             raise ValueError("路由校验失败：" + "；".join(check["problems"]))
         encoded = json.dumps(check["snapshot"], ensure_ascii=False, sort_keys=True,
@@ -8288,7 +8365,8 @@ class V7Store:
             return self._route_candidate_payload(candidate)
 
     def create_institution_release_draft(self, target_deployment_id: str, package_kind: str,
-                                         *, route_version_ids: list[str] | None = None,
+                                         *, release_stage: str | None = None,
+                                         route_version_ids: list[str] | None = None,
                                          knowledge_library_ids: list[str] | None = None,
                                          extra_asset_version_ids: list[str] | None = None,
                                          base_release_id: str | None = None,
@@ -8312,6 +8390,14 @@ class V7Store:
             ))) if route_ids else []
             if len(routes) != len(route_ids):
                 raise ValueError("机构发布包含不存在或未 frozen 的 RouteVersion")
+            route_stages = {item.release_stage for item in routes}
+            if len(route_stages) > 1:
+                raise ValueError("机构发布不能混合测试环境和生产环境的项目版本")
+            resolved_stage = release_stage or (next(iter(route_stages)) if route_stages else deployment.release_stage)
+            if resolved_stage not in {"test", "production"}:
+                raise ValueError("release_stage 只允许 test 或 production")
+            if route_stages and route_stages != {resolved_stage}:
+                raise ValueError("机构发布环境与所选 frozen RouteVersion 不一致")
             project_deployments = {item.id: item for item in session.scalars(select(ProjectDeployment).where(
                 ProjectDeployment.id.in_([item.project_deployment_id for item in routes]),
             ))} if routes else {}
@@ -8322,7 +8408,8 @@ class V7Store:
             draft = InstitutionReleaseDraft(
                 id=new_id("reldraft"), target_deployment_id=deployment.id,
                 package_kind=package_kind, base_release_id=base_release_id,
-                selection_json={"route_version_ids": route_ids, "knowledge_library_ids": library_ids,
+                selection_json={"release_stage": resolved_stage,
+                                "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
                                 "extra_asset_version_ids": extra_asset_ids,
                                 "include_full_document_library": bool(include_full_document_library)},
             )
@@ -8350,6 +8437,7 @@ class V7Store:
         return {"id": draft.id, "target_deployment_id": draft.target_deployment_id,
                 "package_kind": draft.package_kind, "status": draft.status,
                 "revision_no": draft.revision_no, "base_release_id": draft.base_release_id,
+                "release_stage": (draft.selection_json or {}).get("release_stage"),
                 "selection": draft.selection_json or {}, "milvus_override": draft.milvus_override_json or {},
                 "milvus_override_reason": draft.milvus_override_reason, "projects": projects,
                 "created_at": draft.created_at.isoformat(), "updated_at": draft.updated_at.isoformat()}
@@ -8361,7 +8449,8 @@ class V7Store:
                 raise ValueError("机构发布草稿不存在")
             return self._institution_release_draft_payload(session, draft)
 
-    def update_institution_release_draft(self, draft_id: str, *, route_version_ids: list[str] | None = None,
+    def update_institution_release_draft(self, draft_id: str, *, release_stage: str | None = None,
+                                         route_version_ids: list[str] | None = None,
                                          knowledge_library_ids: list[str] | None = None,
                                          extra_asset_version_ids: list[str] | None = None,
                                          base_release_id: str | None = None,
@@ -8389,6 +8478,18 @@ class V7Store:
             ))) if route_ids else []
             if len(routes) != len(route_ids):
                 raise ValueError("机构发布包含不存在或未 frozen 的 RouteVersion")
+            route_stages = {item.release_stage for item in routes}
+            if len(route_stages) > 1:
+                raise ValueError("机构发布不能混合测试环境和生产环境的项目版本")
+            resolved_stage = (release_stage or current.get("release_stage")
+                              or (next(iter(route_stages)) if route_stages else None))
+            if resolved_stage not in {"test", "production"}:
+                deployment = session.get(Deployment, draft.target_deployment_id)
+                resolved_stage = deployment.release_stage if deployment else None
+            if resolved_stage not in {"test", "production"}:
+                raise ValueError("release_stage 只允许 test 或 production")
+            if route_stages and route_stages != {resolved_stage}:
+                raise ValueError("机构发布环境与所选 frozen RouteVersion 不一致")
             bindings = {item.id: item for item in session.scalars(select(ProjectDeployment).where(
                 ProjectDeployment.id.in_([item.project_deployment_id for item in routes]),
             ))} if routes else {}
@@ -8414,6 +8515,7 @@ class V7Store:
                     project_route_version_id=route.id,
                 ))
             draft.selection_json = {
+                "release_stage": resolved_stage,
                 "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
                 "extra_asset_version_ids": extra_asset_ids,
                 "include_full_document_library": bool(
@@ -8511,6 +8613,7 @@ class V7Store:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
             deployment = session.get(Deployment, project_deployment.deployment_id)
+            # Legacy fallback only. New project publishing flows provide release_stage.
             stage = release_stage or deployment.release_stage
             query = select(ProjectRouteVersion).where(ProjectRouteVersion.project_deployment_id == project_deployment.id,
                                                        ProjectRouteVersion.release_stage == stage,
@@ -8546,6 +8649,7 @@ class V7Store:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
             deployment = session.get(Deployment, project_deployment.deployment_id)
+            # Legacy fallback only. New clients provide release_stage.
             stage = release_stage or deployment.release_stage
             return [{"id": item.id, "project_id": item.project_id, "project_deployment_id": item.project_deployment_id,
                      "origin": item.origin, "release_stage": item.release_stage,
@@ -8561,6 +8665,7 @@ class V7Store:
         with self.sessions() as session:
             project_deployment = self._resolve_deployment(session, boundary_id)
             deployment = session.get(Deployment, project_deployment.deployment_id)
+            # Legacy fallback only. New clients provide release_stage.
             stage = release_stage or deployment.release_stage
             value = session.scalar(select(ProjectRouteVersion).where(
                 ProjectRouteVersion.project_deployment_id == project_deployment.id,
@@ -8599,8 +8704,6 @@ class V7Store:
             if not row:
                 raise ValueError("Deployment 不存在")
             project_deployment, deployment = row
-            if deployment.release_stage != release_stage:
-                raise ValueError("Deployment 当前阶段与请求阶段不一致")
             if project.code == KG_PROJECT_CODE and release_stage != "test":
                 raise ValueError("kg_for_consultation 当前没有 production RoutingSnapshot")
             version = session.scalar(select(ProjectRouteVersion).where(

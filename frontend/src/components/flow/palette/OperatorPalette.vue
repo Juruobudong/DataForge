@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { groupOperatorCapabilities } from '../flowModel'
+import { groupOperatorCapabilities, subflowPrimaryName, subflowSubtitle } from '../flowModel'
 
 const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] } })
 const emit = defineEmits(['drag-start', 'add-item', 'add-sink'])
@@ -37,7 +37,7 @@ function toggle(key) {
       </section>
       <section v-if="subflows.length">
         <h4>可复用子图</h4>
-        <button v-for="item in subflows" :key="item.code" class="subflow-item" draggable="true" @dragstart="emit('drag-start', $event, item, 'subflow')" @dblclick="emit('add-item', item, 'subflow')"><span class="item-icon">◈</span><span><b>{{ item.name }}</b><small>{{ item.code }} · r{{ item.revision }}</small></span><span class="grab">⋮⋮</span></button>
+        <button v-for="item in subflows" :key="item.code" class="subflow-item" draggable="true" @dragstart="emit('drag-start', $event, item, 'subflow')" @dblclick="emit('add-item', item, 'subflow')"><span class="item-icon">◈</span><span><b>{{ subflowPrimaryName(item) }}</b><small>{{ subflowSubtitle(item, true) }}</small></span><span class="grab">⋮⋮</span></button>
       </section>
       <section v-if="outputTypes.length">
         <h4>正式知识输出</h4>

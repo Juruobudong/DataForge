@@ -28,7 +28,7 @@
 | 业务工作区 | 向量存储：Collection/Partition 库存、资产映射与受控运维 | `DONE` | 实时聚合 Milvus 与 AssetVersion/Routing/Release/GC；普通刷新只读 stats，显式 verify 持久化最近 count/digest；load/release 仅限严格受管版本 Partition，无任意 drop。`.34` 真实对账仍为 `CONNECT`。 |
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
-| 业务工作区 | 项目发布：任务/授权/优先级、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | Routing Validate 返回结构化配置、AssetVersion、Contract 与 live Milvus Collection/字段/dimension/Partition 检查；中心到 institution Deployment 使用 `deferred_to_local` 且不连接机构现场。institution scope 只 freeze，central scope 保留在线发布。 |
+| 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 由每次 Routing 操作显式选择并独立显示历史；Central live publish，中心侧 institution deferred freeze；机构 code 自动生成，知识范围顺序即 priority，技术对象进入帮助/高级信息。 |
 | 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | `.dfm` v2、项目资产锁定与额外 AssetVersion、结构化冲突门禁、模板闭包、正常 waiting、Prepare target fingerprint、Partition count/digest Activation Preflight 和逐项目/非原子批量激活已本地验证；`.34` 真实服务验收仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
@@ -61,8 +61,8 @@
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | DB Embedding Registry 默认 BCE 768；Profile/Contract/Milvus 强制维度一致，Vector Sync 按 Profile 动态选 Provider，AssetVersion 冻结血缘。 |
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格默认独立、仅显式选择兼容 ready 登记时复用。旧 `graph` Profile 仅供已有库冻结兼容，不参与受管供应或容量探测；真实供应仍属部署验收。 |
-| RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/阶段隔离；Snapshot v3 指向 Ready `kl_*__vN`，local 单项目激活原子，批量明确非原子。 |
-| Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；Deployment 可关联多个 Project，机构码可锁定；local current/candidate/preset 凭据 AES-GCM 入库且响应脱敏。 |
+| RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/显式环境隔离；Snapshot v3 指向 Ready `kl_*__vN`，legacy Deployment stage 不阻止另一环境 Runtime，local 单项目激活原子，批量明确非原子。 |
+| Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；唯一 Central 固定双 Target，新机构发布目标由名称/机构代码生成 `inst-*`，Deployment 可关联多个 Project且机构码可锁定；local current/candidate/preset 凭据 AES-GCM 入库且响应脱敏。 |
 | `.dfm` v2 Seed / Institution Release / Knowledge Update | `DONE` | 多 frozen 项目、完整当前资产、差异/Tombstone、模板运行闭包、Ed25519、v1 导入兼容与检查点恢复。 |
 | Knowledge Type / Profile 发布契约 | `DONE` | 草稿只登记 planned 资源；发布自动 Provision 扩展/Manual create，实时校验 Manual attach，再冻结 Profile 与 Type Revision；同一 Type Revision 拒绝重复 Collection。 |
 | qa_agent FAQ 专用文件生产与固定迁移 | `DONE` | `qa-agent-faq`、自动 Profile、受管 Collection、无 LLM CSV/XLSX 模板、固定 12 Partition CLI/Bash 和 qa_agent `legacy/shadow/primary` 已实现并完成本地定向测试；真实导入归 C-10。 |
@@ -107,6 +107,7 @@
 - 2026-08-18：010 qa_agent FAQ 仓库实现完成；新增专用类型/受管 Collection、确定性 CSV/XLSX 模板、固定 `.34/faq` 导入 CLI 与单 Bash，以及 qa_agent 三阶段读取。DataForge 7 项、qa_agent 20 项定向测试通过；未执行 `.34` 写入、Routing 发布或模式切换，真实验收归 C-10。
 - 2026-08-19：FAQ 手工上传契约改为 `faq-{org_code}.csv|xlsx` 文件名承载机构，CSV 可省略机构列；导出12份修正版 CSV/manifest/checksum 共8,281行，DataForge定向12项和表格运行时12文件导入/渲染通过。部署 API 尚无 FAQ 类型/模板/文档库，预建与上传仍归 C-10。
 - 2026-08-24：015 SourceChunk 人工审核 Gate 仓库实现完成；Preparation、不可变 Chunk Revision/Review Snapshot、自动 Dispatch、Reviewed Flow、Sink/Vector/Routing fail-closed 与 PC 双栏审核工作区已落地。平台 53、迁移 13、前端 50 项及相关定向回归通过；真实 `.34` 顺序与服务验收归 C-11。
+- 2026-08-26：项目发布改为显式双环境；Central live publish、中心侧 Institution deferred freeze、机构 Release 环境一致性、机构 `inst-*` code、知识范围优先级和业务化五 Tab 已落地。无 schema 迁移；本地回归与前端构建通过，`.34` 真实发布仍归 C-09。
 - C-01 至 C-05 是本期的下一执行队列。每完成一项，应更新本文件状态、`wiki/`、Devora 测试用例和上线证据；不得将模拟或缺失依赖的结果写成真实部署验收。
 
 ## 依据

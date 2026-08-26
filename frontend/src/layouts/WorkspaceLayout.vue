@@ -14,6 +14,7 @@ const menuPreferences = useMenuPreferencesStore()
 const instance = ref(null)
 const customizeOpen = ref(false)
 const developer = computed(() => route.path.startsWith('/developer'))
+const hideTopbar = computed(() => route.meta.hideTopbar === true)
 const businessRegistry = computed(() => businessMenuRegistry(instance.value?.instance_mode))
 const businessMenu = computed(() => mergeMenuPreference(businessRegistry.value, menuPreferences.preference))
 const items = computed(() => developer.value ? DEVELOPER_MENU_REGISTRY : businessMenu.value.visible)
@@ -50,7 +51,7 @@ onMounted(async () => {
       <div v-if="!developer" class="sidebar-footer"><button class="customize-menu-button" @click="customizeOpen=true">⚙ 自定义菜单</button></div>
     </aside>
     <main>
-      <header class="topbar"><span class="crumb">{{ developer ? '流程开发区' : '业务工作区' }} / {{ current }}</span><div class="page-actions"><span class="badge blue">{{ instance?.display_name || 'DataForge' }}{{ instance?.deployment_flavor==='institution_private' ? ' · 机构本地' : '' }}</span><span class="admin">Admin</span></div></header>
+      <header v-if="!hideTopbar" class="topbar"><span class="crumb">{{ developer ? '流程开发区' : '业务工作区' }} / {{ current }}</span><div class="page-actions"><span class="badge blue">{{ instance?.display_name || 'DataForge' }}{{ instance?.deployment_flavor==='institution_private' ? ' · 机构本地' : '' }}</span><span class="admin">Admin</span></div></header>
       <div class="content"><RouterView /></div>
     </main>
     <MenuCustomizeDialog v-if="customizeOpen" :items="businessMenu.items" :defaults="businessRegistry" @close="customizeOpen=false" @save="saveMenu" />
