@@ -303,6 +303,7 @@ class KnowledgeFlowTemplate(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     code: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     output_types: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
@@ -313,6 +314,10 @@ class KnowledgeFlowTemplate(Timestamped, Base):
     authoring_mode: Mapped[str] = mapped_column(String(32), default="advanced", nullable=False)
     # 标准配置绑定的托管模板 code（如 standard-qa），advanced 模式下为 None
     managed_template_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Informational authoring provenance only.  Keep these as stable IDs rather
+    # than FKs to avoid a template↔revision deletion cycle during controlled rebuilds.
+    derived_from_template_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    derived_from_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class KnowledgeFlowTemplateRevision(Timestamped, Base):
@@ -672,13 +677,67 @@ class FlowExecutionSnapshot(Timestamped, Base):
     status: Mapped[str] = mapped_column(String(32), default="published", nullable=False)
 
 
+class DebugRunInputSnapshot(Timestamped, Base):
+    """Immutable authoring, input and preview-binding boundary for Debug Runs."""
+    __tablename__ = "debug_run_input_snapshots"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    knowledge_flow_template_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_flow_templates.id"), nullable=False, index=True
+    )
+    knowledge_flow_template_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True
+    )
+    execution_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("flow_execution_snapshots.id"), nullable=False, index=True
+    )
+    authoring_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_definition_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    source_definition_checksum: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    output_types_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    reusable_node_map_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    sink_library_bindings_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    requested_by: Mapped[str] = mapped_column(String(255), default="admin", nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+
+
+class DebugRunReviewInput(Timestamped, Base):
+    __tablename__ = "debug_run_review_inputs"
+    __table_args__ = (
+        UniqueConstraint("debug_input_snapshot_id", "source_version_id", name="uq_debug_review_source_version"),
+        UniqueConstraint("debug_input_snapshot_id", "ordinal", name="uq_debug_review_ordinal"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    debug_input_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("debug_run_input_snapshots.id"), nullable=False, index=True
+    )
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    source_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    )
+    review_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class DebugRunFlowMaterialization(Timestamped, Base):
+    """Idempotent audit boundary for applying or saving a Debug configuration."""
+    __tablename__ = "debug_run_flow_materializations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    target_template_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    target_revision_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
 class FlowRun(Timestamped, Base):
     __tablename__ = "flow_runs"
     __table_args__ = (
         UniqueConstraint("parent_flow_run_id", "idempotency_key", name="uq_derived_run_request"),
         CheckConstraint(
-            "(knowledge_job_id IS NOT NULL AND source_preparation_job_id IS NULL) OR "
-            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NOT NULL)",
+            "(knowledge_job_id IS NOT NULL AND source_preparation_job_id IS NULL AND debug_input_snapshot_id IS NULL) OR "
+            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NOT NULL AND debug_input_snapshot_id IS NULL) OR "
+            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NULL AND debug_input_snapshot_id IS NOT NULL)",
             name="ck_flow_run_single_owner",
         ),
     )
@@ -686,6 +745,9 @@ class FlowRun(Timestamped, Base):
     knowledge_job_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=True, index=True)
     source_preparation_job_id: Mapped[str | None] = mapped_column(
         ForeignKey("source_preparation_jobs.id"), nullable=True, index=True
+    )
+    debug_input_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("debug_run_input_snapshots.id"), nullable=True, index=True
     )
     execution_snapshot_id: Mapped[str] = mapped_column(ForeignKey("flow_execution_snapshots.id"), nullable=False, index=True)
     parent_flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
@@ -724,6 +786,7 @@ class FlowNodeRun(Timestamped, Base):
 
 class Artifact(Timestamped, Base):
     __tablename__ = "artifacts"
+    __table_args__ = (Index("ix_artifacts_flow_run_created_at_id", "flow_run_id", "created_at", "id"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
     flow_node_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_node_runs.id"), nullable=True, index=True)

@@ -22,7 +22,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import create_engine, delete, func, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, load_only, sessionmaker
 import yaml
 
 from .catalog import (
@@ -51,6 +51,9 @@ from .models import (
     DocumentLibraryTemplateBinding,
     DocumentLibraryTemplateOutput,
     DocumentIR,
+    DebugRunInputSnapshot,
+    DebugRunFlowMaterialization,
+    DebugRunReviewInput,
     EmbeddingProfile,
     EmbeddingServing,
     KnowledgeChange,
@@ -448,21 +451,27 @@ class V7Store:
                 else:
                     if template.name == V7_TEMPLATE_LEGACY_NAMES[code]:
                         template.name = name
-                    template.definition_json = stage_config
-                    template.authoring_mode, template.managed_template_code = "standard", code
                     template.purpose, template.needs_review_upgrade = "knowledge", False
                 revision = session.scalar(select(KnowledgeFlowTemplateRevision).where(
-                    KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id))
+                    KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+                ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
                 if not revision:
-                    session.add(KnowledgeFlowTemplateRevision(
+                    revision = KnowledgeFlowTemplateRevision(
                         id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
                         definition_json=stage_config, authoring_mode="standard", managed_template_code=code,
                         status="published", published_at=utc_now(), purpose="knowledge",
-                    ))
+                    )
+                    session.add(revision)
                 else:
-                    revision.definition_json = stage_config
-                    revision.authoring_mode, revision.managed_template_code = "standard", code
                     revision.purpose = "knowledge"
+                # The latest Revision is the authoring-state source of truth.  Seed must
+                # not rewrite an existing draft/published revision or leave the template
+                # row advertising a different mode from the definition returned by APIs.
+                template.definition_json = revision.definition_json
+                template.authoring_mode = revision.authoring_mode or "advanced"
+                template.managed_template_code = (
+                    revision.managed_template_code if template.authoring_mode == "standard" else None
+                )
             # ``graph`` has long normalized to ``graph:triple``.  Move active
             # document bindings to the canonical template before archiving the
             # redundant row, while keeping historical revisions and jobs.
@@ -1881,11 +1890,28 @@ class V7Store:
 
     def list_flow_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            return [{"id": item.id, "knowledge_job_id": item.knowledge_job_id, "execution_snapshot_id": item.execution_snapshot_id,
-                     "parent_flow_run_id": item.parent_flow_run_id, "run_mode": item.run_mode, "start_node_id": item.start_node_id,
-                     "status": item.status, "error": item.error, "created_at": item.created_at.isoformat(),
-                     "completed_at": item.completed_at.isoformat() if item.completed_at else None}
-                    for item in session.scalars(select(FlowRun).order_by(FlowRun.created_at.desc()).limit(limit))]
+            values = []
+            for item in session.scalars(select(FlowRun).order_by(FlowRun.created_at.desc()).limit(limit)):
+                debug_input = session.get(DebugRunInputSnapshot, item.debug_input_snapshot_id) if item.debug_input_snapshot_id else None
+                template = session.get(KnowledgeFlowTemplate, debug_input.knowledge_flow_template_id) if debug_input else None
+                values.append({
+                    "id": item.id, "knowledge_job_id": item.knowledge_job_id,
+                    "source_preparation_job_id": item.source_preparation_job_id,
+                    "debug_input_snapshot_id": item.debug_input_snapshot_id,
+                    "execution_snapshot_id": item.execution_snapshot_id,
+                    "parent_flow_run_id": item.parent_flow_run_id, "run_mode": item.run_mode,
+                    "start_node_id": item.start_node_id, "status": item.status, "error": item.error,
+                    "template_id": template.id if template else None, "template_name": template.name if template else None,
+                    "template_revision_id": debug_input.knowledge_flow_template_revision_id if debug_input else None,
+                    "created_at": item.created_at.isoformat(),
+                    "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                })
+            return values
+
+    def flow_run_is_debug(self, flow_run_id: str) -> bool:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            return bool(run and run.debug_input_snapshot_id)
 
     def audit(self, session: Session, action: str, resource_type: str, resource_id: str, payload: dict[str, Any] | None = None) -> None:
         session.add(AuditEvent(
@@ -3988,10 +4014,16 @@ class V7Store:
                         KnowledgeFlowTemplateRevision.status == "published",
                     ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())
                 )
+                current_mode = (revision.authoring_mode if revision else item.authoring_mode) or "advanced"
+                current_managed_code = (
+                    (revision.managed_template_code if revision else item.managed_template_code)
+                    if current_mode == "standard" else None
+                )
                 values.append({"id": item.id, "code": item.code, "name": item.name,
+                               "description": item.description,
                                "is_builtin": item.code in V7_BUILTIN_TEMPLATE_CODES, "output_types": item.output_types,
-                               "authoring_mode": item.authoring_mode or "advanced",
-                               "managed_template_code": item.managed_template_code,
+                               "authoring_mode": current_mode,
+                               "managed_template_code": current_managed_code,
                                "definition": revision.definition_json if revision else item.definition_json,
                                "status": item.status, "is_default": item.is_default,
                                "purpose": item.purpose, "needs_review_upgrade": item.needs_review_upgrade,
@@ -3999,7 +4031,9 @@ class V7Store:
                                "revision_status": revision.status if revision else None,
                                "published_revision_id": published_revision.id if published_revision else None,
                                "published_revision": published_revision.revision_no if published_revision else None,
-                               "execution_snapshot_id": revision.execution_snapshot_id if revision else None})
+                               "execution_snapshot_id": revision.execution_snapshot_id if revision else None,
+                               "derived_from_template_id": item.derived_from_template_id,
+                               "derived_from_revision_id": item.derived_from_revision_id})
             return values
 
     def source_preparation_chunker(self) -> dict[str, Any]:
@@ -4056,7 +4090,9 @@ class V7Store:
                     "operator_code": "semantic-chunker", "params": normalized}
 
     def create_flow_template(self, code: str, name: str, output_types: list[str], definition: dict[str, Any],
-                             *, authoring_mode: str = "advanced", managed_template_code: str | None = None) -> dict[str, Any]:
+                             *, authoring_mode: str = "advanced", managed_template_code: str | None = None,
+                             description: str = "", derived_from_template_id: str | None = None,
+                             derived_from_revision_id: str | None = None) -> dict[str, Any]:
         code, name = code.strip(), name.strip()
         if not code or not name or not output_types:
             raise ValueError("模板编码、名称和输出知识类型不合法")
@@ -4080,8 +4116,11 @@ class V7Store:
                 KnowledgeFlowTemplate.name == name, KnowledgeFlowTemplate.status != "archived",
             )):
                 raise ValueError("模板名称已存在")
-            template = KnowledgeFlowTemplate(id=new_id("flow"), code=code, name=name, output_types=sorted(set(output_types)),
+            template = KnowledgeFlowTemplate(id=new_id("flow"), code=code, name=name, description=description.strip(),
+                                             output_types=sorted(set(output_types)),
                                              definition_json=saved, authoring_mode=authoring_mode, managed_template_code=managed_template_code,
+                                             derived_from_template_id=derived_from_template_id,
+                                             derived_from_revision_id=derived_from_revision_id,
                                              status="draft", purpose="knowledge")
             session.add(template); session.flush()
             revision = KnowledgeFlowTemplateRevision(id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
@@ -4219,6 +4258,504 @@ class V7Store:
             result["issues"] = []
             return result
 
+    @staticmethod
+    def _definition_checksum(definition: dict[str, Any]) -> str:
+        encoded = json.dumps(definition or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _debug_sink_requirements(compiled_definition: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        values: dict[str, dict[str, Any]] = {}
+        for node in compiled_definition.get("nodes", []):
+            if node.get("kind") != "knowledge_sink":
+                continue
+            knowledge_type = str(node.get("knowledge_type") or "")
+            graph_mode = str(node.get("graph_mode") or "") or None
+            output_key = normalise_output_key(str(node.get("output_key") or (
+                f"graph:{graph_mode}" if knowledge_type == "graph" and graph_mode else knowledge_type
+            )))
+            values[output_key] = {
+                "output_key": output_key, "knowledge_type": knowledge_type,
+                "graph_mode": graph_mode, "node_id": str(node["id"]),
+            }
+        return values
+
+    def _debug_revision(self, session: Session, template_id: str, *, revision_kind: str | None = None,
+                        revision_id: str | None = None) -> tuple[KnowledgeFlowTemplate, KnowledgeFlowTemplateRevision]:
+        template = session.get(KnowledgeFlowTemplate, template_id)
+        if not template or template.status == "archived" or template.purpose != "knowledge":
+            raise ValueError("知识流程不存在或不可调试")
+        query = select(KnowledgeFlowTemplateRevision).where(
+            KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+        )
+        if revision_id:
+            revision = session.scalar(query.where(KnowledgeFlowTemplateRevision.id == revision_id))
+        else:
+            if revision_kind not in {"draft", "published"}:
+                raise ValueError("revision_kind 必须是 draft 或 published")
+            revision = session.scalar(query.where(
+                KnowledgeFlowTemplateRevision.status == revision_kind,
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
+        if not revision or revision.status not in {"draft", "published"}:
+            raise ValueError("所选流程 Revision 不存在或不可调试")
+        return template, revision
+
+    def _debug_compile_bundle(self, session: Session, template: KnowledgeFlowTemplate,
+                              revision: KnowledgeFlowTemplateRevision, *, require_serving_health: bool) -> dict[str, Any]:
+        authoring_mode = revision.authoring_mode or template.authoring_mode or "advanced"
+        source_definition = json.loads(json.dumps(revision.definition_json or {}, ensure_ascii=False))
+        compiled = self._compile_template_definition(
+            session, source_definition, list(template.output_types), purpose="knowledge",
+            require_serving_health=require_serving_health, authoring_mode=authoring_mode,
+        )
+        materialized = compiled["definition"]
+        source_nodes = {str(item["id"]): item for item in materialized.get("nodes", []) if item.get("kind") == "operator"}
+        reusable_map: dict[str, dict[str, Any]] = {}
+        managed = MANAGED_FLOW_CATALOG.get(revision.managed_template_code or template.managed_template_code) \
+            if authoring_mode == "standard" else None
+        stages = {stage.code: stage for stage in managed.stages} if managed else {}
+        for node in compiled["compiled_definition"].get("nodes", []):
+            if node.get("kind") != "operator":
+                continue
+            node_id = str(node["id"])
+            origin_path = list(node.get("origin_path") or node_id.split("::"))
+            if len(origin_path) != 1 or node_id not in source_nodes:
+                continue
+            mapping: dict[str, Any] = {"advanced_source_node_id": node_id}
+            if authoring_mode == "standard":
+                stage_code = str(node.get("stage_code") or "")
+                stage = stages.get(stage_code)
+                allowed = sorted(((stage.config_schema or {}).get("properties") or {}).keys()) if stage else []
+                mapping.update({"standard_stage_code": stage_code, "standard_allowed_keys": allowed})
+            reusable_map[node_id] = mapping
+        return {
+            "template": template, "revision": revision, "authoring_mode": authoring_mode,
+            "source_definition": source_definition,
+            "source_definition_checksum": self._definition_checksum(source_definition),
+            "compiled": compiled, "reusable_map": reusable_map,
+            "sink_requirements": self._debug_sink_requirements(compiled["compiled_definition"]),
+        }
+
+    def _debug_review_selection(self, session: Session, snapshot_ids: list[str], *, require_current: bool) -> list[dict[str, Any]]:
+        ids = list(dict.fromkeys(str(value) for value in snapshot_ids if value))
+        if not ids:
+            raise ValueError("至少选择一份当前审核快照")
+        values: list[dict[str, Any]] = []
+        document_library_ids: set[str] = set()
+        for snapshot_id in ids:
+            snapshot = session.get(SourceReviewSnapshot, snapshot_id)
+            version = session.get(SourceVersion, snapshot.source_version_id) if snapshot else None
+            source = session.get(Source, version.source_id) if version else None
+            library = session.get(DocumentLibrary, source.document_library_id) if source else None
+            if not snapshot or not version or not source or not library:
+                raise ValueError("审核快照上下文不完整")
+            if snapshot.status != "approved" or version.review_status != "approved":
+                raise ValueError("只能使用已批准的审核快照")
+            if require_current and (
+                version.current_review_snapshot_id != snapshot.id or source.current_version_id != version.id
+                or version.status != "active" or source.status != "uploaded"
+            ):
+                raise RuntimeError("所选审核快照已不是文档当前有效版本，请刷新后重试")
+            chunk_count = session.scalar(select(func.count()).select_from(SourceReviewSnapshotChunk).where(
+                SourceReviewSnapshotChunk.source_review_snapshot_id == snapshot.id,
+            )) or 0
+            if not chunk_count:
+                raise ValueError("审核快照不包含文档块")
+            document_library_ids.add(library.id)
+            values.append({
+                "snapshot": snapshot, "version": version, "source": source, "library": library,
+                "chunk_count": int(chunk_count),
+            })
+        if len(document_library_ids) != 1:
+            raise ValueError("一次 Debug Run 只能选择同一文档库中的审核文档")
+        return values
+
+    def _validate_debug_sinks(self, session: Session, requirements: dict[str, dict[str, Any]],
+                              bindings: dict[str, str]) -> dict[str, KnowledgeLibrary]:
+        normalized = {normalise_output_key(str(key)): str(value) for key, value in dict(bindings or {}).items() if value}
+        if set(normalized) != set(requirements):
+            raise ValueError("必须为流程的每个 output_key 且仅为这些 output_key 绑定预览知识库")
+        values: dict[str, KnowledgeLibrary] = {}
+        for output_key, requirement in requirements.items():
+            library = session.get(KnowledgeLibrary, normalized[output_key])
+            if (not library or library.status != "active" or library.knowledge_type != requirement["knowledge_type"]
+                    or (requirement["graph_mode"] and library.graph_mode != requirement["graph_mode"])):
+                raise ValueError(f"{output_key} 必须绑定同类型的有效知识库")
+            values[output_key] = library
+        return values
+
+    def debug_run_options(self, template_id: str, revision_kind: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            template, revision = self._debug_revision(session, template_id, revision_kind=revision_kind)
+            bundle = self._debug_compile_bundle(session, template, revision, require_serving_health=False)
+            review_options = []
+            snapshots = session.scalars(select(SourceReviewSnapshot).where(
+                SourceReviewSnapshot.status == "approved",
+            ).order_by(SourceReviewSnapshot.approved_at.desc())).all()
+            for snapshot in snapshots:
+                try:
+                    row = self._debug_review_selection(session, [snapshot.id], require_current=True)[0]
+                except (ValueError, RuntimeError):
+                    continue
+                review_options.append({
+                    "source_review_snapshot_id": snapshot.id, "source_version_id": row["version"].id,
+                    "source_id": row["source"].id, "source_name": row["source"].name,
+                    "filename": row["source"].original_filename, "review_no": snapshot.review_no,
+                    "review_digest": snapshot.content_digest, "chunk_count": row["chunk_count"],
+                    "approved_at": snapshot.approved_at.isoformat(),
+                    "document_library_id": row["library"].id, "document_library_name": row["library"].name,
+                })
+            sink_options: dict[str, list[dict[str, Any]]] = {}
+            for output_key, requirement in bundle["sink_requirements"].items():
+                query = select(KnowledgeLibrary).where(
+                    KnowledgeLibrary.status == "active", KnowledgeLibrary.knowledge_type == requirement["knowledge_type"],
+                ).order_by(KnowledgeLibrary.name)
+                candidates = list(session.scalars(query))
+                sink_options[output_key] = [
+                    {"id": item.id, "name": item.name, "knowledge_type": item.knowledge_type, "graph_mode": item.graph_mode}
+                    for item in candidates if not requirement["graph_mode"] or item.graph_mode == requirement["graph_mode"]
+                ]
+            return {
+                "template": {"id": template.id, "name": template.name, "is_builtin": template.code in V7_BUILTIN_TEMPLATE_CODES},
+                "revision": {"id": revision.id, "revision": revision.revision_no, "status": revision.status,
+                             "authoring_mode": bundle["authoring_mode"]},
+                "compiled_checksum": bundle["compiled"]["checksum"],
+                "source_definition_checksum": bundle["source_definition_checksum"],
+                "review_inputs": review_options,
+                "sink_requirements": list(bundle["sink_requirements"].values()), "sink_options": sink_options,
+            }
+
+    def _debug_preflight_with_session(self, session: Session, *, template_id: str, revision_id: str,
+                                      expected_compiled_checksum: str, source_review_snapshot_ids: list[str],
+                                      sink_library_bindings: dict[str, str], require_serving_health: bool) -> dict[str, Any]:
+        template, revision = self._debug_revision(session, template_id, revision_id=revision_id)
+        bundle = self._debug_compile_bundle(session, template, revision, require_serving_health=require_serving_health)
+        if bundle["compiled"]["checksum"] != expected_compiled_checksum:
+            raise RuntimeError("流程定义已变化，请重新执行调试预检")
+        reviews = self._debug_review_selection(session, source_review_snapshot_ids, require_current=True)
+        libraries = self._validate_debug_sinks(session, bundle["sink_requirements"], sink_library_bindings)
+        return {**bundle, "reviews": reviews, "libraries": libraries}
+
+    def debug_run_preflight(self, *, template_id: str, revision_id: str, expected_compiled_checksum: str,
+                            source_review_snapshot_ids: list[str], sink_library_bindings: dict[str, str]) -> dict[str, Any]:
+        with self.sessions() as session:
+            value = self._debug_preflight_with_session(
+                session, template_id=template_id, revision_id=revision_id,
+                expected_compiled_checksum=expected_compiled_checksum,
+                source_review_snapshot_ids=source_review_snapshot_ids,
+                sink_library_bindings=sink_library_bindings, require_serving_health=True,
+            )
+            return {
+                "valid": True, "template_id": value["template"].id, "revision_id": value["revision"].id,
+                "revision": value["revision"].revision_no, "compiled_checksum": value["compiled"]["checksum"],
+                "source_definition_checksum": value["source_definition_checksum"],
+                "input_count": len(value["reviews"]), "output_keys": sorted(value["libraries"]),
+                "sink_policy": "preview_only", "issues": [],
+            }
+
+    def create_debug_run(self, *, template_id: str, revision_id: str, expected_compiled_checksum: str,
+                         source_review_snapshot_ids: list[str], sink_library_bindings: dict[str, str],
+                         idempotency_key: str) -> dict[str, Any]:
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key 不能为空")
+        with self.sessions.begin() as session:
+            existing_input = session.scalar(select(DebugRunInputSnapshot).where(
+                DebugRunInputSnapshot.idempotency_key == idempotency_key,
+            ))
+            if existing_input:
+                existing_run = session.scalar(select(FlowRun).where(
+                    FlowRun.debug_input_snapshot_id == existing_input.id,
+                    FlowRun.parent_flow_run_id.is_(None), FlowRun.run_mode == "debug_full",
+                ))
+                if existing_run:
+                    return {"id": existing_run.id, "debug_input_snapshot_id": existing_input.id,
+                            "execution_snapshot_id": existing_run.execution_snapshot_id,
+                            "run_mode": existing_run.run_mode, "status": existing_run.status, "idempotent": True}
+            value = self._debug_preflight_with_session(
+                session, template_id=template_id, revision_id=revision_id,
+                expected_compiled_checksum=expected_compiled_checksum,
+                source_review_snapshot_ids=source_review_snapshot_ids,
+                sink_library_bindings=sink_library_bindings, require_serving_health=True,
+            )
+            revision = value["revision"]
+            snapshot_checksum = self._snapshot_checksum(revision.id, value["compiled"]["checksum"])
+            execution = session.scalar(select(FlowExecutionSnapshot).where(FlowExecutionSnapshot.checksum == snapshot_checksum))
+            if not execution:
+                execution = FlowExecutionSnapshot(
+                    id=new_id("flowsnap"), knowledge_flow_template_revision_id=revision.id,
+                    compiled_definition_json=value["compiled"]["compiled_definition"],
+                    dependency_json={"dependencies": value["compiled"]["dependencies"],
+                                     "source_checksum": value["compiled"]["checksum"]},
+                    checksum=snapshot_checksum, status="debug",
+                )
+                session.add(execution); session.flush()
+            debug_input = DebugRunInputSnapshot(
+                id=new_id("debuginput"), knowledge_flow_template_id=value["template"].id,
+                knowledge_flow_template_revision_id=revision.id, execution_snapshot_id=execution.id,
+                authoring_mode=value["authoring_mode"], source_definition_json=value["source_definition"],
+                source_definition_checksum=value["source_definition_checksum"],
+                output_types_json=list(value["template"].output_types), reusable_node_map_json=value["reusable_map"],
+                sink_library_bindings_json={key: library.id for key, library in value["libraries"].items()},
+                requested_by="admin", idempotency_key=idempotency_key,
+            )
+            session.add(debug_input); session.flush()
+            for ordinal, review in enumerate(value["reviews"]):
+                session.add(DebugRunReviewInput(
+                    id=new_id("debugreview"), debug_input_snapshot_id=debug_input.id,
+                    source_version_id=review["version"].id,
+                    source_review_snapshot_id=review["snapshot"].id,
+                    review_digest=review["snapshot"].content_digest, ordinal=ordinal,
+                ))
+            run = FlowRun(
+                id=new_id("flowrun"), knowledge_job_id=None, source_preparation_job_id=None,
+                debug_input_snapshot_id=debug_input.id, execution_snapshot_id=execution.id,
+                run_mode="debug_full", parameter_overrides={}, sink_policy="preview",
+                requested_by="admin", idempotency_key=idempotency_key, status="queued",
+            )
+            session.add(run); session.flush()
+            self._append_run_event(session, run.id, "run.queued", "完整调试 Run 已进入队列",
+                                   payload={"template_id": value["template"].id, "revision_id": revision.id,
+                                            "input_count": len(value["reviews"]), "sink_policy": "preview_only"})
+            self.audit(session, "debug_run.created", "flow_run", run.id,
+                       {"template_id": value["template"].id, "revision_id": revision.id})
+            return {"id": run.id, "debug_input_snapshot_id": debug_input.id,
+                    "execution_snapshot_id": execution.id, "run_mode": run.run_mode, "status": run.status}
+
+    def _debug_reusable_definition(self, debug_input: DebugRunInputSnapshot, overrides: dict[str, Any],
+                                   *, target_mode: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        if target_mode not in {"standard", "advanced"}:
+            raise ValueError("目标流程模式不合法")
+        source = json.loads(json.dumps(debug_input.source_definition_json or {}, ensure_ascii=False))
+        if target_mode == "advanced" and debug_input.authoring_mode == "standard":
+            definition = FLOW_AUTHORING_COMPILER.materialize(source, list(debug_input.output_types_json))
+        else:
+            definition = source
+        mappings = dict(debug_input.reusable_node_map_json or {})
+        blocked: list[dict[str, Any]] = []
+        for runtime_node_id, raw_params in dict(overrides or {}).items():
+            params = {key: value for key, value in dict(raw_params or {}).items() if key != "force_ocr"}
+            if not params:
+                continue
+            mapping = dict(mappings.get(runtime_node_id) or {})
+            if target_mode == "standard":
+                stage_code = mapping.get("standard_stage_code")
+                allowed = set(mapping.get("standard_allowed_keys") or [])
+                if not stage_code or set(params) - allowed:
+                    blocked.append({"node_id": runtime_node_id, "parameters": sorted(params),
+                                    "reason": "参数不能映射回标准配置阶段"})
+                    continue
+                stages = definition.setdefault("stages", {})
+                stage = stages.setdefault(stage_code, {})
+                stage["config"] = {**dict(stage.get("config") or {}), **params}
+                continue
+            source_node_id = mapping.get("advanced_source_node_id")
+            node = next((item for item in definition.get("nodes", []) if str(item.get("id")) == source_node_id), None)
+            if not node or node.get("kind") != "operator":
+                blocked.append({"node_id": runtime_node_id, "parameters": sorted(params),
+                                "reason": "展开子图内部节点不能写回父流程"})
+                continue
+            node["params"] = {**dict(node.get("params") or {}), **params}
+        runtime_only_force_ocr = [
+            {"node_id": node_id, "parameters": ["force_ocr"], "reason": "force_ocr 仅属于本次运行"}
+            for node_id, params in dict(overrides or {}).items() if "force_ocr" in dict(params or {})
+        ]
+        return definition, [*blocked, *runtime_only_force_ocr]
+
+    def debug_run_materialization(self, flow_run_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            debug_input = session.get(DebugRunInputSnapshot, run.debug_input_snapshot_id) if run and run.debug_input_snapshot_id else None
+            if not run or not debug_input:
+                raise ValueError("调试 Run 不存在")
+            template = session.get(KnowledgeFlowTemplate, debug_input.knowledge_flow_template_id)
+            revision = session.get(KnowledgeFlowTemplateRevision, debug_input.knowledge_flow_template_revision_id)
+            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc())) if template else None
+            _, blocked_advanced = self._debug_reusable_definition(
+                debug_input, dict(run.parameter_overrides or {}), target_mode="advanced",
+            )
+            _, blocked_current = self._debug_reusable_definition(
+                debug_input, dict(run.parameter_overrides or {}), target_mode=debug_input.authoring_mode,
+            )
+            completed = run.status == "completed"
+            can_apply = bool(
+                completed and template and revision and latest and latest.id == revision.id
+                and revision.status == "draft" and template.code not in V7_BUILTIN_TEMPLATE_CODES
+                and self._definition_checksum(revision.definition_json) == debug_input.source_definition_checksum
+                and not blocked_current
+            )
+            return {
+                "run_id": run.id, "status": run.status,
+                "source": {"template_id": template.id if template else None, "template_name": template.name if template else None,
+                           "revision_id": revision.id if revision else None, "revision": revision.revision_no if revision else None,
+                           "revision_status": revision.status if revision else None,
+                           "authoring_mode": debug_input.authoring_mode,
+                           "definition_checksum": debug_input.source_definition_checksum},
+                "effective_parameter_overrides": dict(run.parameter_overrides or {}),
+                "runtime_only_overrides": blocked_advanced,
+                "can_apply_to_current_draft": can_apply,
+                "apply_blockers": [] if can_apply else blocked_current or [
+                    "仅成功完成且来源仍是未变化的当前自定义草稿时可应用"
+                ],
+                "can_save_as_flow": completed and not blocked_advanced,
+                "save_blockers": blocked_advanced if blocked_advanced else ([] if completed else ["仅成功完成的调试 Run 可另存流程"]),
+                "saved_content": ["Operator DAG", "节点连线", "可复用参数", "Prompt/模型/质量配置引用", "输出契约"],
+                "excluded_content": ["审核输入", "KnowledgeLibrary 绑定", "Artifact", "日志与指标", "Sink Preview", "运行状态"],
+            }
+
+    def _apply_debug_run_to_draft_once(self, flow_run_id: str, *, expected_revision_id: str,
+                                       expected_definition_checksum: str, idempotency_key: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            existing = session.scalar(select(DebugRunFlowMaterialization).where(
+                DebugRunFlowMaterialization.idempotency_key == idempotency_key,
+            ))
+            if existing:
+                if existing.flow_run_id != flow_run_id or existing.action != "apply_to_draft":
+                    raise ValueError("流程物化幂等键已用于其他操作")
+                return {**dict(existing.result_json), "idempotent": True}
+            run = session.get(FlowRun, flow_run_id)
+            debug_input = session.get(DebugRunInputSnapshot, run.debug_input_snapshot_id) if run and run.debug_input_snapshot_id else None
+            if not run or not debug_input or run.status != "completed":
+                raise ValueError("只有成功完成的调试 Run 可以应用到草稿")
+            template = session.get(KnowledgeFlowTemplate, debug_input.knowledge_flow_template_id)
+            revision = session.get(KnowledgeFlowTemplateRevision, debug_input.knowledge_flow_template_revision_id)
+            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == debug_input.knowledge_flow_template_id,
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()).with_for_update())
+            if (not template or not revision or not latest or template.code in V7_BUILTIN_TEMPLATE_CODES
+                    or latest.id != revision.id or revision.id != expected_revision_id or revision.status != "draft"):
+                raise RuntimeError("来源已不是当前可编辑的自定义草稿")
+            current_checksum = self._definition_checksum(revision.definition_json)
+            if current_checksum != expected_definition_checksum or current_checksum != debug_input.source_definition_checksum:
+                raise RuntimeError("当前草稿已变化，请重新调试后再应用")
+            definition, blocked = self._debug_reusable_definition(
+                debug_input, dict(run.parameter_overrides or {}), target_mode=debug_input.authoring_mode,
+            )
+            if blocked:
+                raise RuntimeError("存在不能写回源草稿的运行参数：" + "；".join(item["reason"] for item in blocked))
+            compiled = self._compile_template_definition(
+                session, definition, list(debug_input.output_types_json), purpose="knowledge",
+                authoring_mode=debug_input.authoring_mode,
+            )
+            revision.definition_json = definition
+            template.definition_json = definition
+            self.audit(session, "debug_run.applied_to_draft", "knowledge_flow_template", template.id,
+                       {"revision_id": revision.id, "flow_run_id": run.id, "compiled_checksum": compiled["checksum"]})
+            result = {"id": template.id, "revision_id": revision.id, "revision": revision.revision_no,
+                      "status": "draft", "definition_checksum": self._definition_checksum(definition),
+                      "open_url": f"/developer/flow-templates?template_id={template.id}&edit=1"}
+            session.add(DebugRunFlowMaterialization(
+                id=new_id("debugmaterial"), flow_run_id=run.id, action="apply_to_draft",
+                idempotency_key=idempotency_key, target_template_id=template.id,
+                target_revision_id=revision.id, result_json=result,
+            ))
+            return result
+
+    def _save_debug_run_as_flow_once(self, flow_run_id: str, *, name: str, description: str = "",
+                                     idempotency_key: str) -> dict[str, Any]:
+        if not name.strip():
+            raise ValueError("流程名称不能为空")
+        with self.sessions.begin() as session:
+            existing = session.scalar(select(DebugRunFlowMaterialization).where(
+                DebugRunFlowMaterialization.idempotency_key == idempotency_key,
+            ))
+            if existing:
+                if existing.flow_run_id != flow_run_id or existing.action != "save_as_flow":
+                    raise ValueError("流程物化幂等键已用于其他操作")
+                return {**dict(existing.result_json), "idempotent": True}
+            run = session.get(FlowRun, flow_run_id)
+            debug_input = session.get(DebugRunInputSnapshot, run.debug_input_snapshot_id) if run and run.debug_input_snapshot_id else None
+            if not run or not debug_input or run.status != "completed":
+                raise ValueError("只有成功完成的调试 Run 可以另存流程")
+            source_template_id = debug_input.knowledge_flow_template_id
+            source_revision_id = debug_input.knowledge_flow_template_revision_id
+            output_types = list(debug_input.output_types_json)
+            definition, blocked = self._debug_reusable_definition(
+                debug_input, dict(run.parameter_overrides or {}), target_mode="advanced",
+            )
+            if blocked:
+                raise RuntimeError("存在不能保存为流程的运行参数：" + "；".join(item["reason"] for item in blocked))
+            compiled = self._compile_template_definition(
+                session, definition, output_types, purpose="knowledge", authoring_mode="advanced",
+            )
+            if session.scalar(select(KnowledgeFlowTemplate.id).where(
+                KnowledgeFlowTemplate.name == name.strip(), KnowledgeFlowTemplate.status != "archived",
+            )):
+                raise ValueError("模板名称已存在")
+            date_part = utc_now().strftime("%Y%m%d")
+            code = ""
+            for _ in range(32):
+                candidate = f"custom-{date_part}-{secrets.token_hex(3)}"
+                if not session.scalar(select(KnowledgeFlowTemplate.id).where(KnowledgeFlowTemplate.code == candidate)):
+                    code = candidate; break
+            if not code:
+                raise ValueError("自定义流程编码生成失败，请重试")
+            template = KnowledgeFlowTemplate(
+                id=new_id("flow"), code=code, name=name.strip(), description=description.strip(),
+                output_types=sorted(set(output_types)), definition_json=compiled["definition"],
+                authoring_mode="advanced", managed_template_code=None,
+                derived_from_template_id=source_template_id, derived_from_revision_id=source_revision_id,
+                status="draft", purpose="knowledge",
+            )
+            session.add(template); session.flush()
+            revision = KnowledgeFlowTemplateRevision(
+                id=new_id("flowrev"), knowledge_flow_template_id=template.id, revision_no=1,
+                definition_json=compiled["definition"], authoring_mode="advanced",
+                managed_template_code=None, status="draft", purpose="knowledge",
+            )
+            session.add(revision); session.flush()
+            result = {"id": template.id, "revision": 1, "revision_id": revision.id,
+                      "status": "draft", "name": template.name, "code": code,
+                      "open_url": f"/developer/flow-templates?template_id={template.id}&edit=1"}
+            session.add(DebugRunFlowMaterialization(
+                id=new_id("debugmaterial"), flow_run_id=run.id, action="save_as_flow",
+                idempotency_key=idempotency_key, target_template_id=template.id,
+                target_revision_id=revision.id, result_json=result,
+            ))
+            self.audit(session, "debug_run.saved_as_flow", "knowledge_flow_template", template.id,
+                       {"flow_run_id": flow_run_id, "source_template_id": source_template_id,
+                        "source_revision_id": source_revision_id})
+            return result
+
+    def _debug_materialization_retry_result(self, flow_run_id: str, action: str,
+                                            idempotency_key: str) -> dict[str, Any] | None:
+        with self.sessions() as session:
+            existing = session.scalar(select(DebugRunFlowMaterialization).where(
+                DebugRunFlowMaterialization.idempotency_key == idempotency_key,
+            ))
+            if not existing:
+                return None
+            if existing.flow_run_id != flow_run_id or existing.action != action:
+                raise ValueError("流程物化幂等键已用于其他操作")
+            return {**dict(existing.result_json), "idempotent": True}
+
+    def apply_debug_run_to_draft(self, flow_run_id: str, *, expected_revision_id: str,
+                                 expected_definition_checksum: str, idempotency_key: str) -> dict[str, Any]:
+        try:
+            return self._apply_debug_run_to_draft_once(
+                flow_run_id, expected_revision_id=expected_revision_id,
+                expected_definition_checksum=expected_definition_checksum,
+                idempotency_key=idempotency_key,
+            )
+        except IntegrityError:
+            result = self._debug_materialization_retry_result(flow_run_id, "apply_to_draft", idempotency_key)
+            if result is not None:
+                return result
+            raise
+
+    def save_debug_run_as_flow(self, flow_run_id: str, *, name: str, description: str = "",
+                               idempotency_key: str) -> dict[str, Any]:
+        try:
+            return self._save_debug_run_as_flow_once(
+                flow_run_id, name=name, description=description, idempotency_key=idempotency_key,
+            )
+        except IntegrityError:
+            result = self._debug_materialization_retry_result(flow_run_id, "save_as_flow", idempotency_key)
+            if result is not None:
+                return result
+            raise
+
     def list_managed_flow_templates(self) -> list[dict[str, Any]]:
         return MANAGED_FLOW_CATALOG.list_definitions()
 
@@ -4249,6 +4786,7 @@ class V7Store:
             return {"valid": True, "authoring_mode": authoring_mode,
                     "managed_template_code": managed_template_code,
                     "checksum": compiled["checksum"],
+                    "materialized_definition": compiled["definition"] if authoring_mode == "standard" else None,
                     "compiled_definition": compiled["compiled_definition"],
                     "stages": stages,
                     "node_count": len(compiled["compiled_definition"].get("nodes", [])),
@@ -4260,6 +4798,8 @@ class V7Store:
             template = session.get(KnowledgeFlowTemplate, template_id)
             if not template or template.status == "archived":
                 raise ValueError("模板不存在或已归档")
+            if template.code in V7_BUILTIN_TEMPLATE_CODES:
+                raise ValueError("内置流程不能原地转为高级编排，请导入为自定义高级草稿")
             latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                 KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
             ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
@@ -4537,13 +5077,11 @@ class V7Store:
                 raise ValueError("知识任务缺少执行快照")
             return snapshot.compiled_definition_json
 
-    def type_contracts_for_job(self, job_id: str) -> dict[str, dict[str, Any]]:
-        with self.sessions() as session:
-            job = session.get(KnowledgeJob, job_id)
-            if not job:
-                raise ValueError("知识任务不存在")
-            values: dict[str, dict[str, Any]] = {}
-            for output_type, library_id in (job.sink_library_ids or job.output_library_ids).items():
+    def _type_contracts_for_bindings(self, session: Session, bindings: dict[str, str],
+                                     definition: dict[str, Any], template_revision_id: str | None) -> dict[str, dict[str, Any]]:
+        values: dict[str, dict[str, Any]] = {}
+        for output_type, library_id in bindings.items():
+                output_type = normalise_output_key(output_type)
                 library = session.get(KnowledgeLibrary, library_id)
                 revision = session.get(KnowledgeTypeRevision, library.knowledge_type_revision_id) if library and library.knowledge_type_revision_id else None
                 if not revision:
@@ -4556,8 +5094,6 @@ class V7Store:
                         KnowledgeTypeModeRevision.status == "published",
                     ).order_by(KnowledgeTypeModeRevision.revision_no.desc()))
                 prompt_body = ""
-                template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
-                definition = session.get(KnowledgeFlowTemplateRevision, job.knowledge_flow_template_revision_id).definition_json if job.knowledge_flow_template_revision_id else (template.definition_json if template else {})
                 params = dict((definition or {}).get("parameters") or {})
                 prompt_revision_id = params.get("prompt_template_revision_id")
                 if not prompt_revision_id:
@@ -4586,9 +5122,22 @@ class V7Store:
                     "knowledge_type": library.knowledge_type, "graph_mode": library.graph_mode,
                     "prompt": prompt_body, "library_id": library.id,
                     "graph_config": graph_config, "graph_schema_hash": graph_schema_hash,
-                    "template_revision_id": job.knowledge_flow_template_revision_id,
+                    "template_revision_id": template_revision_id,
                 }
-            return values
+        return values
+
+    def type_contracts_for_job(self, job_id: str) -> dict[str, dict[str, Any]]:
+        with self.sessions() as session:
+            job = session.get(KnowledgeJob, job_id)
+            if not job:
+                raise ValueError("知识任务不存在")
+            template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
+            definition = session.get(KnowledgeFlowTemplateRevision, job.knowledge_flow_template_revision_id).definition_json \
+                if job.knowledge_flow_template_revision_id else (template.definition_json if template else {})
+            return self._type_contracts_for_bindings(
+                session, dict(job.sink_library_ids or job.output_library_ids),
+                dict(definition or {}), job.knowledge_flow_template_revision_id,
+            )
 
     def list_knowledge_jobs(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -5219,8 +5768,17 @@ class V7Store:
             run = session.get(FlowRun, flow_run_id)
             if not run:
                 raise ValueError("Flow Run 不存在")
+            artifact_summary_columns = (
+                Artifact.id, Artifact.flow_node_run_id, Artifact.type_code, Artifact.summary_json,
+                Artifact.record_count, Artifact.replayable, Artifact.uri,
+            )
             nodes = session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == run.id).order_by(FlowNodeRun.created_at)).all()
-            artifacts = session.scalars(select(Artifact).where(Artifact.flow_run_id == run.id).order_by(Artifact.created_at)).all()
+            artifacts = session.scalars(
+                select(Artifact)
+                .options(load_only(*artifact_summary_columns))
+                .where(Artifact.flow_run_id == run.id)
+                .order_by(Artifact.created_at, Artifact.id)
+            ).all()
             previews = session.scalars(select(FlowRunSinkPreview).where(FlowRunSinkPreview.flow_run_id == run.id).order_by(FlowRunSinkPreview.created_at)).all()
             snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id)
             definition = snapshot.compiled_definition_json if snapshot else {"nodes": [], "edges": []}
@@ -5248,7 +5806,11 @@ class V7Store:
                 parent_latest = {node.node_id: node for node in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == run.parent_flow_run_id)).all()}
                 reused_artifact_ids = [artifact_id for node_id in reused_ids for artifact_id in (parent_latest.get(node_id).output_artifact_ids if parent_latest.get(node_id) else [])]
                 if reused_artifact_ids:
-                    artifact_by_id.update({item.id: item for item in session.scalars(select(Artifact).where(Artifact.id.in_(reused_artifact_ids))).all()})
+                    artifact_by_id.update({item.id: item for item in session.scalars(
+                        select(Artifact)
+                        .options(load_only(*artifact_summary_columns))
+                        .where(Artifact.id.in_(reused_artifact_ids))
+                    ).all()})
             runtime_nodes = []
             for definition_node in definition.get("nodes", []):
                 node = latest.get(str(definition_node["id"]))
@@ -5270,9 +5832,18 @@ class V7Store:
                         "artifact_type": ", ".join(sorted({item.type_code for item in edge_artifacts})),
                         "record_count": sum(item.record_count or 0 for item in edge_artifacts)}
                 runtime_edges.append(edge)
-            return {"id": run.id, "knowledge_job_id": run.knowledge_job_id, "execution_snapshot_id": run.execution_snapshot_id,
+            debug_input = session.get(DebugRunInputSnapshot, run.debug_input_snapshot_id) if run.debug_input_snapshot_id else None
+            template = session.get(KnowledgeFlowTemplate, debug_input.knowledge_flow_template_id) if debug_input else None
+            return {"id": run.id, "knowledge_job_id": run.knowledge_job_id,
+                    "source_preparation_job_id": run.source_preparation_job_id,
+                    "debug_input_snapshot_id": run.debug_input_snapshot_id,
+                    "execution_snapshot_id": run.execution_snapshot_id,
                     "parent_flow_run_id": run.parent_flow_run_id, "run_mode": run.run_mode, "start_node_id": run.start_node_id,
                     "parameter_overrides": run.parameter_overrides, "sink_policy": run.sink_policy,
+                     "template_id": template.id if template else None,
+                     "template_name": template.name if template else None,
+                     "template_revision_id": debug_input.knowledge_flow_template_revision_id if debug_input else None,
+                     "authoring_mode": debug_input.authoring_mode if debug_input else None,
                      "status": run.status, "error": run.error, "runtime_dag": {"nodes": runtime_nodes, "edges": runtime_edges}, "nodes": [
                         {"id": node.id, "node_id": node.node_id, "status": node.status, "input_artifact_ids": node.input_artifact_ids,
                          "output_artifact_ids": node.output_artifact_ids, "operator_code": node.operator_code, "operator_version": node.operator_version,
@@ -5376,15 +5947,20 @@ class V7Store:
             definition = snapshot.compiled_definition_json or {}; by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
             node = by_id.get(node_id)
             if not node or node.get("kind") != "operator": raise ValueError("只能对展开后的真实算子节点创建派生 Run")
-            overrides = dict(parameter_overrides or {})
-            unknown = set(overrides) - {node_id}
+            override_delta = dict(parameter_overrides or {})
+            unknown = set(override_delta) - {node_id}
             if unknown: raise ValueError("参数覆盖只能包含所选节点")
-            resolved = {**dict(node.get("params") or {}), **dict(overrides.get(node_id) or {})}
+            effective_overrides = json.loads(json.dumps(parent.parameter_overrides or {}, ensure_ascii=False)) \
+                if parent.debug_input_snapshot_id else {}
+            effective_overrides[node_id] = {
+                **dict(effective_overrides.get(node_id) or {}), **dict(override_delta.get(node_id) or {}),
+            }
+            resolved = {**dict(node.get("params") or {}), **dict(effective_overrides.get(node_id) or {})}
             definition_row = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == node.get("ref")))
             version_row = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition_row.id,
                                                                         OperatorVersion.version_no == int(node.get("version") or definition_row.latest_version or 1))) if definition_row else None
             if not definition_row or not definition_row.enabled or not version_row or version_row.status != "published": raise ValueError("算子版本已不可执行")
-            validated_parameters = {key: value for key, value in dict(overrides.get(node_id) or {}).items() if key != "force_ocr"}
+            validated_parameters = {key: value for key, value in dict(effective_overrides.get(node_id) or {}).items() if key != "force_ocr"}
             validation_error = self._validate_parameter_override(version_row.parameter_schema or {"type": "object"}, validated_parameters)
             if validation_error: raise ValueError(f"参数覆盖不符合 Operator Version Schema：{validation_error}")
             if resolved.get("force_ocr") and node.get("ref") != "document-parser": raise ValueError("force_ocr 仅适用于 Document Parser")
@@ -5416,8 +5992,12 @@ class V7Store:
                 artifacts = [session.get(Artifact, value) for value in (record.output_artifact_ids if record else [])]
                 if not artifacts or any(not self._artifact_can_replay(item) for item in artifacts):
                     raise ValueError(f"节点 {predecessor} 缺少完整可重放 Artifact")
-            run = FlowRun(id=new_id("flowrun"), knowledge_job_id=parent.knowledge_job_id, execution_snapshot_id=parent.execution_snapshot_id,
-                          parent_flow_run_id=parent.id, run_mode=mode, start_node_id=node_id, parameter_overrides=overrides,
+            run = FlowRun(id=new_id("flowrun"), knowledge_job_id=parent.knowledge_job_id,
+                          source_preparation_job_id=parent.source_preparation_job_id,
+                          debug_input_snapshot_id=parent.debug_input_snapshot_id,
+                          execution_snapshot_id=parent.execution_snapshot_id,
+                          parent_flow_run_id=parent.id, run_mode=mode, start_node_id=node_id,
+                          parameter_overrides=effective_overrides if parent.debug_input_snapshot_id else override_delta,
                           sink_policy="preview", requested_by="admin", idempotency_key=idempotency_key, status="queued")
             session.add(run); session.flush(); self._append_run_event(session, run.id, "run.queued", "派生 Run 已进入队列", payload={"parent": parent.id, "mode": mode, "node": node_id})
             self.audit(session, "flow_run.derived_created", "flow_run", run.id, {"parent": parent.id, "mode": mode, "node": node_id})
@@ -5425,10 +6005,25 @@ class V7Store:
 
     def claim_derived_run(self, owner: str) -> FlowRun | None:
         with self.sessions.begin() as session:
-            run = session.scalar(select(FlowRun).where(FlowRun.status == "queued", FlowRun.parent_flow_run_id.is_not(None))
+            run = session.scalar(select(FlowRun).where(
+                FlowRun.status == "queued", FlowRun.parent_flow_run_id.is_not(None),
+                FlowRun.debug_input_snapshot_id.is_(None),
+            )
                                  .order_by(FlowRun.created_at).with_for_update(skip_locked=True).limit(1))
             if not run: return None
             run.status = "running"; self._append_run_event(session, run.id, "run.started", f"派生 Run 由 {owner} 开始执行")
+            return run
+
+    def claim_debug_run(self, owner: str) -> FlowRun | None:
+        with self.sessions.begin() as session:
+            run = session.scalar(select(FlowRun).where(
+                FlowRun.status == "queued", FlowRun.debug_input_snapshot_id.is_not(None),
+                FlowRun.run_mode.in_(("debug_full", "node_only", "from_node")),
+            ).order_by(FlowRun.created_at).with_for_update(skip_locked=True).limit(1))
+            if not run:
+                return None
+            run.status = "running"
+            self._append_run_event(session, run.id, "run.started", f"调试 Run 由 {owner} 开始执行")
             return run
 
     def persist_derived_parameters(self, flow_run_id: str, node_id: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -5476,6 +6071,91 @@ class V7Store:
                     "job_id": job.id, "sink_libraries": dict(job.sink_library_ids or job.output_library_ids),
                     "versions": versions_list, "sources": sources, "parent_outputs": parent_outputs}
 
+    def _reviewed_chunks_for_debug_session(self, session: Session, debug_input_id: str) -> list[dict[str, Any]]:
+        inputs = list(session.scalars(select(DebugRunReviewInput).where(
+            DebugRunReviewInput.debug_input_snapshot_id == debug_input_id,
+        ).order_by(DebugRunReviewInput.ordinal)))
+        if not inputs:
+            raise ValueError("调试输入缺少人工审核快照")
+        values: list[dict[str, Any]] = []
+        for item in inputs:
+            version = session.get(SourceVersion, item.source_version_id)
+            snapshot = session.get(SourceReviewSnapshot, item.source_review_snapshot_id)
+            source = session.get(Source, version.source_id) if version else None
+            if (not version or not snapshot or not source or snapshot.status != "approved"
+                    or snapshot.content_digest != item.review_digest):
+                raise ValueError("调试输入引用的人工审核快照已失效")
+            rows = session.execute(select(
+                SourceReviewSnapshotChunk, SourceChunk, SourceChunkRevision,
+            ).join(SourceChunk, SourceChunk.id == SourceReviewSnapshotChunk.source_chunk_id).join(
+                SourceChunkRevision, SourceChunkRevision.id == SourceReviewSnapshotChunk.source_chunk_revision_id,
+            ).where(
+                SourceReviewSnapshotChunk.source_review_snapshot_id == snapshot.id,
+            ).order_by(SourceReviewSnapshotChunk.ordinal)).all()
+            if not rows:
+                raise ValueError("调试审核快照不包含文档块")
+            for mapping, chunk, revision in rows:
+                if revision.content_hash != mapping.content_hash:
+                    raise ValueError("调试审核快照内容摘要不一致")
+                anchor = dict(revision.anchor_json or {})
+                values.append({
+                    "source_id": source.id, "source_version_id": version.id,
+                    "filename": source.original_filename, "source_chunk_id": chunk.source_chunk_id,
+                    "source_chunk_revision_id": revision.id, "source_review_snapshot_id": snapshot.id,
+                    "chunk_index": mapping.ordinal, "content": revision.content, "anchor": anchor,
+                    **({"faq": dict(anchor.get("faq") or {})} if anchor.get("faq") else {}),
+                })
+        return values
+
+    def debug_run_context(self, flow_run_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            run = session.get(FlowRun, flow_run_id)
+            if not run or not run.debug_input_snapshot_id or run.run_mode not in {"debug_full", "node_only", "from_node"}:
+                raise ValueError("调试 Flow Run 不存在")
+            debug_input = session.get(DebugRunInputSnapshot, run.debug_input_snapshot_id)
+            snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id)
+            if not debug_input or not snapshot:
+                raise ValueError("调试 Run 缺少不可变输入或执行快照")
+            review_inputs = list(session.scalars(select(DebugRunReviewInput).where(
+                DebugRunReviewInput.debug_input_snapshot_id == debug_input.id,
+            ).order_by(DebugRunReviewInput.ordinal)))
+            versions_list = list(session.scalars(select(SourceVersion).where(
+                SourceVersion.id.in_([item.source_version_id for item in review_inputs]),
+            )))
+            sources = {item.id: item for item in session.scalars(select(Source).where(
+                Source.id.in_([version.source_id for version in versions_list]),
+            ))}
+            root_documents = self._reviewed_chunks_for_debug_session(session, debug_input.id)
+            parent_outputs: dict[str, dict[str, Any]] = {}
+            ancestor = session.get(FlowRun, run.parent_flow_run_id) if run.parent_flow_run_id else None
+            visited: set[str] = set()
+            while ancestor and ancestor.id not in visited:
+                visited.add(ancestor.id)
+                for node_run in session.scalars(select(FlowNodeRun).where(
+                    FlowNodeRun.flow_run_id == ancestor.id,
+                ).order_by(FlowNodeRun.created_at.desc())):
+                    if node_run.node_id in parent_outputs:
+                        continue
+                    artifacts = [session.get(Artifact, artifact_id) for artifact_id in node_run.output_artifact_ids]
+                    if artifacts and all(self._artifact_can_replay(item) for item in artifacts):
+                        parent_outputs[node_run.node_id] = {
+                            "ids": [item.id for item in artifacts if item],
+                            "values": [dict(item.data_json) for item in artifacts if item],
+                        }
+                ancestor = session.get(FlowRun, ancestor.parent_flow_run_id) if ancestor.parent_flow_run_id else None
+            type_contracts = self._type_contracts_for_bindings(
+                session, dict(debug_input.sink_library_bindings_json),
+                dict(snapshot.compiled_definition_json), debug_input.knowledge_flow_template_revision_id,
+            )
+            return {
+                "id": run.id, "mode": run.run_mode, "start_node_id": run.start_node_id,
+                "parameter_overrides": dict(run.parameter_overrides or {}),
+                "definition": snapshot.compiled_definition_json,
+                "sink_libraries": dict(debug_input.sink_library_bindings_json),
+                "versions": versions_list, "sources": sources, "root_documents": root_documents,
+                "parent_outputs": parent_outputs, "type_contracts": type_contracts,
+            }
+
     def is_flow_run_cancelled(self, flow_run_id: str) -> bool:
         with self.sessions() as session:
             run = session.get(FlowRun, flow_run_id)
@@ -5497,20 +6177,81 @@ class V7Store:
                                .where(KnowledgeItem.knowledge_library_id == library_id).order_by(KnowledgeItem.source_knowledge_id)).all()
         return hashlib.sha256(json.dumps([list(row) for row in rows], ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
+    def _preview_sink_diff(self, session: Session, library_id: str, candidates: list[dict[str, Any]],
+                           successful_chunks: list[dict[str, Any]]) -> dict[str, int]:
+        library = session.get(KnowledgeLibrary, library_id)
+        if not library:
+            raise ValueError("预览目标知识库不存在")
+        revision = session.get(KnowledgeTypeRevision, library.knowledge_type_revision_id) if library.knowledge_type_revision_id else None
+        source_policy = revision.source_policy if revision else "single"
+        current = {item.source_knowledge_id: item for item in session.scalars(select(KnowledgeItem).where(
+            KnowledgeItem.knowledge_library_id == library_id,
+        ))}
+        candidate_by_key: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            key = str(candidate.get("source_knowledge_id") or "")
+            if key:
+                candidate_by_key[key] = candidate
+        counts = {"ADD": 0, "UPDATE": 0, "INACTIVE": 0, "UNCHANGED": 0}
+        for key, candidate in candidate_by_key.items():
+            item = current.get(key)
+            digest = content_hash(str(candidate.get("canonical_content") or ""), dict(candidate.get("data_json") or {}))
+            if not item:
+                counts["ADD"] += 1
+            elif item.status != "active" or item.content_hash != digest:
+                counts["UPDATE"] += 1
+            else:
+                counts["UNCHANGED"] += 1
+        version_ids = {str(item.get("source_version_id") or "") for item in successful_chunks}
+        versions = {item.id: item for item in session.scalars(select(SourceVersion).where(
+            SourceVersion.id.in_(version_ids),
+        ))} if version_ids else {}
+        processed_sources = {
+            (versions[version_id].source_id, int(item.get("chunk_index", -1))): version_id
+            for item in successful_chunks
+            if (version_id := str(item.get("source_version_id") or "")) in versions
+        }
+        if processed_sources:
+            links = session.execute(select(KnowledgeItemSource, KnowledgeItem, SourceVersion).join(
+                KnowledgeItem, KnowledgeItem.id == KnowledgeItemSource.knowledge_item_id,
+            ).join(SourceVersion, SourceVersion.id == KnowledgeItemSource.source_version_id).where(
+                KnowledgeItem.knowledge_library_id == library_id,
+            )).all()
+            by_item: dict[str, list[tuple[KnowledgeItemSource, SourceVersion]]] = {}
+            items: dict[str, KnowledgeItem] = {}
+            for link, item, version in links:
+                by_item.setdefault(item.id, []).append((link, version)); items[item.id] = item
+            inactive: set[str] = set()
+            for item_id, item_links in by_item.items():
+                item = items[item_id]
+                if item.status != "active" or item.source_knowledge_id in candidate_by_key:
+                    continue
+                stale = [
+                    (link, version) for link, version in item_links
+                    if (replacement := processed_sources.get((version.source_id, int((link.anchor_json or {}).get("chunk_index", -1)))))
+                    and replacement != link.source_version_id
+                ]
+                if not stale:
+                    continue
+                remaining = len(item_links) - len(stale)
+                if source_policy == "single" or remaining == 0:
+                    inactive.add(item_id)
+            counts["INACTIVE"] = len(inactive)
+        return counts
+
     def stage_sink_preview(self, flow_run_id: str, output_key: str, library_id: str, candidates: list[dict[str, Any]],
                            successful_chunks: list[dict[str, Any]], quality: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
             base_hash = self._library_state_hash(session, library_id)
-            current_ids = set(session.scalars(select(KnowledgeItem.source_knowledge_id).where(KnowledgeItem.knowledge_library_id == library_id,
-                                                                                               KnowledgeItem.status == "active")))
-            candidate_ids = {str(item.get("source_knowledge_id")) for item in candidates}
-            diff = {"ADD": len(candidate_ids - current_ids), "UPDATE": len(candidate_ids & current_ids), "INACTIVE": 0, "UNCHANGED": 0}
+            diff = self._preview_sink_diff(session, library_id, candidates, successful_chunks)
             checksum = hashlib.sha256(json.dumps({"base": base_hash, "candidates": candidates, "chunks": successful_chunks}, ensure_ascii=False,
                                                  sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            run = session.get(FlowRun, flow_run_id)
             preview = FlowRunSinkPreview(id=new_id("preview"), flow_run_id=flow_run_id, output_key=output_key, knowledge_library_id=library_id,
                                          candidates_json=candidates, successful_chunks_json=successful_chunks, diff_json=diff,
                                          quality_json=quality or {"candidate_count": len(candidates), "status": "pass"},
-                                         base_state_hash=base_hash, preview_checksum=checksum)
+                                         base_state_hash=base_hash, preview_checksum=checksum,
+                                         status="preview_only" if run and run.debug_input_snapshot_id else "pending")
             session.add(preview); self._append_run_event(session, flow_run_id, "sink.preview_ready", f"{output_key} Diff 已暂存", payload={"diff": diff, "checksum": checksum})
             return {"output_key": output_key, "diff": diff, "preview_checksum": checksum}
 
@@ -5569,9 +6310,10 @@ class V7Store:
         """Delete V7 table rows only; schema and external resources are retained."""
         # Order is intentional for MySQL foreign keys.  Never issue DDL here.
         tables = (
-            FlowRunSinkPreview, FlowRunEvent, FlowNodeArtifactBinding, ArtifactLineage, Artifact, FlowNodeRun,
+            DebugRunFlowMaterialization, FlowRunSinkPreview, FlowRunEvent, FlowNodeArtifactBinding, ArtifactLineage, Artifact, FlowNodeRun,
             KnowledgeItemSource, KnowledgeJobReviewInput, KnowledgeDispatch, SourceReviewSnapshotChunk,
-            SourceChunkRevision, SourceReviewSnapshot, SourceChunk, SourceChunkSet, DocumentIR, FlowRun, SourcePreparationJob,
+            SourceChunkRevision, FlowRun, DebugRunReviewInput, DebugRunInputSnapshot,
+            SourceReviewSnapshot, SourceChunk, SourceChunkSet, DocumentIR, SourcePreparationJob,
             FlowExecutionSnapshot, KnowledgeChunkGeneration,
             VectorDeletionJob, VectorRecordState, VectorSyncJob, KnowledgeChange, KnowledgeItem,
             ProjectOrgRouteLibrary, ProjectOrgRoute, ProjectRouteVersion, ProjectTask, Project,

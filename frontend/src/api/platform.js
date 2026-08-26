@@ -1,6 +1,23 @@
+export class ApiRequestError extends Error {
+  constructor({ method, url, status, requestId, detail }) {
+    const message = `${method} ${url} · HTTP ${status}${requestId ? ` · request_id ${requestId}` : ''} · ${detail || '请求失败'}`
+    super(message)
+    this.name = 'ApiRequestError'; this.method = method; this.url = url; this.status = status
+    this.requestId = requestId; this.detail = detail || '请求失败'
+  }
+}
+
 async function request(path, options = {}) {
-  const response = await fetch(path, { credentials: 'same-origin', ...options })
-  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || '请求失败')
+  const method = String(options.method || 'GET').toUpperCase()
+  const requestId = globalThis.crypto?.randomUUID?.() || `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const headers = { 'X-Request-ID': requestId, ...(options.headers || {}) }
+  const response = await fetch(path, { credentials: 'same-origin', ...options, headers })
+  if (!response.ok) {
+    const raw = await response.text().catch(() => '')
+    let detail = raw
+    try { const parsed = JSON.parse(raw); detail = typeof parsed.detail === 'string' ? parsed.detail : JSON.stringify(parsed.detail || parsed) } catch (_) {}
+    throw new ApiRequestError({ method, url: path, status: response.status, requestId: response.headers.get('X-Request-ID') || requestId, detail })
+  }
   return response.status === 204 ? null : response.json()
 }
 
@@ -124,6 +141,12 @@ export const api = {
   flowRuns: () => request('/api/developer/flow-runs'),
   flowRun: id => request(`/api/developer/flow-runs/${id}`),
   flowRunCapabilities: () => request('/api/developer/flow-runs/capabilities'),
+  debugRunOptions: (templateId, revisionKind = 'draft') => request(`/api/developer/debug-runs/options?template_id=${encodeURIComponent(templateId)}&revision_kind=${encodeURIComponent(revisionKind)}`),
+  debugRunPreflight: body => request('/api/developer/debug-runs/preflight', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  createDebugRun: body => request('/api/developer/debug-runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  debugRunMaterialization: id => request(`/api/developer/debug-runs/${id}/flow-materialization`),
+  applyDebugRunToDraft: (id, body) => request(`/api/developer/debug-runs/${id}/apply-to-draft`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  saveDebugRunAsFlow: (id, body) => request(`/api/developer/debug-runs/${id}/save-as-flow`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   flowRunEvents: (id, cursor = 0, limit = 100) => request(`/api/developer/flow-runs/${id}/events?after=${cursor}&limit=${limit}`),
   createDerivedRun: (id, body) => request(`/api/developer/flow-runs/${id}/derived-runs`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   cancelFlowRun: id => request(`/api/developer/flow-runs/${id}/cancel`, { method: 'POST' }),

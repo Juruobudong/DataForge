@@ -100,6 +100,26 @@ function onStageDefinition(value) { stageDefinition.value = value; dirty.value =
 async function onModeChange(mode) {
   if (mode === authoringMode.value) return
   if (mode === 'advanced' && authoringMode.value === 'standard') {
+    if (selected.value?.is_builtin) {
+      if (!window.confirm('进入高级编排将基于当前标准配置创建新的自定义草稿，内置流程及其已发布 Revision 不会被修改。确定继续吗？')) return
+      try {
+        const managedCode = selected.value.managed_template_code || stageDefinition.value?.template_code || selected.value.code
+        const preview = await api.previewFlowCompilation({
+          authoring_mode: 'standard',
+          managed_template_code: managedCode,
+          output_types: outputTypes.value,
+          definition: stageDefinition.value || { schema_version: 1, template_code: managedCode, stages: {} },
+        })
+        selected.value = null; code.value = ''; name.value = ''
+        authoringMode.value = 'advanced'; stageDefinition.value = null
+        result.value = null; sampleResult.value = null; error.value = ''
+        settingsOpen.value = true
+        await nextTick()
+        advancedEditor.value?.loadDefinition(preview.materialized_definition)
+        dirty.value = true
+      } catch (e) { error.value = e.message }
+      return
+    }
     if (selected.value && !window.confirm('进入高级编排将展开当前标准配置的完整执行 DAG，转换后可增删算子。已发布 Revision 不会被修改。确定继续吗？')) return
     if (selected.value) {
       try {
@@ -167,7 +187,15 @@ async function action(kind) {
     selected.value = templates.value.find(item => item.id === selectedId) || null
   } catch (e) { error.value = e.message }
 }
-onMounted(() => { const tabFromQuery = route.query.tab; if (tabs.some(t => t.key === tabFromQuery)) activeTab.value = tabFromQuery; load() })
+onMounted(async () => {
+  const tabFromQuery = route.query.tab
+  if (tabs.some(t => t.key === tabFromQuery)) activeTab.value = tabFromQuery
+  await load()
+  if (route.query.template_id && route.query.edit === '1') {
+    const target = templates.value.find(item => item.id === route.query.template_id)
+    if (target) { activeTab.value = 'templates'; await edit(target) }
+  }
+})
 </script>
 
 <template>

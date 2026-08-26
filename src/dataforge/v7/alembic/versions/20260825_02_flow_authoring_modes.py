@@ -20,7 +20,10 @@ def _columns(table: str) -> set[str]:
 
 
 def upgrade() -> None:
+    tables = set(sa.inspect(op.get_bind()).get_table_names())
     for table in ("knowledge_flow_templates", "knowledge_flow_template_revisions"):
+        if table not in tables:
+            continue
         columns = _columns(table)
         if "authoring_mode" not in columns:
             op.add_column(table, sa.Column("authoring_mode", sa.String(32), nullable=False, server_default="advanced"))
@@ -29,7 +32,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    tables = set(sa.inspect(op.get_bind()).get_table_names())
     for table in ("knowledge_flow_template_revisions", "knowledge_flow_templates"):
+        if table not in tables:
+            continue
         columns = _columns(table)
         if "managed_template_code" in columns:
             op.drop_column(table, "managed_template_code")

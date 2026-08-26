@@ -39,14 +39,14 @@ KnowledgeLibrary 保存业务查询使用的单一当前知识集合，不要求
 - Q&A、图谱及扩展类型按“类型 × 来源版本 × SourceChunk”记录生成状态。失败分块保留上一版正式知识，成功空结果只撤销自己的旧知识范围。
 - 任务形成正式知识后不允许为清理任务历史而删除；任务、Run、变更与来源链继续承担审计。
 
-## 调试与提交
+## 调试与流程演化
 
-DataFlow 调试台读取既有 Flow Run 的 Runtime DAG、事件和 Artifact。派生 Run 必须复用父 Run 的同一快照：
+运行调试从 Draft 或 Published Revision 冻结源 authoring definition 与 Debug Execution Snapshot，再以同一文档库中多个当前 SourceReviewSnapshot 创建 `FlowRun(debug_full)`。Debug Runner 使用版本固定 Operator 执行真实 DAG，持久化 NodeRun、Artifact、事件和准确 Sink Diff，但永远不修改 KnowledgeLibrary，也不创建 KnowledgeJob、KnowledgeChange 或 Vector Sync。
 
-- `node_only` 只执行目标节点；`from_node` 执行目标节点及其可达下游。
-- 临时参数只影响本次派生 Run，不修改已发布模板或父 Run。
-- 派生结果到达 Sink 后先进入 `awaiting_commit` 并生成 Diff；管理员确认时重新校验当前态哈希与预览 checksum。
-- 派生执行与 Sink 提交由两个独立开关控制，默认关闭。
+- `node_only` 只执行目标节点；`from_node` 执行目标及可达下游，并复用同一 Debug 系列父 Artifact。
+- 临时参数按祖先到子 Run 合并；只有 schema-valid 且可映射回源节点的配置能进入流程定义。
+- “应用到当前草稿”要求来源仍是未变化的当前自定义 Draft；“保存为自定义流程”从冻结源定义创建新的 Advanced Draft，Standard 先 materialize。
+- Runtime 输入、KnowledgeLibrary 绑定、Artifact、日志、指标和 Preview 都不进入流程定义；旧业务 Run 派生/提交开关仅保留兼容。
 
 ## 向量化、发布与删除
 
@@ -59,4 +59,4 @@ DataFlow 调试台读取既有 Flow Run 的 Runtime DAG、事件和 Artifact。�
 
 - 实现：`src/dataforge/v7/runner.py`、`store.py`、`worker.py`、`vector.py`、`routing.py`。
 - 详细事实：[`wiki/pages/core-workflows.md`](../../wiki/pages/core-workflows.md)、[`wiki/pages/domain-model.md`](../../wiki/pages/domain-model.md)。
-- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)、[ADR-006 ChunkSet 提升](../adr/ADR-006-source-chunk-set-promotion.md)、[ADR-007 SourceAnchor 血缘](../adr/ADR-007-source-anchor-provenance.md)。
+- 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)、[ADR-006 ChunkSet 提升](../adr/ADR-006-source-chunk-set-promotion.md)、[ADR-007 SourceAnchor 血缘](../adr/ADR-007-source-anchor-provenance.md)、[ADR-008 Debug Sandbox](../adr/ADR-008-debug-execution-sandbox.md)。

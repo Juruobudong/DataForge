@@ -1668,6 +1668,119 @@ def _candidate_chunks(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(result.values())
 
 
+def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, Any]:
+    """Execute a full or derived Debug Run without mutating formal knowledge."""
+    context = store.debug_run_context(flow_run_id)
+    definition = context["definition"]
+    incoming = _incoming(definition)
+    selected = ({str(node["id"]) for node in definition.get("nodes", [])}
+                if context["mode"] == "debug_full"
+                else _reachable_nodes(definition, context["start_node_id"], context["mode"]))
+    versions = {item.id: item for item in context["versions"]}
+    sources = context["sources"]
+    root_documents = context["root_documents"]
+    type_contracts = context["type_contracts"]
+    graph_config = _graph_config_from_contracts(type_contracts)
+    catalog = catalog_by_code()
+    registry = build_builtin_registry(_builtin_dispatch, catalog)
+    outputs: dict[str, list[dict[str, Any]]] = {}
+    artifact_ids: dict[str, list[str]] = {}
+    failed: dict[str, str] = {}
+    generation: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    previews: list[dict[str, Any]] = []
+    runtime = {
+        "root_documents": root_documents, "sources": sources, "versions": versions,
+        "type_contracts": type_contracts, "job_id": None, "store": None,
+        "retry_scope": None, "generation": generation, "graph_config": graph_config,
+        "sink_libraries": context["sink_libraries"],
+    }
+    try:
+        for node in definition.get("nodes", []):
+            node_id = str(node["id"])
+            if node_id not in selected:
+                continue
+            if store.is_flow_run_cancelled(flow_run_id):
+                store.finish_flow_run(flow_run_id, "已协作停止", status="cancelled")
+                return {"id": flow_run_id, "status": "cancelled"}
+            source_nodes = incoming.get(node_id, [])
+            input_values: list[dict[str, Any]] = []
+            input_ids: list[str] = []
+            for source_id in source_nodes:
+                if source_id in selected:
+                    source = {"values": outputs.get(source_id, []), "ids": artifact_ids.get(source_id, [])}
+                else:
+                    source = context["parent_outputs"].get(source_id, {"values": [], "ids": []})
+                input_values.extend(source["values"]); input_ids.extend(source["ids"])
+            failed_upstream = [source_id for source_id in source_nodes if source_id in selected and source_id in failed]
+            if failed_upstream:
+                message = "上游节点失败，已跳过：" + "、".join(failed_upstream)
+                failed[node_id] = message; outputs[node_id] = []
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids, [], error=message, status="skipped",
+                )
+                continue
+            if node.get("kind") == "knowledge_sink":
+                output_key = str(node.get("output_key") or (
+                    f"graph:{node.get('graph_mode')}" if node.get("knowledge_type") == "graph" and node.get("graph_mode")
+                    else node.get("knowledge_type")
+                ))
+                library_id = context["sink_libraries"].get(output_key)
+                if not library_id:
+                    message = "Sink 缺少预览目标知识库"; failed[node_id] = message
+                    artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=message)
+                    continue
+                successful = generation.get(output_key, {}).get("successful") or _candidate_chunks(input_values)
+                preview = store.stage_sink_preview(
+                    flow_run_id, output_key, library_id, input_values, successful,
+                    quality={"candidate_count": len(input_values), "status": "preview_only"},
+                )
+                previews.append(preview)
+                outputs[node_id] = [{"_artifact_type": f"knowledge_preview:{output_key}", **preview}]
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids, outputs[node_id], status="preview_ready",
+                )
+                continue
+            ref = str(node.get("ref"))
+            params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}
+            params.pop("force_ocr", None)
+            operator_version = int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1))
+            try:
+                result = registry.resolve(ref, operator_version).execute(
+                    inputs=input_values, params=params,
+                    context=OperatorExecutionContext(flow_run_id=flow_run_id, node_id=node_id, runtime=runtime),
+                )
+                outputs[node_id] = result.outputs
+                item = catalog.get(ref) or {}
+                recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in result.outputs]
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids, recorded, operator_code=ref,
+                    operator_version=operator_version, resolved_parameters=params,
+                    metrics={"input_records": len(input_values), "output_records": len(result.outputs)},
+                )
+            except Exception as exc:
+                message = str(exc); failed[node_id] = message; outputs[node_id] = []
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids, [], error=message, operator_code=ref,
+                    operator_version=operator_version, resolved_parameters=params,
+                )
+        if failed:
+            status = "completed_with_warnings" if previews else "failed"
+            detail = "；".join(f"{node_id}: {message}" for node_id, message in failed.items())
+            store.finish_flow_run(flow_run_id, detail, status=status)
+            return {"id": flow_run_id, "status": status, "previews": previews, "errors": failed}
+        store.finish_flow_run(flow_run_id, status="completed")
+        return {"id": flow_run_id, "status": "completed", "previews": previews}
+    except Exception as exc:
+        store.finish_flow_run(flow_run_id, str(exc), status="failed")
+        raise
+
+
+def execute_flow_run(store: V7Store, objects, flow_run_id: str) -> dict[str, Any]:
+    if store.flow_run_is_debug(flow_run_id):
+        return execute_debug_run(store, objects, flow_run_id)
+    return execute_derived_run(store, objects, flow_run_id)
+
+
 def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, Any]:
     context = store.derived_run_context(flow_run_id); definition = context["definition"]; incoming = _incoming(definition)
     selected = _reachable_nodes(definition, context["start_node_id"], context["mode"])
@@ -1770,7 +1883,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         with active_lock:
             active_requests.add(request_id)
         try:
-            if payload.flow_run_id: return execute_derived_run(store, objects, payload.flow_run_id)
+            if payload.flow_run_id: return execute_flow_run(store, objects, payload.flow_run_id)
             if payload.source_preparation_job_id:
                 if not payload.lease_owner:
                     raise ValueError("Source Preparation 请求缺少 lease_owner")

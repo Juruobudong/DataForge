@@ -93,6 +93,8 @@ def _run_migration_once(store: V7Store, resolved: Settings, owner: str) -> int |
 
 
 def _run_derived_once(store: V7Store, resolved: Settings, owner: str) -> int | None:
+    if not getattr(resolved, "derived_runs_enabled", False):
+        return None
     claim_derived = getattr(store, "claim_derived_run", None)
     derived_run = claim_derived(owner) if claim_derived else None
     if not derived_run:
@@ -111,6 +113,28 @@ def _run_derived_once(store: V7Store, resolved: Settings, owner: str) -> int | N
         return 1
     except httpx.HTTPError as exc:
         store.finish_flow_run(derived_run.id, f"Runner 投递失败：{exc}", status="failed")
+        return 0
+
+
+def _run_debug_once(store: V7Store, resolved: Settings, owner: str) -> int | None:
+    claim_debug = getattr(store, "claim_debug_run", None)
+    debug_run = claim_debug(owner) if claim_debug else None
+    if not debug_run:
+        return None
+    if not resolved.runner_url:
+        store.finish_flow_run(debug_run.id, "DATAFORGE_RUNNER_URL 未配置", status="failed")
+        return 0
+    headers = {"Authorization": f"Bearer {resolved.runner_service_token}"} if resolved.runner_service_token else {}
+    try:
+        response = httpx.post(
+            f"{resolved.runner_url.rstrip('/')}/internal/jobs",
+            json={"flow_run_id": debug_run.id}, headers=headers,
+            timeout=resolved.runner_timeout_seconds,
+        )
+        response.raise_for_status()
+        return 1
+    except httpx.HTTPError as exc:
+        store.finish_flow_run(debug_run.id, f"Runner 投递失败：{exc}", status="failed")
         return 0
 
 
@@ -221,6 +245,9 @@ def _run_exclusive_once(store: V7Store, resolved: Settings) -> int | None:
     result = _run_migration_once(store, resolved, owner)
     if result is not None:
         return result
+    result = _run_debug_once(store, resolved, owner)
+    if result is not None:
+        return result
     result = _run_derived_once(store, resolved, owner)
     if result is not None:
         return result
@@ -234,6 +261,9 @@ def run_once(settings: Settings | None = None, *, check_schema: bool = True) -> 
         store.assert_schema_current()
     owner = _owner_token("once")
     result = _run_migration_once(store, resolved, owner)
+    if result is not None:
+        return result
+    result = _run_debug_once(store, resolved, owner)
     if result is not None:
         return result
     result = _run_derived_once(store, resolved, owner)

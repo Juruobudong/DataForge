@@ -50,3 +50,7 @@ llm_servings.yaml
 specs/008-knowledge-collection-lifecycle/
 # 前端构建产物（含可能被压缩的内网地址，禁止提交）
 frontend/dist/
+
+# 临时迁移/审查用的本地 SQLite（含内网地址，二进制文件，禁止提交）
+.tmp-review-migration.db
+.tmp-*.db

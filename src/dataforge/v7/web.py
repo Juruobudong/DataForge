@@ -6,6 +6,7 @@ import json
 import os
 import secrets
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path, PurePath
@@ -157,6 +158,30 @@ class DerivedRunRequest(BaseModel):
     node_id: str
     parameter_overrides: dict = Field(default_factory=dict)
     idempotency_key: str | None = None
+
+
+class DebugRunConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    template_id: str
+    revision_id: str
+    expected_compiled_checksum: str
+    source_review_snapshot_ids: list[str] = Field(min_length=1)
+    sink_library_bindings: dict[str, str]
+    idempotency_key: str | None = None
+
+
+class ApplyDebugRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision_id: str
+    expected_definition_checksum: str
+    idempotency_key: str
+
+
+class SaveDebugRunAsFlowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    description: str = ""
+    idempotency_key: str
 
 
 class CommitDerivedRunRequest(BaseModel):
@@ -522,6 +547,15 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if not project_creation and not any(request.url.path.startswith(prefix) for prefix in allowed_prefixes):
                 return JSONResponse(status_code=404, content={"detail": "local 实例尚未完成 Seed 初始化"})
         return await call_next(request)
+
+    @app.middleware("http")
+    async def attach_request_id(request: Request, call_next):
+        supplied = str(request.headers.get("X-Request-ID") or "").strip()
+        request_id = supplied[:120] if supplied and all(ch.isalnum() or ch in "-_." for ch in supplied) else str(uuid.uuid4())
+        request.state.request_id = request_id
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
     @app.get("/api/health")
     def health():
@@ -1328,6 +1362,61 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.execution_snapshot_detail(snapshot_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/developer/debug-runs/options")
+    def debug_run_options(template_id: str, revision_kind: Literal["draft", "published"] = "draft"):
+        try: return store.debug_run_options(template_id, revision_kind)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/debug-runs/preflight")
+    def debug_run_preflight(payload: DebugRunConfigRequest):
+        try:
+            return store.debug_run_preflight(
+                template_id=payload.template_id, revision_id=payload.revision_id,
+                expected_compiled_checksum=payload.expected_compiled_checksum,
+                source_review_snapshot_ids=payload.source_review_snapshot_ids,
+                sink_library_bindings=payload.sink_library_bindings,
+            )
+        except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/debug-runs", status_code=202)
+    def create_debug_run(payload: DebugRunConfigRequest):
+        try:
+            return store.create_debug_run(
+                template_id=payload.template_id, revision_id=payload.revision_id,
+                expected_compiled_checksum=payload.expected_compiled_checksum,
+                source_review_snapshot_ids=payload.source_review_snapshot_ids,
+                sink_library_bindings=payload.sink_library_bindings,
+                idempotency_key=payload.idempotency_key or str(uuid.uuid4()),
+            )
+        except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/developer/debug-runs/{flow_run_id}/flow-materialization")
+    def debug_run_materialization(flow_run_id: str):
+        try: return store.debug_run_materialization(flow_run_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/developer/debug-runs/{flow_run_id}/apply-to-draft")
+    def apply_debug_run_to_draft(flow_run_id: str, payload: ApplyDebugRunRequest):
+        try:
+            return store.apply_debug_run_to_draft(
+                flow_run_id, expected_revision_id=payload.expected_revision_id,
+                expected_definition_checksum=payload.expected_definition_checksum,
+                idempotency_key=payload.idempotency_key,
+            )
+        except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/debug-runs/{flow_run_id}/save-as-flow", status_code=201)
+    def save_debug_run_as_flow(flow_run_id: str, payload: SaveDebugRunAsFlowRequest):
+        try: return store.save_debug_run_as_flow(
+            flow_run_id, name=payload.name, description=payload.description,
+            idempotency_key=payload.idempotency_key,
+        )
+        except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/developer/flow-runs")
     def flow_runs():
         return store.list_flow_runs()
@@ -1336,6 +1425,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def flow_run_capabilities():
         return {"derived_runs_enabled": resolved.derived_runs_enabled,
                 "derived_run_commit_enabled": resolved.derived_run_commit_enabled,
+                "debug_full_enabled": True, "debug_replay_enabled": True,
+                "debug_sink_policy": "preview_only",
                 "cancellation": "cooperative"}
 
     @app.get("/api/developer/flow-runs/{flow_run_id}")
@@ -1345,13 +1436,15 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/developer/flow-runs/{flow_run_id}/derived-runs", status_code=202)
     def create_derived_flow_run(flow_run_id: str, payload: DerivedRunRequest):
-        if not resolved.derived_runs_enabled: raise HTTPException(status_code=403, detail="派生 Run 功能未启用")
+        if not store.flow_run_is_debug(flow_run_id) and not resolved.derived_runs_enabled:
+            raise HTTPException(status_code=403, detail="业务历史 Run 派生功能未启用")
         try: return store.create_derived_run(flow_run_id, payload.mode, payload.node_id, payload.parameter_overrides, payload.idempotency_key)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/flow-runs/{flow_run_id}/cancel")
     def cancel_derived_flow_run(flow_run_id: str):
-        if not resolved.derived_runs_enabled: raise HTTPException(status_code=403, detail="派生 Run 功能未启用")
+        if not store.flow_run_is_debug(flow_run_id) and not resolved.derived_runs_enabled:
+            raise HTTPException(status_code=403, detail="业务历史 Run 派生功能未启用")
         try: return store.cancel_flow_run(flow_run_id)
         except ValueError as exc: raise _error(exc) from exc
 

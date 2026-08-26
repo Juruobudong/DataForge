@@ -1,6 +1,6 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-24
+更新日期：2026-08-26
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
 
 本文件只记录能力完成度与外部验收状态；当前系统结构见 [`docs/architecture/`](docs/architecture/overview.md)，设计原因见 [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md)，历史方案见 [`docs/archive/`](docs/archive/old-plan.md)。
@@ -35,7 +35,7 @@
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
 | 流程开发区 | 标准流程 | `DONE` | Document Parse / Clean / Chunk / Production / Publish 由受控子图与节点组成。 |
 | 流程开发区 | 知识流程模板 / 算子库 / 可复用子图 | `DONE` | Schema 驱动 ServingSelector、模型状态节点卡、九类动态目录与共享 FlowCanvas；发布 Snapshot 冻结 Serving code。 |
-| 流程开发区 | DataFlow 调试台 | `DONE` | 三栏 Runtime DAG + Console、Node/Artifact Inspector、游标事件、派生节点运行、协作式取消与 Sink Diff 确认；派生执行/提交开关默认关闭。 |
+| 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision、多份当前审核输入和 runtime Sink 绑定可创建 Preview-only debug_full；支持 Debug 节点重放、Runtime DAG/Artifact/Console、准确 Diff、应用当前 Draft 与另存自定义 Advanced Flow。真实 `.34` E2E 为 `CONNECT`。 |
 | 流程开发区 | 独立“向量索引”导航页 | `REMOVE` | 已收口进 DataFlow 调试台；旧链接重定向，仍只读。 |
 | 原型能力 | DataFlow WebUI、Shell、任意 Python、运行时改图 | `REMOVE` | 与受控 Flow 和 Runner 安全边界冲突。 |
 | 原型能力 | 任意上游算子、KCenterGreedy、MultiHop Batch、Reference Remover、训练/代码/Text2SQL/Agentic-RAG | `REMOVE` | 不在 V7 Catalog；P1 Refiner/MultiHop/PII 仍需专门批准。 |
@@ -55,6 +55,7 @@
 | 受控模板修订 CRUD、默认、校验、发布、样例运行 | `DONE` | 生产任务固定引用已发布修订。 |
 | Operator / Prompt / Quality / Subflow / Snapshot / Flow Run 接口 | `DONE` | Catalog 屏蔽内部 DataFlow 类名；任务固定 `execution_snapshot_id`，可读取节点和 Artifact 诊断。 |
 | 派生 Run 与 Sink 暂存提交 | `DONE` | `node_only/from_node` 复用同快照可重放 Artifact；Sink 默认 `awaiting_commit`，以 checksum、当前态冲突检测和幂等键确认提交。 |
+| Debug Run / Debug Input Snapshot / 流程物化 | `DONE` | Debug owner 与业务 Job 分离，冻结 authoring+execution definition 和多审核输入；Debug Sink 永远 Preview Only，成功配置可安全应用或另存 Flow Draft。 |
 | Knowledge Sink Schema/来源/质量 Gate | `DONE` | `review` 与失败候选阻断该 Sink；多 Sink 独立事务写入。 |
 | Model Serving 分块生成、失败保留与局部重试 | `DONE` | DB Registry 默认 `qwen3_32b`，新默认策略 120 秒/2 次重试；Flow 发布健康门禁，Snapshot 冻结 code，分块失败隔离不变。 |
 | PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、`0~1` 多位置 SourceAnchor 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU/坐标验收归 C-01～C-04/C-11。 |

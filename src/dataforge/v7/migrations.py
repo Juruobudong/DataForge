@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260825_flow_authoring_modes"
+CURRENT_SCHEMA_REVISION = "20260826_debug_execution_sandbox"
 
 
 def _config(database_url: str) -> Config:
