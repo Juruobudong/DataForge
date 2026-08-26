@@ -1,5 +1,5 @@
-const DEFAULT_INPUT = { input: { artifact_type: '', cardinality: 'one' } }
-const DEFAULT_OUTPUT = { output: { artifact_type: '', cardinality: 'many' } }
+const DEFAULT_INPUT = { input: { artifact_type: '', cardinality: 'one', required: true, binding: 'edge' } }
+const DEFAULT_OUTPUT = { output: { artifact_type: '', cardinality: 'many', required: false, binding: 'edge' } }
 const cloneValue = value => JSON.parse(JSON.stringify(value))
 
 export function artifactMatches(actual, expected) {
@@ -15,6 +15,34 @@ export function resolveCandidateType(type, definition = {}) {
   return `candidate:${family}${family === 'graph' && mode ? `:${mode}` : ''}`
 }
 
+const ARTIFACT_TYPE_LABELS = {
+  approved_source_chunks: '已审核文档块',
+  source_file: '源文件',
+  document_ir: '文档解析结果',
+  chunk_set: '文档块',
+  source_chunk_set: '来源文档块',
+  'candidate:*': '候选知识',
+  'candidate:text': '文本候选',
+  'candidate:qa': '问答候选',
+  'candidate:qa-agent-faq': 'FAQ 候选',
+  'candidate:graph': '图谱候选',
+  'candidate:graph:triple': '三元组候选',
+  'candidate:graph:semantic': '语义图谱候选',
+  entity_candidate_set: '实体候选集',
+  relation_candidate_set: '关系候选集',
+  semantic_relation_set: '语义关系集',
+  execution: '执行结果',
+}
+
+export function runtimeArtifactLabel(type, recordCount = null) {
+  const raw = String(type || '')
+  const label = ARTIFACT_TYPE_LABELS[raw]
+    || (raw.startsWith('knowledge_preview:') ? '知识预览' : raw.startsWith('knowledge_item:') ? '知识项' : raw)
+  if (!label) return ''
+  const hasCount = recordCount !== null && recordCount !== undefined && Number.isFinite(Number(recordCount))
+  return `${label}${hasCount ? ` · ${Number(recordCount)} 条` : ''}`
+}
+
 function catalogItem(catalog, code) {
   return catalog.find(item => item.code === code)
 }
@@ -23,7 +51,16 @@ function normalizedPorts(raw, fallback) {
   return Object.fromEntries(Object.entries(raw || fallback).map(([name, value]) => [name, {
     artifact_type: typeof value === 'string' ? value : value?.artifact_type || '',
     cardinality: typeof value === 'string' ? (fallback === DEFAULT_INPUT ? 'one' : 'many') : value?.cardinality || (fallback === DEFAULT_INPUT ? 'one' : 'many'),
+    required: typeof value === 'string' ? fallback === DEFAULT_INPUT : value?.required ?? (fallback === DEFAULT_INPUT),
+    binding: typeof value === 'string' ? 'edge' : value?.binding || (value?.artifact_type === 'source_file' ? 'system_injected' : value?.artifact_type === 'approved_source_chunks' ? 'runtime_input' : 'edge'),
   }]))
+}
+
+export function nodeRole(definition = {}) {
+  if (['flow_input', 'operator', 'knowledge_output'].includes(definition.node_role)) return definition.node_role
+  if (definition.kind === 'knowledge_sink') return 'knowledge_output'
+  if (definition.kind === 'operator' && definition.ref === 'reviewed-source-chunk-input') return 'flow_input'
+  return 'operator'
 }
 
 export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
@@ -57,8 +94,8 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     const outputKey = definition.output_key || (definition.knowledge_type === 'graph' && definition.graph_mode
       ? `graph:${definition.graph_mode}` : definition.knowledge_type)
     return {
-      kind: 'knowledge_sink', name: 'Knowledge Sink', code: outputKey, category: '正式知识输出', status,
-      known: true, inputs: { input: { artifact_type: `candidate:${outputKey}`, cardinality: 'one' } }, outputs: {}, parameterSchema: {},
+      kind: 'knowledge_sink', nodeRole: 'knowledge_output', name: '知识输出', code: outputKey, category: '正式知识输出', status,
+      known: true, inputs: { input: { artifact_type: `candidate:${outputKey}`, cardinality: 'one', required: true, binding: 'edge' } }, outputs: {}, parameterSchema: {},
       inputExample: { input: [{ canonical_content: '示例正式知识', source_chunk_id: 'chunk-example-001' }] }, outputExample: {},
     }
   }
@@ -70,7 +107,7 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     const entryItem = entry?.kind === 'operator' ? catalogItem(catalog, entry.ref) : null
     const exitItem = exit?.kind === 'operator' ? catalogItem(catalog, exit.ref) : null
     return {
-      kind: 'subflow', name: subflowPrimaryName(subflow || { code: definition.ref }),
+      kind: 'subflow', nodeRole: 'operator', name: subflowPrimaryName(subflow || { code: definition.ref }),
       englishName: subflowEnglishName(subflow), code: definition.ref, category: '可复用子图', status,
       known: Boolean(subflow),
       revision: subflow?.revision, internalCount: child.nodes?.length || 0,
@@ -80,8 +117,9 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     }
   }
   const item = catalogItem(catalog, definition.ref)
+  const role = nodeRole({ ...definition, node_role: definition.node_role || item?.node_role })
   return {
-    kind: 'operator', name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
+    kind: 'operator', nodeRole: role, name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
     code: definition.ref, category: item?.category || '未知算子', status,
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),
@@ -94,12 +132,13 @@ export function hasEditableParameters(node) {
 }
 
 export function makeCanvasNode(definition, position, catalog = [], subflows = []) {
-  const meta = resolveNodeMetadata(definition, catalog, subflows)
+  const normalized = { ...cloneValue(definition), node_role: nodeRole(definition) }
+  const meta = resolveNodeMetadata(normalized, catalog, subflows)
   return {
     id: definition.id,
-    type: meta.kind === 'knowledge_sink' ? 'knowledge-sink' : meta.kind,
+    type: meta.nodeRole === 'flow_input' ? 'flow-input' : meta.kind === 'knowledge_sink' ? 'knowledge-sink' : meta.kind,
     position: { x: Number(position?.x) || 0, y: Number(position?.y) || 0 },
-    data: { definition: cloneValue(definition), meta },
+    data: { definition: normalized, meta },
   }
 }
 
@@ -135,7 +174,7 @@ export function deserializeRuntimeDag(value = {}, catalog = []) {
   graph.edges = graph.edges.map((edge, index) => {
     const raw = (value.edges || [])[index] || {}
     const type = raw.artifact_type || raw.type_code || ''
-    return { ...edge, data: { status: raw.status || 'idle', artifactIds: raw.artifact_ids || [], label: type ? `${type}${raw.record_count ? ` · ${raw.record_count}` : ''}` : '' } }
+    return { ...edge, data: { status: raw.status || 'idle', artifactIds: raw.artifact_ids || [], label: runtimeArtifactLabel(type, raw.record_count), technicalLabel: type } }
   })
   return graph
 }
@@ -143,7 +182,7 @@ export function deserializeRuntimeDag(value = {}, catalog = []) {
 export function serializeDefinition(nodes, edges) {
   return {
     schema_version: 3,
-    nodes: nodes.map(node => ({ ...cloneValue(node.data.definition), id: node.id })),
+    nodes: nodes.map(node => ({ ...cloneValue(node.data.definition), id: node.id, node_role: nodeRole(node.data.definition) })),
     edges: edges.map(edge => ({
       source: edge.source, source_port: edge.sourceHandle || 'output',
       target: edge.target, target_port: edge.targetHandle || 'input',
@@ -160,11 +199,13 @@ export function connectionIssue(connection, nodes, edges) {
   if (!source || !target) return { code: 'UNKNOWN_NODE', message: '连线引用了不存在的节点' }
   if (source.id === target.id) return { code: 'SELF_CONNECTION', message: '节点不能连接自身', nodeId: source.id }
   if (source.data.meta.kind === 'knowledge_sink') return { code: 'SINK_SOURCE', message: 'Knowledge Sink 必须是终点', nodeId: source.id }
+  if (target.data.meta.nodeRole === 'flow_input') return { code: 'FLOW_INPUT_TARGET', message: '流程输入不能连接 Incoming Edge', nodeId: target.id }
   if (!sourcePort) return { code: 'UNKNOWN_SOURCE_PORT', message: `输出端口不存在：${connection.sourceHandle || 'output'}`, nodeId: source.id }
   if (!targetPort) return { code: 'UNKNOWN_TARGET_PORT', message: `输入端口不存在：${connection.targetHandle || 'input'}`, nodeId: target.id }
   const actual = resolveCandidateType(sourcePort.artifact_type, source.data.definition)
   const expected = resolveCandidateType(targetPort.artifact_type, target.data.definition)
   if (expected === 'source_file') return { code: 'ROOT_INPUT', message: 'SourceFile 输入节点只能作为流程根节点', nodeId: target.id }
+  if ((targetPort.binding || 'edge') !== 'edge') return { code: 'RUNTIME_BOUND_PORT', message: `输入端口由运行时绑定，不能连接：${connection.targetHandle || 'input'}`, nodeId: target.id }
   const graphSinkFallback = target.data.meta.kind === 'knowledge_sink' && expected.startsWith('candidate:graph:') && actual === 'candidate:graph'
   if (!artifactMatches(actual, expected) && !graphSinkFallback) {
     return { code: 'TYPE_MISMATCH', message: `端口类型不兼容：${actual} → ${expected}`, nodeId: target.id }
@@ -212,9 +253,13 @@ export function validateFlow(nodes, edges, outputTypes = []) {
     const incoming = edges.filter(edge => edge.target === node.id)
     const outgoing = edges.filter(edge => edge.source === node.id)
     if (!node.data.meta.known) issues.push({ code: node.data.meta.kind === 'subflow' ? 'UNKNOWN_SUBFLOW' : 'UNKNOWN_OPERATOR', message: `${node.data.meta.kind === 'subflow' ? '子图' : '算子'}不存在或未发布：${node.data.meta.code}`, nodeId: node.id })
+    const role = node.data.meta.nodeRole || nodeRole(node.data.definition)
     if (nodes.length > 1 && !incoming.length && !outgoing.length) issues.push({ code: 'ISOLATED_NODE', message: '节点未接入流程', nodeId: node.id })
+    if (role === 'flow_input' && incoming.length) issues.push({ code: 'FLOW_INPUT_HAS_INCOMING', message: '流程输入不能连接 Incoming Edge', nodeId: node.id })
+    if (role === 'flow_input' && nodes.length > 1 && !outgoing.length) issues.push({ code: 'FLOW_INPUT_UNUSED', message: '流程输入必须连接至少一个下游节点', nodeId: node.id })
+    if (role === 'knowledge_output' && outgoing.length) issues.push({ code: 'SINK_NOT_TERMINAL', message: '知识输出必须是终点', nodeId: node.id })
     for (const [port, spec] of Object.entries(node.data.meta.inputs || {})) {
-      if (spec.artifact_type === 'source_file') continue
+      if ((spec.binding || 'edge') !== 'edge' || spec.required === false) continue
       if (!incoming.some(edge => (edge.targetHandle || 'input') === port)) issues.push({ code: 'REQUIRED_INPUT', message: `必需输入端口未连接：${port}`, nodeId: node.id })
     }
   }

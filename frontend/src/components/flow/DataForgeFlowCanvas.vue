@@ -6,6 +6,7 @@ import { Background, BackgroundVariant } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import { MiniMap } from '@vue-flow/minimap'
 import OperatorNode from './nodes/OperatorNode.vue'
+import FlowInputNode from './nodes/FlowInputNode.vue'
 import SubflowNode from './nodes/SubflowNode.vue'
 import KnowledgeSinkNode from './nodes/KnowledgeSinkNode.vue'
 import FlowEdge from './edges/FlowEdge.vue'
@@ -110,6 +111,7 @@ defineExpose({ autoLayout, focusElement, fit, screenToFlowCoordinate })
       <Controls v-if="!compact" position="bottom-right" />
       <MiniMap v-if="!compact" position="bottom-left" :pannable="true" :zoomable="true" :node-stroke-width="2" node-color="#dce8fa" mask-color="rgba(238,242,247,.72)" />
       <template #node-operator="nodeProps"><OperatorNode v-bind="nodeProps" :show-technical-code="showTechnicalCode" /></template>
+      <template #node-flow-input="nodeProps"><FlowInputNode v-bind="nodeProps" /></template>
       <template #node-subflow="nodeProps"><SubflowNode v-bind="nodeProps" :show-technical-code="showTechnicalCode" /></template>
       <template #node-knowledge-sink="nodeProps"><KnowledgeSinkNode v-bind="nodeProps" /></template>
       <template #edge-dataforge="edgeProps"><FlowEdge v-bind="edgeProps" /></template>

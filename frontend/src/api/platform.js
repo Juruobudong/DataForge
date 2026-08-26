@@ -7,9 +7,21 @@ export class ApiRequestError extends Error {
   }
 }
 
+export function createClientRequestId(cryptoApi = globalThis.crypto) {
+  if (typeof cryptoApi?.randomUUID === 'function') return cryptoApi.randomUUID()
+
+  const bytes = new Uint8Array(16)
+  if (typeof cryptoApi?.getRandomValues === 'function') cryptoApi.getRandomValues(bytes)
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256)
+  bytes[6] = (bytes[6] & 0x0f) | 0x40
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
 async function request(path, options = {}) {
   const method = String(options.method || 'GET').toUpperCase()
-  const requestId = globalThis.crypto?.randomUUID?.() || `web-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  const requestId = createClientRequestId()
   const headers = { 'X-Request-ID': requestId, ...(options.headers || {}) }
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers })
   if (!response.ok) {
@@ -114,6 +126,9 @@ export const api = {
   standardPipelines: () => request('/api/developer/standard-pipelines'),
   sourcePreparationChunker: () => request('/api/developer/source-preparation/chunker'),
   createSourcePreparationChunkerRevision: body => request('/api/developer/source-preparation/chunker/revisions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  developerSamples: (purpose = '') => request(`/api/developer/samples${purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''}`),
+  developerSample: code => request(`/api/developer/samples/${encodeURIComponent(code)}`),
+  previewSourcePreparation: body => request('/api/developer/source-preparation/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   operatorCatalog: (params = {}) => request(`/api/developer/operator-catalog?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== '' && value !== null && value !== undefined)).toString()}`),
   operatorCatalogFacets: () => request('/api/developer/operator-catalog/facets'),
   operatorDetail: code => request(`/api/developer/operator-catalog/${encodeURIComponent(code)}`),

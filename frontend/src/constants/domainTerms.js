@@ -3,7 +3,7 @@ export const DOMAIN_TERMS = Object.freeze({
   deployment: { label: '发布目标', technical: 'Deployment' },
   projectDeployment: { label: '项目发布绑定', technical: 'ProjectDeployment' },
   projectTask: { label: '业务任务', technical: 'Project Task' },
-  deploymentTask: { label: '运行任务', technical: 'Deployment Task' },
+  deploymentTask: { label: '检索通道', technical: 'Deployment Task' },
   knowledgeType: { label: '知识类型', technical: 'Knowledge Type' },
   indexProfile: { label: '索引配置', technical: 'Index Profile' },
   qaEmbedding: { label: 'QA 向量化方式', technical: 'QA Embedding' },

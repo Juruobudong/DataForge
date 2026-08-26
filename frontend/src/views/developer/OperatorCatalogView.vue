@@ -26,7 +26,7 @@ onMounted(load)
 
 <template>
   <section class="catalog-page">
-    <div class="page-head"><div><h2>能力组件</h2><p>平台可组合的算子目录；业务说明与技术契约分层展示，数量和分类来自 Registry。</p></div><span class="badge blue">{{ visible.length }} / {{ catalog.length }}</span></div>
+    <div class="page-head"><div><h2>算子组件</h2><p>登记并查看平台后端已实现的 Operator 能力、Contract、Schema、版本和生命周期；这里不执行在线代码。</p></div><span class="badge blue">{{ visible.length }} / {{ catalog.length }}</span></div>
     <div class="catalog-filters">
       <input v-model="query" placeholder="搜索名称、编码或说明">
       <select v-model="category"><option value="">全部分类</option><option v-for="item in facets.categories" :key="item.name" :value="item.name">{{ item.name }} ({{ item.count }})</option></select>

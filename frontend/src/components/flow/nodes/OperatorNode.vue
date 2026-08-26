@@ -12,14 +12,15 @@ const serving = computed(() => {
   const code = props.data.definition.params?.llm_serving
   return servings.value.find(item => item.serving_code === code) || (!code ? servings.value.find(item => item.is_default) : null)
 })
+const edgeInputs = computed(() => Object.fromEntries(Object.entries(props.data.meta.inputs || {}).filter(([, spec]) => (spec.binding || 'edge') === 'edge')))
 onMounted(async () => { if (usesServing.value) { try { servings.value = await api.modelServings() } catch { servings.value = [] } } })
 </script>
 
 <template>
   <article class="flow-node operator-node" :class="[`state-${data.meta.status || 'idle'}`, { selected }]">
     <header><span class="node-icon">◇</span><div><b>{{ data.meta.name }}</b><small>{{ headerSubtitle }}</small></div><span class="node-status">{{ data.meta.status === 'success' ? '✓' : data.meta.status === 'failed' ? '!' : '' }}</span></header>
-    <section class="ports" :class="{ split: Object.keys(data.meta.inputs).length && Object.keys(data.meta.outputs).length }">
-      <div><TypedHandle v-for="(spec, port) in data.meta.inputs" :key="`in-${port}`" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="input" /></div>
+    <section class="ports" :class="{ split: Object.keys(edgeInputs).length && Object.keys(data.meta.outputs).length }">
+      <div><TypedHandle v-for="(spec, port) in edgeInputs" :key="`in-${port}`" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="input" /></div>
       <div><TypedHandle v-for="(spec, port) in data.meta.outputs" :key="`out-${port}`" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="output" /></div>
     </section>
     <section v-if="usesServing" class="serving-line"><b>🤖 {{ serving?.name || data.definition.params?.llm_serving || '系统默认' }}</b><small v-if="serving">● {{ serviceStatus(serving).label }}</small></section>

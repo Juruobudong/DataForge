@@ -5,7 +5,7 @@ defineEmits(['toggle', 'move'])
 
 <template>
   <div class="stack">
-    <p v-if="!libraries.length" class="muted">当前运行任务没有可用的 Ready 知识库。</p>
+    <p v-if="!libraries.length" class="muted">当前检索通道没有可用的 Ready 知识库。</p>
     <div v-for="library in libraries" :key="library.id" class="stat-card">
       <label><input type="checkbox" :checked="chosen.includes(library.id)" @change="$emit('toggle',library.id)"> {{ library.name }}</label>
       <template v-if="chosen.includes(library.id)">

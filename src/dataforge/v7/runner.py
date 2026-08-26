@@ -1724,8 +1724,10 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                     f"graph:{node.get('graph_mode')}" if node.get("knowledge_type") == "graph" and node.get("graph_mode")
                     else node.get("knowledge_type")
                 ))
-                library_id = context["sink_libraries"].get(output_key)
-                if not library_id:
+                target = dict((context.get("sink_preview_targets") or {}).get(output_key) or {})
+                library_id = target.get("knowledge_library_id") or context["sink_libraries"].get(output_key)
+                baseline_kind = str(target.get("baseline_kind") or "knowledge_library")
+                if baseline_kind == "knowledge_library" and not library_id:
                     message = "Sink 缺少预览目标知识库"; failed[node_id] = message
                     artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=message)
                     continue
@@ -1733,6 +1735,7 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                 preview = store.stage_sink_preview(
                     flow_run_id, output_key, library_id, input_values, successful,
                     quality={"candidate_count": len(input_values), "status": "preview_only"},
+                    baseline_kind=baseline_kind,
                 )
                 previews.append(preview)
                 outputs[node_id] = [{"_artifact_type": f"knowledge_preview:{output_key}", **preview}]

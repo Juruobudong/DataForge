@@ -36,7 +36,7 @@ test('QA Profile 自动映射 embedding 模式', () => {
 
 test('发布门禁要求任务、授权和当前阶段 Target', () => {
   assert.deepEqual(routingPublishReadiness([], [], '').problems, [
-    '请先配置并启用运行任务',
+    '请先配置并启用检索通道',
     '请先完成知识范围配置',
     '当前环境尚未配置 Milvus 服务',
   ])

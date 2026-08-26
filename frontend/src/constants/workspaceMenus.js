@@ -14,11 +14,18 @@ export const LOCAL_BUSINESS_MENU_ITEM = {
 
 export const DEVELOPER_MENU_REGISTRY = [
   { key: 'model-services', label: '模型服务', caption: '运行时资源注册中心', icon: '✦', to: '/developer/model-services' },
-  { key: 'standard-pipelines', label: '标准流程', caption: '公共前置处理', icon: '⇢', to: '/developer/standard-pipelines' },
-  { key: 'flow-templates', label: '知识流程', caption: '单产出 / 多产出', icon: '▦', to: '/developer/flow-templates' },
-  { key: 'operator-catalog', label: '能力组件', caption: '平台可组合能力', icon: '⊞', to: '/developer/operator-catalog' },
-  { key: 'dataflow-debug', label: '运行调试', caption: '运行诊断（只读）', icon: '◎', to: '/developer/dataflow-debug' },
+  { key: 'standard-pipelines', label: '文档预处理', caption: '解析、清洗与分块', icon: '⇢', to: '/developer/standard-pipelines' },
+  { key: 'flow-templates', label: '知识流程', caption: '标准配置 / 高级编排', icon: '▦', to: '/developer/flow-templates' },
+  { key: 'dataflow-debug', label: '运行调试', caption: '运行诊断', icon: '◎', to: '/developer/dataflow-debug' },
+  { key: 'developer-resources', label: '开发者资源', group: true, children: [
+    { key: 'operator-catalog', label: '算子组件', caption: 'Registry / Contract', icon: '⊞', to: '/developer/operator-catalog' },
+    { key: 'subflows', label: '可复用子流程', caption: '草稿 / Revision', icon: '◈', to: '/developer/subflows' },
+  ] },
 ]
+
+export function flattenMenuRegistry(items) {
+  return items.flatMap(item => item.group ? item.children || [] : [item])
+}
 
 export function businessMenuRegistry(instanceMode = 'central') {
   return instanceMode === 'local'

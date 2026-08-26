@@ -417,6 +417,10 @@ pre {
   }
 }
 
+.developer-resource-group { display: grid; gap: 4px; margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.1); }
+.developer-resource-group > p { margin: 0 12px 3px; color: #8fa0b8; font-size: 11px; font-weight: 800; letter-spacing: .05em; }
+.developer-resource-group .resource-child { margin-left: 8px; }
+
 .menu-dialog-backdrop {
   position: fixed;
   z-index: 90;

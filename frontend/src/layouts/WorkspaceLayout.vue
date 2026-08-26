@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useWorkspaceStore } from '../stores/workspace'
 import { useMenuPreferencesStore, mergeMenuPreference } from '../stores/menuPreferences'
-import { businessMenuRegistry, DEVELOPER_MENU_REGISTRY, menuItemActive } from '../constants/workspaceMenus'
+import { businessMenuRegistry, DEVELOPER_MENU_REGISTRY, flattenMenuRegistry, menuItemActive } from '../constants/workspaceMenus'
 import MenuCustomizeDialog from '../components/MenuCustomizeDialog.vue'
 import { api } from '../api/platform'
 
@@ -18,7 +18,7 @@ const hideTopbar = computed(() => route.meta.hideTopbar === true)
 const businessRegistry = computed(() => businessMenuRegistry(instance.value?.instance_mode))
 const businessMenu = computed(() => mergeMenuPreference(businessRegistry.value, menuPreferences.preference))
 const items = computed(() => developer.value ? DEVELOPER_MENU_REGISTRY : businessMenu.value.visible)
-const currentRegistry = computed(() => developer.value ? DEVELOPER_MENU_REGISTRY : businessRegistry.value)
+const currentRegistry = computed(() => developer.value ? flattenMenuRegistry(DEVELOPER_MENU_REGISTRY) : businessRegistry.value)
 const current = computed(() => currentRegistry.value.find(item => menuItemActive(item, route.path))?.label || currentRegistry.value[0].label)
 function switchTo(name) {
   workspace.switchTo(name)
@@ -44,9 +44,17 @@ onMounted(async () => {
       </div>
       <p class="nav-group-title">{{ developer ? '流程开发区' : '业务工作区' }}</p>
       <nav class="sidebar-nav">
-        <RouterLink v-for="item in items" :key="item.to" :to="item.to" class="nav-item">
-          <span class="nav-icon">{{ item.icon }}</span><span><b>{{ item.label }}</b><small>{{ item.caption }}</small></span>
-        </RouterLink>
+        <template v-for="item in items" :key="item.key || item.to">
+          <section v-if="item.group" class="developer-resource-group">
+            <p>{{ item.label }}</p>
+            <RouterLink v-for="child in item.children" :key="child.to" :to="child.to" class="nav-item resource-child">
+              <span class="nav-icon">{{ child.icon }}</span><span><b>{{ child.label }}</b><small>{{ child.caption }}</small></span>
+            </RouterLink>
+          </section>
+          <RouterLink v-else :to="item.to" class="nav-item">
+            <span class="nav-icon">{{ item.icon }}</span><span><b>{{ item.label }}</b><small>{{ item.caption }}</small></span>
+          </RouterLink>
+        </template>
       </nav>
       <div v-if="!developer" class="sidebar-footer"><button class="customize-menu-button" @click="customizeOpen=true">⚙ 自定义菜单</button></div>
     </aside>

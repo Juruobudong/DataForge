@@ -157,7 +157,7 @@ def _artifact_example(artifact_type: str) -> dict[str, Any]:
     return {"value": "示例数据"}
 
 
-def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", input_binding: str = "edge", node_role: str = "operator", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     primary_category, subcategory = _catalog_category(code, category)
     parameter_schema: dict[str, Any] = {"type": "object", "additionalProperties": False}
     parameter_docs: dict[str, str] = {"_overview": "此版本没有面向画布的业务可配置参数；运行时内部配置不会返回前端。"}
@@ -182,12 +182,15 @@ def _entry(code: str, name: str, category: str, source: str, target: str, adapte
         "category": primary_category, "subcategory": subcategory, "input": source,
         "output": target, "adapter_code": adapter, "exposure": exposure,
         "risk_level": risk, "upstream": upstream or [], "version": 4 if uses_llm else 3,
+        "node_role": node_role,
         "scenarios": [f"适用于{OPERATOR_DESCRIPTIONS[code]}的受控知识流程"],
         "knowledge_types": _knowledge_types(source, target),
         "recommended_predecessors": [], "recommended_successors": [],
         "lifecycle_status": "deprecated" if exposure == "disabled" else "published",
-        "input_ports": {"input": {"artifact_type": source, "cardinality": input_cardinality}},
-        "output_ports": {"output": {"artifact_type": target, "cardinality": "many"}},
+        "input_ports": {"input": {"artifact_type": source, "cardinality": input_cardinality,
+                                    "required": True, "binding": input_binding}},
+        "output_ports": {"output": {"artifact_type": target, "cardinality": "many",
+                                      "required": False, "binding": "edge"}},
         "input_example": {"input": [_artifact_example(source)]},
         "output_example": {"output": [_artifact_example(target)]},
         "parameter_schema": parameter_schema,
@@ -197,8 +200,8 @@ def _entry(code: str, name: str, category: str, source: str, target: str, adapte
 
 
 CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
-    _entry("reviewed-source-chunk-input", "Reviewed SourceChunk Input", "文档", "approved_source_chunks", "source_chunk_set", "reviewed_source_chunk_input"),
-    _entry("document-parser", "Document Parser", "文档", "source_file", "document_ir", "document_parser", upstream=["DataForgeNativeParser", "MinerUPipelineHTTPAdapter"]),
+    _entry("reviewed-source-chunk-input", "Reviewed SourceChunk Input", "文档", "approved_source_chunks", "source_chunk_set", "reviewed_source_chunk_input", input_binding="runtime_input", node_role="flow_input"),
+    _entry("document-parser", "Document Parser", "文档", "source_file", "document_ir", "document_parser", input_binding="system_injected", upstream=["DataForgeNativeParser", "MinerUPipelineHTTPAdapter"]),
     _entry("document-ir-normalizer", "Document IR Normalizer", "文档", "document_ir", "document_ir", "document_ir_normalizer"),
     _entry("null-filter", "Null Filter", "清洗", "document_ir", "document_ir", "content_null_filter", upstream=["ContentNullFilter"]),
     _entry("language-filter", "Language Filter", "清洗", "document_ir", "document_ir", "language_filter", upstream=["LanguageFilter"]),
@@ -274,7 +277,7 @@ def subflow_seeds() -> tuple[dict[str, Any], ...]:
 
 def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
     nodes: list[dict[str, Any]] = [
-        {"id": "reviewed-input", "kind": "operator", "ref": "reviewed-source-chunk-input"},
+        {"id": "reviewed-input", "kind": "operator", "node_role": "flow_input", "ref": "reviewed-source-chunk-input"},
     ]
     edges: list[list[str]] = []
     generators = {"text": "prompt-generator", "qa": "qa-generator", "graph": "graph-extractor"}
@@ -320,7 +323,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             {"id": validator, "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": quality, "kind": "operator", "ref": "graph-quality-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": diff, "kind": "operator", "ref": "knowledge-diff", "params": {"knowledge_type": family, "graph_mode": mode or None}},
-            {"id": sink, "kind": "knowledge_sink", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
+            {"id": sink, "kind": "knowledge_sink", "node_role": "knowledge_output", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
         ))
         edges.extend(graph_edges or [["reviewed-input", generator]])
         edges.extend((

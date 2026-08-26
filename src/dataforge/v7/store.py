@@ -35,6 +35,7 @@ from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
 from .graph_literal import detect_literal
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
 from .llm_serving import get_llm_serving_registry, resolve_llm_serving_config_path
+from .sample_data import SampleDataService
 from .servings import DatabaseLLMServingRegistry, ServingManager
 from .migrations import assert_schema_current
 from .models import (
@@ -1662,6 +1663,7 @@ class V7Store:
                                "recommended_predecessors": definition.recommended_predecessors, "recommended_successors": definition.recommended_successors,
                                "status": definition.lifecycle_status,
                                "version": version.version_no, "adapter_code": version.adapter_code,
+                               "node_role": ("flow_input" if definition.code == "reviewed-source-chunk-input" else "operator"),
                                "input_ports": version.input_ports, "output_ports": version.output_ports,
                                "input_example": version.input_example, "output_example": version.output_example,
                                "parameter_schema": version.parameter_schema, "parameter_docs": version.parameter_docs}
@@ -1805,6 +1807,7 @@ class V7Store:
                 values.append({"id": item.id, "code": item.code, "name": item.name,
                                "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH.get(item.code), "status": item.status,
                                "revision": revision.revision_no if revision else None,
+                               "latest_revision_id": revision.id if revision else None,
                                "revision_status": revision.status if revision else None,
                                "description": revision.description if revision else "",
                                "input_contract": revision.input_contract if revision else {}, "output_contract": revision.output_contract if revision else {},
@@ -4054,6 +4057,25 @@ class V7Store:
             return {"revision": revision.revision_no, "execution_snapshot_id": snapshot.id,
                     "operator_code": "semantic-chunker", "params": normalize_chunker_params(node.get("params"))}
 
+    def source_preparation_preview_document(self, source_version_id: str) -> dict[str, Any]:
+        """Return an already parsed document for a read-only rechunk preview."""
+        with self.sessions() as session:
+            version = session.get(SourceVersion, source_version_id)
+            source = session.get(Source, version.source_id) if version else None
+            document = session.scalar(select(DocumentIR).where(
+                DocumentIR.source_version_id == source_version_id,
+                DocumentIR.status == "completed",
+            ).order_by(DocumentIR.created_at.desc())) if version else None
+            if not version or not source:
+                raise ValueError("业务文档版本不存在")
+            if not document or not document.text:
+                raise ValueError("业务文档尚无可用于预览的 DocumentIR")
+            return {
+                "type": "source_version", "name": source.name, "filename": source.original_filename,
+                "text": document.text, "source_version_id": version.id,
+                "anchor": dict(document.anchor_json or {}),
+            }
+
     def create_source_preparation_chunker_revision(self, base_revision: int,
                                                    params: dict[str, Any]) -> dict[str, Any]:
         normalized = normalize_chunker_params(params)
@@ -4423,39 +4445,68 @@ class V7Store:
                 "source_definition_checksum": bundle["source_definition_checksum"],
                 "review_inputs": review_options,
                 "sink_requirements": list(bundle["sink_requirements"].values()), "sink_options": sink_options,
+                "builtin_samples": SampleDataService().list("knowledge_flow"),
+                "default_input": {"input_source": "builtin_sample", "sample_code": "reviewed-medical-v1"},
             }
 
     def _debug_preflight_with_session(self, session: Session, *, template_id: str, revision_id: str,
                                       expected_compiled_checksum: str, source_review_snapshot_ids: list[str],
-                                      sink_library_bindings: dict[str, str], require_serving_health: bool) -> dict[str, Any]:
+                                      sink_library_bindings: dict[str, str], require_serving_health: bool,
+                                      input_source: str = "source_review_snapshot",
+                                      sample_code: str | None = None) -> dict[str, Any]:
         template, revision = self._debug_revision(session, template_id, revision_id=revision_id)
         bundle = self._debug_compile_bundle(session, template, revision, require_serving_health=require_serving_health)
         if bundle["compiled"]["checksum"] != expected_compiled_checksum:
             raise RuntimeError("流程定义已变化，请重新执行调试预检")
+        if input_source == "builtin_sample":
+            sample = SampleDataService().reviewed_chunks(sample_code or "reviewed-medical-v1")
+            if sink_library_bindings:
+                raise ValueError("内置示例使用虚拟空库 Diff，不接受 KnowledgeLibrary 绑定")
+            reviews: list[dict[str, Any]] = []
+            libraries: dict[str, KnowledgeLibrary] = {}
+            targets = {key: {"baseline_kind": "empty", "knowledge_library_id": None}
+                       for key in bundle["sink_requirements"]}
+            return {**bundle, "reviews": reviews, "libraries": libraries, "targets": targets,
+                    "sample": sample, "resolved_chunks": list(sample["chunks"]),
+                    "input_descriptor": {"input_source": "builtin_sample", "sample_code": sample["code"],
+                                         "sample_version": sample["version"]},
+                    "input_digest": sample["input_digest"]}
+        if input_source != "source_review_snapshot":
+            raise ValueError("input_source 必须是 builtin_sample 或 source_review_snapshot")
         reviews = self._debug_review_selection(session, source_review_snapshot_ids, require_current=True)
         libraries = self._validate_debug_sinks(session, bundle["sink_requirements"], sink_library_bindings)
-        return {**bundle, "reviews": reviews, "libraries": libraries}
+        targets = {key: {"baseline_kind": "knowledge_library", "knowledge_library_id": library.id}
+                   for key, library in libraries.items()}
+        return {**bundle, "reviews": reviews, "libraries": libraries, "targets": targets,
+                "sample": None, "resolved_chunks": [],
+                "input_descriptor": {"input_source": "source_review_snapshot",
+                                     "source_review_snapshot_ids": [item["snapshot"].id for item in reviews]},
+                "input_digest": hashlib.sha256("|".join(item["snapshot"].content_digest for item in reviews).encode("utf-8")).hexdigest()}
 
     def debug_run_preflight(self, *, template_id: str, revision_id: str, expected_compiled_checksum: str,
-                            source_review_snapshot_ids: list[str], sink_library_bindings: dict[str, str]) -> dict[str, Any]:
+                            source_review_snapshot_ids: list[str], sink_library_bindings: dict[str, str],
+                            input_source: str = "source_review_snapshot", sample_code: str | None = None) -> dict[str, Any]:
         with self.sessions() as session:
             value = self._debug_preflight_with_session(
                 session, template_id=template_id, revision_id=revision_id,
                 expected_compiled_checksum=expected_compiled_checksum,
                 source_review_snapshot_ids=source_review_snapshot_ids,
                 sink_library_bindings=sink_library_bindings, require_serving_health=True,
+                input_source=input_source, sample_code=sample_code,
             )
             return {
                 "valid": True, "template_id": value["template"].id, "revision_id": value["revision"].id,
                 "revision": value["revision"].revision_no, "compiled_checksum": value["compiled"]["checksum"],
                 "source_definition_checksum": value["source_definition_checksum"],
-                "input_count": len(value["reviews"]), "output_keys": sorted(value["libraries"]),
+                "input_count": len(value["resolved_chunks"] or value["reviews"]),
+                "input_source": input_source, "output_keys": sorted(value["targets"]),
                 "sink_policy": "preview_only", "issues": [],
             }
 
     def create_debug_run(self, *, template_id: str, revision_id: str, expected_compiled_checksum: str,
                          source_review_snapshot_ids: list[str], sink_library_bindings: dict[str, str],
-                         idempotency_key: str) -> dict[str, Any]:
+                         idempotency_key: str, input_source: str = "source_review_snapshot",
+                         sample_code: str | None = None) -> dict[str, Any]:
         if not idempotency_key.strip():
             raise ValueError("idempotency_key 不能为空")
         with self.sessions.begin() as session:
@@ -4476,6 +4527,7 @@ class V7Store:
                 expected_compiled_checksum=expected_compiled_checksum,
                 source_review_snapshot_ids=source_review_snapshot_ids,
                 sink_library_bindings=sink_library_bindings, require_serving_health=True,
+                input_source=input_source, sample_code=sample_code,
             )
             revision = value["revision"]
             snapshot_checksum = self._snapshot_checksum(revision.id, value["compiled"]["checksum"])
@@ -4496,6 +4548,9 @@ class V7Store:
                 source_definition_checksum=value["source_definition_checksum"],
                 output_types_json=list(value["template"].output_types), reusable_node_map_json=value["reusable_map"],
                 sink_library_bindings_json={key: library.id for key, library in value["libraries"].items()},
+                input_source=input_source, input_descriptor_json=value["input_descriptor"],
+                resolved_chunks_json=list(value["resolved_chunks"]), input_digest=value["input_digest"],
+                sink_preview_targets_json=value["targets"],
                 requested_by="admin", idempotency_key=idempotency_key,
             )
             session.add(debug_input); session.flush()
@@ -4506,6 +4561,13 @@ class V7Store:
                     source_review_snapshot_id=review["snapshot"].id,
                     review_digest=review["snapshot"].content_digest, ordinal=ordinal,
                 ))
+            session.flush()
+            if input_source == "source_review_snapshot":
+                resolved_chunks = self._reviewed_chunks_for_debug_session(session, debug_input.id)
+                debug_input.resolved_chunks_json = resolved_chunks
+                debug_input.input_digest = hashlib.sha256(json.dumps(
+                    resolved_chunks, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
             run = FlowRun(
                 id=new_id("flowrun"), knowledge_job_id=None, source_preparation_job_id=None,
                 debug_input_snapshot_id=debug_input.id, execution_snapshot_id=execution.id,
@@ -4515,7 +4577,8 @@ class V7Store:
             session.add(run); session.flush()
             self._append_run_event(session, run.id, "run.queued", "完整调试 Run 已进入队列",
                                    payload={"template_id": value["template"].id, "revision_id": revision.id,
-                                            "input_count": len(value["reviews"]), "sink_policy": "preview_only"})
+                                             "input_count": len(debug_input.resolved_chunks_json),
+                                             "input_source": input_source, "sink_policy": "preview_only"})
             self.audit(session, "debug_run.created", "flow_run", run.id,
                        {"template_id": value["template"].id, "revision_id": revision.id})
             return {"id": run.id, "debug_input_snapshot_id": debug_input.id,
@@ -4798,8 +4861,6 @@ class V7Store:
             template = session.get(KnowledgeFlowTemplate, template_id)
             if not template or template.status == "archived":
                 raise ValueError("模板不存在或已归档")
-            if template.code in V7_BUILTIN_TEMPLATE_CODES:
-                raise ValueError("内置流程不能原地转为高级编排，请导入为自定义高级草稿")
             latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
                 KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
             ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
@@ -4812,18 +4873,35 @@ class V7Store:
                 raise ValueError("标准配置缺少 managed_template_code")
             flow_dsl = FLOW_AUTHORING_COMPILER.materialize(latest.definition_json, template.output_types)
             self._compile_template_definition(session, flow_dsl, template.output_types, purpose="knowledge", authoring_mode="advanced")
+            suffix = uuid.uuid4().hex[:8]
+            name = f"{template.name} 高级编排"
+            if session.scalar(select(KnowledgeFlowTemplate.id).where(
+                KnowledgeFlowTemplate.name == name, KnowledgeFlowTemplate.status != "archived",
+            )):
+                name = f"{name} {suffix}"
+            advanced = KnowledgeFlowTemplate(
+                id=new_id("flow"), code=f"custom-advanced-{suffix}", name=name,
+                description=f"由“{template.name}”r{latest.revision_no} 转换生成",
+                output_types=list(template.output_types), definition_json=flow_dsl,
+                authoring_mode="advanced", managed_template_code=None,
+                derived_from_template_id=template.id, derived_from_revision_id=latest.id,
+                status="draft", purpose="knowledge",
+            )
+            session.add(advanced); session.flush()
             revision = KnowledgeFlowTemplateRevision(
-                id=new_id("flowrev"), knowledge_flow_template_id=template.id,
-                revision_no=latest.revision_no + 1, definition_json=flow_dsl,
+                id=new_id("flowrev"), knowledge_flow_template_id=advanced.id,
+                revision_no=1, definition_json=flow_dsl,
                 authoring_mode="advanced", managed_template_code=None,
                 status="draft", purpose="knowledge",
             )
             session.add(revision)
-            template.authoring_mode, template.managed_template_code = "advanced", None
-            template.definition_json = flow_dsl
-            self.audit(session, "flow_template.detached_to_advanced", "knowledge_flow_template", template.id, {"revision": revision.revision_no})
-            return {"id": template.id, "revision": revision.revision_no, "status": "draft",
-                    "authoring_mode": "advanced", "definition": flow_dsl}
+            self.audit(session, "flow_template.converted_to_advanced", "knowledge_flow_template", advanced.id,
+                       {"source_template_id": template.id, "source_revision_id": latest.id})
+            return {"id": advanced.id, "name": advanced.name, "revision_id": revision.id,
+                    "revision": revision.revision_no, "status": "draft", "authoring_mode": "advanced",
+                    "definition": flow_dsl, "source_template_id": template.id,
+                    "source_revision_id": latest.id,
+                    "open_url": f"/developer/flow-templates?template_id={advanced.id}&edit=1"}
 
     def create_knowledge_job(self, source_version_ids: list[str], output_library_ids: dict[str, str], template_id: str,
                              document_library_template_binding_id: str | None = None) -> dict[str, Any]:
@@ -5077,20 +5155,28 @@ class V7Store:
                 raise ValueError("知识任务缺少执行快照")
             return snapshot.compiled_definition_json
 
-    def _type_contracts_for_bindings(self, session: Session, bindings: dict[str, str],
+    def _type_contracts_for_bindings(self, session: Session, bindings: dict[str, str | None],
                                      definition: dict[str, Any], template_revision_id: str | None) -> dict[str, dict[str, Any]]:
         values: dict[str, dict[str, Any]] = {}
         for output_type, library_id in bindings.items():
                 output_type = normalise_output_key(output_type)
-                library = session.get(KnowledgeLibrary, library_id)
-                revision = session.get(KnowledgeTypeRevision, library.knowledge_type_revision_id) if library and library.knowledge_type_revision_id else None
+                library = session.get(KnowledgeLibrary, library_id) if library_id else None
+                knowledge_type, graph_mode = output_contract(output_type)
+                revision = session.get(KnowledgeTypeRevision, library.knowledge_type_revision_id) if library and library.knowledge_type_revision_id else session.scalar(
+                    select(KnowledgeTypeRevision).join(
+                        KnowledgeType, KnowledgeType.current_revision_id == KnowledgeTypeRevision.id,
+                    ).where(KnowledgeType.code == knowledge_type, KnowledgeType.status == "active",
+                            KnowledgeTypeRevision.status == "published")
+                )
                 if not revision:
                     continue
                 mode_revision = None
-                if library.knowledge_type == "graph" and library.graph_mode:
+                effective_type = library.knowledge_type if library else knowledge_type
+                effective_mode = library.graph_mode if library else graph_mode
+                if effective_type == "graph" and effective_mode:
                     mode_revision = session.scalar(select(KnowledgeTypeModeRevision).where(
                         KnowledgeTypeModeRevision.knowledge_type_revision_id == revision.id,
-                        KnowledgeTypeModeRevision.mode == library.graph_mode,
+                        KnowledgeTypeModeRevision.mode == effective_mode,
                         KnowledgeTypeModeRevision.status == "published",
                     ).order_by(KnowledgeTypeModeRevision.revision_no.desc()))
                 prompt_body = ""
@@ -5106,7 +5192,7 @@ class V7Store:
                     prompt_body = prompt.body
                 graph_config: dict[str, Any] | None = None
                 graph_schema_hash: str | None = None
-                if library.knowledge_type == "graph":
+                if effective_type == "graph":
                     try:
                         config = normalize_graph_config((definition or {}).get("graph_config"))
                         graph_config = config.to_dict()
@@ -5119,8 +5205,8 @@ class V7Store:
                     "canonical_fields": mode_revision.canonical_fields if mode_revision else [revision.canonical_field],
                     "identity_fields": mode_revision.identity_fields if mode_revision else revision.identity_fields,
                     "source_policy": mode_revision.source_policy if mode_revision else revision.source_policy,
-                    "knowledge_type": library.knowledge_type, "graph_mode": library.graph_mode,
-                    "prompt": prompt_body, "library_id": library.id,
+                    "knowledge_type": effective_type, "graph_mode": effective_mode,
+                    "prompt": prompt_body, "library_id": library.id if library else None,
                     "graph_config": graph_config, "graph_schema_hash": graph_schema_hash,
                     "template_revision_id": template_revision_id,
                 }
@@ -5854,7 +5940,9 @@ class V7Store:
                                     "summary": item.summary_json, "record_count": item.record_count, "replayable": item.replayable,
                                     "uri": item.uri} for item in artifacts],
                      "sink_previews": [{"id": item.id, "output_key": item.output_key, "status": item.status,
-                                         "diff": item.diff_json, "quality": item.quality_json,
+                                          "baseline_kind": item.baseline_kind,
+                                          "knowledge_library_id": item.knowledge_library_id,
+                                          "diff": item.diff_json, "quality": item.quality_json,
                                          "preview_checksum": item.preview_checksum} for item in previews]}
 
     def _append_run_event(self, session: Session, flow_run_id: str, event_type: str, message: str, *, node_id: str | None = None,
@@ -6119,13 +6207,24 @@ class V7Store:
             review_inputs = list(session.scalars(select(DebugRunReviewInput).where(
                 DebugRunReviewInput.debug_input_snapshot_id == debug_input.id,
             ).order_by(DebugRunReviewInput.ordinal)))
-            versions_list = list(session.scalars(select(SourceVersion).where(
-                SourceVersion.id.in_([item.source_version_id for item in review_inputs]),
-            )))
-            sources = {item.id: item for item in session.scalars(select(Source).where(
-                Source.id.in_([version.source_id for version in versions_list]),
-            ))}
-            root_documents = self._reviewed_chunks_for_debug_session(session, debug_input.id)
+            if debug_input.input_source == "builtin_sample":
+                descriptor = dict(debug_input.input_descriptor_json or {})
+                source_id = f"sample-source:{descriptor.get('sample_code', 'reviewed-medical-v1')}"
+                version_id = f"sample-version:{descriptor.get('sample_code', 'reviewed-medical-v1')}:{descriptor.get('sample_version', '1')}"
+                versions_list = [SimpleNamespace(id=version_id, source_id=source_id)]
+                sources = {source_id: SimpleNamespace(
+                    id=source_id, name="DataForge 示例审核数据", original_filename="builtin-reviewed-sample",
+                )}
+            else:
+                versions_list = list(session.scalars(select(SourceVersion).where(
+                    SourceVersion.id.in_([item.source_version_id for item in review_inputs]),
+                )))
+                sources = {item.id: item for item in session.scalars(select(Source).where(
+                    Source.id.in_([version.source_id for version in versions_list]),
+                ))}
+            root_documents = list(debug_input.resolved_chunks_json or [])
+            if not root_documents:
+                root_documents = self._reviewed_chunks_for_debug_session(session, debug_input.id)
             parent_outputs: dict[str, dict[str, Any]] = {}
             ancestor = session.get(FlowRun, run.parent_flow_run_id) if run.parent_flow_run_id else None
             visited: set[str] = set()
@@ -6143,8 +6242,13 @@ class V7Store:
                             "values": [dict(item.data_json) for item in artifacts if item],
                         }
                 ancestor = session.get(FlowRun, ancestor.parent_flow_run_id) if ancestor.parent_flow_run_id else None
+            targets = dict(debug_input.sink_preview_targets_json or {}) or {
+                key: {"baseline_kind": "knowledge_library", "knowledge_library_id": value}
+                for key, value in dict(debug_input.sink_library_bindings_json or {}).items()
+            }
+            contract_bindings = {key: target.get("knowledge_library_id") for key, target in targets.items()}
             type_contracts = self._type_contracts_for_bindings(
-                session, dict(debug_input.sink_library_bindings_json),
+                session, contract_bindings,
                 dict(snapshot.compiled_definition_json), debug_input.knowledge_flow_template_revision_id,
             )
             return {
@@ -6152,6 +6256,8 @@ class V7Store:
                 "parameter_overrides": dict(run.parameter_overrides or {}),
                 "definition": snapshot.compiled_definition_json,
                 "sink_libraries": dict(debug_input.sink_library_bindings_json),
+                "sink_preview_targets": targets,
+                "input_source": debug_input.input_source,
                 "versions": versions_list, "sources": sources, "root_documents": root_documents,
                 "parent_outputs": parent_outputs, "type_contracts": type_contracts,
             }
@@ -6239,25 +6345,39 @@ class V7Store:
             counts["INACTIVE"] = len(inactive)
         return counts
 
-    def stage_sink_preview(self, flow_run_id: str, output_key: str, library_id: str, candidates: list[dict[str, Any]],
-                           successful_chunks: list[dict[str, Any]], quality: dict[str, Any] | None = None) -> dict[str, Any]:
+    def stage_sink_preview(self, flow_run_id: str, output_key: str, library_id: str | None, candidates: list[dict[str, Any]],
+                           successful_chunks: list[dict[str, Any]], quality: dict[str, Any] | None = None,
+                           baseline_kind: str = "knowledge_library") -> dict[str, Any]:
         with self.sessions.begin() as session:
-            base_hash = self._library_state_hash(session, library_id)
-            diff = self._preview_sink_diff(session, library_id, candidates, successful_chunks)
+            if baseline_kind == "empty":
+                if library_id:
+                    raise ValueError("虚拟空库 Diff 不允许绑定 KnowledgeLibrary")
+                base_hash = hashlib.sha256(b"[]").hexdigest()
+                keys = {str(item.get("source_knowledge_id") or "") for item in candidates}
+                diff = {"ADD": len({key for key in keys if key}), "UPDATE": 0, "INACTIVE": 0, "UNCHANGED": 0}
+            elif baseline_kind == "knowledge_library" and library_id:
+                base_hash = self._library_state_hash(session, library_id)
+                diff = self._preview_sink_diff(session, library_id, candidates, successful_chunks)
+            else:
+                raise ValueError("Sink Preview 基线不合法")
             checksum = hashlib.sha256(json.dumps({"base": base_hash, "candidates": candidates, "chunks": successful_chunks}, ensure_ascii=False,
                                                  sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
             run = session.get(FlowRun, flow_run_id)
-            preview = FlowRunSinkPreview(id=new_id("preview"), flow_run_id=flow_run_id, output_key=output_key, knowledge_library_id=library_id,
+            preview = FlowRunSinkPreview(id=new_id("preview"), flow_run_id=flow_run_id, output_key=output_key,
+                                         knowledge_library_id=library_id, baseline_kind=baseline_kind,
                                          candidates_json=candidates, successful_chunks_json=successful_chunks, diff_json=diff,
                                          quality_json=quality or {"candidate_count": len(candidates), "status": "pass"},
                                          base_state_hash=base_hash, preview_checksum=checksum,
                                          status="preview_only" if run and run.debug_input_snapshot_id else "pending")
             session.add(preview); self._append_run_event(session, flow_run_id, "sink.preview_ready", f"{output_key} Diff 已暂存", payload={"diff": diff, "checksum": checksum})
-            return {"output_key": output_key, "diff": diff, "preview_checksum": checksum}
+            return {"output_key": output_key, "baseline_kind": baseline_kind,
+                    "knowledge_library_id": library_id, "diff": diff, "preview_checksum": checksum}
 
     def commit_derived_run(self, flow_run_id: str, preview_checksum: str, idempotency_key: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
             run = session.get(FlowRun, flow_run_id)
+            if run and run.debug_input_snapshot_id:
+                raise ValueError("Debug Sink Preview 永远不可提交")
             if not run or run.status not in {"awaiting_commit", "completed"}: raise ValueError("Flow Run 没有可提交的 Sink 预览")
             previews = session.scalars(select(FlowRunSinkPreview).where(FlowRunSinkPreview.flow_run_id == flow_run_id)).all()
             preview = next((item for item in previews if item.preview_checksum == preview_checksum), None)
@@ -6265,6 +6385,8 @@ class V7Store:
             if preview.status == "committed":
                 if preview.idempotency_key == idempotency_key: return {"id": run.id, "status": run.status, "idempotent": True}
                 raise ValueError("该 Sink 预览已经提交")
+            if not preview.knowledge_library_id or preview.baseline_kind != "knowledge_library":
+                raise ValueError("虚拟空库 Preview 不可提交")
             if self._library_state_hash(session, preview.knowledge_library_id) != preview.base_state_hash:
                 raise RuntimeError("知识库当前态已变化，请重新生成 Sink 预览")
             payload = {"id": preview.id, "output_key": preview.output_key, "knowledge_library_id": preview.knowledge_library_id,

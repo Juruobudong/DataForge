@@ -22,6 +22,7 @@ from .auth import SESSION_COOKIE, verify_admin_password
 from .models import AdminSession, Deployment, utc_now
 from .observability import COMPONENTS, ComponentCheckService, components_snapshot
 from .runner import preview_template_definition
+from .sample_data import SampleDataService, preview_preprocessing_document
 from .routing import AtomicRoutingPublisher
 from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
@@ -102,6 +103,14 @@ class SourcePreparationChunkerRevisionRequest(BaseModel):
     params: dict
 
 
+class SourcePreparationPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    input_source: Literal["builtin_sample", "source_version"] = "builtin_sample"
+    sample_code: str = "preprocessing-document-v1"
+    source_version_id: str | None = None
+    configuration: dict = Field(default_factory=dict)
+
+
 class DocumentTemplateBatchBindingRequest(BaseModel):
     knowledge_flow_template_ids: list[str] = Field(min_length=1)
 
@@ -116,6 +125,7 @@ class KnowledgeLibraryDeletionRequest(BaseModel):
 
 
 class KnowledgeJobRequest(BaseModel):
+    input_source: str = "source_review_snapshot"
     source_version_ids: list[str] = Field(min_length=1)
     output_library_ids: dict[str, str] = Field(min_length=1)
     knowledge_flow_template_id: str
@@ -165,8 +175,10 @@ class DebugRunConfigRequest(BaseModel):
     template_id: str
     revision_id: str
     expected_compiled_checksum: str
-    source_review_snapshot_ids: list[str] = Field(min_length=1)
-    sink_library_bindings: dict[str, str]
+    input_source: Literal["builtin_sample", "source_review_snapshot"] = "source_review_snapshot"
+    sample_code: str | None = None
+    source_review_snapshot_ids: list[str] = Field(default_factory=list)
+    sink_library_bindings: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str | None = None
 
 
@@ -496,6 +508,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         store.assert_schema_current()
     instance = InstanceContext.load(store, resolved)
     objects = _objects(resolved)
+    samples = SampleDataService()
     component_checks = ComponentCheckService(store, resolved, objects)
     component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
     serving_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="serving-startup-check")
@@ -503,7 +516,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     serving_manager = ServingManager(store.sessions, resolved.config_encryption_key)
     configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
-    app.state.store, app.state.objects, app.state.instance = store, objects, instance
+    app.state.store, app.state.objects, app.state.instance, app.state.samples = store, objects, instance, samples
     app.state.local_milvus_config = local_milvus_config
     app.state.serving_manager = serving_manager
     app.state.serving_startup_check_future = None
@@ -1144,7 +1157,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/knowledge-jobs", status_code=202)
     def create_knowledge_job(payload: KnowledgeJobRequest):
-        try: return store.create_knowledge_job(payload.source_version_ids, payload.output_library_ids, payload.knowledge_flow_template_id)
+        try:
+            if payload.input_source != "source_review_snapshot":
+                raise ReviewGateError("BUILTIN_SAMPLE_NOT_ALLOWED", "正式 KnowledgeJob 只能使用真实审核快照")
+            return store.create_knowledge_job(payload.source_version_ids, payload.output_library_ids, payload.knowledge_flow_template_id)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
@@ -1222,6 +1238,31 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def create_source_preparation_chunker_revision(payload: SourcePreparationChunkerRevisionRequest):
         try: return store.create_source_preparation_chunker_revision(payload.base_revision, payload.params)
         except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/developer/samples")
+    def developer_samples(purpose: str = ""):
+        return samples.list(purpose)
+
+    @app.get("/api/developer/samples/{sample_code}")
+    def developer_sample(sample_code: str):
+        try: return samples.get(sample_code)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/developer/source-preparation/preview")
+    def preview_source_preparation(payload: SourcePreparationPreviewRequest):
+        try:
+            if payload.input_source == "builtin_sample":
+                sample = samples.get(payload.sample_code)
+                if sample["purpose"] != "preprocessing":
+                    raise ValueError("示例用途不是文档预处理")
+                document = {"type": "builtin_sample", "name": sample["name"],
+                            "filename": sample["filename"], "text": sample["content"]}
+            else:
+                if not payload.source_version_id:
+                    raise ValueError("业务文档预览必须指定 source_version_id")
+                document = store.source_preparation_preview_document(payload.source_version_id)
+            return preview_preprocessing_document(document, payload.configuration)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog")
@@ -1375,6 +1416,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 expected_compiled_checksum=payload.expected_compiled_checksum,
                 source_review_snapshot_ids=payload.source_review_snapshot_ids,
                 sink_library_bindings=payload.sink_library_bindings,
+                input_source=payload.input_source, sample_code=payload.sample_code,
             )
         except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
@@ -1388,6 +1430,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 source_review_snapshot_ids=payload.source_review_snapshot_ids,
                 sink_library_bindings=payload.sink_library_bindings,
                 idempotency_key=payload.idempotency_key or str(uuid.uuid4()),
+                input_source=payload.input_source, sample_code=payload.sample_code,
             )
         except RuntimeError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc

@@ -1,173 +1,45 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { api } from '../../../api/platform'
-import CompiledDagPreview from './CompiledDagPreview.vue'
+import { computed, ref, watch } from 'vue'
 
-const props = defineProps({
-  template: { type: Object, default: null },
-  managedTemplates: { type: Array, default: () => [] },
-  catalog: { type: Array, default: () => [] },
-  outputTypes: { type: Array, default: () => [] },
-})
-const emit = defineEmits(['update:definition', 'preview'])
-
-const managedTemplate = computed(() =>
-  props.managedTemplates.find(item => item.code === props.template?.managed_template_code) || null,
-)
+const props = defineProps({ template: { type: Object, default: null }, managedTemplates: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] } })
+const emit = defineEmits(['update:definition'])
+const managedTemplate = computed(() => props.managedTemplates.find(item => item.code === props.template?.managed_template_code) || null)
 const stages = computed(() => managedTemplate.value?.stages || [])
+const configurableStages = computed(() => stages.value.filter(item => item.configurable && item.config_schema))
 const stageConfig = ref({ schema_version: 1, template_code: '', stages: {} })
-const activeStage = ref('generation')
-const compiled = ref(null)
-const showDag = ref(false)
-const loading = ref(false)
-const previewError = ref('')
-let debounceTimer = null
 
 function syncFromTemplate() {
   const code = props.template?.managed_template_code || ''
   const def = props.template?.definition
-  stageConfig.value = {
-    schema_version: 1,
-    template_code: code,
-    stages: def?.template_code === code ? { ...(def.stages || {}) } : {},
-  }
-  activeStage.value = stages.value.find(stage => stage.configurable)?.code || 'generation'
+  stageConfig.value = { schema_version: 1, template_code: code, stages: def?.template_code === code ? { ...(def.stages || {}) } : {} }
 }
-
 watch(() => props.template?.id, syncFromTemplate, { immediate: true })
 watch(() => managedTemplate.value?.code, syncFromTemplate)
-
 function configOf(stageCode) {
   if (!stageConfig.value.stages[stageCode]) stageConfig.value.stages[stageCode] = { config: {} }
   if (!stageConfig.value.stages[stageCode].config) stageConfig.value.stages[stageCode].config = {}
   return stageConfig.value.stages[stageCode].config
 }
-
-function emitDefinition() {
+function update(stageCode, key, value) {
+  configOf(stageCode)[key] = value
   emit('update:definition', JSON.parse(JSON.stringify(stageConfig.value)))
 }
-
-function onChange(stageCode, key, value) {
-  configOf(stageCode)[key] = value
-  emitDefinition()
-  schedulePreview()
-}
-
 function listValue(items) { return Array.isArray(items) ? items.join(', ') : '' }
-function listChange(stageCode, key, raw) {
-  const value = raw.split(',').map(item => item.trim()).filter(Boolean)
-  onChange(stageCode, key, value)
-}
-
-function schedulePreview() {
-  clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => preview(), 450)
-}
-
-async function preview() {
-  if (!managedTemplate.value) return
-  loading.value = true; previewError.value = ''
-  try {
-    const result = await api.previewFlowCompilation({
-      authoring_mode: 'standard',
-      managed_template_code: managedTemplate.value.code,
-      output_types: props.outputTypes,
-      definition: stageConfig.value,
-    })
-    compiled.value = result
-    emit('preview', result)
-  } catch (e) { previewError.value = e.message }
-  finally { loading.value = false }
-}
-
-function toggleDag() { showDag.value = !showDag.value; if (showDag.value) preview() }
-
-onBeforeUnmount(() => clearTimeout(debounceTimer))
+function updateList(stageCode, key, raw) { update(stageCode, key, raw.split(',').map(item => item.trim()).filter(Boolean)) }
 </script>
 
 <template>
   <div class="standard-editor">
-    <div class="standard-grid">
-      <div class="stage-pipeline">
-        <header class="pane-head"><b>流程阶段</b><span>{{ managedTemplate?.name || '标准流程' }}</span></header>
-        <ol class="stage-list">
-          <li
-            v-for="(stage, index) in stages"
-            :key="stage.code"
-            :class="{ active: activeStage === stage.code, locked: stage.locked }"
-            @click="activeStage = stage.code"
-          >
-            <span class="stage-index">{{ index + 1 }}</span>
-            <div class="stage-body">
-              <b>{{ stage.name }}</b>
-              <small>{{ stage.locked ? (stage.configurable ? '可配置 · 系统保护' : '系统管理 · 不可删除') : '可替换' }}</small>
-            </div>
-            <span v-if="stage.locked" class="lock-tag">锁定</span>
-          </li>
-        </ol>
-        <p class="stage-note">阶段顺序由系统控制，用户只配置参数与允许替换的实现。</p>
-      </div>
-
-      <div class="stage-inspector">
-        <header class="pane-head"><b>阶段配置</b></header>
-        <template v-if="managedTemplate">
-          <div v-for="stage in stages.filter(item => item.code === activeStage)" :key="stage.code" class="inspector-body">
-            <template v-if="stage.configurable && stage.config_schema">
-              <label v-for="(spec, key) in stage.config_schema.properties || {}" :key="key" class="field">
-                <span>{{ key === 'llm_serving' ? '模型服务' : key === 'entity_types' ? '实体类型' : key === 'relation_types' ? '关系类型' : key }}</span>
-                <input
-                  v-if="spec.type === 'string'"
-                  :value="configOf(stage.code)[key] ?? ''"
-                  :placeholder="spec.description || ''"
-                  @input="onChange(stage.code, key, $event.target.value)"
-                >
-                <textarea
-                  v-else-if="spec.type === 'array'"
-                  :value="listValue(configOf(stage.code)[key])"
-                  rows="2"
-                  :placeholder="spec.description || '逗号分隔'"
-                  @input="listChange(stage.code, key, $event.target.value)"
-                ></textarea>
-              </label>
-            </template>
-            <p v-else class="readonly-stage">该阶段由系统管理，无可配置参数。</p>
-          </div>
-        </template>
-        <p v-else class="readonly-stage">请先选择标准模板。</p>
-      </div>
-    </div>
-
-    <div class="dag-toggle">
-      <button :class="{ active: showDag }" @click="toggleDag">{{ showDag ? '隐藏执行 DAG' : '查看执行 DAG' }}</button>
-      <span v-if="loading" class="loading-hint">编译中…</span>
-      <span v-if="previewError" class="preview-error">{{ previewError }}</span>
-    </div>
-    <CompiledDagPreview v-if="showDag" :compiled-definition="compiled?.compiled_definition || null" :catalog="catalog" />
+    <article class="business-stage"><span class="number">1</span><div class="stage-content"><h3>输入</h3><b>已审核文档块</b><p>正式运行由 SourceReviewSnapshot 自动注入；开发预览默认使用 DataForge 内置示例审核数据。</p><span class="badge blue">运行时绑定</span></div></article>
+    <span class="arrow">↓</span>
+    <article class="business-stage"><span class="number">2</span><div class="stage-content"><h3>知识生成</h3><div v-if="configurableStages.length" class="config-sections"><section v-for="stage in configurableStages" :key="stage.code"><h4>{{ stage.name }}</h4><label v-for="(spec,key) in stage.config_schema.properties || {}" :key="key"><span>{{ key === 'llm_serving' ? '模型服务' : key === 'entity_types' ? '实体类型' : key === 'relation_types' ? '关系类型' : key }}</span><input v-if="spec.type==='string'" :value="configOf(stage.code)[key] ?? ''" :placeholder="spec.description || ''" @input="update(stage.code,key,$event.target.value)"><textarea v-else-if="spec.type==='array'" :value="listValue(configOf(stage.code)[key])" rows="2" placeholder="逗号分隔" @input="updateList(stage.code,key,$event.target.value)"></textarea></label></section></div><p v-else>当前目标没有需要人工配置的生成参数。</p><small>Prompt 由系统根据目标、Schema 和所选模型生成。</small></div></article>
+    <span class="arrow">↓</span>
+    <article class="business-stage"><span class="number">3</span><div class="stage-content"><h3>质量治理</h3><div class="checks"><span>✓ Schema 校验</span><span>✓ 知识质量校验</span><span>✓ 来源 Evidence</span></div></div></article>
+    <span class="arrow">↓</span>
+    <article class="business-stage"><span class="number">4</span><div class="stage-content"><h3>输出知识</h3><div class="outputs"><section v-for="item in outputTypes" :key="item"><b>{{ item }}</b><span>来源绑定：自动</span><span>质量门禁：开启</span></section></div><p>这里只保存 output key、类型和质量策略，不绑定具体 KnowledgeLibrary。</p></div></article>
   </div>
 </template>
 
 <style scoped>
-.standard-editor { display: grid; gap: 12px; }
-.standard-grid { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(320px, 1.2fr); gap: 12px; }
-.stage-pipeline, .stage-inspector { border: 1px solid var(--border, #dfe5ed); border-radius: 11px; background: #ffffff; overflow: hidden; }
-.pane-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border, #dfe5ed); }
-.pane-head b { color: #34445a; }
-.pane-head span { color: #8a97a8; font-size: 11px; }
-.stage-list { list-style: none; margin: 0; padding: 8px; display: grid; gap: 6px; }
-.stage-list li { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border, #dfe5ed); border-radius: 9px; cursor: pointer; background: #fafbfd; }
-.stage-list li.active { border-color: #b9cff7; background: #eff5ff; }
-.stage-index { width: 22px; height: 22px; border-radius: 50%; background: #2f6fed; color: #fff; display: grid; place-items: center; font-size: 11px; font-weight: 800; }
-.stage-body { flex: 1; display: grid; gap: 2px; }
-.stage-body b { color: #34445a; font-size: 13px; }
-.stage-body small { color: #8290a3; font-size: 11px; }
-.lock-tag { padding: 2px 7px; border-radius: 999px; background: #eef2f7; color: #66758a; font-size: 10px; }
-.stage-note { margin: 8px 12px; color: #8a97a8; font-size: 11px; }
-.inspector-body { padding: 12px 14px; display: grid; gap: 12px; }
-.field { display: grid; gap: 5px; }
-.field span { color: #66758a; font-size: 11px; font-weight: 700; }
-.field input, .field textarea { padding: 8px 10px; border: 1px solid var(--border, #dfe5ed); border-radius: 8px; font: inherit; font-size: 12px; }
-.readonly-stage { padding: 22px 14px; color: #8290a3; font-size: 12px; text-align: center; }
-.dag-toggle { display: flex; align-items: center; gap: 10px; }
-.loading-hint { color: #b97917; font-size: 11px; }
-.preview-error { color: #c0392b; font-size: 11px; }
+.standard-editor{display:grid;justify-items:stretch;gap:8px;max-width:900px;margin:0 auto}.business-stage{display:grid;grid-template-columns:42px 1fr;gap:13px;padding:17px;border:1px solid #dfe5ed;border-radius:13px;background:#fff}.number{display:grid;width:36px;height:36px;place-items:center;border-radius:50%;background:#2f6fed;color:#fff;font-weight:900}.stage-content h3{margin:0 0 10px;color:#2f4058}.stage-content p{margin:6px 0;color:#647287;line-height:1.6}.stage-content small{display:block;margin-top:10px;color:#7b8798}.arrow{text-align:center;color:#7c8ca3;font-size:20px}.config-sections{display:grid;gap:12px}.config-sections section{display:grid;gap:8px;padding:12px;border:1px solid #e5e9ef;border-radius:10px;background:#fafbfd}.config-sections h4{margin:0}.config-sections label{display:grid;grid-template-columns:150px 1fr;gap:10px;align-items:center}.checks{display:flex;flex-wrap:wrap;gap:8px}.checks span{padding:8px 11px;border-radius:8px;background:#edf8f3;color:#207a5c;font-weight:700}.outputs{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.outputs section{display:grid;gap:4px;padding:11px;border:1px solid #dfe8f5;border-radius:9px;background:#f7faff}.outputs span{color:#6f7d91;font-size:11px}
 </style>

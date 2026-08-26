@@ -50,5 +50,8 @@ dataforge-drop-stale-test-collections = "dataforge.v7.stale_collection_cleanup:m
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"dataforge.v7" = ["resources/samples/**/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

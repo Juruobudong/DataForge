@@ -17,7 +17,7 @@ export function compatibleProfilesForTask(task, knowledgeTypes, qaAgent = false)
 
 export function routingPublishReadiness(deploymentTasks, authorizations, targetUri) {
   const problems = []
-  if (!deploymentTasks.some(task => task.enabled)) problems.push('请先配置并启用运行任务')
+  if (!deploymentTasks.some(task => task.enabled)) problems.push('请先配置并启用检索通道')
   if (!authorizations.some(route => route.enabled && route.knowledge_library_ids?.length)) problems.push('请先完成知识范围配置')
   if (!String(targetUri || '').trim()) problems.push('当前环境尚未配置 Milvus 服务')
   return { ready: problems.length === 0, problems }

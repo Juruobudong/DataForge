@@ -33,9 +33,9 @@
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
-| 流程开发区 | 标准流程 | `DONE` | Document Parse / Clean / Chunk / Production / Publish 由受控子图与节点组成。 |
-| 流程开发区 | 知识流程模板 / 算子库 / 可复用子图 | `DONE` | Schema 驱动 ServingSelector、模型状态节点卡、九类动态目录与共享 FlowCanvas；发布 Snapshot 冻结 Serving code。 |
-| 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision、多份当前审核输入和 runtime Sink 绑定可创建 Preview-only debug_full；支持 Debug 节点重放、Runtime DAG/Artifact/Console、准确 Diff、应用当前 Draft 与另存自定义 Advanced Flow。真实 `.34` E2E 为 `CONNECT`。 |
+| 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
+| 流程开发区 | 知识流程 / 开发者资源 | `DONE` | Standard 业务配置不显示 DAG，Advanced 才显示 Authoring DAG；开发者资源不可折叠，含算子 Registry 和可复用子流程。 |
+| 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision 可使用内置审核 Sample + 虚拟空库 Diff，或同库多审核输入 + 真实 Sink Diff；Runtime DAG 只读，真实 `.34` E2E 为 `CONNECT`。 |
 | 流程开发区 | 独立“向量索引”导航页 | `REMOVE` | 已收口进 DataFlow 调试台；旧链接重定向，仍只读。 |
 | 原型能力 | DataFlow WebUI、Shell、任意 Python、运行时改图 | `REMOVE` | 与受控 Flow 和 Runner 安全边界冲突。 |
 | 原型能力 | 任意上游算子、KCenterGreedy、MultiHop Batch、Reference Remover、训练/代码/Text2SQL/Agentic-RAG | `REMOVE` | 不在 V7 Catalog；P1 Refiner/MultiHop/PII 仍需专门批准。 |
@@ -55,7 +55,7 @@
 | 受控模板修订 CRUD、默认、校验、发布、样例运行 | `DONE` | 生产任务固定引用已发布修订。 |
 | Operator / Prompt / Quality / Subflow / Snapshot / Flow Run 接口 | `DONE` | Catalog 屏蔽内部 DataFlow 类名；任务固定 `execution_snapshot_id`，可读取节点和 Artifact 诊断。 |
 | 派生 Run 与 Sink 暂存提交 | `DONE` | `node_only/from_node` 复用同快照可重放 Artifact；Sink 默认 `awaiting_commit`，以 checksum、当前态冲突检测和幂等键确认提交。 |
-| Debug Run / Debug Input Snapshot / 流程物化 | `DONE` | Debug owner 与业务 Job 分离，冻结 authoring+execution definition 和多审核输入；Debug Sink 永远 Preview Only，成功配置可安全应用或另存 Flow Draft。 |
+| Debug Run / Debug Input Snapshot / 流程物化 | `DONE` | Debug owner 与业务 Job 分离，冻结 input source/descriptor/resolved chunks/digest 和 authoring+execution definition；Sample/真实输入共用 Runner，Debug Sink 永远 Preview Only。 |
 | Knowledge Sink Schema/来源/质量 Gate | `DONE` | `review` 与失败候选阻断该 Sink；多 Sink 独立事务写入。 |
 | Model Serving 分块生成、失败保留与局部重试 | `DONE` | DB Registry 默认 `qwen3_32b`，新默认策略 120 秒/2 次重试；Flow 发布健康门禁，Snapshot 冻结 code，分块失败隔离不变。 |
 | PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、`0~1` 多位置 SourceAnchor 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU/坐标验收归 C-01～C-04/C-11。 |

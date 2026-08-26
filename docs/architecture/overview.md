@@ -28,7 +28,7 @@ PC 浏览器
 - API 与 Worker 负责治理、排队和外部存储协调；Runner 执行受控知识流程。
 - 知识处理和 Vector Sync 通过知识库工作租约互斥；不同知识库可并行，多输出任务原子取得全部目标库租约。
 - PDF 固定经 MinerU 3.4.4 `pipeline + auto + ch` 解析；一次性强制 OCR 只允许管理员对 PDF 派生调试 Run 使用。
-- 运行调试已经实现为 V7 自有 Execution Sandbox：管理员可从 Draft/Published Revision、当前审核文档和运行时 Sink 绑定创建 Preview-only `debug_full`，并继续 node-only/from-node 重放。Debug Run 不创建 KnowledgeJob、不写正式知识；成功配置可应用回当前 Draft 或从冻结源定义另存自定义 Advanced Draft。它不是 DataFlow WebUI 或通用 Studio。
+- 运行调试已经实现为 V7 自有 Execution Sandbox：管理员可从 Draft/Published Revision选择版本化内置审核 Sample，或同库多个当前审核 Snapshot；输入统一冻结后由既有 Runner 执行。内置 Sample 使用虚拟空库 Diff，真实输入使用运行时 KnowledgeLibrary Diff，二者均不创建 KnowledgeJob、不写正式知识；Runtime DAG 只读。它不是 DataFlow WebUI 或通用 Studio。
 - 流程开发区旧“向量索引”导航仍已移除并重定向到 DataFlow 调试台；业务工作区另提供“向量存储”实时库存，聚合 Collection/Partition 与逻辑资产关系并开放受控 verify/load/release，不恢复开发区索引编辑能力。
 
 ## 数据与存储边界

@@ -2,6 +2,15 @@
 import { computed, ref, watch } from 'vue'
 const props = defineProps({ node: Object, artifact: Object, content: Object })
 const emit = defineEmits(['inspect-artifact'])
+const tabs = [
+  { key: 'overview', label: '概览' },
+  { key: 'parameters', label: '参数' },
+  { key: 'input', label: '输入' },
+  { key: 'output', label: '输出' },
+  { key: 'logs', label: '日志' },
+  { key: 'metrics', label: '指标' },
+  { key: 'lineage', label: '血缘' },
+]
 const tab = ref('overview')
 watch(() => props.node?.node_id || props.artifact?.id, () => { tab.value = 'overview' })
 const title = computed(() => props.artifact ? `Artifact · ${props.artifact.type || 'execution'}` : props.node?.node_id || '选择节点或 Artifact Edge')
@@ -26,7 +35,7 @@ const payload = computed(() => {
 <template>
   <aside class="runtime-inspector">
     <header><div><h3>{{ title }}</h3><small v-if="node">{{ inspectorType }}</small></div><span v-if="node" class="badge" :class="node.status==='completed'?'green':node.status==='failed'?'red':'amber'">{{ node.status }}</span></header>
-    <nav v-if="node && !artifact"><button v-for="item in ['overview','parameters','input','output','logs','metrics','lineage']" :key="item" :class="{active:tab===item}" @click="tab=item">{{ item }}</button></nav>
+    <nav v-if="node && !artifact"><button v-for="item in tabs" :key="item.key" :class="{active:tab===item.key}" @click="tab=item.key">{{ item.label }}</button></nav>
     <div class="body" v-if="payload"><pre>{{ JSON.stringify(artifact ? payload : payload[tab], null, 2) }}</pre><template v-if="node && ['input','output'].includes(tab)"><button v-for="id in payload[tab] || []" :key="id" class="artifact-link" @click="emit('inspect-artifact', id)">{{ id }}</button></template></div>
     <p v-else class="empty">从 Runtime DAG 选择真实算子节点，或点击 Artifact Edge 查看数据。</p>
   </aside>

@@ -28,6 +28,27 @@ def _type_matches(actual: str, expected: str) -> bool:
     return actual == expected or expected.endswith(":*") and actual.startswith(expected[:-1])
 
 
+def node_role(node: dict[str, Any]) -> str:
+    """Return the stable authoring role while accepting legacy Flow DSL nodes."""
+    explicit = str(node.get("node_role") or "")
+    if explicit in {"flow_input", "operator", "knowledge_output"}:
+        return explicit
+    if node.get("kind") == "knowledge_sink":
+        return "knowledge_output"
+    if node.get("kind") == "operator" and node.get("ref") == "reviewed-source-chunk-input":
+        return "flow_input"
+    return "operator"
+
+
+def _contains_knowledge_library_binding(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(key == "knowledge_library_id" or _contains_knowledge_library_binding(item)
+                   for key, item in value.items())
+    if isinstance(value, list):
+        return any(_contains_knowledge_library_binding(item) for item in value)
+    return False
+
+
 class FlowCompiler:
     def __init__(self, catalog: dict[str, dict[str, Any]] | None = None, subflows: dict[str, dict[str, Any]] | None = None, type_revisions: dict[str, dict[str, Any]] | None = None, *, allow_controlled: bool = False, llm_serving_registry: LLMServingRegistry | None = None):
         self.catalog = catalog or catalog_by_code()
@@ -49,6 +70,7 @@ class FlowCompiler:
             node_id = str(node["id"])
             if node.get("kind") != "subflow":
                 node["id"] = f"{prefix}{node_id}"
+                node["node_role"] = node_role(node)
                 node["origin_path"] = [part for part in f"{prefix}{node_id}".split("::") if part]
                 if definition.get("_subgraph_code"):
                     node["source_subgraph"] = {"code": definition["_subgraph_code"], "revision": definition.get("_subgraph_revision")}
@@ -86,6 +108,8 @@ class FlowCompiler:
         return result_nodes, result_edges
 
     def compile(self, definition: dict[str, Any]) -> dict[str, Any]:
+        if _contains_knowledge_library_binding(definition):
+            raise FlowValidationError("Flow Definition 不允许绑定 KnowledgeLibrary")
         schema_version = int(definition.get("schema_version", 2))
         if schema_version not in {2, 3}:
             raise FlowValidationError("仅支持 Flow DSL schema_version=2 或 3")
@@ -98,14 +122,15 @@ class FlowCompiler:
         outgoing: dict[str, list[str]] = defaultdict(list)
         for edge in edges:
             source_node, target_node = by_id[edge["source"]], by_id[edge["target"]]
-            if source_node.get("kind") != "operator":
+            if source_node.get("kind") != "operator" or node_role(source_node) == "knowledge_output":
                 raise FlowValidationError(f"节点 {edge['source']} 不能作为边的起点")
             source_item = self.catalog.get(str(source_node.get("ref", ""))) or {}
             source_ports = source_item.get("output_ports") or {"output": {"artifact_type": source_item.get("output")}}
             if edge["source_port"] not in source_ports:
                 raise FlowValidationError(f"节点 {edge['source']} 不存在输出端口 {edge['source_port']}")
             if target_node.get("kind") == "knowledge_sink":
-                target_ports = {"input": {"artifact_type": "candidate:*", "cardinality": "one"}}
+                target_ports = {"input": {"artifact_type": "candidate:*", "cardinality": "one",
+                                            "required": True, "binding": "edge"}}
             elif target_node.get("kind") == "operator":
                 target_item = self.catalog.get(str(target_node.get("ref", ""))) or {}
                 target_ports = target_item.get("input_ports") or {"input": {"artifact_type": target_item.get("input"), "cardinality": "one"}}
@@ -113,6 +138,10 @@ class FlowCompiler:
                 raise FlowValidationError(f"展开后仍存在不支持的节点类型：{target_node.get('kind')}")
             if edge["target_port"] not in target_ports:
                 raise FlowValidationError(f"节点 {edge['target']} 不存在输入端口 {edge['target_port']}")
+            if str(target_ports[edge["target_port"]].get("binding") or "edge") != "edge":
+                raise FlowValidationError(f"节点 {edge['target']} 的输入端口 {edge['target_port']} 由运行时绑定，不能连接 Edge")
+            if node_role(target_node) == "flow_input":
+                raise FlowValidationError(f"Flow Input {edge['target']} 不能连接 Incoming Edge")
             incoming[edge["target"]].append(edge["source"]); outgoing[edge["source"]].append(edge["target"])
         isolated = [node_id for node_id in by_id if not incoming[node_id] and not outgoing[node_id]]
         if isolated and len(by_id) > 1:
@@ -137,6 +166,7 @@ class FlowCompiler:
         for node_id in ordered:
             node = by_id[node_id]; kind = node.get("kind")
             if kind == "knowledge_sink":
+                node["node_role"] = "knowledge_output"
                 knowledge_type = str(node.get("knowledge_type", ""))
                 if knowledge_type not in self.type_revisions:
                     raise FlowValidationError(f"Knowledge Sink 引用的知识类型未发布：{knowledge_type}")
@@ -159,14 +189,20 @@ class FlowCompiler:
                 raise FlowValidationError(f"算子不在 Flow allowlist：{code}")
             if item.get("exposure") == "controlled" and not self.allow_controlled:
                 raise FlowValidationError(f"算子尚未获批进入当前 Flow：{code}")
+            node["node_role"] = node_role(node)
             source_types = [outputs[source] for source in incoming[node_id]]
-            port_spec = (item.get("input_ports") or {}).get("input") or {"artifact_type": item["input"], "cardinality": "one"}
+            port_spec = (item.get("input_ports") or {}).get("input") or {"artifact_type": item["input"], "cardinality": "one", "required": True}
             expected = port_spec.get("artifact_type", item["input"])
             cardinality = port_spec.get("cardinality", "one")
-            if expected in {"source_file", "approved_source_chunks"}:
+            binding = str(port_spec.get("binding") or (
+                "runtime_input" if node_role(node) == "flow_input"
+                else "system_injected" if expected == "source_file" else "edge"
+            ))
+            required = bool(port_spec.get("required", True))
+            if binding in {"runtime_input", "system_injected"}:
                 if source_types:
                     raise FlowValidationError(f"{code} 只能作为 Flow 根节点")
-            elif not source_types or cardinality == "one" and len(source_types) != 1 or any(not _type_matches(source_type, expected) for source_type in source_types):
+            elif required and (not source_types or cardinality == "one" and len(source_types) != 1) or source_types and any(not _type_matches(source_type, expected) for source_type in source_types):
                 raise FlowValidationError(f"节点 {node_id} 输入 Artifact Type 不兼容，需要 {expected}")
             params = node.get("params")
             if params is None:

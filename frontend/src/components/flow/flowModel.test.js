@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, operatorNodeSubtitle, removeElements, resolveNodeMetadata, serializeDefinition, subflowEnglishName, subflowPrimaryName, subflowSubtitle, validateFlow } from './flowModel.js'
+import { readFileSync } from 'node:fs'
+import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, operatorNodeSubtitle, removeElements, resolveNodeMetadata, runtimeArtifactLabel, serializeDefinition, subflowEnglishName, subflowPrimaryName, subflowSubtitle, validateFlow } from './flowModel.js'
 import { ref } from 'vue'
 import { useFlowHistory } from './composables/useFlowHistory.js'
 
@@ -10,6 +11,7 @@ const catalog = [
 ]
 const node = (id, ref, x = 0) => makeCanvasNode({ id, kind: 'operator', ref, params: {} }, { x, y: 0 }, catalog, [])
 const sink = makeCanvasNode({ id: 'sink', kind: 'knowledge_sink', knowledge_type: 'qa', output_key: 'qa' }, { x: 400, y: 0 }, catalog, [])
+const edgeView = readFileSync(new URL('./edges/FlowEdge.vue', import.meta.url), 'utf8')
 
 test('artifact type supports exact and target wildcard matching', () => {
   assert.equal(artifactMatches('candidate:qa', 'candidate:qa'), true)
@@ -26,6 +28,14 @@ test('multi-port catalog metadata is preserved and subflow ports resolve from en
   assert.equal(meta.inputs.input.artifact_type, 'source_file')
   assert.equal(meta.outputs.qa.artifact_type, 'candidate:qa')
   assert.deepEqual(meta.inputExample.input, [{ filename: 'guide.md' }])
+})
+
+test('runtime artifact labels use Chinese business terms and readable counts', () => {
+  assert.equal(runtimeArtifactLabel('candidate:*', 5), '候选知识 · 5 条')
+  assert.equal(runtimeArtifactLabel('candidate:text', 3), '文本候选 · 3 条')
+  assert.equal(runtimeArtifactLabel('approved_source_chunks', 0), '已审核文档块 · 0 条')
+  assert.equal(runtimeArtifactLabel('custom_extension', 2), 'custom_extension · 2 条')
+  assert.match(edgeView, /:title="data\?\.technicalLabel \|\| data\?\.label"/)
 })
 
 test('operator metadata separates Chinese display name, English name, and technical code', () => {
@@ -110,11 +120,12 @@ test('DSL round trip preserves explicit ports and positions and loads legacy edg
 test('runtime DAG reuses canvas nodes and overlays node and artifact edge state', () => {
   const graph = deserializeRuntimeDag({
     nodes: [{ id: 'a', kind: 'operator', ref: 'source', status: 'reused' }, { id: 'b', kind: 'operator', ref: 'split', status: 'failed' }],
-    edges: [{ source: 'a', target: 'b', artifact_type: 'chunk_set', status: 'completed' }],
+    edges: [{ source: 'a', target: 'b', artifact_type: 'chunk_set', record_count: 5, status: 'completed' }],
   }, catalog)
   assert.equal(graph.nodes[0].data.meta.status, 'reused')
   assert.equal(graph.nodes[1].data.meta.status, 'failed')
-  assert.equal(graph.edges[0].data.label, 'chunk_set')
+  assert.equal(graph.edges[0].data.label, '文档块 · 5 条')
+  assert.equal(graph.edges[0].data.technicalLabel, 'chunk_set')
   assert.equal(graph.edges[0].data.status, 'completed')
 })
 

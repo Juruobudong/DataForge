@@ -4,7 +4,7 @@ defineProps({ data: { type: Object, required: true }, selected: Boolean })
 </script>
 <template>
   <article class="sink-node" :class="{ selected }">
-    <header><span class="icon">✓</span><div><em>KNOWLEDGE SINK</em><b>{{ data.meta.code }}</b><small>正式知识输出</small></div></header>
+    <header><span class="icon">✓</span><div><em>OUTPUT</em><b>{{ data.meta.code }}</b><small>知识输出 · Knowledge Sink</small></div></header>
     <section><TypedHandle v-for="(spec, port) in data.meta.inputs" :key="port" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="input" /></section>
     <footer>发布流程的受控终点</footer>
   </article>

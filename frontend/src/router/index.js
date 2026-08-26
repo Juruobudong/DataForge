@@ -18,6 +18,8 @@ import DataFlowDebugView from '../views/developer/DataFlowDebugView.vue'
 import SubgraphView from '../views/developer/SubgraphView.vue'
 import ModelServicesView from '../views/developer/ModelServicesView.vue'
 import OperatorCatalogView from '../views/developer/OperatorCatalogView.vue'
+import SubflowListView from '../views/developer/SubflowListView.vue'
+import KnowledgeTypesView from '../views/developer/KnowledgeTypesView.vue'
 
 const routes = [{ path: '/', redirect: '/business/dashboard' }, {
   path: '/', component: WorkspaceLayout, children: [
@@ -38,11 +40,12 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/local/initialization', component: LocalInitializationView },
     { path: '/local/imports/:jobId', component: ImportTaskDetailView },
     { path: '/developer/model-services', component: ModelServicesView },
-    { path: '/developer/knowledge-types', redirect: '/developer/flow-templates?tab=knowledge-types' },
+    { path: '/developer/knowledge-types', component: KnowledgeTypesView },
     { path: '/developer/standard-pipelines', component: PipelineListView },
     { path: '/developer/flow-templates', component: TemplateListView },
     { path: '/developer/flow-templates/subgraphs/:subflowId/revisions/:revision', component: SubgraphView },
     { path: '/developer/operator-catalog', component: OperatorCatalogView },
+    { path: '/developer/subflows', component: SubflowListView },
     { path: '/developer/dataflow-debug', component: DataFlowDebugView },
     // Preserve old V7 bookmarks while keeping the fixed developer navigation intact.
     { path: '/developer/vector-indexes', redirect: '/developer/dataflow-debug' },

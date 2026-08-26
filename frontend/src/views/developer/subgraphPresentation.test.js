@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-const listView = readFileSync(new URL('./TemplateListView.vue', import.meta.url), 'utf8')
+const listView = readFileSync(new URL('./SubflowListView.vue', import.meta.url), 'utf8')
 const subgraphView = readFileSync(new URL('./SubgraphView.vue', import.meta.url), 'utf8')
 const canvas = readFileSync(new URL('../../components/flow/DataForgeFlowCanvas.vue', import.meta.url), 'utf8')
 
@@ -15,7 +15,7 @@ test('可复用子图入口使用明确的完整 DAG 文案', () => {
 test('内置子图各入口使用中文主标题和英文副标题', () => {
   assert.match(listView, /subflowPrimaryName\(item\)/)
   assert.match(listView, /subflowSubtitle\(item\)/)
-  assert.match(listView, /\.subflow-title b,\.subflow-title small,\.subflow-title p \{ display:block; \}/)
+  assert.match(listView, /subflow-row b,.subflow-row small/)
   assert.match(subgraphView, /const detailName = computed/)
   assert.match(subgraphView, /class="subgraph-english-name"/)
   assert.match(subgraphView, /subflowPrimaryName\(item\)/)

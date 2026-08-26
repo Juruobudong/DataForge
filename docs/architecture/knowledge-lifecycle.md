@@ -41,11 +41,11 @@ KnowledgeLibrary 保存业务查询使用的单一当前知识集合，不要求
 
 ## 调试与流程演化
 
-运行调试从 Draft 或 Published Revision 冻结源 authoring definition 与 Debug Execution Snapshot，再以同一文档库中多个当前 SourceReviewSnapshot 创建 `FlowRun(debug_full)`。Debug Runner 使用版本固定 Operator 执行真实 DAG，持久化 NodeRun、Artifact、事件和准确 Sink Diff，但永远不修改 KnowledgeLibrary，也不创建 KnowledgeJob、KnowledgeChange 或 Vector Sync。
+运行调试从 Draft 或 Published Revision 冻结源 authoring definition 与 Debug Execution Snapshot，再选择版本化内置审核 Sample，或同一文档库中多个当前 SourceReviewSnapshot 创建 `FlowRun(debug_full)`。Input Resolver 将二者统一冻结为 resolved approved chunks。Debug Runner 使用版本固定 Operator 执行真实 DAG；内置 Sample 以虚拟空库计算全 ADD Diff，真实输入按运行时 KnowledgeLibrary 计算完整 Diff，但二者都不修改 KnowledgeLibrary，也不创建 KnowledgeJob、KnowledgeChange 或 Vector Sync。
 
 - `node_only` 只执行目标节点；`from_node` 执行目标及可达下游，并复用同一 Debug 系列父 Artifact。
 - 临时参数按祖先到子 Run 合并；只有 schema-valid 且可映射回源节点的配置能进入流程定义。
-- “应用到当前草稿”要求来源仍是未变化的当前自定义 Draft；“保存为自定义流程”从冻结源定义创建新的 Advanced Draft，Standard 先 materialize。
+- “应用到当前草稿”要求来源仍是未变化的当前自定义 Advanced Draft；“保存为自定义流程”和 Standard 转 Advanced 都从冻结/来源定义 materialize 为新的 Advanced Draft，不修改 Standard 来源。
 - Runtime 输入、KnowledgeLibrary 绑定、Artifact、日志、指标和 Preview 都不进入流程定义；旧业务 Run 派生/提交开关仅保留兼容。
 
 ## 向量化、发布与删除
