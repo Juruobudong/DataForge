@@ -1,6 +1,6 @@
 # 知识生命周期
 
-> 当前状态：已实现架构，更新于 2026-08-25。
+> 当前状态：已实现架构，更新于 2026-08-27。
 
 ## Source Preparation 与 ChunkSet
 
@@ -28,6 +28,14 @@ Parser 同时建立 `SourceAnchorV2`：PDF 从 MinerU 内容块保留页码和 `
 3. 任务固定来源版本、结果知识库、模板修订与展开后的 `FlowExecutionSnapshot`。Runner 只执行快照中的受控 DAG。
 4. PDF 使用 MinerU Pipeline GPU OCR 并形成多页 bbox SourceBlock；DOCX 原生解析形成标题、段落和表格行 Block；DOC、CSV/XLSX、Markdown/TXT 继续使用各自原生路径。解析结果形成 Document IR、SourceChunk、SourceAnchor 和 Artifact 血缘。
 5. `Knowledge Sink` 是正式知识唯一写入口。它对来源、Schema、Canonical、质量、身份与 Diff 做门禁；多 Sink 各自事务隔离，成功分支不会被其他失败分支回滚。
+
+## 文本映射与显式生成
+
+Standard 文本和 Multi 的 text 分支使用 `text-knowledge-mapper`，将审核 Chunk 原样映射为 `candidate:text`，无 LLM、Embedding 或二次 Chunk。正文和 Evidence 逐字符保留，候选继承原 SourceAnchor 和审核血缘，并进入原有 Quality/Binding/Diff/Sink。每个非空 Chunk 一对一输出，空块记录成功零候选，重试和替换范围继续以分块处理状态为准。
+
+Standard 转 Advanced 只展开相同 Mapper DAG。显式使用 `prompt-generator` 或 `structured-knowledge-generator` v6 时，文本才按该节点冻结的 Prompt 与 Serving 生成；结构化输出须含有效 canonical 内容，最多一次 Schema 修复，来源和 Evidence 仍由服务器绑定。执行器精确解析版本，已知 v4/v5 保持原文本复制行为，未知版本拒绝回退；不回写历史快照或批量改写 Advanced 定义。
+
+来源：[文本默认映射与 Advanced 显式生成批准基线](../../wiki/sources/text-knowledge-mapping-2026-08-27.md)；前端仅将有 generation 的 Managed 模板显示为四阶段。
 
 ## 单一当前态
 

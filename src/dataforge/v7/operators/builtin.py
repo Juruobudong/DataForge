@@ -27,7 +27,8 @@ class BuiltinOperatorExecutor:
 
     def execute(self, *, inputs: list[dict[str, Any]], params: dict[str, Any],
                 context: OperatorExecutionContext) -> OperatorResult:
-        outputs = self._runner(self.code, dict(params or {}), list(inputs), dict(context.runtime or {}))
+        runtime = {**dict(context.runtime or {}), "operator_version": self.version}
+        outputs = self._runner(self.code, dict(params or {}), list(inputs), runtime)
         return OperatorResult(outputs=outputs)
 
 
@@ -36,4 +37,8 @@ def build_builtin_registry(runner_callable: RunnerCallable, catalog: dict[str, d
     for code, item in catalog.items():
         version = int(item.get("version", 1))
         registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
+        if code in {"prompt-generator", "structured-knowledge-generator", "entity-extractor"}:
+            for legacy_version in (4, 5):
+                if legacy_version < version:
+                    registry.register(BuiltinOperatorExecutor(code, legacy_version, runner_callable))
     return registry

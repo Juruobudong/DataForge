@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260826_flow_dev_convergence"
+CURRENT_SCHEMA_REVISION = "20260827_operator_parameters"
 
 
 def _config(database_url: str) -> Config:

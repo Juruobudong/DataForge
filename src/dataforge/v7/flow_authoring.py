@@ -13,24 +13,34 @@ of truth, then injects user config and stage metadata onto the nodes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
+import re
 from typing import Any
 
 from .catalog import builtin_flow_definition
 from .flow import FlowCompiler, FlowValidationError
+from .entity_types import custom_type_code, entity_type_catalog, normalize_entity_types
 
 
 _EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": False}
 _LLM_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"llm_serving": {"type": "string", "description": "已配置的 Model Serving ID"}},
+    "properties": {"llm_serving": {"type": "string", "title": "模型服务", "description": "已配置的 Model Serving ID", "x-dataforge-ui": {"widget": "llm-serving-selector"}}},
+    "additionalProperties": False,
+}
+_QUALITY_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"quality_profile_revision_id": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}},
     "additionalProperties": False,
 }
 _GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "llm_serving": {"type": "string", "description": "已配置的 Model Serving ID"},
-        "entity_types": {"type": "array", "items": {"type": "string"}, "description": "允许抽取的实体类型 code 列表"},
-        "relation_types": {"type": "array", "items": {"type": "string"}, "description": "允许抽取的关系类型 code 列表"},
+        **_LLM_CONFIG_SCHEMA["properties"],
+        "entity_types": {"type": "array", "title": "实体类型", "items": {"type": "object"},
+                         "x-dataforge-ui": {"widget": "entity-type-editor"},
+                         "description": "实体类型用于约束模型识别哪些对象；未配置的领域实体可通过添加实体类型补充。"},
+        "relation_types": {"type": "array", "title": "关系类型", "items": {"type": "string"}, "description": "允许抽取的关系类型 code 列表"},
     },
     "additionalProperties": False,
 }
@@ -59,7 +69,12 @@ class ManagedFlowDefinition:
 
 _INPUT_STAGE = ManagedStageDefinition(code="input", name="已审核文档输入", locked=True,
                                       operator_refs=("reviewed-source-chunk-input",))
-_QUALITY_STAGE = ManagedStageDefinition(code="quality", name="质量治理", locked=True,
+_TEXT_MAPPING_STAGE = ManagedStageDefinition(
+    code="mapping", name="文本知识映射", input_contract="source_chunk_set",
+    output_contract="candidate:text", operator_refs=("text-knowledge-mapper",),
+)
+_QUALITY_STAGE = ManagedStageDefinition(code="quality", name="质量治理", locked=True, configurable=True,
+                                        config_schema=_QUALITY_CONFIG_SCHEMA,
                                         operator_refs=("quality-evaluator", "quality-filter", "schema-validator", "graph-quality-validator"))
 _BINDING_STAGE = ManagedStageDefinition(code="binding", name="来源绑定", locked=True,
                                         operator_refs=("source-binding",))
@@ -74,7 +89,7 @@ def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA
 
 _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     ManagedFlowDefinition(code="standard-text", name="文本知识", output_types=("text",), stages=(
-        _INPUT_STAGE, _generation("文本生成", operator_refs=("prompt-generator",)),
+        _INPUT_STAGE, _TEXT_MAPPING_STAGE,
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
@@ -95,9 +110,9 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph"), stages=(
-        _INPUT_STAGE,
+        _INPUT_STAGE, _TEXT_MAPPING_STAGE,
         _generation("多产出生成", config_schema=_GRAPH_CONFIG_SCHEMA,
-                    operator_refs=("prompt-generator", "qa-generator", "entity-extractor", "literal-detector",
+                    operator_refs=("qa-generator", "entity-extractor", "literal-detector",
                                    "relation-extractor", "triple-builder")),
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
     )),
@@ -127,9 +142,10 @@ class ManagedFlowCatalog:
                 "code": definition.code,
                 "name": definition.name,
                 "output_types": list(definition.output_types),
+                "default_definition": self.default_stage_config(definition.code),
                 "stages": [{
                     "code": stage.code, "name": stage.name,
-                    "locked": stage.locked, "replaceable": stage.replaceable,
+                    "locked": stage.locked, "replaceable": stage.replaceable, "configurable": stage.configurable,
                     "config_schema": stage.config_schema if stage.configurable else None,
                 } for stage in definition.stages],
             })
@@ -137,7 +153,10 @@ class ManagedFlowCatalog:
 
     def default_stage_config(self, code: str) -> dict[str, Any]:
         definition = self.get(code)
-        return {"schema_version": 1, "template_code": definition.code, "stages": {}}
+        stages = {}
+        if code in {"standard-graph-triple", "standard-graph-semantic"}:
+            stages["generation"] = {"config": {"entity_types": entity_type_catalog()["base"]}}
+        return {"schema_version": 1, "template_code": definition.code, "stages": stages}
 
     def normalize_config(self, code: str, definition: dict[str, Any]) -> dict[str, Any]:
         """Validate and normalize a stage config for persistence (editor state)."""
@@ -148,6 +167,10 @@ class ManagedFlowCatalog:
             stages = {}
         if not isinstance(stages, dict):
             raise ValueError("标准配置的 stages 必须是对象")
+        stages = deepcopy(stages)
+        if code == "standard-text":
+            # This legacy stage never opted a Standard flow into generation.
+            stages.pop("generation", None)
         allowed = {stage.code for stage in flow_definition.stages}
         for stage_code, stage_value in stages.items():
             if stage_code not in allowed:
@@ -160,6 +183,8 @@ class ManagedFlowCatalog:
             if config is not None and not isinstance(config, dict):
                 raise ValueError(f"阶段 {stage_code} 的 config 必须是对象")
             stage = next(item for item in flow_definition.stages if item.code == stage_code)
+            if config is not None and "entity_types" in config:
+                config["entity_types"] = normalize_entity_types(config["entity_types"], allow_legacy_strings=True)
             self._validate_config(stage, config or {})
         return {"schema_version": 1, "template_code": flow_definition.code, "stages": stages}
 
@@ -170,6 +195,9 @@ class ManagedFlowCatalog:
             if key not in properties:
                 raise ValueError(f"阶段 {stage.name} 不接受参数：{key}")
             spec = properties[key]
+            if key == "entity_types":
+                normalize_entity_types(config_value)
+                continue
             expected = spec.get("type")
             if expected == "string" and not isinstance(config_value, str):
                 raise ValueError(f"阶段 {stage.name} 参数 {key} 必须是字符串")
@@ -212,6 +240,11 @@ class ManagedFlowCompiler:
     def _apply_config(self, baseline: dict[str, Any], stage: ManagedStageDefinition, config: dict[str, Any]) -> None:
         if not config:
             return
+        # Stage relation names remain a simple string-list UI; the Graph Schema
+        # and runtime still require definitions and stable codes, respectively.
+        relations = [{"code": name if re.fullmatch(r"[a-z][a-z0-9_]*", name)
+                      else custom_type_code(name), "label": name, "description": ""}
+                     for name in config.get("relation_types", [])]
         for node in baseline.get("nodes", []):
             if node.get("kind") != "operator":
                 continue
@@ -221,16 +254,21 @@ class ManagedFlowCompiler:
             params = node.setdefault("params", {})
             if "llm_serving" in config and "llm_serving" in params:
                 params["llm_serving"] = config["llm_serving"]
+            if ref == "prompt-generator" and "prompt_template_revision_id" in config:
+                params["prompt_template_revision_id"] = config["prompt_template_revision_id"]
+            if ref in {"quality-evaluator", "quality-filter"} and "quality_profile_revision_id" in config:
+                params["quality_profile_revision_id"] = config["quality_profile_revision_id"]
             if ref == "entity-extractor" and "entity_types" in config:
-                params["entity_types"] = list(config["entity_types"])
+                params["entity_types"] = [item["code"] for item in config["entity_types"]]
+                params["entity_type_scope"] = "all"
             if ref == "relation-extractor" and "relation_types" in config:
-                params["relation_types"] = list(config["relation_types"])
+                params["relation_types"] = [item["code"] for item in relations]
         if "entity_types" in config or "relation_types" in config:
             graph_config = baseline.setdefault("graph_config", {})
             if "entity_types" in config:
-                graph_config["entity_types"] = list(config["entity_types"])
+                graph_config["entity_types"] = deepcopy(config["entity_types"])
             if "relation_types" in config:
-                graph_config["relation_types"] = list(config["relation_types"])
+                graph_config["relation_types"] = relations
 
 
 class FlowAuthoringCompiler:

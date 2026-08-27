@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --test src/components/*.test.js src/components/flow/*.test.js src/stores/*.test.js src/views/business/*.test.js src/views/developer/*.test.js",
+    "test": "npm run test:contracts && npm run test:components",
+    "test:contracts": "node --test src/components/*.test.js src/components/flow/*.test.js src/stores/*.test.js src/views/business/*.test.js src/views/developer/*.test.js",
+    "test:components": "vitest run --config vitest.config.js",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -22,6 +24,9 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
-    "vite": "^7.0.6"
+    "@vue/test-utils": "^2.4.11",
+    "jsdom": "^30.0.1",
+    "vite": "^7.0.6",
+    "vitest": "^4.1.11"
   }
 }

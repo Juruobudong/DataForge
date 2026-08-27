@@ -64,7 +64,7 @@ CMD ["dataforge-web"]
 
 # -----------------------------------------------------------------------------
 # V7 Runner 镜像目标。
-# Runner 仅补装结构化输出 Schema Validator；算子执行由本仓库的
+# Runner 仅额外安装 antiword（文档解析）；算子执行由本仓库的
 # DataForge Adapter 完成，不部署 DataFlow WebUI、MCP 或 Agent。
 # -----------------------------------------------------------------------------
 FROM app-common AS runner
@@ -72,7 +72,7 @@ FROM app-common AS runner
 USER root
 
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv sync --frozen --no-editable --extra web --extra runner
+    uv sync --frozen --no-editable --extra web
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

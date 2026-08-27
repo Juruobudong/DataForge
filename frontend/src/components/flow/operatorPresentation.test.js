@@ -23,7 +23,7 @@ test('operator nodes render Chinese names with English subtitles and optional te
 })
 
 test('only advanced orchestration enables node technical codes', () => {
-  assert.match(advancedEditor, /<DataForgeFlowCanvas[^>]*\sshow-technical-code(?:\s|@|\/?>)/)
+  assert.match(advancedEditor, /<DataForgeFlowCanvas[^>]*:show-technical-code="!fragment"/)
   for (const source of [compiledPreview, templateList, subgraphView, debugView]) {
     assert.doesNotMatch(source, /<DataForgeFlowCanvas[^>]*\sshow-technical-code(?:\s|@|\/?>)/)
   }

@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { BaseEdge, EdgeLabelRenderer, getSmoothStepPath } from '@vue-flow/core'
+defineOptions({ inheritAttrs: false })
 const props = defineProps({ id: String, sourceX: Number, sourceY: Number, targetX: Number, targetY: Number, sourcePosition: String, targetPosition: String, markerEnd: String, selected: Boolean, data: Object })
 const geometry = computed(() => getSmoothStepPath({ sourceX: props.sourceX, sourceY: props.sourceY, targetX: props.targetX, targetY: props.targetY, sourcePosition: props.sourcePosition, targetPosition: props.targetPosition, borderRadius: 10 }))
 </script>

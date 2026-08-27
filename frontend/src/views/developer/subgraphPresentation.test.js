@@ -7,7 +7,7 @@ const subgraphView = readFileSync(new URL('./SubgraphView.vue', import.meta.url)
 const canvas = readFileSync(new URL('../../components/flow/DataForgeFlowCanvas.vue', import.meta.url), 'utf8')
 
 test('可复用子图入口使用明确的完整 DAG 文案', () => {
-  assert.match(listView, />查看完整 DAG</)
+  assert.match(listView, />查看 DAG</)
   assert.doesNotMatch(listView, /打开完整画布/)
   assert.match(subgraphView, /当前可复用子图 revision 的完整 DAG/)
 })

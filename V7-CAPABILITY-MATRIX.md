@@ -1,11 +1,13 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-26
+更新日期：2026-08-27
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
 
 本文件只记录能力完成度与外部验收状态；当前系统结构见 [`docs/architecture/`](docs/architecture/overview.md)，设计原因见 [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md)，历史方案见 [`docs/archive/`](docs/archive/old-plan.md)。
 
 ## 状态定义
+
+可复用子流程闭环（2026-08-27）：`DONE`。高级画布节点组另存独立草稿、草稿完整编辑/发布、显式插入与 Revision 切换、固定版本及嵌套展开、独立 DAG 钻取与未保存保护、当前草稿/发布版引用聚合已纳入本地测试。三个内置预处理子流程继续只在审核前使用；Standard 后台组合重构、全历史引用统计和从子流程创建完整知识流程不在本期。来源：[批准基线](wiki/sources/reusable-subflow-closure-2026-08-27.md)。
 
 | 标记 | 含义 |
 | --- | --- |
@@ -34,7 +36,7 @@
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
 | 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
-| 流程开发区 | 知识流程 / 开发者资源 | `DONE` | Standard 业务配置不显示 DAG，Advanced 才显示 Authoring DAG；开发者资源不可折叠，含算子 Registry 和可复用子流程。 |
+| 流程开发区 | 知识流程 / 开发者资源 | `DONE` | Standard 文本三阶段、无模型 Mapper；QA/图谱/Multi 按 Managed generation 合同展示生成。转 Advanced 保留 Mapper，显式选择 v6 Prompt/Structured Generator 才生成文本；历史 v4/v5 保留旧行为。开发者资源不可折叠，真实 `.34` 模型验收为 `CONNECT`。 |
 | 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision 可使用内置审核 Sample + 虚拟空库 Diff，或同库多审核输入 + 真实 Sink Diff；Runtime DAG 只读，真实 `.34` E2E 为 `CONNECT`。 |
 | 流程开发区 | 独立“向量索引”导航页 | `REMOVE` | 已收口进 DataFlow 调试台；旧链接重定向，仍只读。 |
 | 原型能力 | DataFlow WebUI、Shell、任意 Python、运行时改图 | `REMOVE` | 与受控 Flow 和 Runner 安全边界冲突。 |
@@ -110,6 +112,12 @@
 - 2026-08-24：015 SourceChunk 人工审核 Gate 仓库实现完成；Preparation、不可变 Chunk Revision/Review Snapshot、自动 Dispatch、Reviewed Flow、Sink/Vector/Routing fail-closed 与 PC 双栏审核工作区已落地。平台 53、迁移 13、前端 50 项及相关定向回归通过；真实 `.34` 顺序与服务验收归 C-11。
 - 2026-08-26：项目发布改为显式双环境；Central live publish、中心侧 Institution deferred freeze、机构 Release 环境一致性、机构 `inst-*` code、知识范围优先级和业务化五 Tab 已落地。无 schema 迁移；本地回归与前端构建通过，`.34` 真实发布仍归 C-09。
 - C-01 至 C-05 是本期的下一执行队列。每完成一项，应更新本文件状态、`wiki/`、Devora 测试用例和上线证据；不得将模拟或缺失依赖的结果写成真实部署验收。
+
+## 图谱实体类型默认与医疗包（2026-08-27）
+
+- 已实现新建图谱五类默认、医疗 8 类预设、中文自定义类型、来源追踪、按来源撤销、部分补全，以及 Standard/Advanced 共用编辑组件。
+- Draft、编译、Snapshot 与 Runner 共用规范化 Schema；来源不影响语义 hash。节点全量/子集明确区分，清空显式子集不会扩大抽取范围。历史 Published Revision/Snapshot 不回写，不新增行业流程或数据库迁移。
+- 本地验证记录见 `wiki/pages/operations-and-testing.md`；真实 LLM 与 `.34` 端到端验收仍需用户部署后执行。
 
 ## 依据
 

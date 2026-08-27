@@ -1,15 +1,20 @@
-import { connectionIssue, createsCycle } from '../flowModel.js'
+import { checkEdgeCompatibility } from '../edge/edgeCompatibility.js'
 
-export function useFlowConnections(nodes, edges, reportError) {
+export function useFlowConnections(nodes, edges, flowContext, reportError) {
   function issueFor(connection) {
-    const currentEdges = connection.id ? edges.value.filter(edge => edge.id !== connection.id) : edges.value
-    return connectionIssue(connection, nodes.value, currentEdges) ||
-      (createsCycle(nodes.value, currentEdges, connection) ? { code: 'CYCLE', message: '此连线会形成环路' } : null)
+    const result = checkEdgeCompatibility({
+      flowContext: flowContext.value, nodes: nodes.value, edges: edges.value,
+      sourceNodeId: connection.source, sourcePortId: connection.sourceHandle || 'output',
+      targetNodeId: connection.target, targetPortId: connection.targetHandle || 'input',
+      originalEdgeId: connection.id || null,
+    })
+    return result.allowed ? null : { code: result.reasonCode, ...result }
   }
   function isValidConnection(connection) { return !issueFor(connection) }
-  function addTypedEdge(connection) {
+  function addTypedEdge(connection, beforeCommit) {
     const issue = issueFor(connection)
     if (issue) { reportError(issue); return false }
+    beforeCommit?.()
     edges.value.push({
       id: `edge-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
       type: 'dataforge', ...connection,
@@ -19,5 +24,20 @@ export function useFlowConnections(nodes, edges, reportError) {
     reportError(null)
     return true
   }
-  return { issueFor, isValidConnection, addTypedEdge }
+  function reconnectTypedEdge(originalEdge, connection, beforeCommit) {
+    const candidate = { ...connection, id: originalEdge.id }
+    const issue = issueFor(candidate)
+    if (issue) { reportError(issue); return false }
+    const index = edges.value.findIndex(edge => edge.id === originalEdge.id)
+    if (index < 0) return false
+    beforeCommit?.()
+    edges.value.splice(index, 1, {
+      ...originalEdge, ...connection, id: originalEdge.id, type: originalEdge.type || 'dataforge',
+      sourceHandle: connection.sourceHandle || 'output', targetHandle: connection.targetHandle || 'input',
+      data: { ...(originalEdge.data || {}), status: originalEdge.data?.status || 'idle' }, selected: true,
+    })
+    reportError(null)
+    return true
+  }
+  return { issueFor, isValidConnection, addTypedEdge, reconnectTypedEdge }
 }

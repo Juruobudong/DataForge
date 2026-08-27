@@ -4,10 +4,55 @@ import { readFileSync } from 'node:fs'
 
 import { ApiRequestError, createClientRequestId } from '../../api/platform.js'
 import { debugRunPreflightIssue, NO_DEBUG_REVIEW_INPUTS } from './debugRunForm.js'
+import { computed, ref } from 'vue'
+import { deserializeRuntimeDag } from '../../components/flow/flowModel.js'
+import { consoleNodeLabels, consoleNodePresentation } from './debugConsole.js'
 
 const view = readFileSync(new URL('./DataFlowDebugView.vue', import.meta.url), 'utf8')
 const api = readFileSync(new URL('../../api/platform.js', import.meta.url), 'utf8')
 const templates = readFileSync(new URL('./TemplateListView.vue', import.meta.url), 'utf8')
+
+test('console node names reuse Catalog metadata while preserving distinct runtime IDs', () => {
+  const catalog = [{ code: 'prompt-generator', name: 'Prompt Generator', display_name_zh: '提示词生成器' }]
+  const graph = deserializeRuntimeDag({ nodes: [
+    { id: 'input-1', kind: 'operator', node_role: 'flow_input', ref: 'reviewed-source-chunk-input' },
+    { id: 'generate-a', kind: 'operator', ref: 'prompt-generator' },
+    { id: 'child::generate-b', kind: 'operator', ref: 'prompt-generator' },
+    { id: 'sink-1', kind: 'knowledge_sink', knowledge_type: 'text' },
+    { id: 'legacy-1', kind: 'operator', ref: 'unregistered-operator' },
+  ] }, catalog)
+  const labels = consoleNodeLabels(graph.nodes)
+  assert.deepEqual(consoleNodePresentation('generate-a', labels), { label: '提示词生成器', technicalId: 'generate-a' })
+  assert.deepEqual(consoleNodePresentation('child::generate-b', labels), { label: '提示词生成器', technicalId: 'child::generate-b' })
+  assert.equal(consoleNodePresentation('input-1', labels).label, '已审核文档块')
+  assert.equal(consoleNodePresentation('sink-1', labels).label, '知识输出')
+  for (const id of ['legacy-1', 'missing-node']) {
+    assert.deepEqual(consoleNodePresentation(id, labels), { label: id, technicalId: '' })
+  }
+  for (const id of [null, undefined, '']) {
+    assert.deepEqual(consoleNodePresentation(id, labels), { label: '流程运行', technicalId: '' })
+  }
+})
+
+test('console names follow the current Run and polled events without changing raw logs', () => {
+  const runtimeNodes = ref([{ id: 'node-1', data: { meta: { name: '提示词生成器' } } }])
+  const events = ref([{ cursor: 1, node_id: 'node-1', type: 'node.completed', message: '节点 node-1 completed' }])
+  const labels = computed(() => consoleNodeLabels(runtimeNodes.value))
+  const rows = computed(() => events.value.map(event => ({ ...event, nodePresentation: consoleNodePresentation(event.node_id, labels.value) })))
+  assert.equal(rows.value[0].nodePresentation.label, '提示词生成器')
+  events.value.push({ cursor: 2, node_id: 'node-1', type: 'node.log', message: 'next page' })
+  assert.equal(rows.value[1].nodePresentation.label, '提示词生成器')
+  runtimeNodes.value = []
+  assert.equal(rows.value[0].nodePresentation.label, 'node-1')
+  runtimeNodes.value = [{ id: 'node-1', data: { meta: { name: '来源绑定器' } } }]
+  assert.equal(rows.value[0].nodePresentation.label, '来源绑定器')
+  assert.equal(rows.value[0].type, 'node.completed')
+  assert.equal(rows.value[0].message, '节点 node-1 completed')
+  assert.equal(events.value[0].nodePresentation, undefined)
+  assert.match(view, /v-for="event in consoleEvents"/)
+  assert.match(view, /consoleNodeLabels\(runtimeNodes\.value\)/)
+  assert.match(view, /\.console-node-name,\.console-node-id\{display:block;overflow-wrap:anywhere\}/)
+})
 
 test('debug workspace exposes full-run preview and flow evolution without commit', () => {
   assert.match(view, /准备运行/)
@@ -75,4 +120,8 @@ test('structured API error keeps diagnostics', () => {
   assert.equal(error.status, 500)
   assert.equal(error.requestId, 'req-1')
   assert.match(error.message, /GET \/api\/test · HTTP 500 · request_id req-1 · boom/)
+  const problem = { code: 'EDGE_WOULD_CREATE_CYCLE', message: '该连接会形成循环依赖', details: { source_node_id: 'a', target_node_id: 'b' } }
+  const structured = new ApiRequestError({ method: 'PUT', url: '/api/flow', status: 422, requestId: 'req-2', detail: problem })
+  assert.deepEqual(structured.problem, problem)
+  assert.equal(structured.detail, problem.message)
 })

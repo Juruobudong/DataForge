@@ -30,10 +30,12 @@ from .catalog import (
     normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
+from .subflows import SubflowService, published_subflows, pin_subflows
 from .flow_authoring import FLOW_AUTHORING_COMPILER, MANAGED_FLOW_CATALOG
 from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
 from .graph_literal import detect_literal
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, schema_hash
+from .entity_types import clean_removed_entity_references
 from .llm_serving import get_llm_serving_registry, resolve_llm_serving_config_path
 from .sample_data import SampleDataService
 from .servings import DatabaseLLMServingRegistry, ServingManager
@@ -199,6 +201,19 @@ class ReviewGateError(ValueError):
             "source_version_id": self.source_version_id,
             "counts": self.counts,
         }
+
+
+class FlowParameterError(ValueError):
+    """Structured validation failure for governed authoring parameters."""
+
+    def __init__(self, code: str, message: str, *, node_id: str | None = None,
+                 field: str | None = None):
+        super().__init__(message)
+        self.code, self.message, self.node_id, self.field = code, message, node_id, field
+
+    def payload(self) -> dict[str, Any]:
+        return {"code": self.code, "message": self.message,
+                "node_id": self.node_id, "field": self.field}
 
 
 def _database_error_identity(exc: OperationalError) -> tuple[int | None, str | None]:
@@ -848,14 +863,14 @@ class V7Store:
             session.add(quality); session.flush()
         quality_revision = session.scalar(select(QualityProfileRevision).where(QualityProfileRevision.quality_profile_id == quality.id, QualityProfileRevision.revision_no == 1))
         if not quality_revision:
-            quality_revision = QualityProfileRevision(id="qualityrev_default", quality_profile_id=quality.id, revision_no=1, rules_json={"pass_score": 0.8, "review_score": 0.6}, status="published", published_at=utc_now())
+            quality_revision = QualityProfileRevision(id="qualityrev_default", quality_profile_id=quality.id, revision_no=1, rules_json={"pass_score": 0.8, "review_score": 0.6}, knowledge_types=["*"], status="published", published_at=utc_now())
             session.add(quality_revision)
         prompt = session.scalar(select(PromptTemplate).where(PromptTemplate.code == "knowledge-generator-default"))
         if not prompt:
             prompt = PromptTemplate(id="prompt_default", code="knowledge-generator-default", name="默认知识生成提示", status="active")
             session.add(prompt); session.flush()
         if not session.scalar(select(PromptTemplateRevision).where(PromptTemplateRevision.prompt_template_id == prompt.id, PromptTemplateRevision.revision_no == 1)):
-            session.add(PromptTemplateRevision(id="promptrev_default", prompt_template_id=prompt.id, revision_no=1, body="根据输入内容生成结构化知识。", input_schema={"type": "object"}, output_schema={"type": "object"}, status="published", published_at=utc_now()))
+            session.add(PromptTemplateRevision(id="promptrev_default", prompt_template_id=prompt.id, revision_no=1, body="根据输入内容生成结构化知识。", input_schema={"type": "object"}, output_schema={"type": "object"}, knowledge_types=["*"], status="published", published_at=utc_now()))
         profiles = {item.code: item for item in session.scalars(select(KnowledgeIndexProfile)).all()}
         type_contracts = {
             "text": ({"type": "object"}, "canonical_content", ["source_anchor"], "single", ["text"]),
@@ -1722,28 +1737,38 @@ class V7Store:
             version.status, version.published_at = "published", utc_now()
             return {"code": code, "version": version_no, "status": "published"}
 
-    def list_prompt_templates(self) -> list[dict[str, Any]]:
+    def list_prompt_templates(self, *, status: str = "", knowledge_type: str = "") -> list[dict[str, Any]]:
         with self.sessions() as session:
             values = []
             for item in session.scalars(select(PromptTemplate).order_by(PromptTemplate.code)):
                 revisions = session.scalars(select(PromptTemplateRevision).where(PromptTemplateRevision.prompt_template_id == item.id).order_by(PromptTemplateRevision.revision_no.desc())).all()
+                visible = [rev for rev in revisions if (not status or rev.status == status) and
+                           (not knowledge_type or "*" in (rev.knowledge_types or ["*"]) or knowledge_type in (rev.knowledge_types or []))]
+                if (status or knowledge_type) and not visible:
+                    continue
                 values.append({"id": item.id, "code": item.code, "name": item.name, "status": item.status,
                                "revisions": [{"id": rev.id, "revision": rev.revision_no, "status": rev.status,
-                                              "input_schema": rev.input_schema, "output_schema": rev.output_schema,
-                                              "published_at": rev.published_at.isoformat() if rev.published_at else None} for rev in revisions]})
+                                               "knowledge_types": list(rev.knowledge_types or ["*"]),
+                                               "input_schema": rev.input_schema, "output_schema": rev.output_schema,
+                                               "published_at": rev.published_at.isoformat() if rev.published_at else None} for rev in visible]})
             return values
 
-    def list_quality_profiles(self) -> list[dict[str, Any]]:
+    def list_quality_profiles(self, *, status: str = "", knowledge_type: str = "") -> list[dict[str, Any]]:
         with self.sessions() as session:
             values = []
             for item in session.scalars(select(QualityProfile).order_by(QualityProfile.code)):
                 revisions = session.scalars(select(QualityProfileRevision).where(QualityProfileRevision.quality_profile_id == item.id).order_by(QualityProfileRevision.revision_no.desc())).all()
+                visible = [rev for rev in revisions if (not status or rev.status == status) and
+                           (not knowledge_type or "*" in (rev.knowledge_types or ["*"]) or knowledge_type in (rev.knowledge_types or []))]
+                if (status or knowledge_type) and not visible:
+                    continue
                 values.append({"id": item.id, "code": item.code, "name": item.name, "status": item.status,
                                "revisions": [{"id": rev.id, "revision": rev.revision_no, "status": rev.status,
-                                              "rules": rev.rules_json, "published_at": rev.published_at.isoformat() if rev.published_at else None} for rev in revisions]})
+                                               "knowledge_types": list(rev.knowledge_types or ["*"]),
+                                               "rules": rev.rules_json, "published_at": rev.published_at.isoformat() if rev.published_at else None} for rev in visible]})
             return values
 
-    def create_prompt_template(self, code: str, name: str, body: str, input_schema: dict[str, Any], output_schema: dict[str, Any]) -> dict[str, Any]:
+    def create_prompt_template(self, code: str, name: str, body: str, input_schema: dict[str, Any], output_schema: dict[str, Any], knowledge_types: list[str] | None = None) -> dict[str, Any]:
         if not code.strip() or not name.strip() or not body.strip():
             raise ValueError("Prompt 编码、名称和模板内容不能为空")
         with self.sessions.begin() as session:
@@ -1751,8 +1776,11 @@ class V7Store:
                 raise ValueError("Prompt 编码已存在")
             prompt = PromptTemplate(id=new_id("prompt"), code=code.strip(), name=name.strip())
             session.add(prompt); session.flush()
+            scopes = sorted({str(value).strip() for value in (knowledge_types or ["*"]) if str(value).strip()})
+            if not scopes: raise ValueError("Prompt Template 必须至少适用于一种知识类型")
             revision = PromptTemplateRevision(id=new_id("promptrev"), prompt_template_id=prompt.id, revision_no=1,
-                                              body=body, input_schema=input_schema, output_schema=output_schema)
+                                              body=body, input_schema=input_schema, output_schema=output_schema,
+                                              knowledge_types=scopes)
             session.add(revision); self.audit(session, "prompt_template.created", "prompt_template", prompt.id)
             return {"id": prompt.id, "revision_id": revision.id, "revision": 1, "status": "draft"}
 
@@ -1768,7 +1796,7 @@ class V7Store:
             self.audit(session, "prompt_template.published", "prompt_template", prompt.id, {"revision": revision.revision_no})
             return {"id": prompt.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
-    def create_quality_profile(self, code: str, name: str, rules: dict[str, Any]) -> dict[str, Any]:
+    def create_quality_profile(self, code: str, name: str, rules: dict[str, Any], knowledge_types: list[str] | None = None) -> dict[str, Any]:
         if not code.strip() or not name.strip() or not isinstance(rules, dict):
             raise ValueError("Quality Profile 编码、名称和规则不能为空")
         with self.sessions.begin() as session:
@@ -1776,7 +1804,10 @@ class V7Store:
                 raise ValueError("Quality Profile 编码已存在")
             profile = QualityProfile(id=new_id("quality"), code=code.strip(), name=name.strip())
             session.add(profile); session.flush()
-            revision = QualityProfileRevision(id=new_id("qualityrev"), quality_profile_id=profile.id, revision_no=1, rules_json=rules)
+            scopes = sorted({str(value).strip() for value in (knowledge_types or ["*"]) if str(value).strip()})
+            if not scopes: raise ValueError("Quality Profile 必须至少适用于一种知识类型")
+            revision = QualityProfileRevision(id=new_id("qualityrev"), quality_profile_id=profile.id, revision_no=1,
+                                              rules_json=rules, knowledge_types=scopes)
             session.add(revision); self.audit(session, "quality_profile.created", "quality_profile", profile.id)
             return {"id": profile.id, "revision_id": revision.id, "revision": 1, "status": "draft"}
 
@@ -1796,91 +1827,32 @@ class V7Store:
             self.audit(session, "quality_profile.published", "quality_profile", profile.id, {"revision": revision.revision_no})
             return {"id": profile.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
-    def list_subflows(self) -> list[dict[str, Any]]:
-        with self.sessions() as session:
-            values = []
-            for item in session.scalars(select(FlowSubgraph).order_by(FlowSubgraph.code)):
-                revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == item.id,
-                                                                             FlowSubgraphRevision.status == "published")
-                                          .order_by(FlowSubgraphRevision.revision_no.desc()))
-                definition = revision.definition_json if revision else None
-                values.append({"id": item.id, "code": item.code, "name": item.name,
-                               "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH.get(item.code), "status": item.status,
-                               "revision": revision.revision_no if revision else None,
-                               "latest_revision_id": revision.id if revision else None,
-                               "revision_status": revision.status if revision else None,
-                               "description": revision.description if revision else "",
-                               "input_contract": revision.input_contract if revision else {}, "output_contract": revision.output_contract if revision else {},
-                               "node_count": len((definition or {}).get("nodes", [])), "edge_count": len((definition or {}).get("edges", [])),
-                               "definition": definition})
-            return values
+    def list_subflows(self):
+        return SubflowService(self).inventory()
 
-    def subflow_revision_detail(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
-        with self.sessions() as session:
-            item = session.get(FlowSubgraph, subflow_id)
-            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
-                                                                         FlowSubgraphRevision.revision_no == revision_no))
-            if not item or not revision: raise ValueError("子图修订不存在")
-            definition = revision.definition_json or {}
-            return {"id": item.id, "code": item.code, "name": item.name,
-                    "display_name_zh": SUBFLOW_DISPLAY_NAMES_ZH.get(item.code), "status": item.status,
-                    "revision_id": revision.id, "revision": revision.revision_no, "revision_status": revision.status,
-                    "description": revision.description, "input_contract": revision.input_contract, "output_contract": revision.output_contract,
-                    "node_count": len(definition.get("nodes", [])), "edge_count": len(definition.get("edges", [])), "definition": definition}
+    def subflow_revision_detail(self, subflow_id, revision_no):
+        return SubflowService(self).detail(subflow_id, revision_no)
 
-    @staticmethod
-    def _validate_subflow_definition(definition: dict[str, Any]) -> None:
-        nodes = definition.get("nodes") or []; edges = definition.get("edges") or []
-        ids = [str(node.get("id", "")) for node in nodes]
-        if not ids or any(not value for value in ids) or len(ids) != len(set(ids)): raise ValueError("子图节点 id 必须存在且唯一")
-        if definition.get("entry_node") not in ids or definition.get("exit_node") not in ids: raise ValueError("子图 entry_node/exit_node 必须引用内部节点")
-        incoming = {value: 0 for value in ids}; outgoing = {value: [] for value in ids}
-        for raw in edges:
-            source = str(raw[0] if isinstance(raw, list) else raw.get("source", "")); target = str(raw[1] if isinstance(raw, list) else raw.get("target", ""))
-            if source not in incoming or target not in incoming: raise ValueError("子图连线引用了不存在的节点")
-            incoming[target] += 1; outgoing[source].append(target)
-        queue = [value for value in ids if incoming[value] == 0]; visited = []
-        while queue:
-            current = queue.pop(0); visited.append(current)
-            for target in outgoing[current]:
-                incoming[target] -= 1
-                if incoming[target] == 0: queue.append(target)
-        if len(visited) != len(ids): raise ValueError("子图必须是有向无环图")
+    def subflow_revisions(self, subflow_id):
+        return SubflowService(self).revisions(subflow_id)
 
-    def copy_subflow_draft(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
-        with self.sessions.begin() as session:
-            item = session.get(FlowSubgraph, subflow_id)
-            source = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
-                                                                       FlowSubgraphRevision.revision_no == revision_no))
-            if not item or not source: raise ValueError("子图修订不存在")
-            latest = session.scalar(select(func.max(FlowSubgraphRevision.revision_no)).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id)) or 0
-            revision = FlowSubgraphRevision(id=new_id("subflowrev"), flow_subgraph_id=subflow_id, revision_no=latest + 1,
-                                            definition_json=dict(source.definition_json), description=source.description,
-                                            input_contract=dict(source.input_contract), output_contract=dict(source.output_contract), status="draft")
-            session.add(revision); self.audit(session, "subgraph.draft_created", "flow_subgraph", subflow_id, {"revision": revision.revision_no})
-            return {"id": subflow_id, "revision": revision.revision_no, "status": "draft"}
+    def subflow_references(self, subflow_id, revision_no):
+        return SubflowService(self).references(subflow_id, revision_no)
 
-    def update_subflow_draft(self, subflow_id: str, revision_no: int, definition: dict[str, Any], description: str,
-                             input_contract: dict[str, Any], output_contract: dict[str, Any]) -> dict[str, Any]:
-        self._validate_subflow_definition(definition)
-        with self.sessions.begin() as session:
-            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
-                                                                         FlowSubgraphRevision.revision_no == revision_no))
-            if not revision or revision.status != "draft": raise ValueError("只能修改子图草稿")
-            item = session.get(FlowSubgraph, subflow_id); assert item
-            revision.definition_json = {**definition, "_subgraph_code": item.code, "_subgraph_revision": revision_no}
-            revision.description, revision.input_contract, revision.output_contract = description.strip(), input_contract, output_contract
-            return {"id": subflow_id, "revision": revision_no, "status": "draft"}
+    def create_subflow(self, **kwargs):
+        return SubflowService(self).create(**kwargs)
 
-    def publish_subflow_draft(self, subflow_id: str, revision_no: int) -> dict[str, Any]:
-        with self.sessions.begin() as session:
-            revision = session.scalar(select(FlowSubgraphRevision).where(FlowSubgraphRevision.flow_subgraph_id == subflow_id,
-                                                                         FlowSubgraphRevision.revision_no == revision_no))
-            if not revision or revision.status != "draft": raise ValueError("只能发布子图草稿")
-            self._validate_subflow_definition(revision.definition_json)
-            revision.status, revision.published_at = "published", utc_now()
-            self.audit(session, "subgraph.published", "flow_subgraph", subflow_id, {"revision": revision_no})
-            return {"id": subflow_id, "revision": revision_no, "status": "published"}
+    def copy_subflow_draft(self, subflow_id, revision_no):
+        return SubflowService(self).copy(subflow_id, revision_no)
+
+    def update_subflow_draft(self, subflow_id, revision_no, definition, description, input_contract, output_contract):
+        return SubflowService(self).save(subflow_id, revision_no, definition, description, input_contract, output_contract)
+
+    def validate_subflow_draft(self, subflow_id, revision_no):
+        return SubflowService(self).save(subflow_id, revision_no, None, '', None, None, check=True)
+
+    def publish_subflow_draft(self, subflow_id, revision_no):
+        return SubflowService(self).save(subflow_id, revision_no, None, '', None, None, publish=True)
 
     def execution_snapshot_detail(self, snapshot_id: str) -> dict[str, Any]:
         with self.sessions() as session:
@@ -3907,33 +3879,210 @@ class V7Store:
         return {code: {"id": revision_id, "revision": revision_no} for code, revision_id, revision_no in rows}
 
     def _published_subflows(self, session: Session) -> dict[str, dict[str, Any]]:
-        rows = session.execute(
-            select(FlowSubgraph.code, FlowSubgraphRevision.definition_json)
-            .join(FlowSubgraphRevision, FlowSubgraphRevision.flow_subgraph_id == FlowSubgraph.id)
-            .where(FlowSubgraph.status == "active", FlowSubgraphRevision.status == "published")
-        ).all()
-        return {code: value for code, value in rows}
+        return published_subflows(session)
+
+    @staticmethod
+    def _schema_defaults(schema: dict[str, Any], values: dict[str, Any]) -> dict[str, Any]:
+        result = dict(values)
+        for key, spec in dict(schema.get("properties") or {}).items():
+            if key not in result and "default" in spec:
+                result[key] = json.loads(json.dumps(spec["default"], ensure_ascii=False))
+        return result
+
+    @staticmethod
+    def _asset_matches_knowledge_type(scopes: list[str] | None, knowledge_type: str) -> bool:
+        values = set(scopes or ["*"])
+        return "*" in values or knowledge_type in values
+
+    def _normalize_flow_parameters(self, session: Session, definition: dict[str, Any],
+                                   *, previous_definition: dict[str, Any] | None = None,
+                                   llm_registry=None) -> dict[str, Any]:
+        """Normalize one authoring DAG while keeping parameter_schema as the edit allowlist."""
+        from jsonschema import Draft202012Validator
+
+        value = json.loads(json.dumps(definition or {}, ensure_ascii=False))
+        nodes = [item for item in value.get("nodes", []) if isinstance(item, dict)]
+        by_id = {str(item.get("id")): item for item in nodes}
+        outgoing: dict[str, list[str]] = {node_id: [] for node_id in by_id}
+        for raw in value.get("edges", []):
+            source = str(raw[0] if isinstance(raw, list) else raw.get("source", ""))
+            target = str(raw[1] if isinstance(raw, list) else raw.get("target", ""))
+            if source in outgoing and target in by_id:
+                outgoing[source].append(target)
+        sinks = {node_id: item for node_id, item in by_id.items() if item.get("kind") == "knowledge_sink"}
+
+        reach_cache: dict[str, set[str]] = {}
+        def reachable_sinks(node_id: str, trail: frozenset[str] = frozenset()) -> set[str]:
+            if node_id in reach_cache:
+                return reach_cache[node_id]
+            if node_id in trail:
+                return set()
+            result = {node_id} if node_id in sinks else set()
+            for target in outgoing.get(node_id, []):
+                result.update(reachable_sinks(target, trail | {node_id}))
+            reach_cache[node_id] = result
+            return result
+
+        previous_nodes = {str(item.get("id")): item for item in (previous_definition or {}).get("nodes", [])
+                          if isinstance(item, dict)}
+        catalog = catalog_by_code()
+        quality_groups: dict[str, list[dict[str, Any]]] = {}
+        for node_id, node in by_id.items():
+            if node.get("kind") != "operator":
+                continue
+            operator = catalog.get(str(node.get("ref") or ""))
+            if not operator:
+                continue
+            schema = dict(operator.get("parameter_schema") or {"type": "object"})
+            properties = dict(schema.get("properties") or {})
+            editable = set(properties)
+            incoming = dict(node.get("params") or {})
+            previous = dict((previous_nodes.get(node_id) or {}).get("params") or {})
+            contexts = []
+            for sink_id in sorted(reachable_sinks(node_id)):
+                sink = sinks[sink_id]
+                kind = str(sink.get("knowledge_type") or "")
+                mode = str(sink.get("graph_mode") or "") or None
+                contexts.append((sink_id, kind, mode))
+            expected_system: dict[str, Any] = {}
+            if len(contexts) == 1:
+                _, kind, mode = contexts[0]
+                if kind:
+                    expected_system["knowledge_type"] = kind
+                    expected_system["graph_mode"] = mode
+
+            final: dict[str, Any] = {}
+            for key, item in incoming.items():
+                if key in editable:
+                    final[key] = item
+                    continue
+                if key in expected_system:
+                    if item != expected_system[key]:
+                        raise FlowParameterError("SYSTEM_PARAMETER_NOT_EDITABLE",
+                            f"系统参数 {key} 由 Flow Contract 维护，不能修改", node_id=node_id, field=key)
+                    continue
+                if key in previous and previous[key] == item:
+                    final[key] = item
+                    continue
+                raise FlowParameterError("SYSTEM_PARAMETER_NOT_EDITABLE",
+                    f"参数 {key} 不属于算子业务编辑白名单", node_id=node_id, field=key)
+
+            if node.get("ref") == "entity-extractor" and "entity_type_scope" not in final:
+                final["entity_type_scope"] = "subset" if final.get("entity_types") else "all"
+            business = self._schema_defaults(schema, {key: item for key, item in final.items() if key in editable})
+            errors = sorted(Draft202012Validator(schema).iter_errors(business), key=lambda error: list(error.path))
+            if errors:
+                error = errors[0]
+                field = str(next(iter(error.path), "")) or None
+                raise FlowParameterError("PARAMETER_SCHEMA_INVALID", error.message, node_id=node_id, field=field)
+            final.update(business)
+            final.update(expected_system)
+
+            serving_id = final.get("llm_serving")
+            if serving_id:
+                try:
+                    serving = (llm_registry or self.llm_serving_registry).require(str(serving_id))
+                except ValueError as exc:
+                    code = "SERVING_DISABLED" if "停用" in str(exc) else "SERVING_NOT_FOUND"
+                    raise FlowParameterError(code, str(exc), node_id=node_id, field="llm_serving") from exc
+                if serving.type != "openai-compatible-chat":
+                    raise FlowParameterError("SERVING_CAPABILITY_MISMATCH", "算子需要 LLM Chat Serving",
+                                             node_id=node_id, field="llm_serving")
+
+            prompt_id = final.get("prompt_template_revision_id")
+            if prompt_id:
+                revision = session.get(PromptTemplateRevision, str(prompt_id))
+                if not revision or revision.status != "published":
+                    raise FlowParameterError("PROMPT_REVISION_NOT_PUBLISHED", "Prompt Generator 引用的 Prompt Revision 不存在或未发布",
+                                             node_id=node_id, field="prompt_template_revision_id")
+                knowledge_type = str(final.get("knowledge_type") or "")
+                if knowledge_type and not self._asset_matches_knowledge_type(revision.knowledge_types, knowledge_type):
+                    raise FlowParameterError("PROMPT_KNOWLEDGE_TYPE_MISMATCH", "Prompt Revision 与 Flow 知识类型不匹配",
+                                             node_id=node_id, field="prompt_template_revision_id")
+
+            quality_id = final.get("quality_profile_revision_id")
+            if quality_id:
+                revision = session.get(QualityProfileRevision, str(quality_id))
+                if not revision or revision.status != "published":
+                    raise FlowParameterError("QUALITY_PROFILE_INVALID", "Quality Profile Revision 不存在或未发布",
+                                             node_id=node_id, field="quality_profile_revision_id")
+                knowledge_type = str(final.get("knowledge_type") or "")
+                if knowledge_type and not self._asset_matches_knowledge_type(revision.knowledge_types, knowledge_type):
+                    raise FlowParameterError("QUALITY_PROFILE_KNOWLEDGE_TYPE_MISMATCH", "Quality Profile 与 Flow 知识类型不匹配",
+                                             node_id=node_id, field="quality_profile_revision_id")
+                for sink_id, _, _ in contexts:
+                    quality_groups.setdefault(sink_id, []).append(node)
+            node["params"] = final
+
+        for sink_id, group in quality_groups.items():
+            relevant = [node for node in group if node.get("ref") in {"quality-evaluator", "quality-filter"}]
+            values = {str((node.get("params") or {}).get("quality_profile_revision_id") or "") for node in relevant}
+            values.discard("")
+            if len(values) <= 1:
+                continue
+            changed = []
+            for node in relevant:
+                node_id = str(node["id"])
+                current = (node.get("params") or {}).get("quality_profile_revision_id")
+                old = ((previous_nodes.get(node_id) or {}).get("params") or {}).get("quality_profile_revision_id")
+                if current != old:
+                    changed.append(str(current))
+            if len(set(changed)) != 1:
+                raise FlowParameterError("QUALITY_PROFILE_CONFLICT",
+                    f"Sink {sink_id} 链路的质量评估与过滤规则不一致", node_id=sink_id,
+                    field="quality_profile_revision_id")
+            selected = changed[0]
+            for node in relevant:
+                node.setdefault("params", {})["quality_profile_revision_id"] = selected
+        return value
 
     def _compile_template_definition(self, session: Session, definition: dict[str, Any], output_types: list[str],
                                      *, purpose: str = "knowledge", require_serving_health: bool = False, llm_registry=None,
-                                     authoring_mode: str = "advanced") -> dict[str, Any]:
+                                     authoring_mode: str = "advanced",
+                                     previous_definition: dict[str, Any] | None = None) -> dict[str, Any]:
         if authoring_mode == "standard":
             normalized = FLOW_AUTHORING_COMPILER.materialize(definition, output_types)
         else:
             normalized = self._normalise_template_definition(definition, output_types)
+        previous_materialized = None
+        if previous_definition:
+            previous_materialized = (FLOW_AUTHORING_COMPILER.materialize(previous_definition, output_types)
+                                     if authoring_mode == "standard" else previous_definition)
+        clean_removed_entity_references(normalized, previous_materialized)
+        registry = llm_registry or self.llm_serving_registry
+        normalized = self._normalize_flow_parameters(session, normalized,
+                                                     previous_definition=previous_materialized,
+                                                     llm_registry=registry)
         normalized["purpose"] = purpose
+        normalized = pin_subflows(normalized, self._published_subflows(session))
+        if "graph" in {output_contract(value)[0] for value in output_types}:
+            graph_schema = normalize_graph_config(normalized.get("graph_config"))
+            normalized["graph_config"] = graph_schema.to_dict()
+            for node in normalized.get("nodes", []):
+                params = node.get("params") or {}
+                if node.get("ref") == "entity-extractor" and params.get("entity_type_scope") == "subset":
+                    unknown = set(params.get("entity_types") or []) - graph_schema.entity_codes()
+                    if unknown:
+                        raise FlowParameterError("PARAMETER_SCHEMA_INVALID",
+                            "实体类型子集引用了未定义的类型：" + "、".join(sorted(unknown)),
+                            node_id=str(node["id"]), field="entity_types")
         try:
-            registry = llm_registry or self.llm_serving_registry
             compiled = FlowCompiler(
                 catalog=catalog_by_code(), subflows=self._published_subflows(session),
                 type_revisions=self._published_type_revisions(session),
                 llm_serving_registry=registry,
             ).compile(normalized)
         except FlowValidationError as exc:
+            if callable(getattr(exc, "payload", None)):
+                raise
             raise ValueError(str(exc)) from exc
         declared_sinks = set(compiled["compiled_definition"]["sink_types"].values())
         if purpose == "knowledge" and declared_sinks != {normalise_output_key(value) for value in output_types}:
             raise ValueError("Flow Knowledge Sink 必须与模板输出知识类型完全一致")
+        if hasattr(registry, "fingerprint"):
+            for dependency in compiled["dependencies"]:
+                if dependency.get("kind") == "llm_serving":
+                    dependency["fingerprint"] = registry.fingerprint(dependency.get("id"))
         for node in compiled["compiled_definition"]["nodes"]:
             if node.get("kind") != "operator":
                 continue
@@ -3941,19 +4090,29 @@ class V7Store:
             ref = node.get("ref")
             if ref in {"prompt-generator", "structured-knowledge-generator"}:
                 prompt_id = params.get("prompt_template_revision_id")
-                if not prompt_id or not session.scalar(select(PromptTemplateRevision.id).where(PromptTemplateRevision.id == prompt_id, PromptTemplateRevision.status == "published")):
+                prompt = session.get(PromptTemplateRevision, prompt_id) if prompt_id else None
+                if not prompt or prompt.status != "published":
                     raise ValueError("Prompt Generator 只能引用已发布 Prompt Template Revision")
+                params["_resolved_prompt_template"] = {
+                    "id": prompt.id, "body": prompt.body,
+                    "input_schema": prompt.input_schema, "output_schema": prompt.output_schema,
+                }
+                compiled["dependencies"].append({"kind": "prompt_template_revision", "id": prompt.id})
             if ref in {"quality-evaluator", "quality-filter", "prompted-refiner"}:
                 quality_id = params.get("quality_profile_revision_id")
-                if not quality_id or not session.scalar(select(QualityProfileRevision.id).where(QualityProfileRevision.id == quality_id, QualityProfileRevision.status == "published")):
+                quality = session.get(QualityProfileRevision, quality_id) if quality_id else None
+                if not quality or quality.status != "published":
                     raise ValueError("质量节点只能引用已发布 Quality Profile Revision")
-        if "graph" in {output_contract(value)[0] for value in output_types}:
-            config = normalize_graph_config(normalized.get("graph_config"))
-            normalized["graph_config"] = config.to_dict()
+                params["_resolved_quality_profile"] = {"id": quality.id, "rules": dict(quality.rules_json or {})}
+                compiled["dependencies"].append({"kind": "quality_profile_revision", "id": quality.id})
         if require_serving_health and self.enforce_serving_health and hasattr(registry, "require_healthy"):
             for dependency in compiled["dependencies"]:
                 if dependency.get("kind") == "llm_serving":
                     registry.require_healthy(dependency.get("id"))
+        compiled["checksum"] = hashlib.sha256(json.dumps(
+            compiled["compiled_definition"], ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
         return {"definition": normalized, **compiled}
 
     @staticmethod
@@ -3969,6 +4128,8 @@ class V7Store:
             llm_registry=llm_registry,
             authoring_mode=authoring_mode,
         )
+        if authoring_mode == "advanced" and not revision.execution_snapshot_id:
+            revision.definition_json = compiled["definition"]
         snapshot_checksum = self._snapshot_checksum(revision.id, compiled["checksum"])
         snapshot = session.scalar(select(FlowExecutionSnapshot).where(FlowExecutionSnapshot.checksum == snapshot_checksum))
         if not snapshot:
@@ -4128,7 +4289,15 @@ class V7Store:
                 if not managed_template_code:
                     raise ValueError("标准配置必须指定 managed_template_code")
                 saved = MANAGED_FLOW_CATALOG.normalize_config(managed_template_code, definition)
-                self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="standard")
+                defaults = MANAGED_FLOW_CATALOG.default_stage_config(managed_template_code)
+                if defaults["stages"]:
+                    generation = saved["stages"].setdefault("generation", {})
+                    if generation is None:
+                        generation = saved["stages"]["generation"] = {}
+                    config = generation.get("config") or {}
+                    config.setdefault("entity_types", defaults["stages"]["generation"]["config"]["entity_types"])
+                    generation["config"] = config
+                self._compile_template_definition(session, saved, sorted(set(output_types)), purpose="knowledge", authoring_mode="standard")
             else:
                 managed_template_code = None
                 saved = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="advanced")["definition"]
@@ -4149,7 +4318,8 @@ class V7Store:
                                                      definition_json=saved, authoring_mode=authoring_mode, managed_template_code=managed_template_code,
                                                      status="draft", purpose="knowledge")
             session.add(revision); self.audit(session, "flow_template.created", "knowledge_flow_template", template.id)
-            return {"id": template.id, "revision": revision.revision_no, "status": template.status}
+            return {"id": template.id, "revision": revision.revision_no, "status": template.status,
+                    "definition": saved}
 
     def update_flow_template(self, template_id: str, name: str, output_types: list[str], definition: dict[str, Any],
                              *, authoring_mode: str | None = None, managed_template_code: str | None = None) -> dict[str, Any]:
@@ -4165,6 +4335,9 @@ class V7Store:
                 KnowledgeFlowTemplate.status != "archived",
             )):
                 raise ValueError("模板名称已存在")
+            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
+                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
+            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
             mode = authoring_mode or template.authoring_mode or "advanced"
             if mode not in {"standard", "advanced"}:
                 raise ValueError("authoring_mode 必须是 standard 或 advanced")
@@ -4175,13 +4348,14 @@ class V7Store:
                 if not managed_template_code:
                     raise ValueError("标准配置必须指定 managed_template_code")
                 saved = MANAGED_FLOW_CATALOG.normalize_config(managed_template_code, definition)
-                self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="standard")
+                self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge",
+                                                  authoring_mode="standard",
+                                                  previous_definition=latest.definition_json if latest else None)
             else:
                 managed_template_code = None
-                saved = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge", authoring_mode="advanced")["definition"]
-            latest = session.scalar(select(KnowledgeFlowTemplateRevision).where(
-                KnowledgeFlowTemplateRevision.knowledge_flow_template_id == template.id,
-            ).order_by(KnowledgeFlowTemplateRevision.revision_no.desc()))
+                saved = self._compile_template_definition(session, definition, sorted(set(output_types)), purpose="knowledge",
+                                                          authoring_mode="advanced",
+                                                          previous_definition=latest.definition_json if latest else None)["definition"]
             template.name, template.output_types, template.definition_json = name.strip(), sorted(set(output_types)), saved
             template.authoring_mode, template.managed_template_code = mode, managed_template_code
             if latest and latest.status == "draft":
@@ -4193,7 +4367,8 @@ class V7Store:
                     authoring_mode=mode, managed_template_code=managed_template_code, status="draft", purpose="knowledge")
                 session.add(latest)
             self.audit(session, "flow_template.updated", "knowledge_flow_template", template.id, {"revision": latest.revision_no})
-            return {"id": template.id, "revision": latest.revision_no, "status": latest.status}
+            return {"id": template.id, "revision": latest.revision_no, "status": latest.status,
+                    "definition": saved}
 
     def publish_flow_template(self, template_id: str) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -4357,6 +4532,7 @@ class V7Store:
             "compiled": compiled, "reusable_map": reusable_map,
             "sink_requirements": self._debug_sink_requirements(compiled["compiled_definition"]),
         }
+
 
     def _debug_review_selection(self, session: Session, snapshot_ids: list[str], *, require_current: bool) -> list[dict[str, Any]]:
         ids = list(dict.fromkeys(str(value) for value in snapshot_ids if value))
@@ -5153,7 +5329,23 @@ class V7Store:
             snapshot = session.get(FlowExecutionSnapshot, job.execution_snapshot_id) if job.execution_snapshot_id else None
             if not snapshot:
                 raise ValueError("知识任务缺少执行快照")
+            self._validate_snapshot_servings(snapshot)
             return snapshot.compiled_definition_json
+
+    def _validate_snapshot_servings(self, snapshot: FlowExecutionSnapshot) -> None:
+        for dependency in dict(snapshot.dependency_json or {}).get("dependencies", []):
+            if dependency.get("kind") != "llm_serving" or not dependency.get("fingerprint"):
+                continue
+            try:
+                current = self.llm_serving_registry.fingerprint(str(dependency.get("id") or ""))
+            except ValueError as exc:
+                raise FlowParameterError("SERVING_CONFIG_DRIFT", str(exc), field="llm_serving") from exc
+            if current != dependency["fingerprint"]:
+                raise FlowParameterError(
+                    "SERVING_CONFIG_DRIFT",
+                    f"Serving {dependency.get('id')} 配置已变化，不能执行冻结快照",
+                    field="llm_serving",
+                )
 
     def _type_contracts_for_bindings(self, session: Session, bindings: dict[str, str | None],
                                      definition: dict[str, Any], template_revision_id: str | None) -> dict[str, dict[str, Any]]:
@@ -5182,13 +5374,16 @@ class V7Store:
                 prompt_body = ""
                 params = dict((definition or {}).get("parameters") or {})
                 prompt_revision_id = params.get("prompt_template_revision_id")
-                if not prompt_revision_id:
-                    prompt_revision_id = next((dict(node.get("params") or {}).get("prompt_template_revision_id")
-                        for node in (definition or {}).get("nodes", [])
-                        if dict(node.get("params") or {}).get("knowledge_type") == output_type and
-                        dict(node.get("params") or {}).get("prompt_template_revision_id")), None)
+                prompt_node = next((node for node in (definition or {}).get("nodes", [])
+                    if dict(node.get("params") or {}).get("knowledge_type") == effective_type and
+                    (not effective_mode or dict(node.get("params") or {}).get("graph_mode") == effective_mode) and
+                    dict(node.get("params") or {}).get("prompt_template_revision_id")), None)
+                if prompt_node:
+                    node_params = dict(prompt_node.get("params") or {})
+                    prompt_revision_id = node_params.get("prompt_template_revision_id")
+                    prompt_body = str((node_params.get("_resolved_prompt_template") or {}).get("body") or "")
                 prompt = session.get(PromptTemplateRevision, prompt_revision_id) if prompt_revision_id else None
-                if prompt and prompt.status == "published":
+                if not prompt_body and prompt and prompt.status == "published":
                     prompt_body = prompt.body
                 graph_config: dict[str, Any] | None = None
                 graph_schema_hash: str | None = None
@@ -5217,9 +5412,11 @@ class V7Store:
             job = session.get(KnowledgeJob, job_id)
             if not job:
                 raise ValueError("知识任务不存在")
-            template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
-            definition = session.get(KnowledgeFlowTemplateRevision, job.knowledge_flow_template_revision_id).definition_json \
-                if job.knowledge_flow_template_revision_id else (template.definition_json if template else {})
+            snapshot = session.get(FlowExecutionSnapshot, job.execution_snapshot_id) if job.execution_snapshot_id else None
+            if not snapshot:
+                raise ValueError("知识任务缺少执行快照")
+            self._validate_snapshot_servings(snapshot)
+            definition = snapshot.compiled_definition_json
             return self._type_contracts_for_bindings(
                 session, dict(job.sink_library_ids or job.output_library_ids),
                 dict(definition or {}), job.knowledge_flow_template_revision_id,
@@ -6048,8 +6245,14 @@ class V7Store:
             version_row = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition_row.id,
                                                                         OperatorVersion.version_no == int(node.get("version") or definition_row.latest_version or 1))) if definition_row else None
             if not definition_row or not definition_row.enabled or not version_row or version_row.status != "published": raise ValueError("算子版本已不可执行")
-            validated_parameters = {key: value for key, value in dict(effective_overrides.get(node_id) or {}).items() if key != "force_ocr"}
-            validation_error = self._validate_parameter_override(version_row.parameter_schema or {"type": "object"}, validated_parameters)
+            override_schema = version_row.parameter_schema or {"type": "object"}
+            editable = set(dict(override_schema.get("properties") or {}))
+            submitted_keys = set(dict(override_delta.get(node_id) or {})) - {"force_ocr"}
+            unknown_parameters = submitted_keys - editable
+            if unknown_parameters:
+                raise ValueError(f"参数覆盖不符合 Operator Version Schema：不允许参数 {sorted(unknown_parameters)[0]}")
+            validated_parameters = {key: value for key, value in resolved.items() if key in editable}
+            validation_error = self._validate_parameter_override(override_schema, validated_parameters)
             if validation_error: raise ValueError(f"参数覆盖不符合 Operator Version Schema：{validation_error}")
             if resolved.get("force_ocr") and node.get("ref") != "document-parser": raise ValueError("force_ocr 仅适用于 Document Parser")
             if resolved.get("force_ocr"):
@@ -6147,6 +6350,7 @@ class V7Store:
             parent = session.get(FlowRun, run.parent_flow_run_id); snapshot = session.get(FlowExecutionSnapshot, run.execution_snapshot_id)
             job = session.get(KnowledgeJob, run.knowledge_job_id)
             assert parent and snapshot and job
+            self._validate_snapshot_servings(snapshot)
             node_runs = {item.node_id: item for item in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == parent.id)).all()}
             parent_outputs: dict[str, dict[str, Any]] = {}
             for node_id, node_run in node_runs.items():
@@ -6251,6 +6455,7 @@ class V7Store:
                 session, contract_bindings,
                 dict(snapshot.compiled_definition_json), debug_input.knowledge_flow_template_revision_id,
             )
+            self._validate_snapshot_servings(snapshot)
             return {
                 "id": run.id, "mode": run.run_mode, "start_node_id": run.start_node_id,
                 "parameter_overrides": dict(run.parameter_overrides or {}),
@@ -6466,8 +6671,9 @@ class V7Store:
             if errors:
                 raise ValueError("候选项不符合知识 Schema：" + errors[0].message)
         except ImportError:
-            # API/Worker intentionally omit the Runner-only validator.  Keep a
-            # conservative required-field gate for direct administrative calls.
+            # jsonschema is a base dependency since parameter normalization moved
+            # into the compile/seed path; this fallback only guards minimal images
+            # that omit it.  Keep a conservative required-field gate.
             pass
         required = list((schema or {}).get("required") or [])
         missing = [field for field in required if not data.get(field)]
@@ -6523,6 +6729,11 @@ class V7Store:
                 template_rev = session.get(KnowledgeFlowTemplateRevision, job.knowledge_flow_template_revision_id) if job.knowledge_flow_template_revision_id else None
                 template = session.get(KnowledgeFlowTemplate, job.knowledge_flow_template_id)
                 definition = template_rev.definition_json if template_rev else (template.definition_json if template else {})
+                execution = session.get(FlowExecutionSnapshot, job.execution_snapshot_id) if job.execution_snapshot_id else None
+                if execution:
+                    definition = execution.compiled_definition_json
+                elif (definition or {}).get("template_code"):
+                    definition = FLOW_AUTHORING_COMPILER.materialize(definition, template.output_types)
                 config = normalize_graph_config((definition or {}).get("graph_config"))
                 library.graph_schema_snapshot_json = config.to_dict()
                 library.graph_schema_hash = schema_hash(config)

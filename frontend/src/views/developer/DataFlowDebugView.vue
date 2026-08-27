@@ -6,6 +6,7 @@ import DataForgeFlowCanvas from '../../components/flow/DataForgeFlowCanvas.vue'
 import RuntimeInspector from '../../components/flow/inspector/RuntimeInspector.vue'
 import { deserializeRuntimeDag } from '../../components/flow/flowModel'
 import { debugRunPreflightIssue, NO_DEBUG_REVIEW_INPUTS } from './debugRunForm'
+import { consoleNodeLabels, consoleNodePresentation } from './debugConsole'
 
 const router = useRouter()
 const route = useRoute()
@@ -14,6 +15,10 @@ const capabilities = ref({ debug_full_enabled: true, debug_replay_enabled: true,
 const selectedTemplateId = ref(''), selectedRunId = ref(''), runDetail = ref(null), materialization = ref(null)
 const selectedNode = ref(null), selectedArtifact = ref(null), artifactContent = ref(null)
 const runtimeNodes = ref([]), runtimeEdges = ref([]), events = ref([]), cursor = ref(0), parameters = ref('{}')
+const nodeLabels = computed(() => consoleNodeLabels(runtimeNodes.value))
+const consoleEvents = computed(() => events.value.map(event => ({
+  ...event, nodePresentation: consoleNodePresentation(event.node_id, nodeLabels.value),
+})))
 const error = ref(''), dagError = ref(''), loading = ref(false), actionBusy = ref(false), viewMode = ref('dag')
 const drawerOpen = ref(false), revisionKind = ref('draft'), debugOptions = ref(null), selectedReviewIds = ref([]), sinkBindings = ref({}), preflight = ref(null)
 const inputSource = ref('builtin_sample'), sampleCode = ref('reviewed-medical-v1')
@@ -249,10 +254,13 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <section class="console">
         <header><b>Console</b><span>cursor {{ cursor }}</span></header>
         <div class="console-lines" tabindex="0" role="region" aria-label="运行日志">
-          <p v-for="event in events" :key="event.cursor" class="console-row" :class="event.level">
+          <p v-for="event in consoleEvents" :key="event.cursor" class="console-row" :class="event.level">
             <time>{{ event.created_at }}</time>
             <code>{{ event.type }}</code>
-            <span class="console-node">{{ event.node_id || 'run' }}</span>
+            <span class="console-node">
+              <span class="console-node-name">{{ event.nodePresentation.label }}</span>
+              <span v-if="event.nodePresentation.technicalId" class="console-node-id">{{ event.nodePresentation.technicalId }}</span>
+            </span>
             <span class="console-message">{{ event.message }}</span>
           </p>
           <p v-if="!events.length">暂无运行事件。</p>
@@ -275,6 +283,9 @@ onBeforeUnmount(() => window.clearInterval(timer))
 .console-row>*{min-width:0;overflow-wrap:anywhere}
 .console-row code{font:inherit}
 .console-row time,.console-node{color:#aebed2}
+.console-node-name,.console-node-id{display:block;overflow-wrap:anywhere}
+.console-node-name{color:#d9e2ee}
+.console-node-id{color:#aebed2}
 .console-message{white-space:pre-wrap}
 .empty{display:grid;height:590px;place-items:center;color:#7c899a}.muted{color:#7c899a;font-size:11px}.overlay{position:fixed;z-index:30;inset:0;display:flex;justify-content:flex-end;background:rgba(16,24,40,.4)}.drawer{box-sizing:border-box;width:min(620px,90vw);height:100%;overflow:auto;padding:22px;background:#fff;box-shadow:-10px 0 28px rgba(15,23,42,.18)}.drawer header{display:flex;justify-content:space-between}.drawer label,.save-dialog label{display:grid;gap:6px;margin:12px 0;font-weight:700}.drawer select,.save-dialog input,.save-dialog textarea{width:100%}.review-group{margin:10px 0;padding:12px;border:1px solid #e2e7ee;border-radius:10px}.review-option{display:flex!important;grid-template-columns:none!important;flex-direction:row;align-items:flex-start}.review-option small{display:block;color:#7c899a}.preview-policy,.save-scope{display:grid;gap:4px;margin-top:14px;padding:12px;border-radius:10px;background:#edf4ff;color:#365477}.drawer footer,.save-dialog footer{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}.success{color:#1d8c65}.save-dialog{width:min(520px,90vw);margin:auto;padding:22px;border-radius:14px;background:#fff}.global-error{position:sticky;bottom:10px;padding:12px;border:1px solid #efcccc;border-radius:9px;background:#fff0f0;white-space:pre-wrap}@media(max-width:1200px){.workbench{grid-template-columns:220px minmax(520px,1fr) 320px;gap:12px}}
 .form-empty{display:grid;gap:8px;padding:18px;border:1px dashed #b9c8dc;border-radius:10px;background:#f7f9fc;color:#536177}.form-empty p{margin:0;line-height:1.6}.form-empty button{justify-self:start}.field-error{color:#b5473c;font-size:11px;font-weight:500}

@@ -1,9 +1,11 @@
 export class ApiRequestError extends Error {
-  constructor({ method, url, status, requestId, detail }) {
-    const message = `${method} ${url} · HTTP ${status}${requestId ? ` · request_id ${requestId}` : ''} · ${detail || '请求失败'}`
+  constructor({ method, url, status, requestId, detail, problem = null }) {
+    const structured = problem || (detail && typeof detail === 'object' ? detail : null)
+    const readable = structured?.message || (typeof detail === 'string' ? detail : structured ? JSON.stringify(structured) : '请求失败')
+    const message = `${method} ${url} · HTTP ${status}${requestId ? ` · request_id ${requestId}` : ''} · ${readable}`
     super(message)
     this.name = 'ApiRequestError'; this.method = method; this.url = url; this.status = status
-    this.requestId = requestId; this.detail = detail || '请求失败'
+    this.requestId = requestId; this.detail = readable; this.problem = structured
   }
 }
 
@@ -26,9 +28,13 @@ async function request(path, options = {}) {
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers })
   if (!response.ok) {
     const raw = await response.text().catch(() => '')
-    let detail = raw
-    try { const parsed = JSON.parse(raw); detail = typeof parsed.detail === 'string' ? parsed.detail : JSON.stringify(parsed.detail || parsed) } catch (_) {}
-    throw new ApiRequestError({ method, url: path, status: response.status, requestId: response.headers.get('X-Request-ID') || requestId, detail })
+    let detail = raw, problem = null
+    try {
+      const parsed = JSON.parse(raw), value = parsed.detail ?? parsed
+      if (value && typeof value === 'object') { problem = value; detail = value.message || JSON.stringify(value) }
+      else detail = String(value || raw)
+    } catch (_) {}
+    throw new ApiRequestError({ method, url: path, status: response.status, requestId: response.headers.get('X-Request-ID') || requestId, detail, problem })
   }
   return response.status === 204 ? null : response.json()
 }
@@ -132,9 +138,12 @@ export const api = {
   operatorCatalog: (params = {}) => request(`/api/developer/operator-catalog?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== '' && value !== null && value !== undefined)).toString()}`),
   operatorCatalogFacets: () => request('/api/developer/operator-catalog/facets'),
   operatorDetail: code => request(`/api/developer/operator-catalog/${encodeURIComponent(code)}`),
-  promptTemplates: () => request('/api/developer/prompt-templates'),
-  qualityProfiles: () => request('/api/developer/quality-profiles'),
+  promptTemplates: (params = {}) => request(`/api/developer/prompt-templates?${new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString()}`),
+  qualityProfiles: (params = {}) => request(`/api/developer/quality-profiles?${new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString()}`),
   flowSubgraphs: () => request('/api/developer/flow-subgraphs'),
+  createFlowSubgraph: body => request('/api/developer/flow-subgraphs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+  flowSubgraphRevisions: id => request(`/api/developer/flow-subgraphs/${id}/revisions`),
+  flowSubgraphReferences: (id, revision) => request(`/api/developer/flow-subgraphs/${id}/revisions/${revision}/references`),
   flowSubgraphRevision: (id, revision) => request(`/api/developer/flow-subgraphs/${id}/revisions/${revision}`),
   copyFlowSubgraphDraft: (id, revision) => request(`/api/developer/flow-subgraphs/${id}/revisions/${revision}/copy`, { method: 'POST' }),
   updateFlowSubgraphDraft: (id, revision, body) => request(`/api/developer/flow-subgraphs/${id}/revisions/${revision}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
@@ -142,6 +151,8 @@ export const api = {
   publishFlowSubgraphDraft: (id, revision) => request(`/api/developer/flow-subgraphs/${id}/revisions/${revision}/publish`, { method: 'POST' }),
   flowTemplates: () => request('/api/developer/knowledge-flow-templates'),
   managedFlowTemplates: () => request('/api/developer/managed-flow-templates'),
+  graphEntityTypes: () => request('/api/developer/graph-entity-types'),
+  resolveGraphEntityTypes: body => request('/api/developer/graph-entity-types/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   materializeManagedFlow: code => request(`/api/developer/managed-flow-templates/${code}/materialize`, { method: 'POST' }),
   previewFlowCompilation: body => request('/api/developer/flow-compiler/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   detachFlowToAdvanced: id => request(`/api/developer/knowledge-flow-templates/${id}/detach-to-advanced`, { method: 'POST' }),

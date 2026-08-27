@@ -1,42 +1,43 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
+import OperatorParameterForm from '../inspector/OperatorParameterForm.vue'
 
-const props = defineProps({ template: { type: Object, default: null }, managedTemplates: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] } })
+const props = defineProps({ template: { type: Object, default: null }, managedTemplateCode: { type: String, default: '' }, definition: { type: Object, default: null }, managedTemplates: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] } })
 const emit = defineEmits(['update:definition'])
-const managedTemplate = computed(() => props.managedTemplates.find(item => item.code === props.template?.managed_template_code) || null)
+const managedCode = computed(() => props.managedTemplateCode || props.template?.managed_template_code || '')
+const managedTemplate = computed(() => props.managedTemplates.find(item => item.code === managedCode.value) || null)
 const stages = computed(() => managedTemplate.value?.stages || [])
-const configurableStages = computed(() => stages.value.filter(item => item.configurable && item.config_schema))
+const generationStage = computed(() => stages.value.find(item => item.code === 'generation') || null)
+const hasGenerationStage = computed(() => !!generationStage.value)
+const qualityStage = computed(() => stages.value.find(item => item.code === 'quality') || null)
+const qualityNumber = computed(() => hasGenerationStage.value ? 3 : 2)
 const stageConfig = ref({ schema_version: 1, template_code: '', stages: {} })
 
 function syncFromTemplate() {
-  const code = props.template?.managed_template_code || ''
-  const def = props.template?.definition
-  stageConfig.value = { schema_version: 1, template_code: code, stages: def?.template_code === code ? { ...(def.stages || {}) } : {} }
+  const code = managedCode.value
+  const def = props.definition || props.template?.definition || managedTemplate.value?.default_definition
+  stageConfig.value = { schema_version: 1, template_code: code, stages: def?.template_code === code ? JSON.parse(JSON.stringify(def.stages || {})) : {} }
 }
-watch(() => props.template?.id, syncFromTemplate, { immediate: true })
-watch(() => managedTemplate.value?.code, syncFromTemplate)
+watch([managedCode, () => props.template?.id, () => props.definition || props.template?.definition], syncFromTemplate, { immediate: true })
 function configOf(stageCode) {
   if (!stageConfig.value.stages[stageCode]) stageConfig.value.stages[stageCode] = { config: {} }
   if (!stageConfig.value.stages[stageCode].config) stageConfig.value.stages[stageCode].config = {}
   return stageConfig.value.stages[stageCode].config
 }
-function update(stageCode, key, value) {
-  configOf(stageCode)[key] = value
-  emit('update:definition', JSON.parse(JSON.stringify(stageConfig.value)))
-}
-function listValue(items) { return Array.isArray(items) ? items.join(', ') : '' }
-function updateList(stageCode, key, raw) { update(stageCode, key, raw.split(',').map(item => item.trim()).filter(Boolean)) }
+function updateStage(stageCode, value) { stageConfig.value.stages[stageCode] = { config: value }; emit('update:definition', JSON.parse(JSON.stringify(stageConfig.value))) }
 </script>
 
 <template>
   <div class="standard-editor">
     <article class="business-stage"><span class="number">1</span><div class="stage-content"><h3>输入</h3><b>已审核文档块</b><p>正式运行由 SourceReviewSnapshot 自动注入；开发预览默认使用 DataForge 内置示例审核数据。</p><span class="badge blue">运行时绑定</span></div></article>
+    <template v-if="hasGenerationStage">
+      <span class="arrow">↓</span>
+      <article class="business-stage"><span class="number">2</span><div class="stage-content"><h3>知识生成</h3><div v-if="generationStage.configurable && generationStage.config_schema" class="config-sections"><section><h4>{{ generationStage.name }}</h4><OperatorParameterForm :key="`${managedCode}:${template?.id || 'new'}`" :schema="generationStage.config_schema" :model-value="configOf('generation')" @update:model-value="updateStage('generation',$event)" /></section></div><p v-else>当前目标没有需要人工配置的生成参数。</p><small>Prompt 由系统根据目标、Schema 和所选模型生成。</small></div></article>
+    </template>
     <span class="arrow">↓</span>
-    <article class="business-stage"><span class="number">2</span><div class="stage-content"><h3>知识生成</h3><div v-if="configurableStages.length" class="config-sections"><section v-for="stage in configurableStages" :key="stage.code"><h4>{{ stage.name }}</h4><label v-for="(spec,key) in stage.config_schema.properties || {}" :key="key"><span>{{ key === 'llm_serving' ? '模型服务' : key === 'entity_types' ? '实体类型' : key === 'relation_types' ? '关系类型' : key }}</span><input v-if="spec.type==='string'" :value="configOf(stage.code)[key] ?? ''" :placeholder="spec.description || ''" @input="update(stage.code,key,$event.target.value)"><textarea v-else-if="spec.type==='array'" :value="listValue(configOf(stage.code)[key])" rows="2" placeholder="逗号分隔" @input="updateList(stage.code,key,$event.target.value)"></textarea></label></section></div><p v-else>当前目标没有需要人工配置的生成参数。</p><small>Prompt 由系统根据目标、Schema 和所选模型生成。</small></div></article>
+    <article class="business-stage"><span class="number">{{ qualityNumber }}</span><div class="stage-content"><h3>质量治理</h3><div class="checks"><span>✓ Schema 校验</span><span>✓ 知识质量校验</span><span>✓ 来源 Evidence</span></div><div v-if="qualityStage?.configurable && qualityStage.config_schema" class="config-sections"><section><OperatorParameterForm :schema="qualityStage.config_schema" :model-value="configOf('quality')" @update:model-value="updateStage('quality',$event)" /></section></div></div></article>
     <span class="arrow">↓</span>
-    <article class="business-stage"><span class="number">3</span><div class="stage-content"><h3>质量治理</h3><div class="checks"><span>✓ Schema 校验</span><span>✓ 知识质量校验</span><span>✓ 来源 Evidence</span></div></div></article>
-    <span class="arrow">↓</span>
-    <article class="business-stage"><span class="number">4</span><div class="stage-content"><h3>输出知识</h3><div class="outputs"><section v-for="item in outputTypes" :key="item"><b>{{ item }}</b><span>来源绑定：自动</span><span>质量门禁：开启</span></section></div><p>这里只保存 output key、类型和质量策略，不绑定具体 KnowledgeLibrary。</p></div></article>
+    <article class="business-stage"><span class="number">{{ qualityNumber + 1 }}</span><div class="stage-content"><h3>输出知识</h3><div class="outputs"><section v-for="item in outputTypes" :key="item"><b>{{ item }}</b><span>来源绑定：自动</span><span>质量门禁：开启</span></section></div><p>这里只保存 output key、类型和质量策略，不绑定具体 KnowledgeLibrary。</p></div></article>
   </div>
 </template>
 

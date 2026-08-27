@@ -622,6 +622,7 @@ class PromptTemplateRevision(Timestamped, Base):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     input_schema: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     output_schema: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    knowledge_types: Mapped[list] = mapped_column(JSON, default=lambda: ["*"], nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -641,6 +642,7 @@ class QualityProfileRevision(Timestamped, Base):
     quality_profile_id: Mapped[str] = mapped_column(ForeignKey("quality_profiles.id"), nullable=False, index=True)
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     rules_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    knowledge_types: Mapped[list] = mapped_column(JSON, default=lambda: ["*"], nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

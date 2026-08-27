@@ -30,6 +30,7 @@ from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
 from .llm_serving import configure_llm_serving_registry
 from .servings import ServingManager
+from .entity_types import entity_type_catalog, resolve_entity_types
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
 from .migration.verifier import ActivationPreflightVerifier
@@ -163,6 +164,15 @@ class SubflowRevisionRequest(BaseModel):
     definition: dict
 
 
+class SubflowCreateRequest(BaseModel):
+    code: str
+    name: str
+    description: str = ""
+    definition: dict
+    output_types: list[str] = Field(min_length=1)
+    selected_node_ids: list[str] = Field(min_length=1)
+
+
 class DerivedRunRequest(BaseModel):
     mode: Literal["node_only", "from_node"]
     node_id: str
@@ -196,6 +206,13 @@ class SaveDebugRunAsFlowRequest(BaseModel):
     idempotency_key: str
 
 
+class EntityTypesResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entity_types: list[dict | str] = Field(default_factory=list)
+    action: Literal["normalize", "add_custom", "add_medical", "remove_medical"] = "normalize"
+    label: str | None = None
+
+
 class CommitDerivedRunRequest(BaseModel):
     preview_checksum: str
     idempotency_key: str
@@ -212,12 +229,14 @@ class PromptTemplateRequest(BaseModel):
     body: str
     input_schema: dict = Field(default_factory=dict)
     output_schema: dict = Field(default_factory=dict)
+    knowledge_types: list[str] = Field(default_factory=lambda: ["*"])
 
 
 class QualityProfileRequest(BaseModel):
     code: str
     name: str
     rules: dict = Field(default_factory=dict)
+    knowledge_types: list[str] = Field(default_factory=lambda: ["*"])
 
 
 class ProjectRequest(BaseModel):
@@ -482,7 +501,8 @@ def _objects(settings: Settings):
 
 
 def _error(exc: ValueError) -> HTTPException:
-    return HTTPException(status_code=422, detail=str(exc))
+    payload = getattr(exc, "payload", None)
+    return HTTPException(status_code=422, detail=payload() if callable(payload) else str(exc))
 
 
 def _review_error(exc: ReviewGateError) -> HTTPException:
@@ -1280,12 +1300,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/developer/prompt-templates")
-    def prompt_templates():
-        return store.list_prompt_templates()
+    def prompt_templates(status: str = "", knowledge_type: str = ""):
+        return store.list_prompt_templates(status=status, knowledge_type=knowledge_type)
 
     @app.post("/api/developer/prompt-templates", status_code=201)
     def create_prompt_template(payload: PromptTemplateRequest):
-        try: return store.create_prompt_template(payload.code, payload.name, payload.body, payload.input_schema, payload.output_schema)
+        try: return store.create_prompt_template(payload.code, payload.name, payload.body, payload.input_schema, payload.output_schema, payload.knowledge_types)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/prompt-templates/{prompt_id}/publish")
@@ -1294,12 +1314,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/quality-profiles")
-    def quality_profiles():
-        return store.list_quality_profiles()
+    def quality_profiles(status: str = "", knowledge_type: str = ""):
+        return store.list_quality_profiles(status=status, knowledge_type=knowledge_type)
 
     @app.post("/api/developer/quality-profiles", status_code=201)
     def create_quality_profile(payload: QualityProfileRequest):
-        try: return store.create_quality_profile(payload.code, payload.name, payload.rules)
+        try: return store.create_quality_profile(payload.code, payload.name, payload.rules, payload.knowledge_types)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/quality-profiles/{profile_id}/publish")
@@ -1310,6 +1330,21 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/flow-subgraphs")
     def flow_subgraphs():
         return store.list_subflows()
+
+    @app.post("/api/developer/flow-subgraphs", status_code=201)
+    def create_flow_subgraph(payload: SubflowCreateRequest):
+        try: return store.create_subflow(**payload.model_dump())
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/developer/flow-subgraphs/{subflow_id}/revisions")
+    def flow_subgraph_revisions(subflow_id: str):
+        try: return store.subflow_revisions(subflow_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/references")
+    def flow_subgraph_references(subflow_id: str, revision: int):
+        try: return store.subflow_references(subflow_id, revision)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}")
     def flow_subgraph_revision(subflow_id: str, revision: int):
@@ -1329,8 +1364,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/validate")
     def validate_flow_subgraph_revision(subflow_id: str, revision: int):
         try:
-            value = store.subflow_revision_detail(subflow_id, revision); store._validate_subflow_definition(value["definition"])
-            return {"id": subflow_id, "revision": revision, "valid": True}
+            return {"id": subflow_id, "revision": revision, **store.validate_subflow_draft(subflow_id, revision)}
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/flow-subgraphs/{subflow_id}/revisions/{revision}/publish")
@@ -1345,6 +1379,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/managed-flow-templates")
     def managed_flow_templates():
         return store.list_managed_flow_templates()
+
+    @app.get("/api/developer/graph-entity-types")
+    def graph_entity_types():
+        return entity_type_catalog()
+
+    @app.post("/api/developer/graph-entity-types/resolve")
+    def resolve_graph_entity_types(body: EntityTypesResolveRequest):
+        # A pure editor operation: no template, revision or database is written.
+        try:
+            return {"entity_types": resolve_entity_types(body.entity_types, body.action, label=body.label)}
+        except ValueError as exc:
+            raise _error(exc) from exc
 
     @app.post("/api/developer/managed-flow-templates/{code}/materialize")
     def materialize_managed_flow(code: str):

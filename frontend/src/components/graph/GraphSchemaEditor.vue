@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { literalDatatypeLabels } from '../../constants/knowledgeLabels'
+import EntityTypeEditor from './EntityTypeEditor.vue'
 
 const props = defineProps({ modelValue: { type: Object, required: true } })
 const emit = defineEmits(['update:modelValue'])
@@ -12,17 +13,7 @@ const relationTypes = computed(() => props.modelValue.relation_types || [])
 const entityCodes = computed(() => entityTypes.value.map(item => item.code).filter(Boolean))
 
 function patch(partial) { emit('update:modelValue', { ...props.modelValue, ...partial }) }
-function addEntityType() {
-  patch({ entity_types: [...entityTypes.value, { code: '', label: '', description: '' }] })
-}
-function removeEntityType(index) {
-  const next = entityTypes.value.slice(); next.splice(index, 1)
-  patch({ entity_types: next })
-}
-function updateEntityType(index, field, value) {
-  const next = entityTypes.value.map((item, i) => i === index ? { ...item, [field]: value } : item)
-  patch({ entity_types: next })
-}
+function updateEntityTypes(value) { patch({ entity_types: value }) }
 function addRelationType() {
   patch({ relation_types: [...relationTypes.value, { code: '', label: '', description: '', source_types: [], target_types: [] }] })
 }
@@ -48,16 +39,7 @@ function datatypeEnabled(key) {
 <template>
   <div class="schema-editor">
     <section class="schema-block">
-      <header><h4>实体类型</h4><button type="button" @click="addEntityType">+ 新增实体类型</button></header>
-      <div v-if="entityTypes.length" class="type-list">
-        <div v-for="(item, index) in entityTypes" :key="index" class="type-row">
-          <input v-model="item.label" placeholder="中文名称（如：疾病）" @input="updateEntityType(index, 'label', $event.target.value)">
-          <input v-model="item.code" placeholder="代码 code（如：disease）" @input="updateEntityType(index, 'code', $event.target.value)">
-          <input v-model="item.description" placeholder="业务定义（可选）" @input="updateEntityType(index, 'description', $event.target.value)">
-          <button type="button" class="danger" @click="removeEntityType(index)">删除</button>
-        </div>
-      </div>
-      <p v-else class="muted">尚未定义实体类型；留空表示不约束类型。</p>
+      <EntityTypeEditor :model-value="entityTypes" @update:model-value="updateEntityTypes" />
     </section>
 
     <section class="schema-block">
@@ -72,12 +54,12 @@ function datatypeEnabled(key) {
           <div class="relation-constraints">
             <label>source 类型
               <select multiple :model-value="item.source_types || []" @change="updateRelationType(index, 'source_types', [...$event.target.selectedOptions].map(o => o.value))">
-                <option v-for="code in entityCodes" :key="code" :value="code">{{ code }}</option>
+                <option v-for="code in entityCodes" :key="code" :value="code">{{ entityTypes.find(item => item.code === code)?.label || code }}</option>
               </select>
             </label>
             <label>target 类型
               <select multiple :model-value="item.target_types || []" @change="updateRelationType(index, 'target_types', [...$event.target.selectedOptions].map(o => o.value))">
-                <option v-for="code in entityCodes" :key="code" :value="code">{{ code }}</option>
+                <option v-for="code in entityCodes" :key="code" :value="code">{{ entityTypes.find(item => item.code === code)?.label || code }}</option>
               </select>
             </label>
           </div>

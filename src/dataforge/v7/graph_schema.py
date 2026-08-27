@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from .graph_literal import LITERAL_DATATYPES
+from .entity_types import custom_type_code, normalize_entity_label, normalize_entity_origin
 
 _CODE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 _UNKNOWN_POLICIES = ("reject", "other", "suggest")
@@ -32,6 +33,8 @@ class EntityTypeDefinition:
     code: str
     label: str
     description: str = ""
+    source: str = "custom"
+    preset: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,7 +72,8 @@ class GraphExtractionConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "entity_types": [{"code": item.code, "label": item.label, "description": item.description}
+            "entity_types": [{"code": item.code, "label": item.label, "description": item.description,
+                              "source": item.source, **({"preset": item.preset} if item.preset else {})}
                              for item in self.entity_types],
             "relation_types": [{"code": item.code, "label": item.label, "description": item.description,
                                 "source_types": list(item.source_types), "target_types": list(item.target_types)}
@@ -110,16 +114,24 @@ def _optional_text_list(value: Any, field_name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value)
 
 
-def _normalize_entity_type(raw: Any, seen: set[str]) -> EntityTypeDefinition:
+def _normalize_entity_type(raw: Any, seen: set[str], labels: set[str]) -> EntityTypeDefinition:
     if not isinstance(raw, dict):
         raise GraphSchemaError("entity_types 每一项必须是对象")
-    code = _require_code(raw.get("code"), "实体类型 code")
+    try:
+        label = normalize_entity_label(raw.get("label"))
+        code = _require_code(raw.get("code") or custom_type_code(label), "实体类型 code")
+        source, preset = normalize_entity_origin(raw, code, label)
+    except ValueError as exc:
+        raise GraphSchemaError(str(exc)) from exc
+    if label in labels:
+        raise GraphSchemaError(f"实体类型名称重复：{label}")
+    labels.add(label)
     if code in seen:
         raise GraphSchemaError(f"实体类型 code 重复：{code}")
     seen.add(code)
     return EntityTypeDefinition(
         code=code,
-        label=_require_text(raw.get("label"), f"实体类型 {code} 的 label"),
+        label=label, source=source, preset=preset,
         description=_optional_text(raw.get("description"), f"实体类型 {code} 的 description"),
     )
 
@@ -153,7 +165,11 @@ def normalize_graph_config(raw: Any) -> GraphExtractionConfig:
     if not isinstance(raw, dict):
         raise GraphSchemaError("graph_config 必须是对象")
     entity_seen: set[str] = set()
-    entity_types = tuple(_normalize_entity_type(item, entity_seen) for item in (raw.get("entity_types") or []))
+    entity_labels: set[str] = set()
+    raw_entities = raw.get("entity_types", [])
+    if not isinstance(raw_entities, list):
+        raise GraphSchemaError("entity_types 必须是数组")
+    entity_types = tuple(_normalize_entity_type(item, entity_seen, entity_labels) for item in raw_entities)
     relation_seen: set[str] = set()
     entity_codes = frozenset(item.code for item in entity_types)
     relation_types = tuple(_normalize_relation_type(item, entity_codes, relation_seen) for item in (raw.get("relation_types") or []))

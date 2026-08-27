@@ -614,12 +614,14 @@ class VectorSyncService:
                 self.milvus.upsert(profile.collection_name, partition_name, rows)
             if asset:
                 self.store.mark_asset_version_verifying(job.id)
+                # Verification queries require a loaded candidate, including
+                # empty partitions. Keep it loaded for routing after success.
+                self.milvus.load_partition(profile.collection_name, partition_name)
                 verified = self.milvus.verify_partition(profile.collection_name, partition_name)
                 if int(verified.get("count", -1)) != len(rows):
                     raise ValueError(
                         f"候选 Partition 行数 {verified.get('count')} 与正式知识 {len(rows)} 不一致"
                     )
-                self.milvus.load_partition(profile.collection_name, partition_name)
                 if lease_owner:
                     self.store.assert_work_lease("vector_sync", job.id, lease_owner)
                 return self.store.finish_vector_sync(

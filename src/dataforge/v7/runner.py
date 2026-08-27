@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -432,6 +433,8 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
         return result
     if ref == "source-chunk-builder":
         return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
+    if ref == "text-knowledge-mapper":
+        return [candidate for value in values if (candidate := _text_knowledge_candidate(value)) is not None]
     if ref == "entity-extractor":
         return [{**value, "entities": [
             {"name": "高血压", "type": "disease", "type_label": "疾病", "object_kind": "entity", "description": "常见心血管疾病", "aliases": [], "confidence": 0.9},
@@ -454,10 +457,17 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
     if ref == "artifact-merge":
         return [dict(value) for value in values]
     if ref == "quality-evaluator":
-        return [{**value, "quality_score": float(value.get("quality_score", 1.0)), "quality_status": "pass"} for value in values]
+        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
+        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
+        return [{**value, "quality_score": float(value.get("quality_score", 1.0)),
+                 "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score
+                 else "review" if float(value.get("quality_score", 1.0)) >= review_score else "reject"}
+                for value in values]
     if ref == "quality-filter":
-        return [{**value, "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= 0.8 else "review"}
-                for value in values if float(value.get("quality_score", 1.0)) >= 0.6]
+        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
+        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
+        return [{**value, "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score else "review"}
+                for value in values if float(value.get("quality_score", 1.0)) >= review_score]
     if ref == "deduplicate":
         unique: dict[str, dict[str, Any]] = {}
         for value in values:
@@ -722,6 +732,61 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
     return result
 
 
+def _text_knowledge_candidate(chunk: dict[str, Any]) -> dict[str, Any] | None:
+    """Map one frozen reviewed chunk without normalizing its body or provenance."""
+    content = chunk.get("content")
+    if content is None:
+        return None
+    if not isinstance(content, str):
+        raise ValueError("文本知识映射器要求 content 为字符串")
+    if not content.strip():
+        return None
+    data = {"filename": chunk["filename"], "chunk_index": chunk["chunk_index"]}
+    for key in ("heading_context", "metadata"):
+        if key in chunk:
+            data[key] = deepcopy(chunk[key])
+    anchor = deepcopy(chunk.get("anchor") or {})
+    anchor.update(file=chunk["filename"], chunk_index=chunk["chunk_index"], source_chunk_id=chunk["source_chunk_id"])
+    return {
+        "source_knowledge_id": _source_key(chunk["source_id"], "text", str(chunk["chunk_index"])),
+        "canonical_content": content, "data_json": data,
+        "source_version_ids": [chunk["source_version_id"]], "source_chunk_id": chunk["source_chunk_id"],
+        "source_anchor": f"{chunk['filename']}#chunk-{chunk['chunk_index']}",
+        "anchor_json": anchor, "evidence_text": content, "is_primary": True,
+        **{key: chunk[key] for key in ("source_chunk_revision_id", "source_review_snapshot_id") if key in chunk},
+    }
+
+
+def _generated_text_candidates(source: Source, version: SourceVersion, chunk: dict[str, Any],
+                               contract: dict[str, Any], params: dict[str, Any], llm_serving: str) -> list[dict[str, Any]]:
+    """v6 text generation uses the node's frozen prompt, never the type-wide fallback."""
+    frozen_prompt = params.get("_resolved_prompt_template") or {}
+    if not str(frozen_prompt.get("body") or "").strip():
+        raise ValueError("文本生成缺少节点冻结的 Prompt Template Revision")
+    mapped = _text_knowledge_candidate(chunk)
+    if mapped is None:
+        return []
+    effective_contract = {
+        **contract, "prompt": frozen_prompt["body"],
+        "schema": {"allOf": [contract["schema"], {
+            "type": "object", "required": ["canonical_content"],
+            "properties": {"canonical_content": {"type": "string", "pattern": r"\S"}},
+        }]},
+        "canonical_field": "canonical_content", "canonical_fields": ["canonical_content"],
+        # Candidate identity and provenance are server-owned, not model fields.
+        "identity_fields": [],
+    }
+    candidates = _structured_candidates(source, version, "text", chunk, effective_contract, llm_serving=llm_serving)
+    reserved = {"source_knowledge_id", "source_id", "source_version_id", "source_version_ids", "source_chunk_id",
+                "source_chunk_revision_id", "source_review_snapshot_id", "source_anchor", "anchor", "anchor_json",
+                "evidence_text", "evidence", "is_primary"}
+    return [{**deepcopy(mapped), "source_knowledge_id": candidate["source_knowledge_id"],
+             "canonical_content": candidate["canonical_content"],
+             "data_json": {**{key: value for key, value in candidate["data_json"].items() if key not in reserved},
+                           **deepcopy(mapped["data_json"])}}
+            for candidate in candidates]
+
+
 def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
     anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
     if output_type == "text":
@@ -872,13 +937,45 @@ def _literal_entity(name: str) -> dict[str, Any] | None:
     }
 
 
-def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_serving: str) -> list[dict[str, Any]]:
+def _graph_config_for_node(config: GraphExtractionConfig, params: dict[str, Any], *, relation: bool = False) -> GraphExtractionConfig:
+    raw = config.to_dict()
+    selected_entities = {str(item) for item in (params.get("entity_types") or []) if str(item)}
+    if selected_entities and params.get("entity_type_scope") != "all":
+        raw["entity_types"] = [item for item in raw["entity_types"] if item["code"] in selected_entities]
+        # Entity extraction does not consume relation definitions. Keeping them
+        # here would leave references to types excluded by this node's subset.
+        if not relation:
+            raw["relation_types"] = []
+    selected_relations = {str(item) for item in (params.get("relation_types") or []) if str(item)}
+    if selected_relations:
+        raw["relation_types"] = [item for item in raw["relation_types"] if item["code"] in selected_relations]
+    if relation and params.get("unknown_relation_policy"):
+        raw["unknown_relation_policy"] = params["unknown_relation_policy"]
+    if not relation and params.get("unknown_entity_policy"):
+        raw["unknown_entity_policy"] = params["unknown_entity_policy"]
+    if not relation and params.get("prompt_mode"):
+        raw.setdefault("prompt", {})["mode"] = params["prompt_mode"]
+    constraints = {str(item.get("relation_type")): item for item in (params.get("relation_constraints") or [])
+                   if isinstance(item, dict) and item.get("relation_type")}
+    for item in raw.get("relation_types") or []:
+        constraint = constraints.get(str(item.get("code")))
+        if constraint:
+            item["source_types"] = list(constraint.get("source_types") or [])
+            item["target_types"] = list(constraint.get("target_types") or [])
+    return normalize_graph_config(raw)
+
+
+def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_serving: str,
+                      params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """One LLM call extracting typed entities from a single source chunk."""
+    if (params or {}).get("entity_type_scope") == "subset" and not params.get("entity_types"):
+        return []
     system, prompt = entity_prompt_for(config, str(chunk.get("content", "")))
     response = _llm_json(prompt, llm_serving=llm_serving, system=system)
     raw_entities = response.get("entities") if isinstance(response, dict) else None
     if not isinstance(raw_entities, list):
         raise ValueError("LLM 实体抽取未返回 entities 数组")
+    params = dict(params or {})
     entities: list[dict[str, Any]] = []
     for raw in raw_entities:
         if not isinstance(raw, dict):
@@ -900,11 +997,15 @@ def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_
             label = code
         else:
             code, label = resolved
+        confidence = float(raw.get("confidence") or 1.0)
+        if confidence < float(params.get("confidence_threshold", 0.0)):
+            continue
         entities.append({
             "name": name, "type": code, "type_label": label,
-            "description": str(raw.get("description") or "").strip(),
-            "aliases": [str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()],
-            "object_kind": "entity", "confidence": float(raw.get("confidence") or 1.0),
+            "description": str(raw.get("description") or "").strip() if params.get("generate_description", True) else "",
+            "aliases": ([str(item).strip() for item in (raw.get("aliases") or []) if str(item).strip()]
+                        if params.get("extract_aliases", True) else []),
+            "object_kind": "entity", "confidence": confidence,
         })
     return entities
 
@@ -938,6 +1039,13 @@ def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], co
             # The schema code remains the stable identity; the extracted label
             # is the source-language relationship shown to business users.
             label = str(raw.get("label") or schema_label).strip()
+        definition = config.relation_by_code(code)
+        if definition and (definition.source_types or definition.target_types):
+            entity_types = {str(item.get("name")): str(item.get("type") or "") for item in entities}
+            if definition.source_types and entity_types.get(source) not in definition.source_types:
+                continue
+            if definition.target_types and entity_types.get(target) not in definition.target_types:
+                continue
         relations.append({
             "source": source, "target": target, "type": code, "type_label": label,
             "description": str(raw.get("description") or "").strip(),
@@ -1135,7 +1243,7 @@ def _validate_graph_item(data: dict[str, Any], config: GraphExtractionConfig, gr
                 raise ValueError(f"三元组 object_type 非法：{data.get('object_type')}")
 
 
-def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None) -> list[dict[str, Any]]:
+def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None, operator_version: int | None = None) -> list[dict[str, Any]]:
     """Execute only DataForge adapters; DataFlow class names never enter a Flow."""
     cfg = graph_config or _graph_config_from_contracts(type_contracts)
     library_id = str((sink_libraries or {}).get(_graph_output_key(params)) or "")
@@ -1143,6 +1251,26 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         return root_documents
     if ref == "reviewed-source-chunk-input":
         return [dict(value) for value in root_documents]
+    if ref == "text-knowledge-mapper":
+        outcome = (generation if generation is not None else {}).setdefault("text", {"successful": [], "failed": [], "targeted": []})
+        result = []
+        for chunk in values:
+            scope_key = ("text", str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            if retry_scope is not None and scope_key not in retry_scope:
+                continue
+            outcome["targeted"].append(chunk)
+            try:
+                candidate = _text_knowledge_candidate(chunk)
+                if candidate is not None:
+                    result.append(candidate)
+                outcome["successful"].append(chunk)
+                if store and job_id:
+                    store.record_chunk_generation(job_id, "text", chunk, status="completed", candidate_count=int(candidate is not None))
+            except Exception as exc:
+                outcome["failed"].append({**chunk, "error": str(exc)})
+                if store and job_id:
+                    store.record_chunk_generation(job_id, "text", chunk, status="failed", error=str(exc))
+        return result
     if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
         result = []
         mode = select_runtime_mode(len(values))
@@ -1276,10 +1404,18 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             outcome["targeted"].append(chunk)
             try:
-                candidates = _candidates(
-                    sources[chunk["source_id"]], versions[chunk["source_version_id"]], output_key, chunk,
-                    contract=contract, llm_serving=llm_serving,
-                )
+                if ref in {"prompt-generator", "structured-knowledge-generator"} and kind == "text" and operator_version == 6:
+                    if not contract:
+                        raise ValueError("文本生成缺少已发布的文本知识契约")
+                    candidates = _generated_text_candidates(
+                        sources[chunk["source_id"]], versions[chunk["source_version_id"]], chunk,
+                        contract, params, llm_serving,
+                    )
+                else:
+                    candidates = _candidates(
+                        sources[chunk["source_id"]], versions[chunk["source_version_id"]], output_key, chunk,
+                        contract=contract, llm_serving=llm_serving,
+                    )
                 outcome["successful"].append(chunk)
                 result.extend(candidates)
                 if store and job_id:
@@ -1296,6 +1432,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
         outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
+        node_config = _graph_config_for_node(cfg, params)
         result: list[dict[str, Any]] = []
         for chunk in values:
             scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
@@ -1303,7 +1440,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             outcome["targeted"].append(chunk)
             try:
-                entities = _extract_entities(chunk, cfg, llm_serving)
+                entities = _extract_entities(chunk, node_config, llm_serving, params)
                 result.append({**chunk, "entities": entities})
                 outcome["successful"].append(chunk)
                 if store and job_id:
@@ -1317,11 +1454,12 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         output_key = _graph_output_key(params)
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
+        node_config = _graph_config_for_node(cfg, params, relation=True)
         outcome = (generation if generation is not None else {}).get(output_key)
         result = []
         for record in values:
             try:
-                relations = _extract_relations(record, record.get("entities") or [], cfg, llm_serving)
+                relations = _extract_relations(record, record.get("entities") or [], node_config, llm_serving)
                 result.append({**record, "relations": relations})
             except Exception as exc:
                 if outcome is not None:
@@ -1349,14 +1487,21 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
     if ref == "artifact-merge":
         return [dict(value) for value in values]
     if ref == "quality-evaluator":
-        return [{**value, "quality_score": float(value.get("quality_score", 1.0)), "quality_status": "pass"} for value in values]
+        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
+        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
+        return [{**value, "quality_score": float(value.get("quality_score", 1.0)),
+                 "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score
+                 else "review" if float(value.get("quality_score", 1.0)) >= review_score else "reject"}
+                for value in values]
     if ref == "quality-filter":
+        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
+        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
         result = []
         for value in values:
             score = float(value.get("quality_score", 1.0))
-            if score < 0.6:
+            if score < review_score:
                 continue
-            result.append({**value, "quality_status": "pass" if score >= 0.8 else "review"})
+            result.append({**value, "quality_status": "pass" if score >= pass_score else "review"})
         return result
     if ref == "schema-validator":
         if str(params.get("knowledge_type") or "") == "graph":
@@ -1400,6 +1545,7 @@ def _builtin_dispatch(ref: str, params: dict[str, Any], inputs: list[dict[str, A
         generation=runtime.get("generation"),
         graph_config=runtime.get("graph_config"),
         sink_libraries=runtime.get("sink_libraries"),
+        operator_version=runtime.get("operator_version"),
     )
 
 
@@ -1791,6 +1937,7 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
     versions_list = context["versions"]; versions = {item.id: item for item in versions_list}; sources = context["sources"]
     type_contracts = store.type_contracts_for_job(context["job_id"]); catalog = catalog_by_code(); parent_outputs = context["parent_outputs"]
     graph_config = _graph_config_from_contracts(type_contracts)
+    registry = build_builtin_registry(_builtin_dispatch, catalog)
     outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
     try:
@@ -1821,9 +1968,15 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, outputs[node_id], status="awaiting_commit"); continue
             ref = str(node.get("ref")); params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}; params.pop("force_ocr", None)
             try:
-                values = _run_operator(ref, params, input_values, root_documents=root_documents, sources=sources, versions=versions,
-                                       type_contracts=type_contracts, generation=generation,
-                                       graph_config=graph_config, sink_libraries=context.get("sink_libraries"))
+                operator_version = int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1))
+                values = registry.resolve(ref, operator_version).execute(
+                    inputs=input_values, params=params,
+                    context=OperatorExecutionContext(flow_run_id=flow_run_id, node_id=node_id, runtime={
+                        "root_documents": root_documents, "sources": sources, "versions": versions,
+                        "type_contracts": type_contracts, "generation": generation,
+                        "graph_config": graph_config, "sink_libraries": context.get("sink_libraries"),
+                    }),
+                ).outputs
                 outputs[node_id] = values; item = catalog.get(ref) or {}
                 recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,

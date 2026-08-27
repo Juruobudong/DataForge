@@ -73,11 +73,14 @@ test('subflow presentation separates built-in Chinese, English, code, and revisi
   assert.equal(subflowSubtitle(custom, true), 'custom-subflow · r2')
 })
 
-test('Document Parser parameters are read-only while other operators remain editable', () => {
+test('only operator parameter schema properties are editable', () => {
   const parserCatalog = [{ code: 'document-parser', name: 'Document Parser', category: '文档', input_ports: { input: { artifact_type: 'source_file' } }, output_ports: { output: { artifact_type: 'document_ir' } } }]
   const parser = makeCanvasNode({ id: 'parser', kind: 'operator', ref: 'document-parser', params: {} }, { x: 0, y: 0 }, parserCatalog)
   assert.equal(hasEditableParameters(parser), false)
-  assert.equal(hasEditableParameters(node('source', 'source')), true)
+  const configurableCatalog = [{ code: 'prompt-generator', name: 'Prompt', category: 'LLM', parameter_schema: { type: 'object', properties: { llm_serving: { type: 'string' } } } }]
+  const configurable = makeCanvasNode({ id: 'prompt', kind: 'operator', ref: 'prompt-generator', params: {} }, { x: 0, y: 0 }, configurableCatalog)
+  assert.equal(hasEditableParameters(configurable), true)
+  assert.equal(hasEditableParameters(node('source', 'source')), false)
   assert.equal(hasEditableParameters(sink), false)
 })
 
@@ -87,17 +90,17 @@ test('connection validation covers legal, illegal, duplicate and cardinality cas
   assert.equal(connectionIssue(first, nodes, []), null)
   const qa = { source: 'split', sourceHandle: 'qa', target: 'sink', targetHandle: 'input' }
   assert.equal(connectionIssue(qa, nodes, []), null)
-  assert.equal(connectionIssue({ ...qa, sourceHandle: 'text' }, nodes, []).code, 'TYPE_MISMATCH')
-  assert.equal(connectionIssue(first, nodes, [{ id: 'e', ...first }]).code, 'DUPLICATE_EDGE')
+  assert.equal(connectionIssue({ ...qa, sourceHandle: 'text' }, nodes, []).code, 'KNOWLEDGE_TYPE_MISMATCH')
+  assert.equal(connectionIssue(first, nodes, [{ id: 'e', ...first }]).code, 'EDGE_DUPLICATED')
   const alternate = node('source-2', 'source')
   const oneInput = makeCanvasNode({ id: 'one', kind: 'operator', ref: 'source' }, { x: 0, y: 0 }, [{ code: 'source', input_ports: { input: { artifact_type: 'chunk_set', cardinality: 'one' } }, output_ports: { output: { artifact_type: 'chunk_set' } } }])
-  assert.equal(connectionIssue({ source: 'source-2', sourceHandle: 'output', target: 'one', targetHandle: 'input' }, [nodes[0], alternate, oneInput], [{ id: 'used', source: 'source', sourceHandle: 'output', target: 'one', targetHandle: 'input' }]).code, 'PORT_CARDINALITY')
+  assert.equal(connectionIssue({ source: 'source-2', sourceHandle: 'output', target: 'one', targetHandle: 'input' }, [nodes[0], alternate, oneInput], [{ id: 'used', source: 'source', sourceHandle: 'output', target: 'one', targetHandle: 'input' }]).code, 'INPUT_PORT_ALREADY_CONNECTED')
 })
 
 test('source file input remains a root-only port', () => {
   const sourceFileProducer = makeCanvasNode({ id: 'file', kind: 'operator', ref: 'file' }, { x: 0, y: 0 }, [{ code: 'file', input_ports: {}, output_ports: { output: { artifact_type: 'source_file' } } }])
   const parser = node('parser', 'source')
-  assert.equal(connectionIssue({ source: 'file', sourceHandle: 'output', target: 'parser', targetHandle: 'input' }, [sourceFileProducer, parser], []).code, 'ROOT_INPUT')
+  assert.equal(connectionIssue({ source: 'file', sourceHandle: 'output', target: 'parser', targetHandle: 'input' }, [sourceFileProducer, parser], []).code, 'INPUT_NODE_CANNOT_HAVE_INCOMING')
 })
 
 test('graph sink accepts generic candidate graph output', () => {

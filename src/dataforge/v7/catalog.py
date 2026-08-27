@@ -54,6 +54,7 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "reviewed-source-chunk-input": "读取人工审核快照中冻结的来源文本块",
     "faq-table-row-builder": "将单机构 FAQ 表格逐行规范为来源切片",
     "faq-record-mapper": "将规范 FAQ 行确定性映射为专用知识",
+    "text-knowledge-mapper": "将已审核来源切片确定性映射为文本候选知识",
     "deduplicate": "移除重复的候选知识",
     "prompt-generator": "按受控提示生成结构化知识",
     "qa-generator": "从来源文本块生成问答知识",
@@ -93,6 +94,7 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "language-filter": "语言过滤器", "text-cleaner": "文本清洗器", "whitespace-cleaner": "空白清理器",
     "text-normalizer": "文本规范器", "semantic-chunker": "结构化分块器", "source-chunk-builder": "来源切片构建器",
     "reviewed-source-chunk-input": "已审核来源切片",
+    "text-knowledge-mapper": "文本知识映射器",
     "deduplicate": "候选去重器", "prompt-generator": "提示词生成器", "qa-generator": "问答生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
     "triple-builder": "三元组构建器", "entity-normalizer": "实体规范器", "semantic-relation-builder": "语义关系构建器",
@@ -123,6 +125,7 @@ def _catalog_category(code: str, previous: str) -> tuple[str, str]:
 
 
 def _knowledge_types(source: str, target: str) -> list[str]:
+    if target == "candidate:text": return ["text"]
     contract = f"{source}|{target}"
     if "qa-agent-faq" in contract: return ["qa-agent-faq"]
     if "qa" in contract: return ["qa"]
@@ -157,31 +160,39 @@ def _artifact_example(artifact_type: str) -> dict[str, Any]:
     return {"value": "示例数据"}
 
 
-def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", input_binding: str = "edge", node_role: str = "operator", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", input_binding: str = "edge", node_role: str = "operator", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None, version: int | None = None) -> dict[str, Any]:
     primary_category, subcategory = _catalog_category(code, category)
     parameter_schema: dict[str, Any] = {"type": "object", "additionalProperties": False}
     parameter_docs: dict[str, str] = {"_overview": "此版本没有面向画布的业务可配置参数；运行时内部配置不会返回前端。"}
     properties: dict[str, Any] = {}
+    required: list[str] = []
     if uses_llm:
         properties["llm_serving"] = {
             "type": "string",
+            "title": "模型服务",
             "default": DEFAULT_LLM_SERVING_ID,
             "description": "已配置的 Model Serving ID，不是模型名称或 URL",
+            "x-dataforge-ui": {"widget": "llm-serving-selector"},
         }
+        required.append("llm_serving")
         parameter_docs["_overview"] = "选择 DataForge 已配置的 Model Serving；连接信息和密钥不会暴露到 Flow。"
         parameter_docs["llm_serving"] = "Model Serving ID。当前默认 qwen3_32b；未来由 Serving 选择器提供候选。"
     if extra_params:
         for key, spec in extra_params.items():
             properties[key] = spec.get("schema", {"type": "string"})
             parameter_docs[key] = spec.get("doc", key)
+            if spec.get("required"):
+                required.append(key)
     if properties:
         parameter_schema = {"type": "object", "properties": properties, "additionalProperties": False}
+        if required:
+            parameter_schema["required"] = list(dict.fromkeys(required))
     return {
         "code": code, "name": name, "display_name_zh": OPERATOR_DISPLAY_NAMES_ZH[code],
         "summary": OPERATOR_DESCRIPTIONS[code], "description": OPERATOR_DESCRIPTIONS[code],
         "category": primary_category, "subcategory": subcategory, "input": source,
         "output": target, "adapter_code": adapter, "exposure": exposure,
-        "risk_level": risk, "upstream": upstream or [], "version": 4 if uses_llm else 3,
+        "risk_level": risk, "upstream": upstream or [], "version": version or (4 if uses_llm else 3),
         "node_role": node_role,
         "scenarios": [f"适用于{OPERATOR_DESCRIPTIONS[code]}的受控知识流程"],
         "knowledge_types": _knowledge_types(source, target),
@@ -220,24 +231,27 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("source-chunk-builder", "Source Chunk Builder", "治理", "chunk_set", "source_chunk_set", "source_chunk_builder"),
     _entry("faq-table-row-builder", "FAQ Table Row Builder", "清洗", "document_ir", "chunk_set", "faq_table_row_builder"),
     _entry("faq-record-mapper", "FAQ Record Mapper", "知识生成", "source_chunk_set", "candidate:qa-agent-faq", "faq_record_mapper"),
+    _entry("text-knowledge-mapper", "Text Knowledge Mapper", "内容处理", "source_chunk_set", "candidate:text", "text_knowledge_mapper", uses_llm=False),
     _entry("deduplicate", "Candidate Deduplicate", "清洗", "candidate:*", "candidate:*", "candidate_deduplicate", upstream=["MinHashDeduplicateFilter", "SemDeduplicateFilter"]),
-    _entry("prompt-generator", "Prompt Generator", "知识生成", "source_chunk_set", "candidate:*", "prompt_generator", risk="advanced", upstream=["PromptedGenerator", "ChunkedPromptedGenerator"], uses_llm=True),
+    _entry("prompt-generator", "Prompt Generator", "知识生成", "source_chunk_set", "candidate:*", "prompt_generator", risk="advanced", upstream=["PromptedGenerator", "ChunkedPromptedGenerator"], uses_llm=True, version=6,
+           extra_params={"prompt_template_revision_id": {"schema": {"type": "string", "title": "Prompt 模板", "default": "promptrev_default", "x-dataforge-ui": {"widget": "prompt-template-selector"}}, "doc": "已发布且与当前知识类型匹配的 Prompt Template Revision ID。", "required": True}}),
     _entry("qa-generator", "QA Generator", "知识生成", "source_chunk_set", "candidate:qa", "qa_generator", upstream=["Text2QAGenerator"], uses_llm=True),
     _entry("graph-extractor", "Graph Extractor", "知识生成", "source_chunk_set", "candidate:graph", "graph_extractor", uses_llm=True),
-    _entry("entity-extractor", "Entity Extractor", "图谱", "source_chunk_set", "entity_candidate_set", "entity_extractor", uses_llm=True,
+    _entry("entity-extractor", "Entity Extractor", "图谱", "source_chunk_set", "entity_candidate_set", "entity_extractor", uses_llm=True, version=6,
            extra_params={
-               "entity_types": {"schema": {"type": "array", "items": {"type": "string"}}, "doc": "允许抽取的实体类型 code 列表（由模板 graph_config 注入）。"},
-               "unknown_entity_policy": {"schema": {"type": "string", "enum": ["reject", "other", "suggest"], "default": "reject"}, "doc": "未识别实体处理策略：reject=拒绝，other=归为“其他”，suggest=允许模型建议新类型。"},
-               "generate_description": {"schema": {"type": "boolean", "default": True}, "doc": "是否要求 LLM 为实体生成描述。"},
-               "extract_aliases": {"schema": {"type": "boolean", "default": True}, "doc": "是否要求 LLM 抽取实体别名。"},
-               "confidence_threshold": {"schema": {"type": "number", "default": 0.7}, "doc": "实体置信度阈值。"},
-               "prompt_mode": {"schema": {"type": "string", "enum": ["generated", "custom"], "default": "generated"}, "doc": "生成 Prompt 模式。"},
+               "entity_types": {"schema": {"type": "array", "title": "实体类型范围", "items": {"type": "string"}, "default": [], "x-dataforge-ui": {"widget": "entity-type-subset"}}, "doc": "引用流程 Graph Schema 中的实体类型；不在节点创建预设包。"},
+               "entity_type_scope": {"schema": {"type": "string", "enum": ["all", "subset"], "default": "all", "x-dataforge-ui": {"widget": "hidden"}}, "doc": "all 使用完整流程 Schema；subset 使用 entity_types（空子集不抽取实体）。"},
+               "unknown_entity_policy": {"schema": {"type": "string", "title": "未知实体策略", "enum": ["reject", "other", "suggest"], "default": "reject"}, "doc": "未识别实体处理策略。"},
+               "generate_description": {"schema": {"type": "boolean", "title": "生成描述", "default": True}, "doc": "是否要求 LLM 为实体生成描述。"},
+               "extract_aliases": {"schema": {"type": "boolean", "title": "提取别名", "default": True}, "doc": "是否要求 LLM 抽取实体别名。"},
+               "confidence_threshold": {"schema": {"type": "number", "title": "最低置信度", "default": 0.7, "minimum": 0, "maximum": 1}, "doc": "实体置信度阈值。"},
+               "prompt_mode": {"schema": {"type": "string", "title": "Prompt 模式", "enum": ["generated", "custom"], "default": "generated"}, "doc": "生成 Prompt 模式。"},
            }),
-    _entry("relation-extractor", "Relation Extractor", "图谱", "entity_candidate_set", "relation_candidate_set", "relation_extractor", uses_llm=True,
+    _entry("relation-extractor", "Relation Extractor", "图谱", "entity_candidate_set", "relation_candidate_set", "relation_extractor", uses_llm=True, version=5,
            extra_params={
-               "relation_types": {"schema": {"type": "array", "items": {"type": "string"}}, "doc": "允许抽取的关系类型 code 列表（由模板 graph_config 注入）。"},
-               "relation_constraints": {"schema": {"type": "array", "items": {"type": "object"}}, "doc": "关系的 source/target 实体类型约束。"},
-               "unknown_relation_policy": {"schema": {"type": "string", "enum": ["reject", "other", "suggest"], "default": "reject"}, "doc": "未识别关系处理策略。"},
+               "relation_types": {"schema": {"type": "array", "title": "关系类型", "items": {"type": "string"}, "default": [], "x-dataforge-ui": {"widget": "tag-select"}}, "doc": "允许抽取的关系类型 code 列表。"},
+               "relation_constraints": {"schema": {"type": "array", "title": "关系约束", "default": [], "x-dataforge-ui": {"widget": "relation-constraints"}, "items": {"type": "object", "properties": {"relation_type": {"type": "string"}, "source_types": {"type": "array", "items": {"type": "string"}}, "target_types": {"type": "array", "items": {"type": "string"}}}, "required": ["relation_type", "source_types", "target_types"], "additionalProperties": False}}, "doc": "关系的 source/target 实体类型约束。"},
+               "unknown_relation_policy": {"schema": {"type": "string", "title": "未知关系策略", "enum": ["reject", "other", "suggest"], "default": "reject"}, "doc": "未识别关系处理策略。"},
            }),
     _entry("literal-detector", "Literal Detector", "图谱", "entity_candidate_set", "entity_candidate_set", "literal_detector"),
     _entry("triple-builder", "Triple Builder", "图谱", "relation_candidate_set", "candidate:graph:triple", "triple_builder"),
@@ -245,9 +259,12 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("semantic-relation-builder", "Semantic Relation Builder", "图谱", "relation_candidate_set", "semantic_relation_set", "semantic_relation_builder"),
     _entry("evidence-binder", "Evidence Binder", "图谱", "semantic_relation_set", "candidate:graph:semantic", "evidence_binder"),
     _entry("artifact-merge", "Artifact Merge", "治理", "candidate:*", "candidate:*", "artifact_merge", input_cardinality="many"),
-    _entry("structured-knowledge-generator", "Structured Knowledge Generator", "知识生成", "source_chunk_set", "candidate:*", "structured_knowledge_generator", upstream=["ChunkedPromptedGenerator"], uses_llm=True),
-    _entry("quality-evaluator", "Knowledge Evaluator", "质量", "candidate:*", "candidate:*", "quality_evaluator", upstream=["PromptedEvaluator"]),
-    _entry("quality-filter", "Knowledge Filter", "质量", "candidate:*", "candidate:*", "quality_filter", upstream=["PromptedFilter"]),
+    _entry("structured-knowledge-generator", "Structured Knowledge Generator", "知识生成", "source_chunk_set", "candidate:*", "structured_knowledge_generator", upstream=["ChunkedPromptedGenerator"], uses_llm=True, version=6,
+           extra_params={"prompt_template_revision_id": {"schema": {"type": "string", "title": "Prompt 模板", "default": "promptrev_default", "x-dataforge-ui": {"widget": "prompt-template-selector"}}, "doc": "已发布且与当前知识类型匹配的 Prompt Template Revision ID。", "required": True}}),
+    _entry("quality-evaluator", "Knowledge Evaluator", "质量", "candidate:*", "candidate:*", "quality_evaluator", upstream=["PromptedEvaluator"], version=4,
+           extra_params={"quality_profile_revision_id": {"schema": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}, "doc": "已发布且与当前知识类型匹配的 Quality Profile Revision ID。", "required": True}}),
+    _entry("quality-filter", "Knowledge Filter", "质量", "candidate:*", "candidate:*", "quality_filter", upstream=["PromptedFilter"], version=4,
+           extra_params={"quality_profile_revision_id": {"schema": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}, "doc": "已发布且与当前知识类型匹配的 Quality Profile Revision ID。", "required": True}}),
     _entry("source-binding", "Source Binding", "治理", "candidate:*", "candidate:*", "source_binding"),
     _entry("schema-validator", "Schema Validator", "治理", "candidate:*", "candidate:*", "schema_validator"),
     _entry("graph-quality-validator", "Graph Quality Validator", "质量", "candidate:*", "candidate:*", "graph_quality_validator"),
@@ -280,7 +297,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
         {"id": "reviewed-input", "kind": "operator", "node_role": "flow_input", "ref": "reviewed-source-chunk-input"},
     ]
     edges: list[list[str]] = []
-    generators = {"text": "prompt-generator", "qa": "qa-generator", "graph": "graph-extractor"}
+    generators = {"text": "text-knowledge-mapper", "qa": "qa-generator", "graph": "graph-extractor"}
     for raw_kind in output_types:
         kind = "graph:triple" if raw_kind == "graph" else raw_kind
         family, _, mode = kind.partition(":")

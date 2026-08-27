@@ -1,3 +1,5 @@
+import { checkEdgeCompatibility, createsCycle as edgeCreatesCycle } from './edge/edgeCompatibility.js'
+
 const DEFAULT_INPUT = { input: { artifact_type: '', cardinality: 'one', required: true, binding: 'edge' } }
 const DEFAULT_OUTPUT = { output: { artifact_type: '', cardinality: 'many', required: false, binding: 'edge' } }
 const cloneValue = value => JSON.parse(JSON.stringify(value))
@@ -69,6 +71,19 @@ export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
   return showTechnicalCode && meta.code && meta.code !== base ? `${base} · ${meta.code}` : base
 }
 
+export function subflowRevisions(items = []) {
+  return items.flatMap(item => item.revisions?.length ? item.revisions : [item])
+}
+
+export function resolveSubflow(definition, items = []) {
+  if (definition.subflow_revision_id) return subflowRevisions(items).find(item => item.code === definition.ref && (item.revision_id || item.latest_revision_id) === definition.subflow_revision_id)
+  return items.find(item => item.code === definition.ref)
+}
+
+export function subflowNodeDefinition(item, kind = 'subflow') {
+  return { kind, ref: item.code, params: {}, ...(kind === 'subflow' ? { subflow_revision_id: item.revision_id || item.latest_revision_id } : {}) }
+}
+
 export function subflowPrimaryName(item = {}) {
   return item.display_name_zh || item.name || item.code || ''
 }
@@ -100,7 +115,7 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     }
   }
   if (definition.kind === 'subflow') {
-    const subflow = subflows.find(item => item.code === definition.ref)
+    const subflow = resolveSubflow(definition, subflows)
     const child = subflow?.definition || {}
     const entry = child.nodes?.find(node => node.id === child.entry_node)
     const exit = child.nodes?.find(node => node.id === child.exit_node)
@@ -108,11 +123,12 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     const exitItem = exit?.kind === 'operator' ? catalogItem(catalog, exit.ref) : null
     return {
       kind: 'subflow', nodeRole: 'operator', name: subflowPrimaryName(subflow || { code: definition.ref }),
-      englishName: subflowEnglishName(subflow), code: definition.ref, category: '可复用子图', status,
+      englishName: subflowEnglishName(subflow || {}), code: definition.ref, category: '可复用子流程', status,
       known: Boolean(subflow),
-      revision: subflow?.revision, internalCount: child.nodes?.length || 0,
-      inputs: normalizedPorts(entryItem?.input_ports, DEFAULT_INPUT),
-      outputs: normalizedPorts(exitItem?.output_ports, DEFAULT_OUTPUT), parameterSchema: {},
+      revision: subflow?.revision, revisionId: definition.subflow_revision_id, subflowId: subflow?.id,
+      versionLocked: Boolean(definition.subflow_revision_id), internalCount: child.nodes?.length || 0, internalEdgeCount: child.edges?.length || 0,
+      inputs: normalizedPorts(Object.keys(subflow?.input_contract || {}).length ? subflow.input_contract : entryItem?.input_ports, DEFAULT_INPUT),
+      outputs: normalizedPorts(Object.keys(subflow?.output_contract || {}).length ? subflow.output_contract : exitItem?.output_ports, DEFAULT_OUTPUT), parameterSchema: {},
       inputExample: entryItem?.input_example || {}, outputExample: exitItem?.output_example || {},
     }
   }
@@ -128,7 +144,7 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
 }
 
 export function hasEditableParameters(node) {
-  return node?.data?.meta?.kind === 'operator' && node?.data?.meta?.code !== 'document-parser'
+  return node?.data?.meta?.kind === 'operator' && Object.keys(node?.data?.meta?.parameterSchema?.properties || {}).length > 0
 }
 
 export function makeCanvasNode(definition, position, catalog = [], subflows = []) {
@@ -192,54 +208,18 @@ export function serializeDefinition(nodes, edges) {
 }
 
 export function connectionIssue(connection, nodes, edges) {
-  const source = nodes.find(node => node.id === connection.source)
-  const target = nodes.find(node => node.id === connection.target)
-  const sourcePort = source?.data.meta.outputs?.[connection.sourceHandle || 'output']
-  const targetPort = target?.data.meta.inputs?.[connection.targetHandle || 'input']
-  if (!source || !target) return { code: 'UNKNOWN_NODE', message: '连线引用了不存在的节点' }
-  if (source.id === target.id) return { code: 'SELF_CONNECTION', message: '节点不能连接自身', nodeId: source.id }
-  if (source.data.meta.kind === 'knowledge_sink') return { code: 'SINK_SOURCE', message: 'Knowledge Sink 必须是终点', nodeId: source.id }
-  if (target.data.meta.nodeRole === 'flow_input') return { code: 'FLOW_INPUT_TARGET', message: '流程输入不能连接 Incoming Edge', nodeId: target.id }
-  if (!sourcePort) return { code: 'UNKNOWN_SOURCE_PORT', message: `输出端口不存在：${connection.sourceHandle || 'output'}`, nodeId: source.id }
-  if (!targetPort) return { code: 'UNKNOWN_TARGET_PORT', message: `输入端口不存在：${connection.targetHandle || 'input'}`, nodeId: target.id }
-  const actual = resolveCandidateType(sourcePort.artifact_type, source.data.definition)
-  const expected = resolveCandidateType(targetPort.artifact_type, target.data.definition)
-  if (expected === 'source_file') return { code: 'ROOT_INPUT', message: 'SourceFile 输入节点只能作为流程根节点', nodeId: target.id }
-  if ((targetPort.binding || 'edge') !== 'edge') return { code: 'RUNTIME_BOUND_PORT', message: `输入端口由运行时绑定，不能连接：${connection.targetHandle || 'input'}`, nodeId: target.id }
-  const graphSinkFallback = target.data.meta.kind === 'knowledge_sink' && expected.startsWith('candidate:graph:') && actual === 'candidate:graph'
-  if (!artifactMatches(actual, expected) && !graphSinkFallback) {
-    return { code: 'TYPE_MISMATCH', message: `端口类型不兼容：${actual} → ${expected}`, nodeId: target.id }
-  }
-  if (edges.some(edge => edge.source === source.id && edge.target === target.id &&
-    (edge.sourceHandle || 'output') === (connection.sourceHandle || 'output') &&
-    (edge.targetHandle || 'input') === (connection.targetHandle || 'input'))) {
-    return { code: 'DUPLICATE_EDGE', message: '相同端口之间已经存在连线', nodeId: target.id }
-  }
-  if (targetPort.cardinality !== 'many' && edges.some(edge => edge.target === target.id && (edge.targetHandle || 'input') === (connection.targetHandle || 'input'))) {
-    return { code: 'PORT_CARDINALITY', message: `输入端口 ${connection.targetHandle || 'input'} 只允许一条连线`, nodeId: target.id }
-  }
-  return null
+  const result = checkEdgeCompatibility({
+    flowContext: { schemaVersion: 3 }, nodes, edges,
+    sourceNodeId: connection.source, sourcePortId: connection.sourceHandle || 'output',
+    targetNodeId: connection.target, targetPortId: connection.targetHandle || 'input',
+    originalEdgeId: connection.id || null,
+  })
+  return result.allowed ? null : { code: result.reasonCode, message: result.message, nodeId: result.nodeId,
+    resolvedSourceType: result.resolvedSourceType, resolvedTargetType: result.resolvedTargetType }
 }
 
 export function createsCycle(nodes, edges, candidate = null) {
-  const links = candidate ? [...edges, candidate] : edges
-  const outgoing = new Map(nodes.map(node => [node.id, []]))
-  const indegree = new Map(nodes.map(node => [node.id, 0]))
-  for (const edge of links) {
-    if (!outgoing.has(edge.source) || !indegree.has(edge.target)) continue
-    outgoing.get(edge.source).push(edge.target)
-    indegree.set(edge.target, indegree.get(edge.target) + 1)
-  }
-  const queue = [...indegree].filter(([, count]) => count === 0).map(([id]) => id)
-  let visited = 0
-  while (queue.length) {
-    const id = queue.shift(); visited += 1
-    for (const target of outgoing.get(id) || []) {
-      indegree.set(target, indegree.get(target) - 1)
-      if (indegree.get(target) === 0) queue.push(target)
-    }
-  }
-  return visited !== nodes.length
+  return edgeCreatesCycle(nodes, edges, candidate)
 }
 
 export function validateFlow(nodes, edges, outputTypes = []) {
@@ -283,6 +263,15 @@ export function removeElements(nodes, edges, nodeIds = [], edgeIds = []) {
     nodes: nodes.filter(node => !nodeSet.has(node.id)),
     edges: edges.filter(edge => !edgeSet.has(edge.id) && !nodeSet.has(edge.source) && !nodeSet.has(edge.target)),
   }
+}
+
+export function validateSubflow(nodes, edges) {
+  const entries = nodes.filter(node => !edges.some(edge => edge.target === node.id))
+  const exits = nodes.filter(node => !edges.some(edge => edge.source === node.id))
+  const issues = validateFlow(nodes, edges).filter(issue => issue.code !== 'MISSING_SINK' && !(issue.code === 'REQUIRED_INPUT' && entries.some(node => node.id === issue.nodeId)))
+  if (entries.length !== 1 || exits.length !== 1) issues.push({ code: 'SUBFLOW_BOUNDARY', message: '子流程必须连通、单入口、单出口' })
+  for (const node of nodes) if (node.data.meta.nodeRole !== 'operator' || node.data.definition.ref === 'reviewed-source-chunk-input') issues.push({ code: 'SUBFLOW_NODE_ROLE', nodeId: node.id, message: '子流程不能包含流程输入或知识输出' })
+  return issues
 }
 
 export function cloneGraph(nodes, edges) {

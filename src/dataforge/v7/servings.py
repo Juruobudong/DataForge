@@ -184,6 +184,32 @@ class ServingManager:
                 raise ValueError("Serving 不存在")
             return self._payload(value)
 
+    def fingerprint(self, kind: str, serving_code: str) -> str:
+        """Return a secret-safe digest of execution-relevant Serving configuration."""
+        model = self._model(kind)
+        with self.sessions() as session:
+            value = session.scalar(select(model).where(model.serving_code == serving_code))
+            if not value:
+                raise ValueError(f"Serving 未配置：{serving_code}")
+            payload = {
+                "serving_code": value.serving_code,
+                "model_name": value.model_name,
+                "base_url": value.base_url,
+                "timeout_seconds": value.timeout_seconds,
+                "max_retries": value.max_retries,
+                "is_enabled": value.is_enabled,
+                "credential_digest": hashlib.sha256(
+                    str(value.credential_ciphertext or "").encode("utf-8")
+                ).hexdigest(),
+            }
+            if isinstance(value, ModelServing):
+                payload.update({"serving_type": value.serving_type, "max_tokens": value.max_tokens,
+                                "disable_thinking": value.disable_thinking})
+            else:
+                payload.update({"provider_type": value.provider_type, "dimension": value.dimension,
+                                "batch_size": value.batch_size})
+            return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
     def create(self, kind: str, serving_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         model = self._model(kind)
         payload = dict(payload)
@@ -448,6 +474,10 @@ class DatabaseLLMServingRegistry:
         value, _ = self.manager.resolved("model", serving_id, require_healthy=True)
         return LLMServingConfig(value.serving_code, value.serving_type, value.model_name, value.base_url,
                                 value.timeout_seconds, value.max_retries, value.max_tokens, value.disable_thinking)
+
+    def fingerprint(self, serving_id: str | None = None) -> str:
+        value = self.require(serving_id)
+        return self.manager.fingerprint("model", value.id)
 
     def client(self, serving_id: str | None = None) -> tuple[LLMServingConfig, Any]:
         value, credential = self.manager.resolved("model", serving_id)

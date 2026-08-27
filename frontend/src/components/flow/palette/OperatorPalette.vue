@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { groupOperatorCapabilities, subflowPrimaryName, subflowSubtitle } from '../flowModel'
 
-const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] } })
+const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] }, purpose: { type: String, default: 'knowledge' } })
 const emit = defineEmits(['drag-start', 'add-item', 'add-sink'])
 
 const query = ref('')
@@ -12,6 +12,13 @@ const grouped = computed(() => groupOperatorCapabilities(props.catalog, undefine
 const commonItems = computed(() => grouped.value.common)
 const capabilityGroups = computed(() => grouped.value.groups)
 const searching = computed(() => query.value.trim() !== '')
+const versions = ref({})
+const matchingSubflows = computed(() => props.subflows.filter(item => [item.name, item.display_name_zh, item.code, item.description].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
+const published = item => (item.revisions || [item]).filter(version => version.revision_status === 'published')
+const selected = item => published(item).find(version => (version.revision_id || version.latest_revision_id) === versions.value[item.id]) || published(item)[0]
+const unavailable = item => !selected(item) || item.status !== 'active' || (props.purpose === 'knowledge' && item.usage === 'source_preparation')
+function addSubflow(item) { if (!unavailable(item)) emit('add-item', selected(item), 'subflow') }
+function dragSubflow(event, item) { if (unavailable(item)) event.preventDefault(); else emit('drag-start', event, selected(item), 'subflow') }
 
 function toggle(key) {
   const next = new Set(expanded.value)
@@ -22,22 +29,29 @@ function toggle(key) {
 
 <template>
   <aside class="operator-palette">
-    <div class="palette-title"><div><h3>能力组件</h3><small>{{ catalog.length }} 个受控算子</small></div><span>＋</span></div>
-    <label class="search"><span>⌕</span><input v-model="query" aria-label="搜索算子" placeholder="搜索名称或编码"></label>
+    <div class="palette-title"><div><h3>添加节点</h3><small>{{ catalog.length }} 个受控算子</small></div><span>＋</span></div>
+    <label class="search"><span>⌕</span><input v-model="query" aria-label="搜索算子或子流程" placeholder="搜索名称或编码"></label>
     <div class="palette-scroll">
+      <h3>算子</h3>
       <section v-if="commonItems.length">
         <h4>常用</h4>
-        <button v-for="item in commonItems" :key="item.code" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><span class="item-icon">◇</span><span><b>{{ item._label }}</b><small>{{ item.display_name_zh }} · v{{ item.version }}</small></span><span class="grab">⋮⋮</span></button>
+        <div v-for="item in commonItems" :key="item.code" class="palette-entry" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><b>{{ item._label }}</b><small>{{ item.display_name_zh }} · v{{ item.version }}</small><button @dblclick.stop @click.stop="emit('add-item', item, 'operator')">添加</button></div>
       </section>
       <section v-for="([category, items]) in capabilityGroups" :key="category">
         <button class="capability-head" @click="toggle(category)"><span class="capability-name">{{ category }}</span><span class="capability-count">{{ items.length }}</span><span class="chev">{{ searching || expanded.has(category) ? '▾' : '▸' }}</span></button>
         <template v-if="searching || expanded.has(category)">
-          <button v-for="item in items" :key="item.code" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><span class="item-icon">◇</span><span><b>{{ item.display_name_zh || item.name }}</b><small :title="item.description || item.code">{{ item.code }} · v{{ item.version }}</small></span><span class="grab">⋮⋮</span></button>
+          <div v-for="item in items" :key="item.code" class="palette-entry" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><b>{{ item.display_name_zh || item.name }}</b><small :title="item.description || item.code">{{ item.code }} · v{{ item.version }}</small><button @dblclick.stop @click.stop="emit('add-item', item, 'operator')">添加</button></div>
         </template>
       </section>
-      <section v-if="subflows.length">
-        <h4>可复用子图</h4>
-        <button v-for="item in subflows" :key="item.code" class="subflow-item" draggable="true" @dragstart="emit('drag-start', $event, item, 'subflow')" @dblclick="emit('add-item', item, 'subflow')"><span class="item-icon">◈</span><span><b>{{ subflowPrimaryName(item) }}</b><small>{{ subflowSubtitle(item, true) }}</small></span><span class="grab">⋮⋮</span></button>
+      <section class="subflow-section">
+        <h3>可复用子流程</h3>
+        <div v-for="item in matchingSubflows" :key="item.id" class="palette-entry subflow-item" :draggable="!unavailable(item)" @dragstart="dragSubflow($event, item)" @dblclick="addSubflow(item)">
+          <b>{{ subflowPrimaryName(item) }}</b><small>{{ subflowSubtitle(selected(item) || item, true) }}</small>
+          <select v-if="published(item).length" :aria-label="`${subflowPrimaryName(item)}版本`" :value="versions[item.id] || selected(item)?.revision_id || selected(item)?.latest_revision_id" @change="versions[item.id] = $event.target.value" @dblclick.stop><option v-for="version in published(item)" :key="version.revision_id" :value="version.revision_id || version.latest_revision_id">r{{ version.revision }}</option></select>
+          <small v-if="item.usage === 'source_preparation'">审核前 · 文档预处理</small><small v-else-if="!selected(item)">尚未发布</small>
+          <button :disabled="unavailable(item)" @dblclick.stop @click.stop="addSubflow(item)">添加</button>
+        </div>
+        <p v-if="!matchingSubflows.length">暂无匹配的子流程</p>
       </section>
       <section v-if="outputTypes.length">
         <h4>正式知识输出</h4>
@@ -75,4 +89,7 @@ function toggle(key) {
 .subflow-item .item-icon{background:#e6efff}
 .sink-item .item-icon{color:#1d8c65;background:#eaf7f1}
 .hint{margin:0;padding:9px 10px;border-top:1px solid #edf0f4;color:#8792a4;background:#fafbfd;font-size:7.5px;text-align:center}
+</style>
+<style scoped>
+.palette-scroll h3{margin:12px 4px 8px;font-size:15px}.palette-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;margin:6px 0;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.palette-entry b,.palette-entry small{grid-column:1/-1;white-space:normal;font-size:13px}.palette-entry small{font-size:12px}.palette-entry button{display:block;width:auto;min-height:30px;grid-column:2;padding:4px 10px;font-size:13px;color:#2f6fed}.palette-entry select{min-width:0;max-width:120px}.subflow-section{border-top:1px solid #e2e8f0}.subflow-section>p{font-size:13px;color:#748198}.palette-title h3{font-size:15px}.palette-title small,.hint,.palette-scroll h4{font-size:12px}
 </style>

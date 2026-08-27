@@ -5,6 +5,7 @@ import hashlib
 import json
 from collections import defaultdict, deque
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from .catalog import catalog_by_code, normalize_chunker_params
@@ -13,6 +14,28 @@ from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 class FlowValidationError(ValueError):
     pass
+
+
+class FlowEdgeValidationError(FlowValidationError):
+    """Structured authoring-edge failure returned by every Flow compile entry."""
+
+    def __init__(self, code: str, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+    def payload(self) -> dict[str, Any]:
+        return {"code": self.code, "message": self.message, "details": self.details}
+
+
+@dataclass(frozen=True)
+class ResolvedPortContract:
+    raw_type: str
+    kind: str
+    knowledge_type: str | None = None
+    graph_mode: str | None = None
+    resolved_type: str = ""
 
 
 def _edge(value: Any) -> dict[str, str]:
@@ -38,6 +61,291 @@ def node_role(node: dict[str, Any]) -> str:
     if node.get("kind") == "operator" and node.get("ref") == "reviewed-source-chunk-input":
         return "flow_input"
     return "operator"
+
+
+def _edge_details(edge: dict[str, str]) -> dict[str, str]:
+    return {
+        "source_node_id": edge["source"],
+        "source_port": edge["source_port"],
+        "target_node_id": edge["target"],
+        "target_port": edge["target_port"],
+    }
+
+
+def _edge_error(code: str, message: str, edge: dict[str, str]) -> FlowEdgeValidationError:
+    return FlowEdgeValidationError(code, message, details=_edge_details(edge))
+
+
+def _candidate_parts(raw_type: str) -> tuple[str | None, str | None]:
+    if not raw_type.startswith("candidate:"):
+        return None, None
+    parts = raw_type.split(":")
+    knowledge_type = parts[1] if len(parts) > 1 and parts[1] != "*" else None
+    graph_mode = parts[2] if knowledge_type == "graph" and len(parts) > 2 else None
+    return knowledge_type, graph_mode
+
+
+def _sink_context(node: dict[str, Any]) -> tuple[str, str | None] | None:
+    if node.get("kind") != "knowledge_sink":
+        return None
+    knowledge_type = str(node.get("knowledge_type") or "")
+    graph_mode = str(node.get("graph_mode") or "") or None
+    output_key = str(node.get("output_key") or "")
+    if not knowledge_type and output_key:
+        knowledge_type, _, parsed_mode = output_key.partition(":")
+        graph_mode = graph_mode or parsed_mode or None
+    return (knowledge_type, graph_mode) if knowledge_type else None
+
+
+def _reachable_sink_contexts(node_id: str, by_id: dict[str, dict[str, Any]],
+                             outgoing: dict[str, list[str]], trail: frozenset[str] = frozenset()) -> set[tuple[str, str | None]]:
+    if node_id in trail:
+        return set()
+    context = _sink_context(by_id.get(node_id, {}))
+    result = {context} if context else set()
+    for target in outgoing.get(node_id, []):
+        result.update(_reachable_sink_contexts(target, by_id, outgoing, trail | {node_id}))
+    return result
+
+
+def resolve_port_contract(flow_context: dict[str, Any], node: dict[str, Any],
+                          port: dict[str, Any]) -> ResolvedPortContract:
+    """Resolve polymorphic candidate ports against normalized Flow context."""
+    raw_type = str(port.get("artifact_type") or "")
+    if not raw_type.startswith("candidate:"):
+        return ResolvedPortContract(raw_type=raw_type, kind=raw_type,
+                                    resolved_type=raw_type)
+
+    raw_knowledge_type, raw_graph_mode = _candidate_parts(raw_type)
+    params = dict(node.get("params") or {})
+    knowledge_type = raw_knowledge_type or str(params.get("knowledge_type") or "") or None
+    graph_mode = raw_graph_mode or (str(params.get("graph_mode") or "") or None if knowledge_type == "graph" else None)
+    contexts = set(flow_context.get("contexts") or set())
+    if len(contexts) == 1:
+        context_knowledge_type, context_graph_mode = next(iter(contexts))
+        knowledge_type = knowledge_type or context_knowledge_type
+        if knowledge_type == "graph":
+            graph_mode = graph_mode or context_graph_mode
+
+    resolved_type = raw_type
+    if knowledge_type:
+        resolved_type = f"candidate:{knowledge_type}"
+        if knowledge_type == "graph" and graph_mode:
+            resolved_type += f":{graph_mode}"
+    return ResolvedPortContract(raw_type=raw_type, kind="candidate",
+                                knowledge_type=knowledge_type, graph_mode=graph_mode,
+                                resolved_type=resolved_type)
+
+
+def validate_edge_compatibility(source_contract: ResolvedPortContract,
+                                target_contract: ResolvedPortContract, *,
+                                details: dict[str, str]) -> None:
+    """Validate two already-resolved port contracts using stable error semantics."""
+    if source_contract.kind != target_contract.kind:
+        raise FlowEdgeValidationError(
+            "PORT_TYPE_MISMATCH",
+            f"端口数据类型不兼容：{source_contract.resolved_type} → {target_contract.resolved_type}",
+            details=details,
+        )
+    if source_contract.kind != "candidate":
+        if source_contract.resolved_type != target_contract.resolved_type:
+            raise FlowEdgeValidationError(
+                "PORT_TYPE_MISMATCH",
+                f"端口数据类型不兼容：{source_contract.resolved_type} → {target_contract.resolved_type}",
+                details=details,
+            )
+        return
+    source_knowledge_type = source_contract.knowledge_type or target_contract.knowledge_type
+    target_knowledge_type = target_contract.knowledge_type or source_contract.knowledge_type
+    source_graph_mode = source_contract.graph_mode or target_contract.graph_mode
+    target_graph_mode = target_contract.graph_mode or source_contract.graph_mode
+    if not source_knowledge_type or not target_knowledge_type:
+        raise FlowEdgeValidationError(
+            "OPERATOR_CONTRACT_MISMATCH",
+            "无法从当前 Flow 上下文解析 candidate:* 的实际知识类型",
+            details=details,
+        )
+    if source_knowledge_type != target_knowledge_type:
+        raise FlowEdgeValidationError(
+            "KNOWLEDGE_TYPE_MISMATCH",
+            f"知识类型不兼容：{source_contract.resolved_type} → {target_contract.resolved_type}",
+            details=details,
+        )
+    if source_knowledge_type == "graph":
+        if not source_graph_mode or not target_graph_mode:
+            raise FlowEdgeValidationError(
+                "OPERATOR_CONTRACT_MISMATCH",
+                "无法从当前 Flow 上下文解析 graph_mode",
+                details=details,
+            )
+        if source_graph_mode != target_graph_mode:
+            raise FlowEdgeValidationError(
+                "GRAPH_MODE_MISMATCH",
+                f"图谱模式不兼容：{source_contract.resolved_type} → {target_contract.resolved_type}",
+                details=details,
+            )
+
+
+def resolve_subflow(node: dict[str, Any], subflows: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    key = str(node.get("subflow_revision_id") or node.get("ref") or "")
+    child = subflows.get(key)
+    if not child or (child.get("_subgraph_code") and child["_subgraph_code"] != node.get("ref")):
+        raise FlowValidationError(f"子流程修订不存在、编码不匹配或未发布：{key}")
+    return child
+
+
+def subflow_dependencies(definition: dict[str, Any], subflows: dict[str, dict[str, Any]],
+                         prefix: tuple[str, ...] = (), stack: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    result = []
+    for node in definition.get("nodes", []):
+        if node.get("kind") != "subflow":
+            continue
+        child = resolve_subflow(node, subflows)
+        identity = str(node.get("subflow_revision_id") or node["ref"])
+        if identity in stack:
+            raise FlowValidationError("禁止递归子流程")
+        path = (*prefix, str(node["id"]))
+        result.append({"kind": "subflow_revision", "id": child.get("_subgraph_revision_id"),
+                       "code": node["ref"], "revision": child.get("_subgraph_revision"), "instance_path": list(path)})
+        result.extend(subflow_dependencies(child, subflows, path, (*stack, identity)))
+    return result
+
+
+def subflow_boundary_path(definition: dict[str, Any], boundary: str, subflows: dict[str, dict[str, Any]]) -> str:
+    node_id = definition.get(boundary)
+    node = next((value for value in definition.get("nodes", []) if value.get("id") == node_id), None)
+    if not node:
+        raise FlowValidationError(f"子流程缺少合法的 {boundary}")
+    if node.get("kind") == "subflow":
+        return f"{node_id}::{subflow_boundary_path(resolve_subflow(node, subflows), boundary, subflows)}"
+    return str(node_id)
+
+
+def _node_ports(node: dict[str, Any], *, direction: str,
+                catalog: dict[str, dict[str, Any]], subflows: dict[str, dict[str, Any]],
+                stack: tuple[str, ...] = ()) -> dict[str, dict[str, Any]]:
+    if node.get("kind") == "knowledge_sink":
+        if direction == "output":
+            return {}
+        knowledge_type = str(node.get("knowledge_type") or "")
+        graph_mode = str(node.get("graph_mode") or "") or None
+        output_key = str(node.get("output_key") or (f"graph:{graph_mode}" if knowledge_type == "graph" and graph_mode else knowledge_type))
+        return {"input": {"artifact_type": f"candidate:{output_key}", "cardinality": "one",
+                          "required": True, "binding": "edge"}}
+    if node.get("kind") == "operator":
+        item = catalog.get(str(node.get("ref") or "")) or {}
+        key = "output_ports" if direction == "output" else "input_ports"
+        fallback_key = "output" if direction == "output" else "input"
+        fallback_type = item.get(fallback_key)
+        if item.get(key):
+            return dict(item[key])
+        if fallback_type:
+            return {fallback_key: {"artifact_type": fallback_type,
+                                   "cardinality": "many" if direction == "output" else "one",
+                                   "binding": "edge"}}
+        return {}
+    if node.get("kind") != "subflow":
+        return {}
+    code = str(node.get("subflow_revision_id") or node.get("ref") or "")
+    if code in stack:
+        raise FlowValidationError(f"子图不存在、未发布或递归引用：{code}")
+    child = resolve_subflow(node, subflows)
+    contract = child.get("_output_contract" if direction == "output" else "_input_contract")
+    if contract:
+        return deepcopy(contract)
+    boundary_id = child.get("exit_node" if direction == "output" else "entry_node")
+    boundary = next((item for item in child.get("nodes", []) if item.get("id") == boundary_id), None)
+    if not boundary:
+        raise FlowValidationError(f"子图 {code} 缺少 {'exit_node' if direction == 'output' else 'entry_node'}")
+    return _node_ports(boundary, direction=direction, catalog=catalog, subflows=subflows,
+                       stack=stack + (code,))
+
+
+def _would_create_cycle(edges: list[dict[str, str]], candidate: dict[str, str]) -> bool:
+    outgoing: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        outgoing[edge["source"]].append(edge["target"])
+    queue = deque([candidate["target"]])
+    seen: set[str] = set()
+    while queue:
+        current = queue.popleft()
+        if current == candidate["source"]:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        queue.extend(outgoing[current])
+    return False
+
+
+def validate_flow_edges(definition: dict[str, Any], *, catalog: dict[str, dict[str, Any]],
+                        subflows: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    """Validate the authoring graph before subflow expansion and return normalized edges."""
+    schema_version = int(definition.get("schema_version", 2))
+    if schema_version not in {2, 3}:
+        raise FlowEdgeValidationError(
+            "FLOW_DSL_VERSION_UNSUPPORTED",
+            "仅支持 Flow DSL schema_version=2 或 3",
+            details={},
+        )
+    nodes = [dict(node) for node in definition.get("nodes", []) if isinstance(node, dict)]
+    by_id = {str(node.get("id") or ""): node for node in nodes if node.get("id")}
+    normalized = [_edge(value) for value in definition.get("edges", [])]
+    outgoing: dict[str, list[str]] = defaultdict(list)
+    for edge in normalized:
+        outgoing[edge["source"]].append(edge["target"])
+
+    accepted: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    incoming_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for edge in normalized:
+        details = _edge_details(edge)
+        source = by_id.get(edge["source"])
+        target = by_id.get(edge["target"])
+        if not source:
+            raise _edge_error("SOURCE_NODE_NO_OUTPUT", "连线来源节点不存在", edge)
+        if not target:
+            raise _edge_error("TARGET_NODE_NO_INPUT", "连线目标节点不存在", edge)
+        if source["id"] == target["id"]:
+            raise _edge_error("EDGE_SELF_LOOP", "节点不能连接自身", edge)
+        if source.get("kind") == "knowledge_sink" or node_role(source) == "knowledge_output":
+            raise _edge_error("SINK_NODE_CANNOT_HAVE_OUTGOING", "Knowledge Sink 不允许作为上游节点", edge)
+        if node_role(target) == "flow_input":
+            raise _edge_error("INPUT_NODE_CANNOT_HAVE_INCOMING", "INPUT 节点不允许存在 Incoming Edge", edge)
+
+        source_ports = _node_ports(source, direction="output", catalog=catalog, subflows=subflows)
+        target_ports = _node_ports(target, direction="input", catalog=catalog, subflows=subflows)
+        source_port = source_ports.get(edge["source_port"])
+        target_port = target_ports.get(edge["target_port"])
+        if not source_port and edge["source_port"] in _node_ports(source, direction="input", catalog=catalog, subflows=subflows):
+            raise _edge_error("EDGE_DIRECTION_INVALID", "Edge 必须从 output port 指向 input port", edge)
+        if not target_port and edge["target_port"] in _node_ports(target, direction="output", catalog=catalog, subflows=subflows):
+            raise _edge_error("EDGE_DIRECTION_INVALID", "Edge 必须从 output port 指向 input port", edge)
+        if not source_port:
+            raise _edge_error("SOURCE_NODE_NO_OUTPUT", f"来源节点不存在输出端口 {edge['source_port']}", edge)
+        if not target_port:
+            raise _edge_error("TARGET_NODE_NO_INPUT", f"目标节点不存在输入端口 {edge['target_port']}", edge)
+        if str(target_port.get("binding") or "edge") != "edge":
+            raise _edge_error("INPUT_NODE_CANNOT_HAVE_INCOMING", "目标输入端口由系统或运行时绑定，不能连接 Edge", edge)
+
+        identity = (edge["source"], edge["source_port"], edge["target"], edge["target_port"])
+        if identity in seen:
+            raise _edge_error("EDGE_DUPLICATED", "相同端口之间已经存在连线", edge)
+        target_key = (edge["target"], edge["target_port"])
+        if str(target_port.get("cardinality") or "one") != "many" and incoming_counts[target_key] >= 1:
+            raise _edge_error("INPUT_PORT_ALREADY_CONNECTED", f"输入端口 {edge['target_port']} 已经有上游节点", edge)
+        if _would_create_cycle(accepted, edge):
+            raise _edge_error("EDGE_WOULD_CREATE_CYCLE", "该连接会形成循环依赖，Flow 必须是有向无环图", edge)
+
+        source_context = {"contexts": _reachable_sink_contexts(edge["source"], by_id, outgoing)}
+        target_context = {"contexts": _reachable_sink_contexts(edge["target"], by_id, outgoing)}
+        source_contract = resolve_port_contract(source_context, source, source_port)
+        target_contract = resolve_port_contract(target_context, target, target_port)
+        validate_edge_compatibility(source_contract, target_contract, details=details)
+        seen.add(identity)
+        incoming_counts[target_key] += 1
+        accepted.append(edge)
+    return normalized
 
 
 def _contains_knowledge_library_binding(value: Any) -> bool:
@@ -73,16 +381,16 @@ class FlowCompiler:
                 node["node_role"] = node_role(node)
                 node["origin_path"] = [part for part in f"{prefix}{node_id}".split("::") if part]
                 if definition.get("_subgraph_code"):
-                    node["source_subgraph"] = {"code": definition["_subgraph_code"], "revision": definition.get("_subgraph_revision")}
+                    node["source_subgraph"] = {"code": definition["_subgraph_code"], "revision": definition.get("_subgraph_revision"), "revision_id": definition.get("_subgraph_revision_id")}
                 result_nodes.append(node)
                 continue
             code = str(node.get("ref", ""))
-            if code not in self.subflows:
-                raise FlowValidationError(f"子图不存在或未发布：{code}")
-            if code in stack:
+            identity = str(node.get("subflow_revision_id") or code)
+            if identity in stack:
                 raise FlowValidationError("禁止递归子图")
-            child = self.subflows[code]
-            child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (code,))
+            child = resolve_subflow(node, self.subflows)
+            validate_flow_edges(child, catalog=self.catalog, subflows=self.subflows)
+            child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (identity,))
             if code == "knowledge-chunk" and node.get("params"):
                 for child_node in child_nodes:
                     if child_node.get("ref") == "semantic-chunker":
@@ -90,7 +398,8 @@ class FlowCompiler:
             entry, exit_node = child.get("entry_node"), child.get("exit_node")
             if not entry or not exit_node:
                 raise FlowValidationError(f"子图 {code} 缺少 entry_node 或 exit_node")
-            replacement[node_id] = (f"{prefix}{node_id}::{entry}", f"{prefix}{node_id}::{exit_node}")
+            replacement[node_id] = (f"{prefix}{node_id}::{subflow_boundary_path(child, 'entry_node', self.subflows)}",
+                                    f"{prefix}{node_id}::{subflow_boundary_path(child, 'exit_node', self.subflows)}")
             result_nodes.extend(child_nodes)
             # Recursive expansion has already applied the full namespace to
             # child edges; applying this frame's prefix again would corrupt
@@ -110,9 +419,8 @@ class FlowCompiler:
     def compile(self, definition: dict[str, Any]) -> dict[str, Any]:
         if _contains_knowledge_library_binding(definition):
             raise FlowValidationError("Flow Definition 不允许绑定 KnowledgeLibrary")
+        validate_flow_edges(definition, catalog=self.catalog, subflows=self.subflows)
         schema_version = int(definition.get("schema_version", 2))
-        if schema_version not in {2, 3}:
-            raise FlowValidationError("仅支持 Flow DSL schema_version=2 或 3")
         purpose = str(definition.get("purpose") or "knowledge")
         if purpose not in {"knowledge", "source_preparation"}:
             raise FlowValidationError("Flow purpose 必须是 knowledge 或 source_preparation")
@@ -161,7 +469,7 @@ class FlowCompiler:
         if len(ordered) != len(by_id):
             raise FlowValidationError("Flow 必须是有向无环图")
         outputs: dict[str, str] = {}
-        dependencies: list[dict[str, Any]] = []
+        dependencies: list[dict[str, Any]] = subflow_dependencies(definition, self.subflows)
         sink_types: dict[str, str] = {}
         for node_id in ordered:
             node = by_id[node_id]; kind = node.get("kind")
@@ -266,5 +574,8 @@ class FlowCompiler:
             if len(non_sink_terminals) != 1 or outputs.get(non_sink_terminals[0]) != "source_chunk_set":
                 raise FlowValidationError("Source Preparation 必须且只能以 SourceChunk 结束")
         compiled = {"schema_version": 3, "purpose": purpose, "nodes": [by_id[node_id] for node_id in ordered], "edges": edges, "sink_types": sink_types}
+        compiled["subflow_revisions"] = [value for value in dependencies if value["kind"] == "subflow_revision"]
+        if definition.get("graph_config") is not None:
+            compiled["graph_config"] = deepcopy(definition["graph_config"])
         checksum = hashlib.sha256(json.dumps(compiled, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         return {"compiled_definition": compiled, "dependencies": dependencies, "checksum": checksum}
