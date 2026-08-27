@@ -5,6 +5,7 @@ fallback path here: a V7 deployment starts with freshly uploaded material.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import logging
@@ -30,6 +31,7 @@ from .catalog import (
     normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
+from .operator_catalog import load_catalog, seed_catalog, resolve_operator, technical_projection
 from .subflows import SubflowService, published_subflows, pin_subflows
 from .flow_authoring import FLOW_AUTHORING_COMPILER, MANAGED_FLOW_CATALOG
 from .faq import FAQ_COLLECTION_NAME, FAQ_PROFILE_CODE, FAQ_TYPE_CODE
@@ -871,6 +873,12 @@ class V7Store:
             session.add(prompt); session.flush()
         if not session.scalar(select(PromptTemplateRevision).where(PromptTemplateRevision.prompt_template_id == prompt.id, PromptTemplateRevision.revision_no == 1)):
             session.add(PromptTemplateRevision(id="promptrev_default", prompt_template_id=prompt.id, revision_no=1, body="根据输入内容生成结构化知识。", input_schema={"type": "object"}, output_schema={"type": "object"}, knowledge_types=["*"], status="published", published_at=utc_now()))
+        if not session.get(PromptTemplate, "prompt_refiner"):
+            session.add(PromptTemplate(id="prompt_refiner", code="knowledge-refiner-default", name="候选知识修订", status="active"))
+            session.flush()
+            session.add(PromptTemplateRevision(id="promptrev_refiner", prompt_template_id="prompt_refiner", revision_no=1,
+                body="修订以下候选知识的表述，保留原有事实，不添加新事实。输入为 JSON，只返回相同字段的 JSON 对象，不输出来源、Evidence 或其他字段。",
+                input_schema={"type": "object"}, output_schema={"type": "object"}, knowledge_types=["text", "qa"], status="published", published_at=utc_now()))
         profiles = {item.code: item for item in session.scalars(select(KnowledgeIndexProfile)).all()}
         type_contracts = {
             "text": ({"type": "object"}, "canonical_content", ["source_anchor"], "single", ["text"]),
@@ -956,33 +964,7 @@ class V7Store:
                             canonical_fields=canonical_fields, identity_fields=identity_fields,
                             source_policy="multiple", status="published", published_at=utc_now(),
                         ))
-        for item in CATALOG_SEEDS:
-            definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == item["code"]))
-            if not definition:
-                definition = OperatorDefinition(id=f"op_{item['code'].replace('-', '_')}", code=item["code"], name=item["name"], description=item["description"], category=item["category"], exposure=item["exposure"], risk_level=item["risk_level"], enabled=item["exposure"] != "disabled")
-                session.add(definition); session.flush()
-            definition.name, definition.description, definition.category = item["name"], item["description"], item["category"]
-            definition.display_name_zh, definition.subcategory = item["display_name_zh"], item["subcategory"]
-            definition.summary, definition.scenarios = item["summary"], item["scenarios"]
-            definition.knowledge_types = item["knowledge_types"]
-            definition.recommended_predecessors, definition.recommended_successors = item["recommended_predecessors"], item["recommended_successors"]
-            definition.lifecycle_status = item["lifecycle_status"]
-            definition.exposure, definition.risk_level = item["exposure"], item["risk_level"]
-            definition.enabled = item["exposure"] != "disabled"
-            version_no = int(item.get("version", 1))
-            version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id, OperatorVersion.version_no == version_no))
-            if not version:
-                version = OperatorVersion(id=new_id("oprev"), operator_definition_id=definition.id, version_no=version_no, status="published", published_at=utc_now())
-                session.add(version)
-            version.adapter_code = item["adapter_code"]
-            version.input_ports = item.get("input_ports") or {"input": {"artifact_type": item["input"], "cardinality": "one"}}
-            version.output_ports = item.get("output_ports") or {"output": {"artifact_type": item["output"], "cardinality": "many"}}
-            version.input_example, version.output_example = item["input_example"], item["output_example"]
-            version.parameter_schema, version.parameter_docs, version.runtime_requirements = item["parameter_schema"], item["parameter_docs"], item["runtime_requirements"]
-            missing = self._operator_publication_errors(definition, version)
-            if missing:
-                raise RuntimeError(f"算子 {definition.code} 发布元数据不完整：{', '.join(missing)}")
-            definition.latest_version = max(definition.latest_version or 0, version_no)
+        seed_catalog(session)
         for item in subflow_seeds():
             subflow = session.scalar(select(FlowSubgraph).where(FlowSubgraph.code == item["code"]))
             if not subflow:
@@ -1659,39 +1641,99 @@ class V7Store:
             return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
     def list_operator_catalog(self, *, include_internal: bool = False, query: str = "", category: str = "",
-                              knowledge_type: str = "", exposure: str = "", status: str = "") -> list[dict[str, Any]]:
+                              knowledge_type: str = "", exposure: str = "", status: str = "", surface: str = "", provider: str = "") -> list[dict[str, Any]]:
         with self.sessions() as session:
-            rows = session.execute(
-                select(OperatorDefinition, OperatorVersion).join(OperatorVersion, OperatorVersion.operator_definition_id == OperatorDefinition.id)
-                .where(OperatorVersion.status == "published").order_by(OperatorDefinition.category, OperatorDefinition.code, OperatorVersion.version_no.desc())
-            ).all()
+            catalog = load_catalog(session)
             values = []
-            seen: set[str] = set()
-            for definition, version in rows:
-                if definition.code in seen or (definition.exposure == "internal" and not include_internal):
+            runtime_states = {}
+            def runtime_state(requirements):
+                identity = json.dumps(requirements, sort_keys=True)
+                if identity not in runtime_states:
+                    runtime_states[identity] = self.operator_runtime_status(requirements)
+                return runtime_states[identity]
+            for value in sorted(catalog.values(), key=lambda item: (item["category"], item["code"])):
+                value = dict(value)
+                if not include_internal and value["exposure"] == "internal":
                     continue
-                seen.add(definition.code)
-                value = {"id": definition.id, "code": definition.code, "name": definition.name, "display_name_zh": definition.display_name_zh,
-                               "summary": definition.summary, "description": definition.description, "category": definition.category, "subcategory": definition.subcategory,
-                               "exposure": definition.exposure, "risk_level": definition.risk_level, "enabled": definition.enabled,
-                               "scenarios": definition.scenarios, "knowledge_types": definition.knowledge_types,
-                               "recommended_predecessors": definition.recommended_predecessors, "recommended_successors": definition.recommended_successors,
-                               "status": definition.lifecycle_status,
-                               "version": version.version_no, "adapter_code": version.adapter_code,
-                               "node_role": ("flow_input" if definition.code == "reviewed-source-chunk-input" else "operator"),
-                               "input_ports": version.input_ports, "output_ports": version.output_ports,
-                               "input_example": version.input_example, "output_example": version.output_example,
-                               "parameter_schema": version.parameter_schema, "parameter_docs": version.parameter_docs}
-                searchable = " ".join((definition.code, definition.name, definition.display_name_zh, definition.summary,
-                                       definition.description, json.dumps(version.input_ports, ensure_ascii=False),
-                                       json.dumps(version.output_ports, ensure_ascii=False))).lower()
+                searchable = json.dumps(value, ensure_ascii=False).lower()
                 if query and query.lower() not in searchable: continue
-                if category and definition.category != category: continue
-                if knowledge_type and knowledge_type not in (definition.knowledge_types or []): continue
-                if exposure and definition.exposure != exposure: continue
-                if status and definition.lifecycle_status != status: continue
+                if category and value["category"] != category: continue
+                if knowledge_type and "*" not in value["knowledge_types"] and knowledge_type not in value["knowledge_types"]: continue
+                if exposure and value["exposure"] != {"canvas": "public"}.get(exposure, exposure): continue
+                if status and value["status"] != status: continue
+                if surface and surface not in value["surfaces"]: continue
+                if provider and value["provider"] != provider: continue
+                value["dependency_status"] = runtime_state(value["runtime_requirements"])
+                value["versions"] = [{**{key: item_value for key, item_value in item.items() if key != "runtime_requirements"},
+                                      "dependency_status": runtime_state(item["runtime_requirements"])}
+                                     for (code, _), item in catalog.versions.items() if code == value["code"]]
+                value.pop("runtime_requirements", None)
                 values.append(value)
             return values
+
+    def operator_runtime_status(self, requirements, *, check=False):
+        from .operators.runtime import OperatorRuntime
+        if requirements.get("provider", "dataforge") == "dataforge":
+            return {"status": "ready"}
+        runner_url = os.getenv("DATAFORGE_RUNNER_URL")
+        if runner_url:
+            import httpx
+            try:
+                response = httpx.post(runner_url.rstrip("/") + "/internal/operators/check",
+                    json={"requirements": requirements, "check": check},
+                    headers={"Authorization": "Bearer " + os.getenv("DATAFORGE_RUNNER_SERVICE_TOKEN", "")}, timeout=30)
+                response.raise_for_status()
+                return response.json()
+            except Exception:
+                return {"status": "unknown", "reason": "Runner 依赖状态不可达"}
+        runtime = OperatorRuntime()
+        status = runtime.status(requirements)
+        if check and status["status"] == "ready":
+            try:
+                runtime.call(requirements, records=[], action="check", timeout=30)
+            except Exception as exc:
+                return {"status": "incompatible", "reason": str(exc)}
+        return status
+
+    def require_operator_runtime(self, requirements):
+        status = self.operator_runtime_status(requirements, check=True)
+        if status["status"] != "ready":
+            raise ValueError(status.get("reason", "算子依赖尚未就绪"))
+        return status
+
+    def operator_candidates(self, definition, output_types, source_node_id=None, source_port="output"):
+        from .flow import _node_ports, _reachable_sink_contexts, _edge, resolve_port_contract, validate_edge_compatibility, FlowEdgeValidationError
+        values = self.list_operator_catalog(surface="advanced-canvas")
+        families = {normalise_output_key(value).split(":")[0] for value in output_types}
+        with self.sessions() as session:
+            catalog, subflows = load_catalog(session), self._published_subflows(session)
+        source = next((node for node in definition.get("nodes", []) if node["id"] == source_node_id), None)
+        if source_node_id and source is None:
+            raise ValueError("推荐来源节点不存在")
+        contexts = {(normalise_output_key(value).split(":")[0], normalise_output_key(value).split(":")[1] if ":" in normalise_output_key(value) else None) for value in output_types}
+        if source:
+            by_id = {node["id"]: node for node in definition.get("nodes", [])}
+            outgoing = {}
+            for edge in map(_edge, definition.get("edges", [])):
+                outgoing.setdefault(edge["source"], []).append(edge["target"])
+            contexts = _reachable_sink_contexts(source_node_id, by_id, outgoing) or contexts
+        result = []
+        for item in values:
+            if not item["enabled"] or not item["approved"] or item["status"] != "published" or item["dependency_status"]["status"] != "ready": continue
+            if families and "*" not in item["knowledge_types"] and not families.intersection(item["knowledge_types"]): continue
+            if contexts and item.get("graph_modes") and not {mode for kind, mode in contexts if kind == "graph"}.intersection(item["graph_modes"]): continue
+            if source:
+                source_spec = _node_ports(source, direction="output", catalog=catalog, subflows=subflows).get(source_port)
+                target_spec = item["input_ports"].get("input")
+                if not source_spec or not target_spec or target_spec.get("binding", "edge") != "edge": continue
+                candidate = {"params": dict(source.get("params") or {})}
+                try:
+                    validate_edge_compatibility(resolve_port_contract({"contexts": contexts}, source, source_spec),
+                        resolve_port_contract({"contexts": contexts}, candidate, target_spec), details={})
+                except FlowEdgeValidationError:
+                    continue
+            result.append({**item, "matching_ports": ["input"] if source else []})
+        return result
 
     def operator_catalog_facets(self) -> dict[str, Any]:
         values = self.list_operator_catalog(include_internal=True)
@@ -1727,6 +1769,12 @@ class V7Store:
         return [label for label, value in required.items() if value in (None, "", [], {})]
 
     def publish_operator_version(self, code: str, version_no: int) -> dict[str, Any]:
+        with self.sessions() as lookup:
+            version = lookup.scalar(select(OperatorVersion).join(OperatorDefinition).where(OperatorDefinition.code == code, OperatorVersion.version_no == version_no))
+            custom = version and (version.runtime_requirements or {}).get("provider") == "custom"
+        if custom:
+            from .operator_plugins import OperatorPluginService
+            return OperatorPluginService(self).publish(code, version_no)
         with self.sessions.begin() as session:
             definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == code))
             version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id,
@@ -1860,6 +1908,7 @@ class V7Store:
             if not value:
                 raise ValueError("执行快照不存在")
             return {"id": value.id, "knowledge_flow_template_revision_id": value.knowledge_flow_template_revision_id,
+                    **technical_projection(value.compiled_definition_json, load_catalog(session)),
                     "compiled_definition": value.compiled_definition_json, "dependencies": value.dependency_json,
                     "checksum": value.checksum, "status": value.status, "created_at": value.created_at.isoformat()}
 
@@ -3925,14 +3974,15 @@ class V7Store:
 
         previous_nodes = {str(item.get("id")): item for item in (previous_definition or {}).get("nodes", [])
                           if isinstance(item, dict)}
-        catalog = catalog_by_code()
+        catalog = load_catalog(session)
         quality_groups: dict[str, list[dict[str, Any]]] = {}
         for node_id, node in by_id.items():
             if node.get("kind") != "operator":
                 continue
-            operator = catalog.get(str(node.get("ref") or ""))
+            operator = resolve_operator(catalog, node)
             if not operator:
                 continue
+            node["operator_version"] = operator["version"]
             schema = dict(operator.get("parameter_schema") or {"type": "object"})
             properties = dict(schema.get("properties") or {})
             editable = set(properties)
@@ -4068,7 +4118,7 @@ class V7Store:
                             node_id=str(node["id"]), field="entity_types")
         try:
             compiled = FlowCompiler(
-                catalog=catalog_by_code(), subflows=self._published_subflows(session),
+                catalog=load_catalog(session), subflows=self._published_subflows(session),
                 type_revisions=self._published_type_revisions(session),
                 llm_serving_registry=registry,
             ).compile(normalized)
@@ -4077,18 +4127,40 @@ class V7Store:
                 raise
             raise ValueError(str(exc)) from exc
         declared_sinks = set(compiled["compiled_definition"]["sink_types"].values())
+        if purpose == "knowledge":
+            # Validate the expanded DAG so a published subflow may own the Diff tail.
+            nodes_by_id = {node["id"]: node for node in compiled["compiled_definition"]["nodes"]}
+            for sink in (node for node in nodes_by_id.values() if node.get("kind") == "knowledge_sink"):
+                predecessors = [nodes_by_id[edge["source"]] for edge in compiled["compiled_definition"]["edges"] if edge["target"] == sink["id"]]
+                if not predecessors or any(item.get("ref") != "knowledge-diff" for item in predecessors):
+                    raise ValueError("Knowledge Sink 必须直接连接受控 Knowledge Diff")
         if purpose == "knowledge" and declared_sinks != {normalise_output_key(value) for value in output_types}:
             raise ValueError("Flow Knowledge Sink 必须与模板输出知识类型完全一致")
         if hasattr(registry, "fingerprint"):
             for dependency in compiled["dependencies"]:
                 if dependency.get("kind") == "llm_serving":
-                    dependency["fingerprint"] = registry.fingerprint(dependency.get("id"))
+                    if isinstance(registry, DatabaseLLMServingRegistry):
+                        dependency["fingerprint"] = registry.fingerprint(dependency.get("id"), include_credentials=False)
+                        dependency["fingerprint_version"] = 2
+                    else:
+                        dependency["fingerprint"] = registry.fingerprint(dependency.get("id"))
         for node in compiled["compiled_definition"]["nodes"]:
             if node.get("kind") != "operator":
                 continue
             params = node.get("params") or {}
             ref = node.get("ref")
-            if ref in {"prompt-generator", "structured-knowledge-generator"}:
+            requirements = (node.get("operator_spec") or {}).get("runtime_requirements") or {}
+            if requirements.get("uses_llm"):
+                from .operators.dataflow import serving_snapshot
+                params["_resolved_serving"] = serving_snapshot(registry, params["llm_serving"])
+            if require_serving_health and requirements.get("provider") in {"dataflow", "custom"}:
+                state = self.require_operator_runtime(requirements)
+                requirements["environment_digest"] = state["runtime_digest"]
+            elif requirements.get("provider") in {"dataflow", "custom"}:
+                state = self.operator_runtime_status(requirements)
+                if state["status"] == "ready":
+                    requirements["environment_digest"] = state["runtime_digest"]
+            if params.get("prompt_template_revision_id"):
                 prompt_id = params.get("prompt_template_revision_id")
                 prompt = session.get(PromptTemplateRevision, prompt_id) if prompt_id else None
                 if not prompt or prompt.status != "published":
@@ -4098,13 +4170,17 @@ class V7Store:
                     "input_schema": prompt.input_schema, "output_schema": prompt.output_schema,
                 }
                 compiled["dependencies"].append({"kind": "prompt_template_revision", "id": prompt.id})
-            if ref in {"quality-evaluator", "quality-filter", "prompted-refiner"}:
+            if ref in {"quality-evaluator", "quality-filter"} or params.get("quality_profile_revision_id"):
                 quality_id = params.get("quality_profile_revision_id")
                 quality = session.get(QualityProfileRevision, quality_id) if quality_id else None
                 if not quality or quality.status != "published":
                     raise ValueError("质量节点只能引用已发布 Quality Profile Revision")
                 params["_resolved_quality_profile"] = {"id": quality.id, "rules": dict(quality.rules_json or {})}
                 compiled["dependencies"].append({"kind": "quality_profile_revision", "id": quality.id})
+        frozen_operators = {(node["ref"], node["operator_version"]): node["operator_spec"] for node in compiled["compiled_definition"]["nodes"] if node.get("kind") == "operator"}
+        for dependency in compiled["dependencies"]:
+            if dependency.get("kind") == "operator":
+                dependency["runtime_requirements"] = deepcopy(frozen_operators[(dependency["code"], dependency["version"])]["runtime_requirements"])
         if require_serving_health and self.enforce_serving_health and hasattr(registry, "require_healthy"):
             for dependency in compiled["dependencies"]:
                 if dependency.get("kind") == "llm_serving":
@@ -4996,7 +5072,23 @@ class V7Store:
             raise
 
     def list_managed_flow_templates(self) -> list[dict[str, Any]]:
-        return MANAGED_FLOW_CATALOG.list_definitions()
+        with self.sessions() as session:
+            return MANAGED_FLOW_CATALOG.list_definitions(load_catalog(session))
+
+    def resolve_standard_flow(self, managed_template_code, output_types, definition):
+        if definition.get("template_code") != managed_template_code:
+            raise ValueError("标准模板标识不一致")
+        flow = FLOW_AUTHORING_COMPILER.materialize(definition, output_types)
+        with self.sessions() as session:
+            catalog = load_catalog(session)
+            for node in flow["nodes"]:
+                if node.get("kind") == "operator":
+                    item = resolve_operator(catalog, node)
+                    if item:
+                        node["params"] = self._schema_defaults(item["parameter_schema"], node.get("params") or {})
+                        if item["uses_llm"] and not node["params"].get("llm_serving"):
+                            node["params"]["llm_serving"] = self.llm_serving_registry.require(None).id
+            return {"managed_template_code": managed_template_code, **technical_projection(flow, catalog)}
 
     def materialize_managed_flow(self, managed_code: str) -> dict[str, Any]:
         flow_definition = MANAGED_FLOW_CATALOG.get(managed_code)
@@ -5337,7 +5429,9 @@ class V7Store:
             if dependency.get("kind") != "llm_serving" or not dependency.get("fingerprint"):
                 continue
             try:
-                current = self.llm_serving_registry.fingerprint(str(dependency.get("id") or ""))
+                registry = self.llm_serving_registry
+                current = (registry.fingerprint(str(dependency.get("id") or ""), include_credentials=dependency.get("fingerprint_version", 1) == 1)
+                           if isinstance(registry, DatabaseLLMServingRegistry) else registry.fingerprint(str(dependency.get("id") or "")))
             except ValueError as exc:
                 raise FlowParameterError("SERVING_CONFIG_DRIFT", str(exc), field="llm_serving") from exc
             if current != dependency["fingerprint"]:
@@ -6102,6 +6196,7 @@ class V7Store:
                                       "source_subgraph": definition_node.get("source_subgraph"),
                                       "stage_id": definition_node.get("stage_id"), "stage_code": definition_node.get("stage_code"),
                                       "stage_label": definition_node.get("stage_label"), "operator_version": definition_node.get("operator_version"),
+                                      "operator_spec": definition_node.get("operator_spec"),
                                       "status": node.status if node else "reused" if str(definition_node["id"]) in reused_ids else "skipped",
                                       "node_run_id": node.id if node else None})
             runtime_edges = []

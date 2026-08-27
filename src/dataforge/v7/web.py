@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path, PurePath
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
@@ -151,6 +151,17 @@ class FlowCompilerPreviewRequest(BaseModel):
     managed_template_code: str | None = None
     output_types: list[str] = Field(min_length=1)
     definition: dict = Field(default_factory=dict)
+
+
+class OperatorCandidatesRequest(BaseModel):
+    definition: dict = Field(default_factory=dict)
+    output_types: list[str] = Field(default_factory=list)
+    source_node_id: str | None = None
+    source_port: str = "output"
+
+
+class OperatorManifestRequest(BaseModel):
+    manifest: dict
 
 
 class TemplateSampleRequest(BaseModel):
@@ -1287,12 +1298,49 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/developer/operator-catalog")
     def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",
-                         include_internal: bool = True):
+                         include_internal: bool = True, surface: str = "", provider: str = ""):
         return store.list_operator_catalog(include_internal=include_internal, query=q, category=category, knowledge_type=knowledge_type,
-                                           exposure=exposure, status=status)
+                                           exposure=exposure, status=status, surface=surface, provider=provider)
+
+    @app.post("/api/developer/operator-catalog/candidates")
+    def operator_candidates(payload: OperatorCandidatesRequest):
+        try: return store.operator_candidates(payload.definition, payload.output_types, payload.source_node_id, payload.source_port)
+        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog/facets")
     def operator_catalog_facets(): return store.operator_catalog_facets()
+
+    @app.get("/api/developer/operator-plugins")
+    def operator_plugins():
+        from .operator_plugins import OperatorPluginService
+        return OperatorPluginService(store).versions()
+
+    @app.post("/api/developer/operator-plugins", status_code=201)
+    def register_operator_plugin(payload: OperatorManifestRequest):
+        from .operator_plugins import OperatorPluginService
+        try: return OperatorPluginService(store).register(payload.manifest)
+        except (ValueError, KeyError, TypeError) as exc: raise _error(ValueError(str(exc))) from exc
+
+    @app.post("/api/developer/operator-plugins/{code}/versions/{version}/validate", status_code=202)
+    def validate_operator_plugin(code: str, version: int, background_tasks: BackgroundTasks):
+        from .operator_plugins import OperatorPluginService
+        service = OperatorPluginService(store)
+        try: result = service.start_validation(code, version)
+        except ValueError as exc: raise _error(exc) from exc
+        background_tasks.add_task(service.validate, result["id"])
+        return result
+
+    @app.get("/api/developer/operator-validations/{run_id}")
+    def operator_validation(run_id: str):
+        from .operator_plugins import OperatorPluginService
+        try: return OperatorPluginService(store).report(run_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/operator-plugins/{code}/versions/{version}/publish")
+    def publish_operator_plugin(code: str, version: int):
+        from .operator_plugins import OperatorPluginService
+        try: return OperatorPluginService(store).publish(code, version)
+        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog/{code}")
     def operator_catalog_detail(code: str):
@@ -1452,6 +1500,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/debug-runs/options")
     def debug_run_options(template_id: str, revision_kind: Literal["draft", "published"] = "draft"):
         try: return store.debug_run_options(template_id, revision_kind)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/flow-compiler/resolve")
+    def resolve_standard_flow(payload: FlowCompilerPreviewRequest):
+        if payload.authoring_mode != "standard":
+            raise HTTPException(status_code=422, detail="只读物化仅适用于 Standard")
+        try: return store.resolve_standard_flow(payload.managed_template_code, payload.output_types, payload.definition)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/debug-runs/preflight")

@@ -20,7 +20,7 @@ import { beginEdgeInteraction, idleEdgeInteraction } from './edge/edgeInteractio
 const nodes = defineModel('nodes', { required: true })
 const edges = defineModel('edges', { required: true })
 const props = defineProps({ issue: Object, mode: { type: String, default: 'edit' }, height: { type: [String, Number], default: 720 }, canvasId: { type: String, default: 'dataforge-template-flow' }, showTechnicalCode: { type: Boolean, default: false }, flowContext: { type: Object, default: () => ({ schemaVersion: 3, outputTypes: [] }) } })
-const emit = defineEmits(['before-change', 'select-node', 'select-edge', 'connection-error', 'add-definition', 'open-subflow'])
+const emit = defineEmits(['before-change', 'select-node', 'select-edge', 'connection-error', 'connection-source', 'add-definition', 'open-subflow'])
 const editable = computed(() => props.mode === 'edit')
 const compact = computed(() => props.mode === 'mini')
 const canvasHeight = computed(() => {
@@ -66,6 +66,7 @@ function connect(connection) {
 }
 function connectStart(params) {
   if (!editable.value) return
+  if (params.handleType === 'source') emit('connection-source', { nodeId: params.nodeId, port: params.handleId || 'output' })
   connectionCommitted.value = false; connectionCancelled.value = false; hoverTooltip.value = null; flashTooltip.value = null
   const original = pendingReconnectEdge.value
   if (!original && params.handleType !== 'source') return

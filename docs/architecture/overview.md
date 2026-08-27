@@ -1,6 +1,6 @@
 # DataForge 当前架构概览
 
-> 当前状态：已实现架构，更新于 2026-08-26。
+> 当前状态：已实现架构，更新于 2026-08-27。
 > 本目录只描述当前系统事实；完成度与外部环境验收状态以 [`V7-CAPABILITY-MATRIX.md`](../../V7-CAPABILITY-MATRIX.md) 为准，设计原因以 [`docs/adr/`](../adr/ADR-001-single-current-knowledge.md) 为准。
 
 ## 系统定位
@@ -26,6 +26,9 @@ PC 浏览器
 ```
 
 - API 与 Worker 负责治理、排队和外部存储协调；Runner 执行受控知识流程。
+- Standard 保存固定阶段配置并只读展示真实算子；Advanced 保存完整强类型 DAG。两者经编译器生成冻结快照。
+- Runner 按精确版本构建 Native/DataFlow/Custom Registry。首批 QA、去重、修订调用独立 Python 3.12 CPU 环境中的 `open-dataflow==1.0.10`；适配层只转换契约、参数、Serving 和血缘。图谱、原文映射、治理及 Sink 保持原生。
+- 维护人员安装可信插件，管理员通过 Manifest、真实样例、契约和血缘验证后发布。快照固定包/依赖/环境摘要，运行前检查漂移；插件只取得序列化上下文和 Serving 代理，不取得数据库或模型凭据。子进程故障隔离不代替代码审核。
 - 知识处理和 Vector Sync 通过知识库工作租约互斥；不同知识库可并行，多输出任务原子取得全部目标库租约。
 - PDF 固定经 MinerU 3.4.4 `pipeline + auto + ch` 解析；一次性强制 OCR 只允许管理员对 PDF 派生调试 Run 使用。
 - 运行调试已经实现为 V7 自有 Execution Sandbox：管理员可从 Draft/Published Revision选择版本化内置审核 Sample，或同库多个当前审核 Snapshot；输入统一冻结后由既有 Runner 执行。内置 Sample 使用虚拟空库 Diff，真实输入使用运行时 KnowledgeLibrary Diff，二者均不创建 KnowledgeJob、不写正式知识；Runtime DAG 只读。它不是 DataFlow WebUI 或通用 Studio。

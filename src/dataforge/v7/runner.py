@@ -29,6 +29,8 @@ from sqlalchemy import select
 from ..config import Settings
 from .catalog import catalog_by_code, normalize_chunker_params
 from .operators import OperatorExecutionContext, build_builtin_registry
+from .operators.factory import build_runtime_registry
+from .operator_catalog import load_catalog
 from .graph_literal import classify_object, detect_literal
 from .graph_prompt import entity_prompt_for, relation_prompt_for
 from .graph_quality import evaluate_graph_quality
@@ -1641,13 +1643,16 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         incoming = _incoming(definition)
         root_documents = store.reviewed_chunks_for_job(job_id)
         current_source_chunks = [dict(value) for value in root_documents]
-        catalog = catalog_by_code()
-        registry = build_builtin_registry(_builtin_dispatch, catalog)
+        with store.sessions() as session:
+            catalog = load_catalog(session)
+        registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
         runtime = {
             "root_documents": root_documents, "sources": sources, "versions": versions,
             "type_contracts": type_contracts, "job_id": job_id, "store": store,
             "retry_scope": retry_scope, "generation": generation,
             "graph_config": graph_config, "sink_libraries": sink_libraries,
+            "cancelled": lambda: store.is_job_cancelled(job_id),
+            "llm_serving_registry": store.llm_serving_registry,
         }
         sink_nodes: list[dict[str, Any]] = []
         for node in definition.get("nodes", []):
@@ -1827,8 +1832,9 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
     root_documents = context["root_documents"]
     type_contracts = context["type_contracts"]
     graph_config = _graph_config_from_contracts(type_contracts)
-    catalog = catalog_by_code()
-    registry = build_builtin_registry(_builtin_dispatch, catalog)
+    with store.sessions() as session:
+        catalog = load_catalog(session)
+    registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
     outputs: dict[str, list[dict[str, Any]]] = {}
     artifact_ids: dict[str, list[str]] = {}
     failed: dict[str, str] = {}
@@ -1839,6 +1845,8 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
         "type_contracts": type_contracts, "job_id": None, "store": None,
         "retry_scope": None, "generation": generation, "graph_config": graph_config,
         "sink_libraries": context["sink_libraries"],
+        "cancelled": lambda: store.is_flow_run_cancelled(flow_run_id),
+        "llm_serving_registry": store.llm_serving_registry,
     }
     try:
         for node in definition.get("nodes", []):
@@ -1935,9 +1943,11 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
     selected = _reachable_nodes(definition, context["start_node_id"], context["mode"])
     by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
     versions_list = context["versions"]; versions = {item.id: item for item in versions_list}; sources = context["sources"]
-    type_contracts = store.type_contracts_for_job(context["job_id"]); catalog = catalog_by_code(); parent_outputs = context["parent_outputs"]
+    type_contracts = store.type_contracts_for_job(context["job_id"]); parent_outputs = context["parent_outputs"]
+    with store.sessions() as session:
+        catalog = load_catalog(session)
     graph_config = _graph_config_from_contracts(type_contracts)
-    registry = build_builtin_registry(_builtin_dispatch, catalog)
+    registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
     outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
     try:
@@ -1975,6 +1985,8 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                         "root_documents": root_documents, "sources": sources, "versions": versions,
                         "type_contracts": type_contracts, "generation": generation,
                         "graph_config": graph_config, "sink_libraries": context.get("sink_libraries"),
+                        "cancelled": lambda: store.is_flow_run_cancelled(flow_run_id),
+                        "llm_serving_registry": store.llm_serving_registry,
                     }),
                 ).outputs
                 outputs[node_id] = values; item = catalog.get(ref) or {}
@@ -2060,6 +2072,26 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def runtime_status(authorization: str | None = Header(None)):
         verify(authorization)
         return runtime
+
+    @app.post("/internal/operators/check")
+    def check_operator(payload: dict, authorization: str | None = Header(None)):
+        verify(authorization)
+        from .operators.runtime import OperatorRuntime
+        requirements = payload.get("requirements") or {}
+        operator_runtime = OperatorRuntime()
+        status = operator_runtime.status(requirements)
+        if payload.get("check") and status["status"] == "ready":
+            try: operator_runtime.call(requirements, records=[], action="check", timeout=30)
+            except Exception as exc: return {"status": "incompatible", "reason": str(exc)}
+        return status
+
+    @app.post("/internal/operators/validate")
+    def validate_operator(payload: dict, authorization: str | None = Header(None)):
+        verify(authorization)
+        from .operator_plugins import OperatorPluginService
+        service = OperatorPluginService(store)
+        service.validate(payload["run_id"], local=True)
+        return service.report(payload["run_id"])
 
     @app.get("/internal/health")
     def health(authorization: str | None = Header(None)):

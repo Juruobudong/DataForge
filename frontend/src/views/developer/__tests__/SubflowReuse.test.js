@@ -8,7 +8,7 @@ import { api } from '../../../api/platform'
 const router = vi.hoisted(() => ({ push: vi.fn() }))
 const route = vi.hoisted(() => ({ params: { subflowId: 'parent', revision: '1' }, query: { return_template_id: 'consumer' } }))
 vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => route }))
-vi.mock('../../../api/platform', () => ({ api: Object.fromEntries(['createFlowSubgraph', 'flowSubgraphRevision', 'flowSubgraphs', 'operatorCatalog', 'flowSubgraphReferences'].map(name => [name, vi.fn()])) }))
+vi.mock('../../../api/platform', () => ({ api: Object.fromEntries(['createFlowSubgraph', 'flowSubgraphRevision', 'flowSubgraphs', 'operatorCatalog', 'flowSubgraphReferences', 'operatorCandidates'].map(name => [name, vi.fn()])) }))
 vi.mock('../../../components/flow/DataForgeFlowCanvas.vue', () => ({ default: {
   name: 'CanvasStub', props: ['nodes', 'edges'], template: '<div class="canvas-stub"></div>',
   methods: { fit() {}, screenToFlowCoordinate(value) { return value } },
@@ -23,6 +23,7 @@ const version = revision => ({ id: 'quality', code: 'quality-flow', name: '质�
 const asset = { ...version(2), revisions: [version(2), version(1)] }
 let wrapper
 beforeEach(() => {
+  api.operatorCandidates.mockResolvedValue(catalog)
   api.operatorCatalog.mockResolvedValue(catalog)
   api.flowSubgraphs.mockResolvedValue([asset])
   api.flowSubgraphReferences.mockResolvedValue({ reference_count: 0, references: [], unlocked_references: [] })
@@ -31,9 +32,21 @@ afterEach(() => { wrapper?.unmount(); document.body.innerHTML = '' })
 const button = label => wrapper.findAll('button').find(item => item.text() === label)
 
 describe('reusable subflow production and consumption', () => {
+  it('queries server candidates for the selected port and keeps only returned operators', async () => {
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [], outputTypes: ['text'] } })
+    wrapper.vm.loadDefinition({ nodes: [{ id: 'quality-node', kind: 'operator', ref: 'quality', operator_version: 1 }], edges: [] })
+    await flushPromises()
+    wrapper.findComponent({ name: 'CanvasStub' }).vm.$emit('select-node', wrapper.vm.nodes[0])
+    await vi.waitFor(() => expect(api.operatorCandidates).toHaveBeenCalledWith(expect.objectContaining({ source_node_id: 'quality-node', source_port: 'output' })))
+    await flushPromises()
+    expect(wrapper.findComponent(OperatorPalette).props('candidateCodes')).toEqual(['quality'])
+    api.operatorCandidates.mockResolvedValue([])
+    wrapper.findComponent(OperatorPalette).vm.$emit('clear-source')
+    await vi.waitFor(() => expect(wrapper.findComponent(OperatorPalette).props('candidateCodes')).toEqual([]))
+  })
   it('searches subflows, selects old published versions and excludes preparation from insertion', async () => {
     wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset, { ...asset, id: 'prepare', name: '文档预处理', usage: 'source_preparation' }] } })
-    expect(wrapper.findAll('.subflow-item button')[1].attributes('disabled')).toBeDefined()
+    expect(wrapper.findAll('.subflow-item')).toHaveLength(1)
     await wrapper.get('input').setValue('quality-flow')
     await wrapper.findAll('.subflow-item select')[0].setValue('r1')
     await wrapper.findAll('.subflow-item button')[0].trigger('click')

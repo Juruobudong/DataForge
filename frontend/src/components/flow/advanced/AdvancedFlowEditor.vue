@@ -1,5 +1,6 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { api } from '../../../api/platform'
 import DataForgeFlowCanvas from '../DataForgeFlowCanvas.vue'
 import OperatorPalette from '../palette/OperatorPalette.vue'
 import NodeInspector from '../inspector/NodeInspector.vue'
@@ -23,6 +24,9 @@ const emit = defineEmits(['dirty', 'error', 'open-subflow', 'subflow-created'])
 const extraction = ref(null)
 
 const selectedNode = ref(null), selectedEdge = ref(null)
+const connectionSource = ref(null)
+const candidateCodes = ref(null), candidateError = ref(''), candidatesLoading = ref(false)
+let candidateTimer, candidateSequence = 0
 const issues = ref([]), focusedIssue = ref(null), connectionError = ref(null)
 const nodes = ref([]), edges = ref([])
 const canvas = ref(null), editor = ref(null)
@@ -62,6 +66,7 @@ function validate() {
   return issues.value.length === 0
 }
 function loadDefinition(value) {
+  connectionSource.value = null
   const graph = deserializeDefinition(value, props.catalog, props.subflows)
   nodes.value = graph.nodes; edges.value = graph.edges
   graphConfig.value = normalizeGraphConfig(value?.graph_config)
@@ -71,6 +76,7 @@ function loadDefinition(value) {
   nextTick(() => canvas.value?.fit())
 }
 function reset() {
+  connectionSource.value = null
   selectedNode.value = null; selectedEdge.value = null
   nodes.value = []; edges.value = []
   graphConfig.value = normalizeGraphConfig(null); graphConfigOpen.value = false
@@ -95,6 +101,25 @@ function addItem(item, kind) {
   const position = canvas.value?.screenToFlowCoordinate({ x: (rect?.left || 500) + (rect?.width || 900) / 2, y: (rect?.top || 200) + 300 }) || { x: 320, y: 200 }
   addDefinition(subflowNodeDefinition(item, kind), position)
 }
+function refreshCandidates() {
+  clearTimeout(candidateTimer)
+  const sequence = ++candidateSequence
+  if (props.purpose !== 'knowledge') { candidateCodes.value = null; return }
+  candidatesLoading.value = true; candidateCodes.value = []; candidateError.value = ''
+  candidateTimer = setTimeout(async () => {
+    try {
+      const values = await api.operatorCandidates({ definition: serialize(), output_types: props.outputTypes,
+        source_node_id: connectionSource.value?.nodeId, source_port: connectionSource.value?.port || 'output' })
+      if (sequence === candidateSequence) candidateCodes.value = values.map(item => item.code)
+    } catch (error) {
+      if (sequence === candidateSequence) candidateError.value = error.message || '算子候选查询失败'
+    } finally {
+      if (sequence === candidateSequence) candidatesLoading.value = false
+    }
+  }, 150)
+}
+watch(() => [serialize(), connectionSource.value, props.outputTypes, props.catalog], refreshCandidates, { deep: true })
+onBeforeUnmount(() => { clearTimeout(candidateTimer); candidateSequence++ })
 function extractSelection() {
   const ids = nodes.value.filter(node => node.selected).map(node => node.id)
   if (!ids.length) { emit('error', '请先选择需要另存的节点'); return }
@@ -119,6 +144,12 @@ function addSink(outputKey) {
   const family = outputFamily(outputKey), mode = outputKey.includes(':') ? outputKey.split(':')[1] : null
   const definition = { id: uniqueId(`sink-${outputKey.replace(':', '-')}`), kind: 'knowledge_sink', knowledge_type: family, graph_mode: mode, output_key: outputKey }
   nodes.value.push(makeCanvasNode(definition, { x: 760, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows))
+  const item = props.catalog.find(item => item.code === 'knowledge-diff')
+  if (item) {
+    const diff = { id: uniqueId('diff'), kind: 'operator', ref: item.code, operator_version: item.version, params: { knowledge_type: family, graph_mode: mode } }
+    nodes.value.push(makeCanvasNode(diff, { x: 460, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows))
+    edges.value.push({ id: `${diff.id}-${definition.id}`, source: diff.id, target: definition.id, sourceHandle: 'output', targetHandle: 'input', type: 'flow', data: {} })
+  }
 }
 function applyParameters(value) {
   if (!selectedNode.value) return
@@ -134,6 +165,17 @@ function applyParameters(value) {
       if ([...sinksOf(node.id)].some(id => selectedSinks.has(id))) node.data.definition.params = { ...(node.data.definition.params || {}), quality_profile_revision_id: value.quality_profile_revision_id }
     }
   }
+}
+function changeOperatorVersion(version) {
+  if (!selectedNode.value) return
+  const item = props.catalog.find(item => item.code === selectedNode.value.data.definition.ref)?.versions?.find(item => item.version === version)
+  if (!item) return
+  beforeChange()
+  const definition = selectedNode.value.data.definition
+  definition.operator_version = version; delete definition.operator_spec
+  definition.params = Object.fromEntries(Object.entries(definition.params || {}).filter(([key]) => key in (item.parameter_schema?.properties || {}) || ['knowledge_type', 'graph_mode'].includes(key)))
+  selectedNode.value.data.meta = makeCanvasNode(definition, selectedNode.value.position, props.catalog, props.subflows).data.meta
+  validate()
 }
 function applyNormalizedDefinition(value) {
   if (value?.graph_config) graphConfig.value = normalizeGraphConfig(value.graph_config)
@@ -154,7 +196,7 @@ function applyGraphConfig(value) {
   nodes.value = cleaned.nodes
   if (selectedNode.value) selectedNode.value = nodes.value.find(node => node.id === selectedNode.value.id) || null
 }
-function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null }
+function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null; connectionSource.value = { nodeId: node.id, port: 'output' } }
 function selectEdge(edge) { selectedEdge.value = edge; selectedNode.value = null; connectionError.value = null }
 function deleteEdge(edgeId) { canvas.value?.deleteEdge(edgeId) }
 function reportConnectionError(issue) { connectionError.value = issue; if (issue) emit('error', issue.message) }
@@ -192,10 +234,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
       <div><span class="selection-state">{{ nodes.length }} 节点 · {{ edges.length }} 连线</span><button v-if="!fragment" :disabled="!nodes.some(node => node.selected)" @click="extractSelection">另存为可复用子流程</button><button v-if="hasGraphOutput" :class="{ active: graphConfigOpen }" @click="graphConfigOpen = !graphConfigOpen">图谱抽取配置</button></div>
     </div>
     <div ref="editor" class="flow-workspace">
-      <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
-      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @select-node="selectNode" @select-edge="selectEdge" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
+      <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :candidate-codes="candidateCodes" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
+      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
-      <NodeInspector v-else :node="selectedNode" :subflows="subflows" :entity-types="graphConfig.entity_types" :issue="selectedIssue" :sample-result="sampleResult" @apply-parameters="applyParameters" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" />
+      <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :entity-types="graphConfig.entity_types" :issue="selectedIssue" :sample-result="sampleResult" @apply-parameters="applyParameters" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
     </div>
     <section v-if="graphConfigOpen && hasGraphOutput" class="graph-config-panel"><GraphSchemaEditor :model-value="graphConfig" @update:model-value="applyGraphConfig" /><PromptPreview :graph-config="graphConfig" /></section>
     <section v-if="issues.length" class="validation-panel"><div><h3>画布校验</h3><span>{{ issues.length }} 个问题</span></div><button v-for="(issue,index) in issues" :key="`${issue.code}-${index}`" @click="focusIssue(issue)"><b>{{ issue.code }}</b><span>{{ issue.message }}</span><small>定位 →</small></button></section>

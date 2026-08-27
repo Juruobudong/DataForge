@@ -64,8 +64,8 @@ CMD ["dataforge-web"]
 
 # -----------------------------------------------------------------------------
 # V7 Runner 镜像目标。
-# Runner 仅额外安装 antiword（文档解析）；算子执行由本仓库的
-# DataForge Adapter 完成，不部署 DataFlow WebUI、MCP 或 Agent。
+# Runner 额外安装 antiword 和独立 Python 3.12 CPU 算子环境。
+# 仅安装精选算子依赖，不部署 DataFlow WebUI、MCP、Agent 或 GPU 推理。
 # -----------------------------------------------------------------------------
 FROM app-common AS runner
 
@@ -78,6 +78,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends antiword
+
+COPY runtime/dataflow ./runtime/dataflow
+COPY scripts/install-operator-runtime.py scripts/register-operator-runtime.py ./scripts/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    /usr/local/bin/python -m pip download --no-deps --only-binary=:all: --require-hashes \
+        -r runtime/dataflow/upstream.lock -d /tmp/operator-wheels \
+    && /usr/local/bin/python scripts/install-operator-runtime.py \
+        --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
+        --environment /opt/dataforge-operators/dataflow-1.0.10 \
+        --manifest /opt/dataforge-operators/operator-runtime.json
+
+ENV DATAFORGE_OPERATOR_RUNTIME_MANIFEST=/opt/dataforge-operators/operator-runtime.json
 
 USER dataforge
 EXPOSE 8010

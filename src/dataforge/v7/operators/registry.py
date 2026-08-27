@@ -17,6 +17,8 @@ class OperatorExecutorRegistry:
         self._executors: dict[tuple[str, int], OperatorExecutor] = {}
 
     def register(self, executor: OperatorExecutor) -> None:
+        if (executor.code, executor.version) in self._executors:
+            raise ValueError(f"Operator {executor.code} v{executor.version} 已注册，禁止覆盖")
         self._executors[(executor.code, executor.version)] = executor
 
     def resolve(self, code: str, version: int) -> OperatorExecutor:

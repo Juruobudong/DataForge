@@ -1,19 +1,36 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { groupOperatorCapabilities, subflowPrimaryName, subflowSubtitle } from '../flowModel'
+import { makeCanvasNode, subflowPrimaryName, subflowSubtitle } from '../flowModel'
+import { checkEdgeCompatibility } from '../edge/edgeCompatibility'
 
-const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] }, purpose: { type: String, default: 'knowledge' } })
-const emit = defineEmits(['drag-start', 'add-item', 'add-sink'])
+const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] }, purpose: { type: String, default: 'knowledge' }, nodes: { type: Array, default: () => [] }, edges: { type: Array, default: () => [] }, source: { type: Object, default: null }, candidateCodes: { type: Array, default: null }, loading: Boolean, error: String })
+const emit = defineEmits(['drag-start', 'add-item', 'add-sink', 'retry', 'clear-source'])
 
 const query = ref('')
-const expanded = ref(new Set())
+const expanded = ref(new Set(['DataForge 平台算子', 'DataFlow 精选', '自定义算子']))
 
-const grouped = computed(() => groupOperatorCapabilities(props.catalog, undefined, query.value))
-const commonItems = computed(() => grouped.value.common)
-const capabilityGroups = computed(() => grouped.value.groups)
+const providers = { dataforge: 'DataForge 平台算子', dataflow: 'DataFlow 精选', custom: '自定义算子' }
+function connects(raw) {
+  if (!props.source?.nodeId) return true
+  const sourceNode = props.nodes.find(node => node.id === props.source.nodeId)
+  const candidate = makeCanvasNode({ ...raw, id: '__candidate__', params: { ...(sourceNode?.data?.definition?.params || {}) } }, { x: 0, y: 0 }, props.catalog, props.subflows)
+  return Object.keys(candidate.data.meta.inputs || {}).some(port => checkEdgeCompatibility({ nodes: [...props.nodes, candidate], edges: props.edges,
+    flowContext: { outputTypes: props.outputTypes }, sourceNodeId: props.source.nodeId, sourcePortId: props.source.port || 'output', targetNodeId: candidate.id, targetPortId: port }).allowed)
+}
+const available = computed(() => props.catalog.filter(item => {
+  if (props.candidateCodes && !props.candidateCodes.includes(item.code)) return false
+  if (item.enabled === false || item.status === 'deprecated' || item.approved === false || ['internal', 'disabled'].includes(item.exposure)) return false
+  if (item.surfaces && !item.surfaces.includes(props.purpose === 'knowledge' ? 'advanced-canvas' : 'system-internal')) return false
+  if (item.dependency_status && item.dependency_status.status !== 'ready') return false
+  if (props.outputTypes.length && item.knowledge_types?.length && !item.knowledge_types.includes('*') && !props.outputTypes.some(kind => item.knowledge_types.includes(kind.split(':')[0]))) return false
+  if (props.outputTypes.length && item.graph_modes?.length && !props.outputTypes.some(kind => kind.startsWith('graph') && item.graph_modes.includes(kind.split(':')[1] || 'triple'))) return false
+  if (query.value && ![item.code, item.name, item.display_name_zh].join(' ').toLowerCase().includes(query.value.toLowerCase())) return false
+  return connects({ kind: 'operator', ref: item.code, operator_version: item.version })
+}))
+const capabilityGroups = computed(() => Object.entries(providers).map(([provider, label]) => [label, available.value.filter(item => (item.provider || 'dataforge') === provider)]).filter(([, items]) => items.length))
 const searching = computed(() => query.value.trim() !== '')
 const versions = ref({})
-const matchingSubflows = computed(() => props.subflows.filter(item => [item.name, item.display_name_zh, item.code, item.description].join(' ').toLowerCase().includes(query.value.trim().toLowerCase())))
+const matchingSubflows = computed(() => props.subflows.filter(item => !unavailable(item) && [item.name, item.display_name_zh, item.code, item.description].join(' ').toLowerCase().includes(query.value.trim().toLowerCase()) && connects({ kind: 'subflow', ref: item.code, subflow_revision_id: selected(item)?.revision_id || selected(item)?.latest_revision_id })))
 const published = item => (item.revisions || [item]).filter(version => version.revision_status === 'published')
 const selected = item => published(item).find(version => (version.revision_id || version.latest_revision_id) === versions.value[item.id]) || published(item)[0]
 const unavailable = item => !selected(item) || item.status !== 'active' || (props.purpose === 'knowledge' && item.usage === 'source_preparation')
@@ -29,14 +46,13 @@ function toggle(key) {
 
 <template>
   <aside class="operator-palette">
-    <div class="palette-title"><div><h3>添加节点</h3><small>{{ catalog.length }} 个受控算子</small></div><span>＋</span></div>
+    <div class="palette-title"><div><h3>添加节点</h3><small>{{ available.length }} 个{{ source ? '可连接' : '可用' }}算子</small></div><span>＋</span></div>
     <label class="search"><span>⌕</span><input v-model="query" aria-label="搜索算子或子流程" placeholder="搜索名称或编码"></label>
+    <p v-if="loading" class="hint">正在匹配端口与运行依赖…</p>
+    <p v-if="error" class="hint" role="alert">{{ error }} <button @click="emit('retry')">重试</button></p>
+    <button v-if="source" class="hint" @click="emit('clear-source')">清除端口筛选</button>
     <div class="palette-scroll">
       <h3>算子</h3>
-      <section v-if="commonItems.length">
-        <h4>常用</h4>
-        <div v-for="item in commonItems" :key="item.code" class="palette-entry" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><b>{{ item._label }}</b><small>{{ item.display_name_zh }} · v{{ item.version }}</small><button @dblclick.stop @click.stop="emit('add-item', item, 'operator')">添加</button></div>
-      </section>
       <section v-for="([category, items]) in capabilityGroups" :key="category">
         <button class="capability-head" @click="toggle(category)"><span class="capability-name">{{ category }}</span><span class="capability-count">{{ items.length }}</span><span class="chev">{{ searching || expanded.has(category) ? '▾' : '▸' }}</span></button>
         <template v-if="searching || expanded.has(category)">

@@ -45,8 +45,10 @@ export function runtimeArtifactLabel(type, recordCount = null) {
   return `${label}${hasCount ? ` · ${Number(recordCount)} 条` : ''}`
 }
 
-function catalogItem(catalog, code) {
-  return catalog.find(item => item.code === code)
+function catalogItem(catalog, code, version = null) {
+  const item = catalog.find(item => item.code === code)
+  if (version == null || item?.version === version) return item
+  return item?.versions?.find(entry => entry.version === version)
 }
 
 function normalizedPorts(raw, fallback) {
@@ -81,7 +83,7 @@ export function resolveSubflow(definition, items = []) {
 }
 
 export function subflowNodeDefinition(item, kind = 'subflow') {
-  return { kind, ref: item.code, params: {}, ...(kind === 'subflow' ? { subflow_revision_id: item.revision_id || item.latest_revision_id } : {}) }
+  return { kind, ref: item.code, params: {}, ...(kind === 'subflow' ? { subflow_revision_id: item.revision_id || item.latest_revision_id } : { operator_version: item.version }) }
 }
 
 export function subflowPrimaryName(item = {}) {
@@ -119,8 +121,8 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     const child = subflow?.definition || {}
     const entry = child.nodes?.find(node => node.id === child.entry_node)
     const exit = child.nodes?.find(node => node.id === child.exit_node)
-    const entryItem = entry?.kind === 'operator' ? catalogItem(catalog, entry.ref) : null
-    const exitItem = exit?.kind === 'operator' ? catalogItem(catalog, exit.ref) : null
+    const entryItem = entry?.kind === 'operator' ? catalogItem(catalog, entry.ref, entry.operator_version) : null
+    const exitItem = exit?.kind === 'operator' ? catalogItem(catalog, exit.ref, exit.operator_version) : null
     return {
       kind: 'subflow', nodeRole: 'operator', name: subflowPrimaryName(subflow || { code: definition.ref }),
       englishName: subflowEnglishName(subflow || {}), code: definition.ref, category: '可复用子流程', status,
@@ -132,11 +134,13 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
       inputExample: entryItem?.input_example || {}, outputExample: exitItem?.output_example || {},
     }
   }
-  const item = catalogItem(catalog, definition.ref)
+  const catalogVersion = catalogItem(catalog, definition.ref, definition.operator_version)
+  const item = definition.operator_spec || catalogVersion
   const role = nodeRole({ ...definition, node_role: definition.node_role || item?.node_role })
   return {
     kind: 'operator', nodeRole: role, name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
     code: definition.ref, category: item?.category || '未知算子', status,
+    provider: item?.runtime_requirements?.provider || item?.provider || 'dataforge', dependencyStatus: catalogVersion?.dependency_status || { status: 'unknown', reason: '该版本不在当前可用目录中' },
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),
     parameterSchema: item?.parameter_schema || {}, inputExample: item?.input_example || {}, outputExample: item?.output_example || {}, version: item?.version,

@@ -7,6 +7,7 @@ never leak into a published Flow definition.
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
 
 from .llm_serving import DEFAULT_LLM_SERVING_ID
 
@@ -206,7 +207,7 @@ def _entry(code: str, name: str, category: str, source: str, target: str, adapte
         "output_example": {"output": [_artifact_example(target)]},
         "parameter_schema": parameter_schema,
         "parameter_docs": parameter_docs,
-        "runtime_requirements": {"executor": "dataforge-adapter", "upstream": upstream or [], "uses_llm": uses_llm},
+        "runtime_requirements": {"executor": "dataforge-native", "provider": "dataforge", "implementation": adapter, "adapter_version": 1, "upstream": upstream or [], "uses_llm": uses_llm},
     }
 
 
@@ -280,7 +281,83 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
 )
 
 
-def catalog_by_code(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...] = CATALOG_SEEDS) -> dict[str, dict[str, Any]]:
+DATAFLOW_PACKAGE = "open-dataflow"
+DATAFLOW_VERSION = "1.0.10"
+DATAFLOW_DIGEST = "75dd8e03fd96875472c11bd9fdf8af30e66d76a6b2d59b6b426d998db25e8790"
+DATAFLOW_LOCK_DIGEST = "d575faf7e20b1bf75725fa15a4d29de17168c957d09f99f5b2cd5053df257a28"
+
+
+def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[str]:
+    if exposure == "internal" or source in {"source_file", "document_ir", "chunk_set"}:
+        return ["system-internal"]
+    standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "qa-generator",
+                "entity-extractor", "literal-detector", "relation-extractor", "triple-builder",
+                "entity-normalizer", "semantic-relation-builder", "evidence-binder",
+                "quality-evaluator", "quality-filter", "source-binding", "schema-validator",
+                "graph-quality-validator", "knowledge-diff"}
+    return (["standard-template"] if code in standard else []) + ["advanced-canvas"]
+
+
+LEGACY_CATALOG_SEEDS = tuple(deepcopy(item) for item in CATALOG_SEEDS)
+
+
+def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
+    item = deepcopy(item)
+    item["surfaces"] = operator_surfaces(item["code"], item["input"], item["exposure"])
+    item["provider"] = "dataforge"
+    graph_modes = {"triple-builder": ["triple"], "semantic-relation-builder": ["semantic"], "evidence-binder": ["semantic"]}
+    if item["code"] in graph_modes:
+        item["graph_modes"] = graph_modes[item["code"]]
+        item["runtime_requirements"]["graph_modes"] = item["graph_modes"]
+    if item["code"] == "graph-quality-validator":
+        item["knowledge_types"] = ["graph"]
+    if item["code"] in {"reviewed-source-chunk-input", "prompt-generator", "structured-knowledge-generator",
+                        "quality-evaluator", "quality-filter", "source-binding", "schema-validator",
+                        "knowledge-diff", "artifact-merge"}:
+        item["knowledge_types"] = ["*"]
+    implementations = {
+        "qa-generator": (5, "dataflow.operators.core_text:Text2QAGenerator", "source-chunk-to-qa-v1"),
+        "deduplicate": (4, "dataflow.operators.general_text:HashDeduplicateFilter", "candidate-deduplicate-v1"),
+        "prompted-refiner": (4, "dataflow.operators.core_text:PromptedRefiner", "candidate-refiner-v1"),
+    }
+    if item["code"] not in implementations:
+        return item
+    version, implementation, adapter = implementations[item["code"]]
+    uses_llm = item["code"] != "deduplicate"
+    item.update(version=version, provider="dataflow", adapter_code=adapter)
+    item["runtime_requirements"] = {
+        "executor": "dataflow-llm" if uses_llm else "dataflow-storage", "provider": "dataflow",
+        "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
+        "dependency_lock_digest": DATAFLOW_LOCK_DIGEST,
+        "implementation": implementation, "adapter_version": adapter, "uses_llm": uses_llm,
+        "preserve_fields": ["source_version_ids", "source_chunk_id", "source_chunk_revision_id", "source_review_snapshot_id", "anchor_json", "evidence_text"],
+    }
+    props = item["parameter_schema"].setdefault("properties", {})
+    docs = item["parameter_docs"]
+    if uses_llm:
+        props["llm_serving"] = {"type": "string", "title": "模型服务", "x-dataforge-ui": {"widget": "llm-serving-selector"}}
+        docs["llm_serving"] = "已配置的模型服务，发布时冻结配置指纹。"
+    if item["code"] == "qa-generator":
+        props["questions_per_chunk"] = {"type": "integer", "title": "每块最多问题数", "default": 1, "minimum": 1, "maximum": 10}
+        docs["questions_per_chunk"] = "上游先生成提问方向，再生成问答；每块最多生成的问题数。"
+    elif item["code"] == "deduplicate":
+        props.update(method={"type": "string", "enum": ["identity", "minhash"], "default": "identity", "title": "去重方式"},
+                     threshold={"type": "number", "minimum": 0.01, "maximum": 1, "default": 0.9, "title": "相似度阈值"})
+        docs.update(method="identity 按知识 ID 精确去重；minhash 仅在同一来源 Chunk 内对文本或问答去重。", threshold="MinHash 相似度阈值。")
+        item["runtime_requirements"]["implementations"] = {"identity": implementation, "minhash": "dataflow.operators.general_text:MinHashDeduplicateFilter"}
+    else:
+        item["knowledge_types"] = ["text", "qa"]
+        props["prompt_template_revision_id"] = {"type": "string", "title": "修订 Prompt", "default": "promptrev_refiner", "x-dataforge-ui": {"widget": "prompt-template-selector"}}
+        item["parameter_schema"]["required"] = ["prompt_template_revision_id"]
+        docs["prompt_template_revision_id"] = "已发布的修订提示词；只修订候选正文，不能改变来源 Evidence。"
+    return item
+
+
+CATALOG_SEEDS = tuple(_curated_entry(item) for item in CATALOG_SEEDS)
+
+
+def catalog_by_code(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None) -> dict[str, dict[str, Any]]:
+    entries = CATALOG_SEEDS if entries is None else entries
     return {entry["code"]: dict(entry) for entry in entries}
 
 
@@ -338,14 +415,15 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             {"id": quality_filter, "kind": "operator", "ref": "quality-filter", "params": {"knowledge_type": family, "graph_mode": mode or None, "quality_profile_revision_id": "qualityrev_default"}},
             {"id": binding, "kind": "operator", "ref": "source-binding", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": validator, "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}},
-            {"id": quality, "kind": "operator", "ref": "graph-quality-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}},
+            *([{"id": quality, "kind": "operator", "ref": "graph-quality-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}}] if family == "graph" else []),
             {"id": diff, "kind": "operator", "ref": "knowledge-diff", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": sink, "kind": "knowledge_sink", "node_role": "knowledge_output", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
         ))
         edges.extend(graph_edges or [["reviewed-input", generator]])
         edges.extend((
             [generator, evaluator], [evaluator, quality_filter],
-            [quality_filter, binding], [binding, validator], [validator, quality], [quality, diff], [diff, sink],
+            [quality_filter, binding], [binding, validator],
+            *([[validator, quality], [quality, diff]] if family == "graph" else [[validator, diff]]), [diff, sink],
         ))
     return {"schema_version": 3, "purpose": "knowledge", "nodes": nodes, "edges": [
         {"source": edge[0], "source_port": "output", "target": edge[1], "target_port": "input"} for edge in edges

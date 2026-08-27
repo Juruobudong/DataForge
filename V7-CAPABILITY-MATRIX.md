@@ -37,10 +37,11 @@
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
 | 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
 | 流程开发区 | 知识流程 / 开发者资源 | `DONE` | Standard 文本三阶段、无模型 Mapper；QA/图谱/Multi 按 Managed generation 合同展示生成。转 Advanced 保留 Mapper，显式选择 v6 Prompt/Structured Generator 才生成文本；历史 v4/v5 保留旧行为。开发者资源不可折叠，真实 `.34` 模型验收为 `CONNECT`。 |
+| 流程开发区 | 五类 Standard 透明算子与精选 DataFlow / Custom | `LOCAL` | 固定模板只读算子链、Advanced 版本目录与上下文候选、真实 DataFlow QA v5/去重 v4/修订 v4、可信插件验证发布及包/环境/Serving 冻结；实际包 + stub 模型本地验证，`.34` 容器与真实模型效果待验收。 |
 | 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision 可使用内置审核 Sample + 虚拟空库 Diff，或同库多审核输入 + 真实 Sink Diff；Runtime DAG 只读，真实 `.34` E2E 为 `CONNECT`。 |
 | 流程开发区 | 独立“向量索引”导航页 | `REMOVE` | 已收口进 DataFlow 调试台；旧链接重定向，仍只读。 |
 | 原型能力 | DataFlow WebUI、Shell、任意 Python、运行时改图 | `REMOVE` | 与受控 Flow 和 Runner 安全边界冲突。 |
-| 原型能力 | 任意上游算子、KCenterGreedy、MultiHop Batch、Reference Remover、训练/代码/Text2SQL/Agentic-RAG | `REMOVE` | 不在 V7 Catalog；P1 Refiner/MultiHop/PII 仍需专门批准。 |
+| 原型能力 | 任意上游算子、KCenterGreedy、MultiHop Batch、Reference Remover、训练/代码/Text2SQL/Agentic-RAG | `REMOVE` | 不在 V7 Catalog；MultiHop/PII 等未适配能力仍需专门批准；文本/QA Refiner v4 已单独接入。 |
 
 ## API 与数据契约
 

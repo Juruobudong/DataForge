@@ -2,8 +2,9 @@
 import { computed, ref, watch } from 'vue'
 import { hasEditableParameters, operatorNodeSubtitle, subflowRevisions } from '../flowModel.js'
 import OperatorParameterForm from './OperatorParameterForm.vue'
-const props = defineProps({ node: Object, issue: Object, sampleResult: Object, entityTypes: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] } })
-const emit = defineEmits(['apply-parameters', 'open-subflow', 'change-subflow-revision'])
+const props = defineProps({ node: Object, issue: Object, sampleResult: Object, entityTypes: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, catalog: { type: Array, default: () => [] } })
+const emit = defineEmits(['apply-parameters', 'open-subflow', 'change-subflow-revision', 'change-operator-version'])
+const operatorVersions = computed(() => props.catalog.find(item => item.code === props.node?.data.definition.ref)?.versions || [])
 const availableRevisions = computed(() => subflowRevisions(props.subflows).filter(item => item.code === props.node?.data.definition.ref && item.revision_status === 'published'))
 function changeRevision(event) { emit('change-subflow-revision', availableRevisions.value.find(item => (item.revision_id || item.latest_revision_id) === event.target.value)) }
 const tab = ref('parameters'), params = ref({})
@@ -31,6 +32,7 @@ function updateParameters(value) { params.value = value; emit('apply-parameters'
       <div class="node-summary"><span class="summary-icon">{{ node.data.meta.kind === 'subflow' ? '◈' : node.data.meta.kind === 'knowledge_sink' ? '✓' : '◇' }}</span><div><b>{{ node.data.meta.name }}</b><small>{{ nodeSubtitle }}</small></div></div>
       <section v-if="node.data.meta.kind === 'subflow'" class="subflow-settings"><label>引用版本<select aria-label="子流程引用版本" :value="node.data.definition.subflow_revision_id || ''" @change="changeRevision"><option v-if="!node.data.definition.subflow_revision_id" value="">版本未锁定</option><option v-for="item in availableRevisions" :key="item.revision_id" :value="item.revision_id || item.latest_revision_id">r{{ item.revision }}</option></select></label><button :disabled="!node.data.definition.subflow_revision_id || !node.data.meta.known" @click="emit('open-subflow')">查看内部 DAG</button></section>
       <nav><button :class="{ active: tab==='parameters' }" @click="tab='parameters'">配置</button><button :class="{ active: tab==='ports' }" @click="tab='ports'">输入输出</button><button :class="{ active: tab==='schema' }" @click="tab='schema'">Schema</button><button :class="{ active: tab==='result' }" @click="tab='result'">运行结果</button></nav>
+      <section v-if="node.data.meta.kind === 'operator'" class="inspector-body"><p>{{ node.data.meta.provider || 'dataforge' }} · v{{ node.data.definition.operator_version || node.data.meta.version }}</p><p v-if="node.data.meta.dependencyStatus && node.data.meta.dependencyStatus.status !== 'ready'" class="error">{{ node.data.meta.dependencyStatus.reason || '算子依赖不可用' }}</p><label v-if="operatorVersions.length > 1">执行版本<select aria-label="算子执行版本" :value="node.data.definition.operator_version || node.data.meta.version" @change="emit('change-operator-version', Number($event.target.value))"><option v-for="item in operatorVersions" :key="item.version" :value="item.version">v{{ item.version }} · {{ item.provider }}</option></select></label></section>
       <section v-if="tab==='parameters'" class="inspector-body">
         <div v-if="documentParser" class="fixed-parser"><h4>PDF 自动解析</h4><dl><div><dt>Backend</dt><dd>pipeline</dd></div><div><dt>Parse method</dt><dd>auto</dd></div></dl><p class="muted">扫描件判断与 OCR 由 MinerU 内部处理，当前不开放节点参数。</p></div>
         <template v-else>

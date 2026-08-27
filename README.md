@@ -15,6 +15,8 @@ conda activate sun
 uv sync --extra web
 ```
 
+精选 QA、去重、修订算子还需要 Runner 的独立 Python 3.12 CPU 环境。安装与自定义包审核登记见 [算子运行环境](runtime/dataflow/README.md)。Runner 镜像已包含锁定的 DataFlow 环境；API/Worker 不安装 DataFlow，不在任务执行期间自动下载依赖。
+
 ## 初始化或升级 V7 Schema
 
 目标必须是空数据库或已有 V7 schema；命令会执行 Alembic 升级并写入 V7 种子。

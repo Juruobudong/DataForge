@@ -7,6 +7,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from .catalog import SUBFLOW_DISPLAY_NAMES_ZH, catalog_by_code
+from .operator_catalog import load_catalog, resolve_operator
 from .flow import (FlowCompiler, FlowValidationError, _edge, _node_ports, node_role,
                    resolve_port_contract, resolve_subflow, subflow_dependencies,
                    validate_flow_edges, _contains_knowledge_library_binding)
@@ -81,7 +82,7 @@ class SubflowService:
         self.store = store
 
     def validate(self, session, definition, input_contract=None, output_contract=None, *, preparation=False, previous_definition=None):
-        registry, catalog = published_subflows(session), catalog_by_code()
+        registry, catalog = published_subflows(session), load_catalog(session)
         definition = pin_subflows(definition, registry)
         entry, exit_node = fragment_boundaries(definition)
         if definition.get("entry_node") != entry or definition.get("exit_node") != exit_node:
@@ -106,11 +107,15 @@ class SubflowService:
         expanded, edges = FlowCompiler(catalog=catalog, subflows=registry)._expand(definition)
         validate_flow_edges({"schema_version": 3, "nodes": expanded, "edges": edges}, catalog=catalog, subflows=registry)
         for node in expanded:
-            item = catalog.get(node.get("ref"))
+            item = resolve_operator(catalog, node)
             if node.get("kind") != "operator" or node_role(node) != "operator" or node.get("ref") == "reviewed-source-chunk-input":
                 raise FlowValidationError("子流程不能包含 Flow Input 或 Knowledge Sink")
             if not item or item.get("exposure") in {"disabled", "internal"} or not item.get("enabled", True):
                 raise FlowValidationError("子流程包含未登记或不可用算子")
+            if item.get("exposure") == "controlled" and not item.get("approved"):
+                raise FlowValidationError("子流程包含尚未批准的算子")
+            if not preparation and item.get("surfaces") and "advanced-canvas" not in item["surfaces"]:
+                raise FlowValidationError("该算子不能用于知识子流程")
             if not preparation and node.get("ref") in {"document-parser", "source-chunk-builder"}:
                 raise FlowValidationError("知识子流程不得重新解析或构建 SourceChunk")
         incoming = {(edge["target"], edge["target_port"]) for edge in edges}
@@ -161,18 +166,18 @@ class SubflowService:
                 description=description.strip(), status="draft")
             session.add(revision); session.flush()
             self.store.audit(session, "subgraph.created", "flow_subgraph", asset.id, {"revision": 1})
-            return self.payload(asset, revision, published_subflows(session))
+            return self.payload(asset, revision, published_subflows(session), load_catalog(session))
 
     @staticmethod
-    def payload(asset, revision, registry):
+    def payload(asset, revision, registry, catalog):
         definition = deepcopy(revision.definition_json or {})
         inputs, outputs = revision.input_contract or {}, revision.output_contract or {}
         try:
             by_id = {node["id"]: node for node in definition.get("nodes", [])}
             if not inputs:
-                inputs = _node_ports(by_id[definition["entry_node"]], direction="input", catalog=catalog_by_code(), subflows=registry)
+                inputs = _node_ports(by_id[definition["entry_node"]], direction="input", catalog=catalog, subflows=registry)
             if not outputs:
-                outputs = _node_ports(by_id[definition["exit_node"]], direction="output", catalog=catalog_by_code(), subflows=registry)
+                outputs = _node_ports(by_id[definition["exit_node"]], direction="output", catalog=catalog, subflows=registry)
         except (ValueError, KeyError):
             pass  # Legacy invalid definitions remain inspectable, never silently repaired.
         return {"id": asset.id, "code": asset.code, "name": asset.name, "status": asset.status,
@@ -188,6 +193,7 @@ class SubflowService:
             assets = list(session.scalars(select(FlowSubgraph).order_by(FlowSubgraph.code)))
             revisions = list(session.scalars(select(FlowSubgraphRevision).order_by(FlowSubgraphRevision.revision_no.desc())))
             registry = published_subflows(session)
+            catalog = load_catalog(session)
             references = self.reference_index(session)
             values = []
             for asset in assets:
@@ -197,11 +203,11 @@ class SubflowService:
                 published = next((rev for rev in versions if rev.status == "published"), None)
                 draft = next((rev for rev in versions if rev.status == "draft"), None)
                 current = published or draft or versions[0]
-                payload = self.payload(asset, current, registry)
+                payload = self.payload(asset, current, registry, catalog)
                 payload["draft_revision"] = draft.revision_no if draft else None
                 payload["reference_count"] = len({row["template_id"] for row in references.get(current.id, [])})
                 # Batch metadata allows old and mixed revisions to render without per-node fetches.
-                payload["revisions"] = [self.payload(asset, rev, registry) for rev in versions]
+                payload["revisions"] = [self.payload(asset, rev, registry, catalog) for rev in versions]
                 values.append(payload)
             return values
 
@@ -211,7 +217,8 @@ class SubflowService:
             if not asset:
                 raise ValueError("子流程不存在")
             registry = published_subflows(session)
-            return [self.payload(asset, rev, registry) for rev in session.scalars(select(FlowSubgraphRevision).where(
+            catalog = load_catalog(session)
+            return [self.payload(asset, rev, registry, catalog) for rev in session.scalars(select(FlowSubgraphRevision).where(
                 FlowSubgraphRevision.flow_subgraph_id == subflow_id).order_by(FlowSubgraphRevision.revision_no.desc()))]
 
     def detail(self, subflow_id, revision_no):
@@ -234,7 +241,7 @@ class SubflowService:
                 input_contract=deepcopy(source.input_contract), output_contract=deepcopy(source.output_contract), status="draft")
             session.add(revision); session.flush()
             self.store.audit(session, "subgraph.draft_created", "flow_subgraph", asset.id, {"revision": revision.revision_no})
-            return self.payload(asset, revision, published_subflows(session))
+            return self.payload(asset, revision, published_subflows(session), load_catalog(session))
 
     def save(self, subflow_id, revision_no, definition, description, input_contract, output_contract, *, publish=False, check=False):
         with self.store.sessions.begin() as session:
@@ -259,7 +266,7 @@ class SubflowService:
                 revision.status, revision.published_at, asset.status = "published", utc_now(), "active"
             self.store.audit(session, "subgraph.published" if publish else "subgraph.saved", "flow_subgraph", asset.id, {"revision": revision_no})
             session.flush()
-            return {**self.payload(asset, revision, published_subflows(session)), "status": revision.status}
+            return {**self.payload(asset, revision, published_subflows(session), load_catalog(session)), "status": revision.status}
 
     def reference_index(self, session):
         assets = {asset.id: asset for asset in session.scalars(select(FlowSubgraph))}

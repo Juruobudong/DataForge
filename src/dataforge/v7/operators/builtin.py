@@ -33,12 +33,17 @@ class BuiltinOperatorExecutor:
 
 
 def build_builtin_registry(runner_callable: RunnerCallable, catalog: dict[str, dict[str, Any]]) -> OperatorExecutorRegistry:
+    from ..catalog import LEGACY_CATALOG_SEEDS
     registry = OperatorExecutorRegistry()
-    for code, item in catalog.items():
+    entries = {(item["code"], item["version"]): item for item in LEGACY_CATALOG_SEEDS if item["code"] in catalog}
+    entries.update({(code, item.get("version", 1)): item for code, item in catalog.items()})
+    for (code, _), item in entries.items():
+        if (item.get("runtime_requirements") or {}).get("provider", "dataforge") != "dataforge":
+            continue
         version = int(item.get("version", 1))
         registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
         if code in {"prompt-generator", "structured-knowledge-generator", "entity-extractor"}:
             for legacy_version in (4, 5):
-                if legacy_version < version:
+                if legacy_version < version and (code, legacy_version) not in entries:
                     registry.register(BuiltinOperatorExecutor(code, legacy_version, runner_callable))
     return registry

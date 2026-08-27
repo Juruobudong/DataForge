@@ -1,0 +1,2 @@
+# The curated upstream wheel; unrelated extras are deliberately not installed.
+open-dataflow==1.0.10 --hash=sha256:75dd8e03fd96875472c11bd9fdf8af30e66d76a6b2d59b6b426d998db25e8790

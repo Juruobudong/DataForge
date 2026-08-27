@@ -47,6 +47,8 @@ function graphNeighborQuery(depth, filters = {}, confirmLarge = false) {
   return params.toString()
 }
 
+function json(method, payload) { return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) } }
+
 export const api = {
   servingCategories: () => request('/api/serving-categories'),
   modelServings: () => request('/api/model-servings'),
@@ -137,6 +139,13 @@ export const api = {
   previewSourcePreparation: body => request('/api/developer/source-preparation/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
   operatorCatalog: (params = {}) => request(`/api/developer/operator-catalog?${new URLSearchParams(Object.entries(params).filter(([, value]) => value !== '' && value !== null && value !== undefined)).toString()}`),
   operatorCatalogFacets: () => request('/api/developer/operator-catalog/facets'),
+  operatorCandidates: (payload) => request('/api/developer/operator-catalog/candidates', json('POST', payload)),
+  resolveStandardFlow: (payload) => request('/api/developer/flow-compiler/resolve', json('POST', payload)),
+  operatorPlugins: () => request('/api/developer/operator-plugins'),
+  registerOperatorPlugin: manifest => request('/api/developer/operator-plugins', json('POST', { manifest })),
+  validateOperatorPlugin: (code, version) => request(`/api/developer/operator-plugins/${encodeURIComponent(code)}/versions/${version}/validate`, { method: 'POST' }),
+  operatorValidation: id => request(`/api/developer/operator-validations/${id}`),
+  publishOperatorPlugin: (code, version) => request(`/api/developer/operator-plugins/${encodeURIComponent(code)}/versions/${version}/publish`, { method: 'POST' }),
   operatorDetail: code => request(`/api/developer/operator-catalog/${encodeURIComponent(code)}`),
   promptTemplates: (params = {}) => request(`/api/developer/prompt-templates?${new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString()}`),
   qualityProfiles: (params = {}) => request(`/api/developer/quality-profiles?${new URLSearchParams(Object.entries(params).filter(([, value]) => value)).toString()}`),

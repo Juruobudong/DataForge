@@ -17,7 +17,8 @@ from copy import deepcopy
 import re
 from typing import Any
 
-from .catalog import builtin_flow_definition
+from .catalog import builtin_flow_definition, catalog_by_code
+from .operator_catalog import technical_projection
 from .flow import FlowCompiler, FlowValidationError
 from .entity_types import custom_type_code, entity_type_catalog, normalize_entity_types
 
@@ -33,6 +34,10 @@ _QUALITY_CONFIG_SCHEMA: dict[str, Any] = {
     "properties": {"quality_profile_revision_id": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}},
     "additionalProperties": False,
 }
+_QA_CONFIG_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
+    **_LLM_CONFIG_SCHEMA["properties"],
+    "questions_per_chunk": {"type": "integer", "title": "每块最多问题数", "minimum": 1, "maximum": 10, "default": 1},
+}}
 _GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -83,7 +88,7 @@ _SUBMIT_STAGE = ManagedStageDefinition(code="submit", name="知识提交", locke
 
 
 def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA, operator_refs: tuple[str, ...]) -> ManagedStageDefinition:
-    return ManagedStageDefinition(code="generation", name=name, configurable=True, replaceable=True,
+    return ManagedStageDefinition(code="generation", name=name, configurable=True, replaceable=False,
                                   config_schema=config_schema, operator_refs=operator_refs)
 
 
@@ -93,7 +98,7 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
-        _INPUT_STAGE, _generation("问答生成", operator_refs=("qa-generator",)),
+        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-generator",)),
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
@@ -111,7 +116,7 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     )),
     ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph"), stages=(
         _INPUT_STAGE, _TEXT_MAPPING_STAGE,
-        _generation("多产出生成", config_schema=_GRAPH_CONFIG_SCHEMA,
+        _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], "questions_per_chunk": _QA_CONFIG_SCHEMA["properties"]["questions_per_chunk"]}},
                     operator_refs=("qa-generator", "entity-extractor", "literal-detector",
                                    "relation-extractor", "triple-builder")),
         _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
@@ -135,10 +140,13 @@ class ManagedFlowCatalog:
             raise ValueError(f"未知的标准模板：{code}")
         return definition
 
-    def list_definitions(self) -> list[dict[str, Any]]:
+    def list_definitions(self, operator_catalog=None) -> list[dict[str, Any]]:
         values = []
         for definition in self._by_code.values():
+            resolved = technical_projection(ManagedFlowCompiler(self).materialize(
+                self.default_stage_config(definition.code), list(definition.output_types)), operator_catalog if operator_catalog is not None else catalog_by_code())
             values.append({
+                **resolved,
                 "code": definition.code,
                 "name": definition.name,
                 "output_types": list(definition.output_types),
@@ -147,6 +155,7 @@ class ManagedFlowCatalog:
                     "code": stage.code, "name": stage.name,
                     "locked": stage.locked, "replaceable": stage.replaceable, "configurable": stage.configurable,
                     "config_schema": stage.config_schema if stage.configurable else None,
+                    "operators": [node for node in resolved["resolved_operators"] if node["stage_id"] == stage.code],
                 } for stage in definition.stages],
             })
         return values
@@ -201,6 +210,8 @@ class ManagedFlowCatalog:
             expected = spec.get("type")
             if expected == "string" and not isinstance(config_value, str):
                 raise ValueError(f"阶段 {stage.name} 参数 {key} 必须是字符串")
+            if expected == "integer" and (not isinstance(config_value, int) or isinstance(config_value, bool) or not spec.get("minimum", 0) <= config_value <= spec.get("maximum", 10)):
+                raise ValueError(f"阶段 {stage.name} 参数 {key} 超出整数范围")
             if expected == "array" and (not isinstance(config_value, list) or any(not isinstance(item, str) for item in config_value)):
                 raise ValueError(f"阶段 {stage.name} 参数 {key} 必须是字符串数组")
 
@@ -254,6 +265,8 @@ class ManagedFlowCompiler:
             params = node.setdefault("params", {})
             if "llm_serving" in config and "llm_serving" in params:
                 params["llm_serving"] = config["llm_serving"]
+            if ref == "qa-generator" and "questions_per_chunk" in config:
+                params["questions_per_chunk"] = config["questions_per_chunk"]
             if ref == "prompt-generator" and "prompt_template_revision_id" in config:
                 params["prompt_template_revision_id"] = config["prompt_template_revision_id"]
             if ref in {"quality-evaluator", "quality-filter"} and "quality_profile_revision_id" in config:

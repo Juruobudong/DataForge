@@ -582,6 +582,7 @@ class OperatorDefinition(Timestamped, Base):
     recommended_successors: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     lifecycle_status: Mapped[str] = mapped_column(String(32), default="published", nullable=False, index=True)
     exposure: Mapped[str] = mapped_column(String(32), default="canvas", nullable=False)
+    surfaces: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     risk_level: Mapped[str] = mapped_column(String(32), default="standard", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     latest_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -603,6 +604,16 @@ class OperatorVersion(Timestamped, Base):
     runtime_requirements: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False, index=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OperatorValidationRun(Timestamped, Base):
+    __tablename__ = "operator_validation_runs"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operator_version_id: Mapped[str] = mapped_column(ForeignKey("operator_versions.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    manifest_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    report: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class PromptTemplate(Timestamped, Base):

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .catalog import catalog_by_code, normalize_chunker_params
+from .operator_catalog import resolve_operator
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
@@ -233,7 +234,7 @@ def _node_ports(node: dict[str, Any], *, direction: str,
         return {"input": {"artifact_type": f"candidate:{output_key}", "cardinality": "one",
                           "required": True, "binding": "edge"}}
     if node.get("kind") == "operator":
-        item = catalog.get(str(node.get("ref") or "")) or {}
+        item = resolve_operator(catalog, node) or {}
         key = "output_ports" if direction == "output" else "input_ports"
         fallback_key = "output" if direction == "output" else "input"
         fallback_type = item.get(fallback_key)
@@ -432,7 +433,7 @@ class FlowCompiler:
             source_node, target_node = by_id[edge["source"]], by_id[edge["target"]]
             if source_node.get("kind") != "operator" or node_role(source_node) == "knowledge_output":
                 raise FlowValidationError(f"节点 {edge['source']} 不能作为边的起点")
-            source_item = self.catalog.get(str(source_node.get("ref", ""))) or {}
+            source_item = resolve_operator(self.catalog, source_node) or {}
             source_ports = source_item.get("output_ports") or {"output": {"artifact_type": source_item.get("output")}}
             if edge["source_port"] not in source_ports:
                 raise FlowValidationError(f"节点 {edge['source']} 不存在输出端口 {edge['source_port']}")
@@ -440,7 +441,7 @@ class FlowCompiler:
                 target_ports = {"input": {"artifact_type": "candidate:*", "cardinality": "one",
                                             "required": True, "binding": "edge"}}
             elif target_node.get("kind") == "operator":
-                target_item = self.catalog.get(str(target_node.get("ref", ""))) or {}
+                target_item = resolve_operator(self.catalog, target_node) or {}
                 target_ports = target_item.get("input_ports") or {"input": {"artifact_type": target_item.get("input"), "cardinality": "one"}}
             else:
                 raise FlowValidationError(f"展开后仍存在不支持的节点类型：{target_node.get('kind')}")
@@ -492,10 +493,12 @@ class FlowCompiler:
                 continue
             if kind != "operator":
                 raise FlowValidationError(f"不支持的节点类型：{kind}")
-            code = str(node.get("ref", "")); item = self.catalog.get(code)
+            code = str(node.get("ref", "")); item = resolve_operator(self.catalog, node)
             if not item or item.get("exposure") in {"disabled", "internal"} or not item.get("enabled", True):
                 raise FlowValidationError(f"算子不在 Flow allowlist：{code}")
-            if item.get("exposure") == "controlled" and not self.allow_controlled:
+            if purpose == "knowledge" and item.get("surfaces") and "advanced-canvas" not in item["surfaces"] and "standard-template" not in item["surfaces"]:
+                raise FlowValidationError(f"算子不允许用于知识流程：{code}")
+            if item.get("exposure") == "controlled" and not (item.get("approved") or self.allow_controlled):
                 raise FlowValidationError(f"算子尚未获批进入当前 Flow：{code}")
             node["node_role"] = node_role(node)
             source_types = [outputs[source] for source in incoming[node_id]]
@@ -542,9 +545,16 @@ class FlowCompiler:
             node["params"] = params
             node["operator_version"] = item.get("version", 1)
             node["adapter_code"] = item["adapter_code"]
+            node["operator_spec"] = deepcopy({key: item.get(key) for key in (
+                "code", "version", "name", "display_name_zh", "description", "adapter_code", "runtime_requirements",
+                "input_ports", "output_ports", "parameter_schema")})
             output_spec = (item.get("output_ports") or {}).get("output") or {"artifact_type": item["output"]}
             output = str(output_spec.get("artifact_type", item["output"]))
             knowledge_type = str(params.get("knowledge_type", ""))
+            if knowledge_type and item.get("knowledge_types") and knowledge_type not in item["knowledge_types"] and "*" not in item["knowledge_types"]:
+                raise FlowValidationError(f"算子 {code} 不支持知识类型 {knowledge_type}")
+            if knowledge_type == "graph" and params.get("graph_mode") and item.get("graph_modes") and params["graph_mode"] not in item["graph_modes"]:
+                raise FlowValidationError(f"算子 {code} 不支持图谱模式 {params['graph_mode']}")
             if output == "candidate:*":
                 if knowledge_type:
                     if knowledge_type not in self.type_revisions:
@@ -556,7 +566,7 @@ class FlowCompiler:
                 else:
                     raise FlowValidationError(f"节点 {node_id} 无法从输入推导候选知识类型")
             outputs[node_id] = output
-            dependencies.append({"kind": "operator", "code": code, "version": item.get("version", 1), "adapter": item["adapter_code"]})
+            dependencies.append({"kind": "operator", "code": code, "version": item.get("version", 1), "adapter": item["adapter_code"], "runtime_requirements": deepcopy(item.get("runtime_requirements") or {})})
         root_refs = {str(by_id[node_id].get("ref") or "") for node_id in ordered if not incoming[node_id]}
         node_refs = {str(node.get("ref") or "") for node in by_id.values() if node.get("kind") == "operator"}
         if purpose == "knowledge":
