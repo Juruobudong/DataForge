@@ -1,0 +1,95 @@
+{
+  "code": "medical-entity-dictionary-matcher",
+  "name": "Medical Entity Dictionary Matcher",
+  "display_name_zh": "医学实体词典匹配器",
+  "description": "从已审核来源正文匹配医学词典。",
+  "provider": "custom",
+  "executor": "dataflow-storage",
+  "package": "dataforge-medical-demo-operators",
+  "package_version": "0.1.0",
+  "package_digest": "REPLACE_WITH_REGISTERED_WHEEL_SHA256",
+  "implementation": "medical_demo_operators:MedicalEntityDictionaryMatcher",
+  "surfaces": [
+    "advanced-canvas"
+  ],
+  "knowledge_types": [
+    "graph"
+  ],
+  "input_ports": {
+    "input": {
+      "artifact_type": "source_chunk_set",
+      "cardinality": "one",
+      "binding": "edge"
+    }
+  },
+  "output_ports": {
+    "output": {
+      "artifact_type": "entity_candidate_set",
+      "cardinality": "many",
+      "binding": "edge"
+    }
+  },
+  "parameter_schema": {
+    "type": "object",
+    "properties": {
+      "terms": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "高血压"
+        ]
+      }
+    },
+    "additionalProperties": false
+  },
+  "parameter_docs": {
+    "terms": "审核过的医学词典。"
+  },
+  "init_parameters": [
+    "terms"
+  ],
+  "input_mapping": {
+    "content": "text"
+  },
+  "output_mapping": {
+    "entities": "entities"
+  },
+  "run_arguments": {
+    "input_key": "text",
+    "output_key": "entities"
+  },
+  "capabilities": [
+    "source-review-read"
+  ],
+  "timeout_seconds": 30,
+  "input_example": {
+    "input": [
+      {
+        "source_version_id": "v",
+        "source_chunk_id": "c",
+        "source_chunk_revision_id": "r",
+        "source_review_snapshot_id": "review",
+        "anchor_json": {
+          "page": 1
+        },
+        "evidence_text": "高血压患者。",
+        "content": "高血压患者。"
+      }
+    ]
+  },
+  "output_example": {
+    "output": [
+      {
+        "entities": [
+          {
+            "name": "高血压",
+            "type": "疾病",
+            "confidence": 1.0
+          }
+        ]
+      }
+    ]
+  }
+}

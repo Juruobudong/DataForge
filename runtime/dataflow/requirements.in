@@ -1,0 +1,16 @@
+# Runtime dependency closure for the curated CPU operators, not DataFlow's
+# unrelated GPU, speech, agents, parsing or UI pipelines. The upstream wheel
+# is installed separately with its approved SHA-256, without dependency scans.
+numpy==1.26.4
+pandas==2.2.3
+scipy==1.15.3
+datasketch==1.6.5
+tqdm==4.67.1
+colorlog==6.9.0
+rich==13.9.4
+xxhash==3.5.0
+psutil==7.0.0
+pyarrow==20.0.0
+clickhouse-driver==0.2.9
+requests==2.32.4
+docstring-parser==0.16
