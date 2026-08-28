@@ -45,6 +45,7 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
         <select v-if="spec.enum" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @change="patch(name,$event.target.value)"><option v-for="choice in spec.enum" :key="choice" :value="choice">{{ choice }}</option></select>
         <input v-else-if="spec.type==='boolean'" type="checkbox" :checked="Boolean(modelValue[name] ?? spec.default)" :disabled="disabled" @change="scalar(name,spec,$event)">
         <input v-else-if="spec.type==='array'" :value="(modelValue[name] || []).join(', ')" placeholder="逗号分隔" :disabled="disabled" @input="tags(name,$event)">
+        <textarea v-else-if="widget(spec)==='textarea'" :aria-label="spec.title || name" rows="5" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @input="scalar(name,spec,$event)"></textarea>
         <input v-else :type="spec.type==='number' || spec.type==='integer' ? 'number' : 'text'" :min="spec.minimum" :max="spec.maximum" :step="spec.type==='number' ? '0.01' : '1'" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @input="scalar(name,spec,$event)">
         <small v-if="spec.description">{{ spec.description }}</small>
       </label>

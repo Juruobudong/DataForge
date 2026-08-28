@@ -9,16 +9,52 @@ import contextlib
 import hashlib
 import importlib
 import importlib.metadata
+import importlib.util
 import inspect
 import io
 import json
 import sys
+import threading
+from pathlib import Path
 from types import SimpleNamespace
+
+if __package__:
+    from .diagnostics import OperatorDiagnostics
+else:
+    # -I intentionally excludes the script directory from sys.path. Load only
+    # our adjacent stdlib-only helper, never add package-search directories.
+    spec = importlib.util.spec_from_file_location("operator_diagnostics", Path(__file__).with_name("diagnostics.py"))
+    diagnostics_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(diagnostics_module)
+    OperatorDiagnostics = diagnostics_module.OperatorDiagnostics
+
+_PROTOCOL_LOCK = threading.RLock()
 
 
 def send(value):
-    sys.__stdout__.write(json.dumps(value, ensure_ascii=True, allow_nan=False) + "\n")
-    sys.__stdout__.flush()
+    with _PROTOCOL_LOCK:
+        sys.__stdout__.write(json.dumps(value, ensure_ascii=True, allow_nan=False) + "\n")
+        sys.__stdout__.flush()
+
+
+class LogWriter(io.TextIOBase):
+    def __init__(self, stream, diagnostics):
+        self.stream, self.diagnostics = stream, diagnostics
+        self.notified_truncation = False
+
+    @property
+    def encoding(self):
+        return "utf-8"
+
+    def write(self, value):
+        with _PROTOCOL_LOCK:
+            fragment, truncated = self.diagnostics.append(self.stream, value)
+            for offset in range(0, len(fragment), 4096):
+                send({"type": "operator_log", "stream": self.stream, "message": fragment[offset:offset + 4096]})
+            if truncated and not self.notified_truncation:
+                send({"type": "operator_log", "stream": self.stream, "message": "", "truncated": True})
+                self.notified_truncation = True
+        return len(value)
 
 
 def distribution_digest(name):
@@ -48,8 +84,7 @@ def load_approved_class(implementation, package_name):
     return cls
 
 
-def main():
-    request = json.loads(sys.stdin.readline())
+def execute(request):
     if request.get("python_version") and request["python_version"] != ".".join(map(str, sys.version_info[:3])):
         raise ValueError("OPERATOR_DEPENDENCY_DRIFT: Python version changed")
     for name, version in request.get("dependencies", {}).items():
@@ -59,11 +94,10 @@ def main():
     if importlib.metadata.version(package["name"]) != package["version"] or distribution_digest(package["name"]) != package["installed_digest"]:
         raise ValueError("OPERATOR_PACKAGE_DRIFT: installed implementation changed")
     if request.get("action") == "check":
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            cls = load_approved_class(request["implementation"], package["name"])
+        cls = load_approved_class(request["implementation"], package["name"])
         if not callable(cls):
             raise ValueError("Implementation is not callable")
-        send({"type": "result", "outputs": [], "checked": True}); return
+        return {"outputs": [], "checked": True}
 
     calls_failed = []
     class Serving:
@@ -79,46 +113,58 @@ def main():
                 raise ValueError("Serving result cardinality mismatch")
             return values
 
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        cls = load_approved_class(request["implementation"], package["name"])
-        init = dict(request.get("init") or {})
-        if request.get("uses_llm") and request["executor"] != "custom-native":
-            init["llm_serving"] = Serving()
-        operator = cls(**init)
-        if request["executor"] == "custom-native":
-            ctx = SimpleNamespace(**request["context"])
-            if request.get("uses_llm"):
-                ctx.runtime["serving"] = Serving()
-            result = operator.execute(inputs=request["records"], params=request["params"], context=ctx)
-            outputs = result.get("outputs") if isinstance(result, dict) else result.outputs
-        else:
-            import pandas as pd
-            from dataflow.utils.storage import DataFlowStorage
-            class MemoryStorage(DataFlowStorage):
-                def __init__(self, records):
-                    self.frame = pd.DataFrame(records); self.written = False
-                def get_keys_from_dataframe(self):
-                    return list(self.frame.columns)
-                def read(self, output_type="dataframe"):
-                    if output_type != "dataframe":
-                        raise ValueError("Only dataframe storage is supported")
-                    return self.frame.copy(deep=True)
-                def write(self, data):
-                    self.frame = data.copy(deep=True); self.written = True
-                    return "dataforge-memory"
-            storage = MemoryStorage(request["records"])
-            operator.run(storage=storage, **request.get("run_arguments", {}))
-            if not storage.written or calls_failed:
-                raise ValueError("OPERATOR_NO_OUTPUT: upstream failed or did not write storage")
-            outputs = storage.frame.to_dict(orient="records")
-        if calls_failed:
-            raise ValueError("Upstream Serving failed")
-        send({"type": "result", "outputs": outputs})
+    cls = load_approved_class(request["implementation"], package["name"])
+    init = dict(request.get("init") or {})
+    if request.get("uses_llm") and request["executor"] != "custom-native":
+        init["llm_serving"] = Serving()
+    operator = cls(**init)
+    if request["executor"] == "custom-native":
+        ctx = SimpleNamespace(**request["context"])
+        if request.get("uses_llm"):
+            ctx.runtime["serving"] = Serving()
+        result = operator.execute(inputs=request["records"], params=request["params"], context=ctx)
+        outputs = result.get("outputs") if isinstance(result, dict) else result.outputs
+    else:
+        import pandas as pd
+        from dataflow.utils.storage import DataFlowStorage
+        class MemoryStorage(DataFlowStorage):
+            def __init__(self, records):
+                self.frame = pd.DataFrame(records); self.written = False
+            def get_keys_from_dataframe(self):
+                return list(self.frame.columns)
+            def read(self, output_type="dataframe"):
+                if output_type != "dataframe":
+                    raise ValueError("Only dataframe storage is supported")
+                return self.frame.copy(deep=True)
+            def write(self, data):
+                self.frame = data.copy(deep=True); self.written = True
+                return "dataforge-memory"
+        storage = MemoryStorage(request["records"])
+        operator.run(storage=storage, **request.get("run_arguments", {}))
+        if not storage.written or calls_failed:
+            raise ValueError("OPERATOR_NO_OUTPUT: upstream failed or did not write storage")
+        outputs = storage.frame.to_dict(orient="records")
+    if calls_failed:
+        raise ValueError("Upstream Serving failed")
+    return {"outputs": outputs}
+
+
+def main():
+    diagnostics = OperatorDiagnostics()
+    try:
+        request = json.loads(sys.stdin.readline())
+        diagnostics.add_secrets({"init": request.get("init"), "params": request.get("params"), "context": request.get("context")})
+        with contextlib.redirect_stdout(LogWriter("stdout", diagnostics)), contextlib.redirect_stderr(LogWriter("stderr", diagnostics)):
+            result = execute(request)
+        send({"type": "result", "ok": True, "error": None, "logs_streamed": True,
+              "operator_logs": diagnostics.snapshot(), **result})
+        return 0
+    except Exception as exc:
+        message = diagnostics.error(f"{type(exc).__name__}: {exc}")
+        send({"type": "error", "ok": False, "message": message, "error": message,
+              "logs_streamed": True, "operator_logs": diagnostics.snapshot()})
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-        sys.exit(1)
+    sys.exit(main())

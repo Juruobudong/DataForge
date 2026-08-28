@@ -6,7 +6,18 @@ import {
   normaliseTemplateOutputKey,
   templateOutputLabel,
   templateOutputSummary,
+  templateRevisionSummary,
 } from './templatePresentation.js'
+
+test('版本摘要区分最新草稿、已发布修订和未保存的新流程', () => {
+  const cases = [
+    [null, '最新草稿：无 · 已发布版本：未发布'],
+    [{ revision: 1, revision_status: 'draft', published_revision: null }, '最新草稿：r1 · 已发布版本：未发布'],
+    [{ revision: 1, revision_status: 'published', published_revision: 1 }, '最新草稿：无 · 已发布版本：r1'],
+    [{ revision: 2, revision_status: 'draft', published_revision: 1 }, '最新草稿：r2 · 已发布版本：r1'],
+  ]
+  for (const [template, expected] of cases) assert.equal(templateRevisionSummary(template), expected)
+})
 
 test('内置模板按业务顺序分组且不通过 standard 前缀推断', () => {
   const templates = [

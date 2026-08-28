@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { api } from '../../api/platform'
 import OperatorInspector from '../../components/flow/inspector/OperatorInspector.vue'
 import OperatorPluginManager from '../../components/flow/OperatorPluginManager.vue'
+import { operatorPrimaryName, operatorSubtitle } from '../../components/flow/flowModel'
 
 const EXPOSURE_LABELS = { public: '可直接使用', controlled: '受控使用', internal: '系统内部', disabled: '已禁用' }
 const PROVIDERS = { dataforge: 'DataForge', dataflow: 'DataFlow', custom: 'Custom' }
@@ -11,7 +12,7 @@ const query = ref(''), category = ref(''), knowledge = ref(''), exposure = ref('
 const selected = ref(null), error = ref('')
 
 const visible = computed(() => catalog.value.filter(item =>
-  (!query.value || `${item.display_name_zh} ${item.code} ${item.summary}`.toLowerCase().includes(query.value.toLowerCase())) &&
+  (!query.value || `${item.display_name_zh} ${item.name} ${item.code} ${item.summary}`.toLowerCase().includes(query.value.toLowerCase())) &&
   (!category.value || item.category === category.value) &&
   (!knowledge.value || item.knowledge_types?.includes('*') || item.knowledge_types?.includes(knowledge.value)) &&
   (!exposure.value || item.exposure === exposure.value) &&
@@ -39,7 +40,16 @@ onMounted(load)
     <div class="catalog-layout">
       <div class="panel catalog-list">
         <button v-for="item in visible" :key="item.id" class="operator-row" :class="{ active: selected?.id === item.id }" @click="selected = item">
-          <div><b>{{ item.display_name_zh || item.name }}</b><small>{{ item.code }} · v{{ item.version }} · {{ PROVIDERS[item.provider] }} · {{ item.category }}</small><p>{{ item.summary }}</p><small v-if="item.dependency_status?.status !== 'ready'">{{ item.dependency_status?.reason || '依赖状态未知' }}</small></div>
+          <div>
+            <b>{{ operatorPrimaryName(item) }}</b>
+            <small class="operator-meta">
+              <span class="operator-bilingual">{{ operatorSubtitle(item, true) }} · v{{ item.version }}</span>
+              <span class="badge provider-badge" :class="{ blue: item.provider === 'dataforge', 'provider-dataflow': item.provider === 'dataflow' }">{{ PROVIDERS[item.provider] || item.provider || '未知来源' }}</span>
+              <span>{{ item.category }}</span>
+            </small>
+            <p>{{ item.summary }}</p>
+            <small v-if="item.dependency_status?.status !== 'ready'">{{ item.dependency_status?.reason || '依赖状态未知' }}</small>
+          </div>
           <span class="badge" :class="item.exposure === 'public' ? 'green' : 'amber'">{{ EXPOSURE_LABELS[item.exposure] }}</span>
         </button>
         <p v-if="!visible.length" class="empty-catalog">没有匹配的算子。</p>
@@ -60,6 +70,11 @@ onMounted(load)
 .operator-row{display:flex;width:100%;justify-content:space-between;gap:16px;margin-top:6px;padding:12px;text-align:left}
 .operator-row.active{border-color:#2f6fed;background:#f1f6ff}
 .operator-row small{display:block;margin-top:3px;color:#7b8798}
+.operator-row .operator-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.provider-badge{min-height:22px;white-space:nowrap}
+.provider-badge.provider-dataflow{border-color:#ddd6fe;color:#6d28d9;background:#f5f3ff}
 .operator-row p{margin:6px 0 0;color:#5d6a7c}
 @media(max-width:1100px){.catalog-layout{grid-template-columns:1fr}}
 </style>
+
+<style scoped>.operator-row>div{min-width:0}.operator-bilingual{overflow-wrap:anywhere;white-space:normal}</style>

@@ -382,7 +382,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
         "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
         "evidence_text": content, "is_primary": True,
     }
-    kind = "qa" if ref in {"qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
+    kind = "qa" if ref in {"Text2QAGenerator", "qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
     mode = str(params.get("graph_mode") or "")
     if ref == "triple-builder" or kind == "graph" and mode != "semantic":
         data = {"subject": "高血压", "predicate": "需要", "object": "规范随访"}
@@ -452,7 +452,7 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
                                        for index, item in enumerate((value.get("entities") or [])) if item.get("object_kind") != "literal"]} for value in values]
     if ref in {"triple-builder", "semantic-relation-builder", "evidence-binder"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
-    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+    if ref in {"prompt-generator", "Text2QAGenerator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
     if ref == "graph-quality-validator":
         return [{**value, "graph_quality": {"hard_fail": False, "warnings": []}} for value in values]
@@ -470,12 +470,12 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
         pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
         return [{**value, "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score else "review"}
                 for value in values if float(value.get("quality_score", 1.0)) >= review_score]
-    if ref == "deduplicate":
+    if ref in {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "deduplicate"}:
         unique: dict[str, dict[str, Any]] = {}
         for value in values:
             unique.setdefault(str(value.get("source_knowledge_id") or json.dumps(value, sort_keys=True, default=str)), dict(value))
         return list(unique.values())
-    if ref in {"source-binding", "schema-validator", "knowledge-diff", "prompted-refiner"}:
+    if ref in {"source-binding", "schema-validator", "knowledge-diff", "PromptedRefiner", "prompted-refiner"}:
         return [dict(value) for value in values]
     raise ValueError(f"算子不支持受控内存预览：{ref}")
 
@@ -1684,7 +1684,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 values = result.outputs
             except Exception as exc:
                 node_errors[node_id] = str(exc); outputs[node_id] = []
-                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
+                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), logs=getattr(exc, "operator_logs", []), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
             if ref == "document-parser":
                 store.record_document_irs(flow_run["id"], values)
@@ -1699,7 +1699,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
             artifact_values = values
             if ref == "document-parser":
                 artifact_values = [{key: value for key, value in item.items() if key != "_faq_table_rows"} for item in values]
-            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values, operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
+            artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values, logs=getattr(result, "logs", []), metrics=getattr(result, "metrics", {}), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
             if ref == "document-parser":
                 persisted_parser_keys.update(created_parser_keys)
                 outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]
@@ -1911,14 +1911,15 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                 recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in result.outputs]
                 artifact_ids[node_id] = store.record_flow_node(
                     flow_run_id, node_id, input_ids, recorded, operator_code=ref,
-                    operator_version=operator_version, resolved_parameters=params,
-                    metrics={"input_records": len(input_values), "output_records": len(result.outputs)},
+                    operator_version=operator_version, resolved_parameters=params, logs=getattr(result, "logs", []),
+                    metrics={**getattr(result, "metrics", {}), "input_records": len(input_values), "output_records": len(result.outputs)},
                 )
             except Exception as exc:
                 message = str(exc); failed[node_id] = message; outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(
                     flow_run_id, node_id, input_ids, [], error=message, operator_code=ref,
-                    operator_version=operator_version, resolved_parameters=params,
+                    operator_version=operator_version, resolved_parameters=params, logs=getattr(exc, "operator_logs", []),
+                    metrics=getattr(exc, "operator_metrics", {}),
                 )
         if failed:
             status = "completed_with_warnings" if previews else "failed"
@@ -1979,7 +1980,7 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
             ref = str(node.get("ref")); params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}; params.pop("force_ocr", None)
             try:
                 operator_version = int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1))
-                values = registry.resolve(ref, operator_version).execute(
+                result = registry.resolve(ref, operator_version).execute(
                     inputs=input_values, params=params,
                     context=OperatorExecutionContext(flow_run_id=flow_run_id, node_id=node_id, runtime={
                         "root_documents": root_documents, "sources": sources, "versions": versions,
@@ -1988,16 +1989,17 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                         "cancelled": lambda: store.is_flow_run_cancelled(flow_run_id),
                         "llm_serving_registry": store.llm_serving_registry,
                     }),
-                ).outputs
+                )
+                values = result.outputs
                 outputs[node_id] = values; item = catalog.get(ref) or {}
                 recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
-                                                               operator_version=int(node.get("operator_version") or item.get("version", 1)), resolved_parameters=params,
+                                                               operator_version=int(node.get("operator_version") or item.get("version", 1)), resolved_parameters=params, logs=getattr(result, "logs", []),
                                                                metrics={"input_records": len(input_values), "output_records": len(values)})
             except Exception as exc:
                 failed.add(node_id); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=str(exc), operator_code=ref,
-                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params)
+                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params, logs=getattr(exc, "operator_logs", []))
         if previews:
             store.finish_flow_run(flow_run_id, status="awaiting_commit"); return {"id": flow_run_id, "status": "awaiting_commit", "previews": previews}
         status = "failed" if context["start_node_id"] in failed else "completed"

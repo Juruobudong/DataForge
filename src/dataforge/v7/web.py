@@ -140,16 +140,19 @@ class KnowledgeJobBatchActionRequest(BaseModel):
 class FlowTemplateRequest(BaseModel):
     code: str = ""
     name: str
-    output_types: list[str] = Field(min_length=1)
+    output_types: list[str] | None = None
     authoring_mode: Literal["standard", "advanced"] = "advanced"
     managed_template_code: str | None = None
-    definition: dict = Field(default_factory=lambda: {"steps": ["validate", "parse", "normalize", "structure_recovery", "semantic_chunks", "generate"], "parameters": {"chunk_size": 800}})
+    definition: dict = Field(default_factory=dict)
+    expected_definition_checksum: str | None = None
+    derived_from_template_id: str | None = None
+    derived_from_revision_id: str | None = None
 
 
 class FlowCompilerPreviewRequest(BaseModel):
     authoring_mode: Literal["standard", "advanced"] = "advanced"
     managed_template_code: str | None = None
-    output_types: list[str] = Field(min_length=1)
+    output_types: list[str] | None = None
     definition: dict = Field(default_factory=dict)
 
 
@@ -1451,18 +1454,19 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-flow-templates/{template_id}/detach-to-advanced")
-    def detach_flow_template_to_advanced(template_id: str):
-        try: return store.detach_flow_template_to_advanced(template_id)
+    def detach_flow_template_to_advanced(template_id: str, preview: bool = False):
+        try: return store.detach_flow_template_to_advanced(template_id, preview=preview)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-flow-templates", status_code=201)
     def create_flow_template(payload: FlowTemplateRequest):
-        try: return store.create_flow_template(payload.code, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code)
+        try: return store.create_flow_template(payload.code, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code,
+                                             derived_from_template_id=payload.derived_from_template_id, derived_from_revision_id=payload.derived_from_revision_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.put("/api/developer/knowledge-flow-templates/{template_id}")
     def update_flow_template(template_id: str, payload: FlowTemplateRequest):
-        try: return store.update_flow_template(template_id, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code)
+        try: return store.update_flow_template(template_id, payload.name, payload.output_types, payload.definition, authoring_mode=payload.authoring_mode, managed_template_code=payload.managed_template_code, expected_definition_checksum=payload.expected_definition_checksum)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.delete("/api/developer/knowledge-flow-templates/{template_id}")
@@ -1576,6 +1580,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/flow-runs/{flow_run_id}")
     def flow_run(flow_run_id: str):
         try: return store.flow_run_detail(flow_run_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/developer/flow-runs/{flow_run_id}/sink-previews/{preview_id}/candidates")
+    def sink_preview_candidates(flow_run_id: str, preview_id: str, offset: int = 0, limit: int = 50):
+        try: return store.sink_preview_candidates(flow_run_id, preview_id, offset, limit)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/developer/flow-runs/{flow_run_id}/derived-runs", status_code=202)

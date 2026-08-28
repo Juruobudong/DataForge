@@ -7,6 +7,7 @@ import { debugRunPreflightIssue, NO_DEBUG_REVIEW_INPUTS } from './debugRunForm.j
 import { computed, ref } from 'vue'
 import { deserializeRuntimeDag } from '../../components/flow/flowModel.js'
 import { consoleNodeLabels, consoleNodePresentation } from './debugConsole.js'
+import { dataflowOperators } from '../../components/flow/__tests__/flowFixtures.js'
 
 const view = readFileSync(new URL('./DataFlowDebugView.vue', import.meta.url), 'utf8')
 const api = readFileSync(new URL('../../api/platform.js', import.meta.url), 'utf8')
@@ -32,6 +33,14 @@ test('console node names reuse Catalog metadata while preserving distinct runtim
   for (const id of [null, undefined, '']) {
     assert.deepEqual(consoleNodePresentation(id, labels), { label: '流程运行', technicalId: '' })
   }
+})
+
+test('DataFlow console labels show both languages from the frozen operator spec', () => {
+  const operator = dataflowOperators[0]
+  const graph = deserializeRuntimeDag({ nodes: [{ id: 'qa-run-node', kind: 'operator', ref: operator.code, operator_version: operator.version, operator_spec: operator }] }, [])
+  assert.deepEqual(consoleNodePresentation('qa-run-node', consoleNodeLabels(graph.nodes)), {
+    label: '文本转问答生成器 / DataFlow · Text2QAGenerator', technicalId: 'qa-run-node',
+  })
 })
 
 test('console names follow the current Run and polled events without changing raw logs', () => {

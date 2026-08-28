@@ -66,3 +66,5 @@ function updateParameters(value) { params.value = value; emit('apply-parameters'
 .advanced{margin-top:12px}.advanced summary{cursor:pointer;color:#2f6fed;font-size:8px;font-weight:800}.advanced label{margin-top:8px}
 .system-config{padding:12px;border:1px solid #dfe6ef;border-radius:9px;background:#f8fafc}.system-config h4{margin:0 0 8px}.system-config dl{margin:0}.system-config dl div{display:grid;grid-template-columns:1fr 1.2fr;gap:8px;padding:7px 0;border-top:1px solid #e7ebf1}.system-config dt{color:#748198;font-size:8px}.system-config dd{margin:0;overflow-wrap:anywhere;color:#2d3d54;font-size:8px;font-weight:700}
 </style>
+
+<style scoped>.node-summary b,.node-summary small{white-space:normal;overflow-wrap:anywhere}.node-summary>div{min-width:0}</style>

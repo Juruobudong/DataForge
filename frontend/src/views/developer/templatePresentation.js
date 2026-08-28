@@ -23,6 +23,12 @@ export function templateOutputSummary(template, knowledgeTypes = []) {
   return `输出：${outputKeys.map(value => templateOutputLabel(value, knowledgeTypes)).join('、')}`
 }
 
+export function templateRevisionSummary(template) {
+  const draft = template?.revision_status === 'draft' && template.revision != null ? `r${template.revision}` : '无'
+  const published = template?.published_revision != null ? `r${template.published_revision}` : '未发布'
+  return `最新草稿：${draft} · 已发布版本：${published}`
+}
+
 export function groupFlowTemplates(templates = []) {
   const order = new Map(BUILTIN_TEMPLATE_ORDER.map((code, index) => [code, index]))
   return {

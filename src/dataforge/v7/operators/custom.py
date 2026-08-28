@@ -3,6 +3,7 @@ from copy import deepcopy
 from .base import OperatorResult
 from .dataflow import serving_call
 from .runtime import OperatorRuntime
+from .diagnostics import capture_operator_diagnostics
 
 PROTECTED = ("source_id", "source_version_id", "source_version_ids", "source_chunk_id", "source_chunk_revision_id",
              "source_review_snapshot_id", "source_anchor", "anchor", "anchor_json", "evidence_text", "source_knowledge_id")
@@ -41,6 +42,7 @@ class CustomOperatorExecutor:
             raise ValueError("未批准的自定义字段适配版本")
         self.runtime = runtime or OperatorRuntime()
 
+    @capture_operator_diagnostics
     def execute(self, *, inputs, params, context):
         if not self.spec.get("approved") and not context.runtime.get("validation"):
             raise ValueError("自定义算子尚未获批")
@@ -64,6 +66,7 @@ class CustomOperatorExecutor:
                    if "source-review-read" in self.spec.get("capabilities", []) else []}}
         rows = self.runtime.call(self.spec, records=records, init=init, run_arguments=self.spec.get("run_arguments"),
             context=ctx, params=params, cancelled=context.runtime.get("cancelled"),
+            diagnostics=context.runtime["_operator_diagnostics"],
             serving=serving_call(params, context.runtime) if self.spec.get("uses_llm") else None)["outputs"]
         result = []
         for row in rows:

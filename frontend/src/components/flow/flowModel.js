@@ -67,10 +67,26 @@ export function nodeRole(definition = {}) {
   return 'operator'
 }
 
+export function operatorPrimaryName(item = {}) {
+  return item.display_name_zh || item.name || item.code || ''
+}
+
+export function operatorSubtitle(item = {}, showTechnicalCode = false) {
+  const englishName = item.englishName || (item.display_name_zh ? item.name : '') || ''
+  const provider = item.runtime_requirements?.provider || item.provider
+  const base = englishName && (englishName !== operatorPrimaryName(item) || provider === 'dataflow') ? englishName : item.code || ''
+  const parts = provider === 'dataflow' ? ['DataFlow', base] : [base]
+  if (showTechnicalCode && item.code && item.code !== base) parts.push(item.code)
+  return parts.filter(Boolean).join(' · ')
+}
+
 export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
-  const englishName = meta.englishName || ''
-  const base = englishName && englishName !== meta.name ? englishName : meta.code || ''
-  return showTechnicalCode && meta.code && meta.code !== base ? `${base} · ${meta.code}` : base
+  return operatorSubtitle(meta, showTechnicalCode)
+}
+
+export function operatorLabel(item = {}) {
+  const title = operatorPrimaryName(item)
+  return (item.runtime_requirements?.provider || item.provider) === 'dataflow' ? `${title} / ${operatorSubtitle(item)}` : title
 }
 
 export function subflowRevisions(items = []) {
@@ -139,7 +155,7 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
   const role = nodeRole({ ...definition, node_role: definition.node_role || item?.node_role })
   return {
     kind: 'operator', nodeRole: role, name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
-    code: definition.ref, category: item?.category || '未知算子', status,
+    code: definition.ref, category: item?.category || (definition.operator_spec ? '已冻结算子' : '未知算子'), status,
     provider: item?.runtime_requirements?.provider || item?.provider || 'dataforge', dependencyStatus: catalogVersion?.dependency_status || { status: 'unknown', reason: '该版本不在当前可用目录中' },
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),
@@ -284,10 +300,10 @@ export function cloneGraph(nodes, edges) {
 
 // Capability-first 算子呈现：常用能力快捷入口 + 按业务能力分组的算子实现。
 export const COMMON_OPERATOR_CAPABILITIES = [
-  { code: 'qa-generator', label: '问答生成' },
+  { code: 'Text2QAGenerator', label: '问答生成' },
   { code: 'prompt-generator', label: '文本生成' },
   { code: 'graph-extractor', label: '实体关系抽取' },
-  { code: 'quality-evaluator', label: '质量检查' },
+  { code: 'graph-quality-validator', label: '图谱校验' },
 ]
 
 export function groupOperatorCapabilities(catalog = [], common = COMMON_OPERATOR_CAPABILITIES, query = '') {

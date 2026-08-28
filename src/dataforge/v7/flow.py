@@ -8,13 +8,21 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from .catalog import catalog_by_code, normalize_chunker_params
+from .catalog import (catalog_by_code, normalize_chunker_params,
+                      RETIRED_KNOWLEDGE_OPERATORS, DEFAULT_QA_EXTRACTION_INSTRUCTIONS, RENAMED_DATAFLOW_OPERATORS)
 from .operator_catalog import resolve_operator
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
 class FlowValidationError(ValueError):
     pass
+
+
+def _reject_renamed_operators(definition):
+    for node in definition.get("nodes", []):
+        if node.get("kind") == "operator" and node.get("ref") in RENAMED_DATAFLOW_OPERATORS:
+            replacements = " / ".join(RENAMED_DATAFLOW_OPERATORS[node["ref"]])
+            raise FlowValidationError(f"算子 {node['ref']} 已改名，新编排请使用 {replacements}；历史快照保持原版本")
 
 
 class FlowEdgeValidationError(FlowValidationError):
@@ -390,6 +398,7 @@ class FlowCompiler:
             if identity in stack:
                 raise FlowValidationError("禁止递归子图")
             child = resolve_subflow(node, self.subflows)
+            _reject_renamed_operators(child)
             validate_flow_edges(child, catalog=self.catalog, subflows=self.subflows)
             child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (identity,))
             if code == "knowledge-chunk" and node.get("params"):
@@ -418,6 +427,7 @@ class FlowCompiler:
         return result_nodes, result_edges
 
     def compile(self, definition: dict[str, Any]) -> dict[str, Any]:
+        _reject_renamed_operators(definition)
         if _contains_knowledge_library_binding(definition):
             raise FlowValidationError("Flow Definition 不允许绑定 KnowledgeLibrary")
         validate_flow_edges(definition, catalog=self.catalog, subflows=self.subflows)
@@ -426,6 +436,9 @@ class FlowCompiler:
         if purpose not in {"knowledge", "source_preparation"}:
             raise FlowValidationError("Flow purpose 必须是 knowledge 或 source_preparation")
         nodes, edges = self._expand(definition)
+        # Recheck actual boundary ports, not just a subflow's declared interface.
+        validate_flow_edges({**definition, "nodes": nodes, "edges": edges},
+                            catalog=self.catalog, subflows=self.subflows)
         by_id = {node["id"]: node for node in nodes}
         incoming: dict[str, list[str]] = defaultdict(list)
         outgoing: dict[str, list[str]] = defaultdict(list)
@@ -480,9 +493,12 @@ class FlowCompiler:
                 if knowledge_type not in self.type_revisions:
                     raise FlowValidationError(f"Knowledge Sink 引用的知识类型未发布：{knowledge_type}")
                 output_key = str(node.get("output_key") or (f"graph:{node.get('graph_mode')}" if knowledge_type == "graph" and node.get("graph_mode") else knowledge_type))
+                expected_key = (f"graph:{node.get('graph_mode')}" if knowledge_type == "graph" else knowledge_type)
+                if output_key != expected_key or knowledge_type == "graph" and node.get("graph_mode") not in {"triple", "semantic"}:
+                    raise FlowValidationError(f"Knowledge Sink {node_id} 输出键与知识类型或图谱模式不一致")
                 required = f"candidate:{output_key}"
                 source_types = [outputs[source] for source in incoming[node_id]]
-                if len(source_types) != 1 or not (_type_matches(source_types[0], required) or knowledge_type == "graph" and _type_matches(source_types[0], "candidate:graph")):
+                if source_types != [required]:
                     raise FlowValidationError(f"Knowledge Sink {node_id} 需要 {required}")
                 if outgoing[node_id]:
                     raise FlowValidationError(f"Knowledge Sink {node_id} 必须是终点")
@@ -494,6 +510,8 @@ class FlowCompiler:
             if kind != "operator":
                 raise FlowValidationError(f"不支持的节点类型：{kind}")
             code = str(node.get("ref", "")); item = resolve_operator(self.catalog, node)
+            if code in RETIRED_KNOWLEDGE_OPERATORS:
+                raise FlowValidationError(f"算子已退出新编排：{code}；最终治理由 Knowledge Sink 执行")
             if not item or item.get("exposure") in {"disabled", "internal"} or not item.get("enabled", True):
                 raise FlowValidationError(f"算子不在 Flow allowlist：{code}")
             if purpose == "knowledge" and item.get("surfaces") and "advanced-canvas" not in item["surfaces"] and "standard-template" not in item["surfaces"]:
@@ -520,6 +538,16 @@ class FlowCompiler:
                 params = {}
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
+            if code == "schema-validator":
+                if not source_types or any(value not in {"candidate:graph:triple", "candidate:graph:semantic"} for value in source_types):
+                    raise FlowValidationError("schema-validator 仅支持 Graph Candidate")
+                params.setdefault("knowledge_type", "graph")
+                params.setdefault("graph_mode", source_types[0].split(":")[2])
+            if code == "Text2QAGenerator" and item.get("version") == 6:
+                instructions = params.get("extraction_instructions", "")
+                if not isinstance(instructions, str):
+                    raise FlowValidationError("QA 提取要求必须是字符串")
+                params["extraction_instructions"] = instructions.strip() or DEFAULT_QA_EXTRACTION_INSTRUCTIONS
             if code == "document-parser" and params:
                 raise FlowValidationError(
                     f"节点 {node_id} 的 Document Parser 当前不接受参数；"
@@ -565,6 +593,15 @@ class FlowCompiler:
                     output = source_types[0]
                 else:
                     raise FlowValidationError(f"节点 {node_id} 无法从输入推导候选知识类型")
+            if output == "candidate:graph":
+                contract = resolve_port_contract(
+                    {"contexts": _reachable_sink_contexts(node_id, by_id, outgoing)}, node, output_spec,
+                )
+                if contract.graph_mode not in {"triple", "semantic"}:
+                    raise FlowValidationError(f"节点 {node_id} 无法解析 Graph Candidate 模式")
+                params.setdefault("knowledge_type", "graph")
+                params.setdefault("graph_mode", contract.graph_mode)
+                output = contract.resolved_type
             outputs[node_id] = output
             dependencies.append({"kind": "operator", "code": code, "version": item.get("version", 1), "adapter": item["adapter_code"], "runtime_requirements": deepcopy(item.get("runtime_requirements") or {})})
         root_refs = {str(by_id[node_id].get("ref") or "") for node_id in ordered if not incoming[node_id]}

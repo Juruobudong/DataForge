@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [vue()],
   test: {
     environment: 'jsdom',
-    include: ['src/components/flow/standard/*.test.js', 'src/components/graph/*.test.js', 'src/views/developer/__tests__/*.test.js'],
+    include: ['src/components/flow/standard/*.test.js', 'src/components/flow/inspector/*.test.js', 'src/components/graph/*.test.js', 'src/views/developer/__tests__/*.test.js'],
     clearMocks: true,
     restoreMocks: true,
   },

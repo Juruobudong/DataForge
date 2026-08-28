@@ -6,7 +6,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
-from .catalog import CATALOG_SEEDS
+from .catalog import PLATFORM_RESERVED_OPERATOR_CODES
 from .models import OperatorDefinition, OperatorVersion, OperatorValidationRun, utc_now
 from .operator_catalog import version_payload
 from .operators.base import OperatorExecutionContext
@@ -24,7 +24,7 @@ def validate_manifest(raw):
                 "input_ports", "output_ports", "parameter_schema", "input_example", "output_example"}
     if not isinstance(value, dict) or required - value.keys():
         raise ValueError("Manifest 缺少必需字段")
-    if not re.fullmatch(r"[a-z][a-z0-9-]{2,100}", value["code"]) or value["code"] in {item["code"] for item in CATALOG_SEEDS} | {"knowledge-sink"}:
+    if not re.fullmatch(r"[a-z][a-z0-9-]{2,100}", value["code"]) or value["code"].casefold() in PLATFORM_RESERVED_OPERATOR_CODES:
         raise ValueError("自定义 code 不合法或覆盖平台保留算子")
     if value["provider"] != "custom" or value["executor"] not in {"dataflow-storage", "dataflow-llm", "custom-native"}:
         raise ValueError("不支持的自定义执行器")

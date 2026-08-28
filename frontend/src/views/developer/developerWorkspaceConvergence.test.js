@@ -20,12 +20,12 @@ test('developer navigation exposes the fixed main flow and an always-visible res
 
 test('standard authoring is business configuration while advanced and runtime DAG stay separate', () => {
   assert.match(standard, /知识生成/)
-  assert.match(standard, /质量治理/)
+  assert.match(standard, /图谱校验/)
   assert.match(standard, /不绑定具体 KnowledgeLibrary/)
   assert.doesNotMatch(standard, /CompiledDagPreview|DataForgeFlowCanvas/)
   assert.match(debug, /mode="runtime"/)
   assert.match(templates, /<FieldHelp label="高级编排转换说明"/)
-  assert.match(templates, /基于当前标准配置展开完整执行 DAG，并创建一个新的自定义高级流程。原标准流程不会被修改。/)
+  assert.match(templates, /首次保存或运行前保存时才创建独立的自定义高级流程，直接退出不会创建草稿。原标准流程不会被修改。/)
   assert.doesNotMatch(templates, /window\.confirm\('将基于当前标准配置展开完整执行 DAG/)
 })
 

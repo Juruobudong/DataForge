@@ -45,3 +45,5 @@ onMounted(async () => { if (usesServing.value) { try { servings.value = await ap
 .flow-node.edge-source-node{border-color:#2f6fed;box-shadow:0 0 0 3px rgba(47,111,237,.18)}.flow-node.edge-compatible-node{border-color:#1d8c65;box-shadow:0 0 0 3px rgba(29,140,101,.15)}.flow-node.edge-incompatible-node{opacity:.45}
 .serving-line{display:flex;align-items:center;justify-content:space-between;padding:8px 13px;border-top:1px solid #edf0f4;background:#f6f9ff;color:#2f6fed}.serving-line b{font-size:9px}.serving-line small{font-size:8px}
 </style>
+
+<style scoped>header b,header small{white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}header>div{min-width:0}</style>

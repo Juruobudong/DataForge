@@ -1,12 +1,13 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, createClientRequestId } from '../../api/platform'
 import DataForgeFlowCanvas from '../../components/flow/DataForgeFlowCanvas.vue'
 import RuntimeInspector from '../../components/flow/inspector/RuntimeInspector.vue'
+import FinalResultsPanel from './FinalResultsPanel.vue'
 import { deserializeRuntimeDag } from '../../components/flow/flowModel'
 import { debugRunPreflightIssue, NO_DEBUG_REVIEW_INPUTS } from './debugRunForm'
-import { consoleNodeLabels, consoleNodePresentation } from './debugConsole'
+import { consoleNodeLabels, consoleNodePresentation, consoleEventMessage } from './debugConsole'
 
 const router = useRouter()
 const route = useRoute()
@@ -17,20 +18,37 @@ const selectedNode = ref(null), selectedArtifact = ref(null), artifactContent = 
 const runtimeNodes = ref([]), runtimeEdges = ref([]), events = ref([]), cursor = ref(0), parameters = ref('{}')
 const nodeLabels = computed(() => consoleNodeLabels(runtimeNodes.value))
 const consoleEvents = computed(() => events.value.map(event => ({
-  ...event, nodePresentation: consoleNodePresentation(event.node_id, nodeLabels.value),
+  ...event, message: consoleEventMessage(event), nodePresentation: consoleNodePresentation(event.node_id, nodeLabels.value),
 })))
 const error = ref(''), dagError = ref(''), loading = ref(false), actionBusy = ref(false), viewMode = ref('dag')
 const drawerOpen = ref(false), revisionKind = ref('draft'), debugOptions = ref(null), selectedReviewIds = ref([]), sinkBindings = ref({}), preflight = ref(null)
 const inputSource = ref('builtin_sample'), sampleCode = ref('reviewed-medical-v1')
 const saveOpen = ref(false), saveName = ref(''), saveDescription = ref(''), actionResult = ref(null)
 const runtimeCanvas = ref(null)
+const runtimeInspector = ref(null)
 let timer
+let pollingRunId = null
+let inspectVersion = 0, firstPreviewShown = false, viewChosen = false
 
 const selectedTemplate = computed(() => templates.value.find(item => item.id === selectedTemplateId.value) || null)
 const debugRuns = computed(() => runs.value.filter(item => item.debug_input_snapshot_id && (!selectedTemplateId.value || item.template_id === selectedTemplateId.value)))
 const businessRuns = computed(() => runs.value.filter(item => !item.debug_input_snapshot_id))
 const isDebugRun = computed(() => Boolean(runDetail.value?.debug_input_snapshot_id))
 const activePreviews = computed(() => runDetail.value?.sink_previews || [])
+watch(activePreviews, previews => {
+  if (isDebugRun.value && previews.length && !firstPreviewShown) {
+    firstPreviewShown = true
+    if (!viewChosen) viewMode.value = 'results'
+  }
+})
+function setView(mode) { viewChosen = true; viewMode.value = mode }
+async function inspectResultNode(id) {
+  const node = runtimeNodes.value.find(item => item.id === id)
+  if (!node) return
+  inspectNode(node)
+  await nextTick()
+  if (selectedNode.value?.node_id === id) runtimeInspector.value?.showDiagnostics()
+}
 const canReplay = computed(() => isDebugRun.value && capabilities.value.debug_replay_enabled && selectedNode.value)
 const groupedReviews = computed(() => {
   const groups = new Map()
@@ -69,6 +87,7 @@ const stageStatusLabel = { completed: '✓', failed: '×', running: '…', skipp
 function autoLayoutRuntimeDag() { runtimeCanvas.value?.autoLayout() }
 
 function messageOf(value) { return value instanceof Error ? value.message : String(value || '请求失败') }
+function runTime(value) { return value ? new Date(value).toLocaleString('zh-CN', { hour12: false, timeZoneName: 'short' }) : '尚未开始' }
 async function load() {
   loading.value = true; error.value = ''
   try {
@@ -84,11 +103,14 @@ async function load() {
   } catch (e) { error.value = messageOf(e) } finally { loading.value = false }
 }
 
-function selectTemplate(item) { selectedTemplateId.value = item.id }
+async function selectTemplate(item) {
+  selectedTemplateId.value = item.id
+  await inspectRun(debugRuns.value[0]?.id || '')
+}
 async function openDebugDrawer() {
   if (!selectedTemplate.value) return
   revisionKind.value = selectedTemplate.value.revision_status === 'draft' ? 'draft' : 'published'
-  if (route.query.revision_kind === 'draft' || route.query.revision_kind === 'published') revisionKind.value = route.query.revision_kind
+  if (route.query.template_id === selectedTemplateId.value && ['draft', 'published'].includes(route.query.revision_kind)) revisionKind.value = route.query.revision_kind
   drawerOpen.value = true; selectedReviewIds.value = []; sinkBindings.value = {}; preflight.value = null; error.value = ''
   await loadDebugOptions()
 }
@@ -97,6 +119,10 @@ async function loadDebugOptions() {
   actionBusy.value = true; preflight.value = null; error.value = ''
   try {
     debugOptions.value = await api.debugRunOptions(selectedTemplateId.value, revisionKind.value)
+    if (route.query.template_id === selectedTemplateId.value && revisionKind.value === 'draft' &&
+        route.query.draft_checksum && route.query.draft_checksum !== debugOptions.value.source_definition_checksum) {
+      throw new Error('草稿在离开画布后已变化，请返回流程确认当前 DAG 后重新运行。')
+    }
     inputSource.value = debugOptions.value.default_input?.input_source || 'builtin_sample'
     sampleCode.value = debugOptions.value.default_input?.sample_code || debugOptions.value.builtin_samples?.[0]?.code || 'reviewed-medical-v1'
     selectedReviewIds.value = []
@@ -144,17 +170,30 @@ async function createDebugRun() {
 }
 
 async function inspectRun(id) {
+  const version = ++inspectVersion
+  firstPreviewShown = false; viewChosen = false; viewMode.value = 'dag'
   selectedRunId.value = id; selectedNode.value = null; selectedArtifact.value = null; artifactContent.value = null
   runDetail.value = null; materialization.value = null; runtimeNodes.value = []; runtimeEdges.value = []
   events.value = []; cursor.value = 0; dagError.value = ''; actionResult.value = null
+  if (!id) return
   try {
     const detail = await api.flowRun(id)
+    if (version !== inspectVersion) return
     runDetail.value = detail
     const graph = deserializeRuntimeDag(detail.runtime_dag, catalog.value)
     runtimeNodes.value = graph.nodes; runtimeEdges.value = graph.edges
-    if (detail.debug_input_snapshot_id && detail.status === 'completed') materialization.value = await api.debugRunMaterialization(id)
+    if (detail.debug_input_snapshot_id && detail.status === 'completed') {
+      try {
+        const value = await api.debugRunMaterialization(id)
+        if (version !== inspectVersion) return
+        materialization.value = value
+      } catch (e) {
+        if (version === inspectVersion) error.value = `流程演化信息暂不可用，不影响查看最终结果：${messageOf(e)}`
+      }
+    }
     await nextTick()
-  } catch (e) { dagError.value = messageOf(e) }
+  } catch (e) { if (version === inspectVersion) dagError.value = messageOf(e) }
+  if (version !== inspectVersion) return
   await pollEvents()
 }
 function inspectNode(node) {
@@ -175,11 +214,26 @@ async function inspectArtifact(id) {
   } catch (e) { error.value = messageOf(e) }
 }
 async function pollEvents() {
-  if (!selectedRunId.value) return
+  const runId = selectedRunId.value
+  const version = inspectVersion
+  if (!runId || pollingRunId === runId) return
+  pollingRunId = runId
   try {
-    const page = await api.flowRunEvents(selectedRunId.value, cursor.value)
+    const page = await api.flowRunEvents(runId, cursor.value)
+    if (selectedRunId.value !== runId || version !== inspectVersion) return
     events.value.push(...page.items); cursor.value = page.next_cursor
-  } catch (e) { error.value = messageOf(e) }
+    if (page.items.some(event => event.type.startsWith('node.') || event.type.startsWith('run.') || event.type === 'sink.preview_ready')) {
+      const detail = await api.flowRun(runId)
+      if (selectedRunId.value !== runId || version !== inspectVersion) return
+      runDetail.value = detail
+      const graph = deserializeRuntimeDag(detail.runtime_dag, catalog.value)
+      const positions = new Map(runtimeNodes.value.map(node => [node.id, node.position]))
+      for (const node of graph.nodes) if (positions.has(node.id)) node.position = positions.get(node.id)
+      runtimeNodes.value = graph.nodes; runtimeEdges.value = graph.edges
+      if (selectedNode.value) selectedNode.value = [...detail.nodes].reverse().find(node => node.node_id === selectedNode.value.node_id) || selectedNode.value
+    }
+  } catch (e) { if (selectedRunId.value === runId && version === inspectVersion) error.value = messageOf(e) }
+  finally { if (pollingRunId === runId) pollingRunId = null }
 }
 async function derive(mode) {
   if (!selectedNode.value || !isDebugRun.value) return
@@ -238,14 +292,33 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <details class="business-history"><summary>业务 Run（只读） · {{ businessRuns.length }}</summary><button v-for="run in businessRuns" :key="run.id" class="run-card" :class="{active:selectedRunId===run.id}" @click="inspectRun(run.id)"><b>{{ run.run_mode || 'full' }}</b><span>{{ run.status }}</span><small>{{ run.id }}</small></button></details>
       </aside>
       <main class="dag-pane">
-        <div class="dag-toolbar"><div><div class="dag-view-controls"><div class="view-switch"><button :class="{active:viewMode==='stages'}" @click="viewMode='stages'">阶段视图</button><button :class="{active:viewMode==='dag'}" @click="viewMode='dag'">执行 DAG</button></div><button v-if="runDetail && viewMode==='dag' && !dagError" :disabled="!runtimeNodes.length" @click="autoLayoutRuntimeDag">自动布局</button></div><small v-if="runDetail">{{ runDetail.execution_snapshot_id }} · {{ runDetail.status }}</small></div><div class="actions"><button v-if="canReplay" :disabled="actionBusy" @click="derive('node_only')">运行此节点</button><button v-if="canReplay" class="primary" :disabled="actionBusy" @click="derive('from_node')">从此节点运行</button><button v-if="canReplay && selectedNode?.status==='failed'" :disabled="actionBusy" @click="derive('from_node')">重新运行失败节点</button><button v-if="isDebugRun && runDetail && ['queued','running'].includes(runDetail.status)" @click="cancelRun">停止</button></div></div>
+        <div class="dag-toolbar"><div><div class="dag-view-controls"><div class="view-switch"><button :class="{active:viewMode==='stages'}" @click="setView('stages')">阶段视图</button><button :class="{active:viewMode==='dag'}" @click="setView('dag')">执行 DAG</button><button v-if="isDebugRun" :class="{active:viewMode==='results'}" @click="setView('results')">最终结果</button></div><button v-if="runDetail && viewMode==='dag' && !dagError" :disabled="!runtimeNodes.length" @click="autoLayoutRuntimeDag">自动布局</button></div><small v-if="runDetail">运行状态：{{ runDetail.status }}</small></div><div class="actions"><button v-if="canReplay" :disabled="actionBusy" @click="derive('node_only')">运行此节点</button><button v-if="canReplay" class="primary" :disabled="actionBusy" @click="derive('from_node')">从此节点运行</button><button v-if="canReplay && selectedNode?.status==='failed'" :disabled="actionBusy" @click="derive('from_node')">重新运行失败节点</button><button v-if="isDebugRun && runDetail && ['queued','running'].includes(runDetail.status)" @click="cancelRun">停止</button></div></div>
+        <section v-if="runDetail" class="run-provenance" aria-label="本次运行快照">
+          <b>Run {{ runDetail.id }}</b>
+          <span>来源：{{ runDetail.revision_kind === 'draft' ? '当前草稿（启动时冻结）' : runDetail.revision_kind === 'published' ? '已发布 Revision' : '执行快照' }}<template v-if="runDetail.source_revision"> · r{{ runDetail.source_revision }}</template></span>
+          <span>{{ runDetail.node_count ?? runtimeNodes.length }} 节点 · {{ runDetail.edge_count ?? runtimeEdges.length }} 连线</span>
+          <span>启动时间：{{ runTime(runDetail.started_at) }} · 入队：{{ runDetail.created_at ? runTime(runDetail.created_at) : '—' }}</span>
+          <button @click="setView('dag')">查看本次运行 DAG</button><small>本次运行使用不可变执行快照；继续编辑草稿不会改变本次运行。</small>
+          <details :key="runDetail.id" class="run-technical-details">
+            <summary>技术详情</summary>
+            <div class="run-technical-values">
+              <code v-if="runDetail.source_definition_checksum">Draft checksum：{{ runDetail.source_definition_checksum }}</code>
+              <code>Flow checksum：{{ runDetail.compiled_checksum || runDetail.execution_checksum || '—' }}</code>
+              <code>执行快照 ID：{{ runDetail.execution_snapshot_id || '—' }}</code>
+              <code v-if="runDetail.parent_flow_run_id">父 Run ID：{{ runDetail.parent_flow_run_id }}；参数覆盖见节点记录。</code>
+            </div>
+          </details>
+        </section>
         <div v-if="dagError" class="dag-error"><b>Runtime DAG 加载失败</b><p>{{ dagError }}</p><button @click="inspectRun(selectedRunId)">重新加载</button></div>
-        <div v-else-if="viewMode==='stages' && runDetail" class="stage-view"><button v-for="group in stageGroups" :key="group.code" class="stage-row" :class="stageStatus(group)" @click="viewMode='dag'"><span class="stage-status">{{ stageStatusLabel[stageStatus(group)] }}</span><span class="stage-name">{{ group.label }}</span><span class="stage-count">{{ group.nodes.length }} 节点</span></button><p v-if="!stageGroups.length" class="empty">该 Run 没有阶段元数据。</p></div>
-        <DataForgeFlowCanvas v-else-if="runDetail" ref="runtimeCanvas" v-model:nodes="runtimeNodes" v-model:edges="runtimeEdges" mode="runtime" height="590" canvas-id="dataforge-runtime-flow" @select-node="inspectNode" @select-edge="inspectEdge" />
-        <div v-else class="ready-state"><b>准备运行</b><p>流程：{{ selectedTemplate?.name || '请选择知识流程' }}</p><p>输入：DataForge 内置示例审核数据</p><p>运行后将在这里显示不可变 Runtime DAG、Artifact 与 Sink Diff。</p><button class="primary" :disabled="!selectedTemplate" @click="openDebugDrawer">开始配置</button></div>
+        <template v-else-if="runDetail">
+          <div v-show="viewMode==='stages'" class="stage-view"><button v-for="group in stageGroups" :key="group.code" class="stage-row" :class="stageStatus(group)" @click="setView('dag')"><span class="stage-status">{{ stageStatusLabel[stageStatus(group)] }}</span><span class="stage-name">{{ group.label }}</span><span class="stage-count">{{ group.nodes.length }} 节点</span></button><p v-if="!stageGroups.length" class="empty">该 Run 没有阶段元数据。</p></div>
+          <DataForgeFlowCanvas v-show="viewMode==='dag'" ref="runtimeCanvas" v-model:nodes="runtimeNodes" v-model:edges="runtimeEdges" mode="runtime" height="590" canvas-id="dataforge-runtime-flow" @select-node="inspectNode" @select-edge="inspectEdge" />
+          <FinalResultsPanel v-if="isDebugRun" v-show="viewMode==='results'" :key="runDetail.id" :run="runDetail" @inspect-node="inspectResultNode" />
+        </template>
+        <div v-else class="ready-state"><b>准备运行</b><p>流程：{{ selectedTemplate?.name || '请选择知识流程' }}</p><p>输入：DataForge 内置示例审核数据</p><p>运行后将在这里显示不可变 Runtime DAG、最终结果、Artifact 与 Sink Diff。</p><button class="primary" :disabled="!selectedTemplate" @click="openDebugDrawer">开始配置</button></div>
       </main>
       <aside class="right-pane">
-        <RuntimeInspector :node="selectedNode" :artifact="selectedArtifact" :content="artifactContent" @inspect-artifact="inspectArtifact" />
+        <RuntimeInspector ref="runtimeInspector" :node="selectedNode" :operator="runtimeNodes.find(node => node.id === selectedNode?.node_id)?.data.meta" :artifact="selectedArtifact" :content="artifactContent" @inspect-artifact="inspectArtifact" />
         <div v-if="selectedNode && isDebugRun" class="override"><label>本次运行参数覆盖</label><textarea v-model="parameters" rows="7"></textarea><small>只接受 Operator Version Schema 已支持参数；不修改源流程。</small></div>
         <div v-for="preview in activePreviews" :key="preview.id" class="preview"><h4>{{ preview.output_key }} · Sink Diff Preview</h4><div class="diff-grid"><span>新增<b>{{ preview.diff.ADD || 0 }}</b></span><span>更新<b>{{ preview.diff.UPDATE || 0 }}</b></span><span>删除<b>{{ preview.diff.INACTIVE || 0 }}</b></span><span>不变<b>{{ preview.diff.UNCHANGED || 0 }}</b></span></div><small>本次调试不会写入正式知识。</small></div>
         <div v-if="materialization" class="evolution"><h4>流程演化</h4><button v-if="materialization.can_apply_to_current_draft" :disabled="actionBusy" @click="applyToDraft">应用到当前草稿</button><button v-if="materialization.can_save_as_flow" class="primary" :disabled="actionBusy" @click="openSaveDialog">保存为自定义流程</button><button @click="openFlow(`/developer/flow-templates?template_id=${materialization.source.template_id}&edit=1`)">打开源流程</button><small v-if="!materialization.can_apply_to_current_draft">{{ materialization.apply_blockers?.[0]?.reason || materialization.apply_blockers?.[0] }}</small></div>
@@ -274,6 +347,13 @@ onBeforeUnmount(() => window.clearInterval(timer))
 </template>
 
 <style scoped>
+.run-provenance { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 12px 12px; padding: 12px; border: 1px solid #dbe3ef; border-radius: 8px; background: #f7f9fc; font-size: var(--font-technical); }
+.run-provenance code, .run-provenance small { width: 100%; overflow-wrap: anywhere; color: #627189; }
+.run-technical-details { width: 100%; min-width: 0; }
+.run-technical-details summary { cursor: pointer; color: #536177; font-weight: 600; }
+.run-technical-details summary:focus-visible { outline: 2px solid #2f6fed; outline-offset: 3px; border-radius: 3px; }
+.run-technical-values { display: grid; gap: 8px; min-width: 0; padding-top: 12px; }
+.run-technical-values code { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .environment{margin-bottom:12px;padding:10px 14px;border:1px solid #dce3ed;border-radius:10px;background:#fff}.environment summary{cursor:pointer;color:#536177;font-weight:700}.env-grid{display:flex;flex-wrap:wrap;gap:7px;padding-top:10px}.workbench{display:grid;grid-template-columns:240px minmax(620px,1fr) 350px;grid-template-rows:minmax(680px,1fr) 260px;gap:16px}.left-pane,.dag-pane,.right-pane,.console{min-width:0;border:1px solid #dbe3ef;border-radius:12px;background:#fff}.left-pane{overflow:auto;padding:14px}.left-pane h3{margin:10px 0;font-size:var(--font-card)}.template-card,.run-card{display:flex;width:100%;flex-wrap:wrap;justify-content:space-between;margin:5px 0;padding:11px;border:1px solid #e0e6ee;background:#fff;text-align:left}.template-card b,.template-card small{width:100%}.template-card small,.run-card small,.dag-toolbar small{display:block;margin-top:4px;color:#7a8799;font-size:var(--font-technical)}.template-card.active,.run-card.active{border-color:#2f6fed;background:#edf4ff}.run-card small{width:100%;overflow:hidden;text-overflow:ellipsis}.business-history{margin-top:12px}.business-history summary{cursor:pointer;color:#6c7a8e;font-size:11px}.dag-pane{overflow:hidden}.dag-toolbar{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-bottom:1px solid #edf0f4}.actions{display:flex;gap:6px}.view-switch{display:inline-flex;gap:2px;padding:2px;border:1px solid #dfe5ed;border-radius:8px;background:#eef2f7}.view-switch button{border:0;border-radius:6px;padding:4px 11px;background:transparent;color:#66758a;font-weight:700}.view-switch button.active{background:#fff;color:#2f6fed}.stage-view{display:grid;gap:8px;padding:16px}.stage-row{display:flex;align-items:center;gap:12px;padding:13px 15px;border:1px solid #e0e6ee;border-radius:10px;background:#fafbfd;text-align:left}.stage-row.completed .stage-status{color:#1d8c65}.stage-row.failed .stage-status{color:#c0392b}.stage-name{flex:1;font-weight:700}.stage-count{color:#8290a3;font-size:11px}.dag-error{display:grid;height:590px;place-content:center;padding:30px;color:#9b3434;text-align:center}.dag-error p{max-width:760px;line-height:1.6}.right-pane{display:grid;grid-template-rows:minmax(280px,1fr) auto auto auto;gap:10px;padding-bottom:10px;overflow:auto}.override,.preview,.evolution,.action-result{margin:0 10px;padding:13px;border:1px solid #e0e6ee;border-radius:9px}.override label{display:block;margin-bottom:6px;font-weight:700}.override textarea{box-sizing:border-box;width:100%;font:var(--font-technical) ui-monospace,monospace}.override small,.preview small,.evolution small{display:block;margin-top:6px;color:#748196}.diff-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.diff-grid span{padding:8px;border-radius:8px;background:#f5f7fb;color:#6c788a;font-size:10px}.diff-grid b{display:block;margin-top:4px;color:#24364f;font-size:16px}.evolution{display:grid;gap:7px}.action-result{display:grid;gap:7px;border-color:#b9dfce;background:#f2fbf7}
 .console{grid-column:1/-1;display:flex;flex-direction:column;overflow:hidden;background:#182231;color:#d9e2ee}
 .console header{display:flex;flex:none;justify-content:space-between;padding:11px 16px;border-bottom:1px solid #344155;font-size:var(--font-body)}

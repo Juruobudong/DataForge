@@ -4,6 +4,7 @@ import OperatorPalette from '../../../components/flow/palette/OperatorPalette.vu
 import AdvancedFlowEditor from '../../../components/flow/advanced/AdvancedFlowEditor.vue'
 import SubgraphView from '../SubgraphView.vue'
 import { api } from '../../../api/platform'
+import { dataflowOperators } from '../../../components/flow/__tests__/flowFixtures'
 
 const router = vi.hoisted(() => ({ push: vi.fn() }))
 const route = vi.hoisted(() => ({ params: { subflowId: 'parent', revision: '1' }, query: { return_template_id: 'consumer' } }))
@@ -32,6 +33,36 @@ afterEach(() => { wrapper?.unmount(); document.body.innerHTML = '' })
 const button = label => wrapper.findAll('button').find(item => item.text() === label)
 
 describe('reusable subflow production and consumption', () => {
+  it('offers Hash and MinHash as separate bilingual nodes with exact refs', async () => {
+    const operators = dataflowOperators.filter(item => item.code.endsWith('DeduplicateFilter'))
+    wrapper = mount(OperatorPalette, { props: { catalog: operators, subflows: [] } })
+    for (const [index, card] of wrapper.findAll('.palette-entry').entries()) {
+      expect(card.text()).toContain(operators[index].display_name_zh)
+      expect(card.text()).toContain(`DataFlow · ${operators[index].code}`)
+      await card.trigger('dblclick')
+      expect(wrapper.emitted('add-item').at(-1)[0].code).toBe(operators[index].code)
+    }
+    expect(wrapper.findAll('.palette-entry')).toHaveLength(2)
+  })
+  it('edits QA extraction instructions as a normal Advanced business parameter', async () => {
+    const qa = { ...catalog[0], code: 'Text2QAGenerator', version: 6, provider: 'dataflow',
+      input_ports: { input: { artifact_type: 'source_chunk_set', binding: 'edge' } },
+      output_ports: { output: { artifact_type: 'candidate:qa' } },
+      parameter_schema: { properties: { extraction_instructions: { type: 'string', title: 'QA 提取要求', 'x-dataforge-ui': { widget: 'textarea' } } } } }
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog: [qa], subflows: [], outputTypes: ['qa'] } })
+    wrapper.vm.loadDefinition({ nodes: [{ id: 'qa', kind: 'operator', ref: 'Text2QAGenerator', operator_version: 6, params: { extraction_instructions: '原要求' } }], edges: [] })
+    wrapper.findComponent({ name: 'CanvasStub' }).vm.$emit('select-node', wrapper.vm.nodes[0])
+    await flushPromises()
+    await wrapper.get('textarea[aria-label="QA 提取要求"]').setValue('只提取随访事项\n使用患者口吻')
+    expect(wrapper.vm.serialize().nodes[0].params.extraction_instructions).toBe('只提取随访事项\n使用患者口吻')
+  })
+  it('adding a sink never inserts a Diff even when an old catalog contains it', async () => {
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog: [...catalog, { ...catalog[0], code: 'knowledge-diff' }], subflows: [], outputTypes: ['text'] } })
+    wrapper.findComponent(OperatorPalette).vm.$emit('add-sink', 'text')
+    await flushPromises()
+    expect(wrapper.vm.serialize().nodes.map(node => node.kind)).toEqual(['knowledge_sink'])
+    expect(wrapper.vm.serialize().edges).toEqual([])
+  })
   it('queries server candidates for the selected port and keeps only returned operators', async () => {
     wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [], outputTypes: ['text'] } })
     wrapper.vm.loadDefinition({ nodes: [{ id: 'quality-node', kind: 'operator', ref: 'quality', operator_version: 1 }], edges: [] })
@@ -49,15 +80,27 @@ describe('reusable subflow production and consumption', () => {
     expect(wrapper.findAll('.subflow-item')).toHaveLength(1)
     await wrapper.get('input').setValue('quality-flow')
     await wrapper.findAll('.subflow-item select')[0].setValue('r1')
-    await wrapper.findAll('.subflow-item button')[0].trigger('click')
-    expect(wrapper.emitted('add-item')[0]).toEqual([version(1), 'subflow'])
+    const card = wrapper.get('.subflow-item')
+    expect(card.find('button').exists()).toBe(false)
+    await card.trigger('dragstart')
+    expect(wrapper.emitted('drag-start')[0].slice(1)).toEqual([version(1), 'subflow'])
+    expect(wrapper.emitted('add-item')).toBeUndefined()
     await wrapper.get('input').setValue('absent')
     expect(wrapper.findAll('.subflow-item')).toHaveLength(0)
   })
 
   it('inserts pinned revisions, switches explicitly without deleting edges and opens the exact revision', async () => {
     wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [asset], outputTypes: ['text'] } })
-    await wrapper.get('.subflow-item button').trigger('click')
+    const dataTransfer = { setData: vi.fn(), effectAllowed: '' }
+    await wrapper.get('.subflow-item').trigger('dragstart', { dataTransfer })
+    expect(wrapper.vm.nodes).toHaveLength(0)
+    expect(dataTransfer.effectAllowed).toBe('copy')
+    const [type, payload] = dataTransfer.setData.mock.calls[0]
+    expect(type).toBe('application/dataforge-operator')
+    wrapper.findComponent({ name: 'CanvasStub' }).vm.$emit('add-definition', JSON.parse(payload), { x: 600, y: 350 })
+    await flushPromises()
+    expect(wrapper.vm.nodes).toHaveLength(1)
+    expect(wrapper.vm.nodes[0].position).toEqual({ x: 465, y: 280 })
     const graph = wrapper.vm.serialize()
     expect(graph.nodes[0].subflow_revision_id).toBe('r2')
     const node = wrapper.vm.nodes[0]
@@ -69,6 +112,37 @@ describe('reusable subflow production and consumption', () => {
     expect(wrapper.vm.edges).toHaveLength(1)
     await button('查看内部 DAG').trigger('click')
     expect(wrapper.emitted('open-subflow')[0][0].revision).toBe(1)
+  })
+
+  it('drags an operator without an add button and inserts only on canvas drop with undo', async () => {
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [], outputTypes: ['text'] } })
+    const card = wrapper.get('.palette-entry')
+    expect(card.find('button').exists()).toBe(false)
+    await card.trigger('click')
+    const dataTransfer = { setData: vi.fn(), effectAllowed: '' }
+    await card.trigger('dragstart', { dataTransfer })
+    expect(wrapper.vm.nodes).toHaveLength(0)
+    const [type, payload] = dataTransfer.setData.mock.calls[0]
+    expect(type).toBe('application/dataforge-operator')
+    expect(JSON.parse(payload)).toEqual({ kind: 'operator', ref: 'quality', params: {}, operator_version: 1 })
+    wrapper.findComponent({ name: 'CanvasStub' }).vm.$emit('add-definition', JSON.parse(payload), { x: 600, y: 350 })
+    await flushPromises()
+    expect(wrapper.vm.nodes).toHaveLength(1)
+    expect(wrapper.vm.nodes[0].position).toEqual({ x: 465, y: 280 })
+    await button('↶ 撤销').trigger('click')
+    expect(wrapper.vm.nodes).toHaveLength(0)
+  })
+
+  it('keeps keyboard insertion on cards without hijacking subflow revision selection', async () => {
+    wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset] } })
+    await wrapper.get('.palette-entry').trigger('keydown', { key: 'Enter' })
+    expect(wrapper.emitted('add-item')[0]).toEqual([catalog[0], 'operator'])
+    await wrapper.get('.subflow-item select').setValue('r1')
+    await wrapper.get('.subflow-item select').trigger('keydown', { key: 'Enter' })
+    await wrapper.get('.subflow-item select').trigger('keydown', { key: ' ' })
+    expect(wrapper.emitted('add-item')).toHaveLength(1)
+    await wrapper.get('.subflow-item').trigger('keydown', { key: ' ' })
+    expect(wrapper.emitted('add-item')[1]).toEqual([version(1), 'subflow'])
   })
 
   it('extracts selected current nodes without replacing the source graph', async () => {

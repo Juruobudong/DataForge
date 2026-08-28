@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from .base import OperatorExecutionContext, OperatorExecutor, OperatorResult
 from .registry import OperatorExecutorRegistry
+from .outcomes import capture_generation_metrics
 
 RunnerCallable = Callable[[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
 
@@ -25,6 +26,7 @@ class BuiltinOperatorExecutor:
         self.version = version
         self._runner = runner_callable
 
+    @capture_generation_metrics
     def execute(self, *, inputs: list[dict[str, Any]], params: dict[str, Any],
                 context: OperatorExecutionContext) -> OperatorResult:
         runtime = {**dict(context.runtime or {}), "operator_version": self.version}

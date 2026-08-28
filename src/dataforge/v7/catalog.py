@@ -11,6 +11,21 @@ from copy import deepcopy
 
 from .llm_serving import DEFAULT_LLM_SERVING_ID
 
+RETIRED_KNOWLEDGE_OPERATORS = frozenset({
+    "quality-evaluator", "quality-filter", "source-binding", "knowledge-diff",
+})
+RENAMED_DATAFLOW_OPERATORS = {
+    "qa-generator": ("Text2QAGenerator",),
+    "prompted-refiner": ("PromptedRefiner",),
+    "deduplicate": ("HashDeduplicateFilter", "MinHashDeduplicateFilter"),
+}
+DEFAULT_QA_EXTRACTION_INSTRUCTIONS = "基于审核原文提取有明确答案的问答，保持原文语言，不补充来源以外的信息。"
+QA_EXTRACTION_SCHEMA = {
+    "type": "string", "title": "QA 提取要求", "default": DEFAULT_QA_EXTRACTION_INSTRUCTIONS,
+    "description": "填写提取主题、对象、问法和答案要求；空白使用通用提取规则。无匹配内容时正常产出零条问答。",
+    "x-dataforge-ui": {"widget": "textarea"},
+}
+
 
 DEFAULT_CHUNKER_PARAMS: dict[str, Any] = {
     "chunk_size": 800,
@@ -288,13 +303,12 @@ DATAFLOW_LOCK_DIGEST = "d575faf7e20b1bf75725fa15a4d29de17168c957d09f99f5b2cd5053
 
 
 def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[str]:
-    if exposure == "internal" or source in {"source_file", "document_ir", "chunk_set"}:
+    if code in RETIRED_KNOWLEDGE_OPERATORS or code in RENAMED_DATAFLOW_OPERATORS or exposure == "internal" or source in {"source_file", "document_ir", "chunk_set"}:
         return ["system-internal"]
-    standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "qa-generator",
+    standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "Text2QAGenerator",
                 "entity-extractor", "literal-detector", "relation-extractor", "triple-builder",
                 "entity-normalizer", "semantic-relation-builder", "evidence-binder",
-                "quality-evaluator", "quality-filter", "source-binding", "schema-validator",
-                "graph-quality-validator", "knowledge-diff"}
+                "schema-validator", "graph-quality-validator"}
     return (["standard-template"] if code in standard else []) + ["advanced-canvas"]
 
 
@@ -303,6 +317,10 @@ LEGACY_CATALOG_SEEDS = tuple(deepcopy(item) for item in CATALOG_SEEDS)
 
 def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     item = deepcopy(item)
+    if item["code"] in RETIRED_KNOWLEDGE_OPERATORS:
+        item["exposure"] = "internal"
+        item["lifecycle_status"] = "deprecated"
+        item["description"] = item["summary"] = "已退出新编排，仅保留历史执行版本；最终治理由 Knowledge Sink 完成。"
     item["surfaces"] = operator_surfaces(item["code"], item["input"], item["exposure"])
     item["provider"] = "dataforge"
     graph_modes = {"triple-builder": ["triple"], "semantic-relation-builder": ["semantic"], "evidence-binder": ["semantic"]}
@@ -315,6 +333,10 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
                         "quality-evaluator", "quality-filter", "source-binding", "schema-validator",
                         "knowledge-diff", "artifact-merge"}:
         item["knowledge_types"] = ["*"]
+    if item["code"] == "schema-validator":
+        item["knowledge_types"] = ["graph"]
+        item["display_name_zh"] = "图谱结构校验器"
+        item["description"] = item["summary"] = "独立校验图谱实体、关系与方向约束，非法结构阻止该分支提交"
     implementations = {
         "qa-generator": (5, "dataflow.operators.core_text:Text2QAGenerator", "source-chunk-to-qa-v1"),
         "deduplicate": (4, "dataflow.operators.general_text:HashDeduplicateFilter", "candidate-deduplicate-v1"),
@@ -354,6 +376,65 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
 
 
 CATALOG_SEEDS = tuple(_curated_entry(item) for item in CATALOG_SEEDS)
+# Keep the published DataFlow v5 specification addressable; v6 adds guidance.
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "qa-generator")
+for _item in CATALOG_SEEDS:
+    if _item["code"] == "qa-generator":
+        _item["version"] = 6
+        _item["adapter_code"] = "source-chunk-to-qa-v2"
+        _item["runtime_requirements"]["adapter_version"] = "source-chunk-to-qa-v2"
+        _item["parameter_schema"]["properties"]["extraction_instructions"] = deepcopy(QA_EXTRACTION_SCHEMA)
+        _item["parameter_docs"]["extraction_instructions"] = QA_EXTRACTION_SCHEMA["description"]
+
+
+# New identities reuse the existing versioned execution contracts. Old codes
+# remain exact historical registrations, never aliases to a new implementation.
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in RENAMED_DATAFLOW_OPERATORS)
+
+
+def _upstream_named_entries(item):
+    names = RENAMED_DATAFLOW_OPERATORS.get(item["code"])
+    if not names:
+        return [item]
+    chinese = {"Text2QAGenerator": "文本转问答生成器", "PromptedRefiner": "提示词修订器",
+               "HashDeduplicateFilter": "哈希去重过滤器", "MinHashDeduplicateFilter": "MinHash 相似去重过滤器"}
+    result = []
+    for name in names:
+        value = deepcopy(item)
+        value.update(code=name, name=name, display_name_zh=chinese[name])
+        value["surfaces"] = operator_surfaces(name, value["input"], value["exposure"])
+        if item["code"] == "deduplicate":
+            method = "identity" if name == "HashDeduplicateFilter" else "minhash"
+            runtime = value["runtime_requirements"]
+            runtime["implementation"] = runtime["implementations"][method]
+            adapter = "candidate-hash-deduplicate-v1" if method == "identity" else "candidate-minhash-deduplicate-v1"
+            value["adapter_code"] = runtime["adapter_version"] = adapter
+            value["parameter_schema"]["properties"].pop("method", None)
+            value["parameter_docs"].pop("method", None)
+            if method == "identity":
+                value["parameter_schema"]["properties"].pop("threshold", None)
+                value["parameter_docs"].pop("threshold", None)
+                runtime["implementations"] = {"identity": runtime["implementation"]}
+                description = "使用 DataFlow HashDeduplicateFilter 按知识身份精确去重，保留来源与 Evidence"
+            else:
+                value["knowledge_types"] = ["text", "qa"]
+                description = "使用 DataFlow MinHashDeduplicateFilter 在同一来源 Chunk 内做相似去重；少于 5 字符的正文使用 HashDeduplicateFilter 精确去重保护"
+            value["description"] = value["summary"] = description
+        result.append(value)
+    return result
+
+
+CATALOG_SEEDS = tuple(value for item in CATALOG_SEEDS for value in _upstream_named_entries(item))
+for _item in LEGACY_CATALOG_SEEDS:
+    if _item["code"] in RENAMED_DATAFLOW_OPERATORS:
+        _item.update(exposure="internal", surfaces=["system-internal"], lifecycle_status="deprecated")
+for _item in CATALOG_SEEDS:
+    for _key in ("recommended_predecessors", "recommended_successors"):
+        _item[_key] = [new for code in _item.get(_key, []) for new in RENAMED_DATAFLOW_OPERATORS.get(code, (code,))]
+
+PLATFORM_RESERVED_OPERATOR_CODES = frozenset(
+    {item["code"].casefold() for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)} | {"knowledge-sink"}
+)
 
 
 def catalog_by_code(entries: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None) -> dict[str, dict[str, Any]]:
@@ -374,12 +455,12 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
         {"id": "reviewed-input", "kind": "operator", "node_role": "flow_input", "ref": "reviewed-source-chunk-input"},
     ]
     edges: list[list[str]] = []
-    generators = {"text": "text-knowledge-mapper", "qa": "qa-generator", "graph": "graph-extractor"}
+    generators = {"text": "text-knowledge-mapper", "qa": "Text2QAGenerator", "graph": "graph-extractor"}
     for raw_kind in output_types:
         kind = "graph:triple" if raw_kind == "graph" else raw_kind
         family, _, mode = kind.partition(":")
-        generator = f"generate-{kind}"; evaluator = f"evaluate-{kind}"; quality_filter = f"filter-{kind}"
-        binding = f"bind-{kind}"; validator = f"validate-{kind}"; quality = f"quality-{kind}"; diff = f"diff-{kind}"; sink = f"sink-{kind}"
+        generator = f"generate-{kind}"
+        validator = f"validate-{kind}"; quality = f"quality-{kind}"; sink = f"sink-{kind}"
         generator_params: dict[str, Any] = {"knowledge_type": family}
         if mode:
             generator_params["graph_mode"] = mode
@@ -406,25 +487,18 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             generator_ref = "evidence-binder"
         if generator_ref in {"prompt-generator", "structured-knowledge-generator"}:
             generator_params["prompt_template_revision_id"] = "promptrev_default"
-        if generator_ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+        if generator_ref in {"prompt-generator", "Text2QAGenerator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
             generator_params["llm_serving"] = DEFAULT_LLM_SERVING_ID
         nodes.extend(graph_prefix)
         nodes.extend((
             {"id": generator, "kind": "operator", "ref": generator_ref, "params": generator_params},
-            {"id": evaluator, "kind": "operator", "ref": "quality-evaluator", "params": {"knowledge_type": family, "graph_mode": mode or None, "quality_profile_revision_id": "qualityrev_default"}},
-            {"id": quality_filter, "kind": "operator", "ref": "quality-filter", "params": {"knowledge_type": family, "graph_mode": mode or None, "quality_profile_revision_id": "qualityrev_default"}},
-            {"id": binding, "kind": "operator", "ref": "source-binding", "params": {"knowledge_type": family, "graph_mode": mode or None}},
-            {"id": validator, "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}},
+            *([{"id": validator, "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": family, "graph_mode": mode}}] if family == "graph" else []),
             *([{"id": quality, "kind": "operator", "ref": "graph-quality-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}}] if family == "graph" else []),
-            {"id": diff, "kind": "operator", "ref": "knowledge-diff", "params": {"knowledge_type": family, "graph_mode": mode or None}},
             {"id": sink, "kind": "knowledge_sink", "node_role": "knowledge_output", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
         ))
         edges.extend(graph_edges or [["reviewed-input", generator]])
-        edges.extend((
-            [generator, evaluator], [evaluator, quality_filter],
-            [quality_filter, binding], [binding, validator],
-            *([[validator, quality], [quality, diff]] if family == "graph" else [[validator, diff]]), [diff, sink],
-        ))
+        edges.extend([[generator, validator], [validator, quality], [quality, sink]]
+                     if family == "graph" else [[generator, sink]])
     return {"schema_version": 3, "purpose": "knowledge", "nodes": nodes, "edges": [
         {"source": edge[0], "source_port": "output", "target": edge[1], "target_port": "input"} for edge in edges
     ], "graph_config": {"entity_types": [], "relation_types": []}, "ui": {"positions": {}}}

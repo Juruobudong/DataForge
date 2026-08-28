@@ -1,12 +1,12 @@
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../../api/platform'
 import { useRouter, useRoute } from 'vue-router'
 import StandardFlowEditor from '../../components/flow/standard/StandardFlowEditor.vue'
 import AdvancedFlowEditor from '../../components/flow/advanced/AdvancedFlowEditor.vue'
 import UnsavedNavigationDialog from '../../components/flow/UnsavedNavigationDialog.vue'
 import FieldHelp from '../../components/common/FieldHelp.vue'
-import { groupFlowTemplates, templateOutputSummary } from './templatePresentation'
+import { groupFlowTemplates, templateOutputSummary, templateRevisionSummary } from './templatePresentation'
 
 const templates = ref([]), catalog = ref([]), subflows = ref([]), types = ref([]), managedTemplates = ref([])
 const authoringMode = ref('advanced'), stageDefinition = ref(null)
@@ -18,22 +18,39 @@ const editing = ref(false)
 const wizardOpen = ref(false)
 const advancedEditor = ref(null)
 const pendingSubflow = ref(null), navigationSaving = ref(false)
+const saving = ref(false), saveFailed = ref(false)
+const pendingConversion = ref(null), converting = ref(false)
+const publishNotice = ref('')
+let publishNoticeTimer
+let saveTimer, savePromise, editGeneration = 0, editorSession = 0
 const router = useRouter()
 const route = useRoute()
-const advancedConversionHelp = '基于当前标准配置展开完整执行 DAG，并创建一个新的自定义高级流程。原标准流程不会被修改。'
+const advancedConversionHelp = '基于当前标准配置展开完整执行 DAG，先在当前页面预览和编辑。首次保存或运行前保存时才创建独立的自定义高级流程，直接退出不会创建草稿。原标准流程不会被修改。'
 
 const typeOptions = computed(() => {
   const normal = types.value.filter(item => item.status === 'active' && item.current_revision && item.code !== 'graph').map(item => ({ code: item.code, name: item.name }))
   return [...normal, { code: 'graph:triple', name: '三元组图谱' }, { code: 'graph:semantic', name: '语义图谱' }]
 })
 const templateGroups = computed(() => groupFlowTemplates(templates.value))
-const statusLabel = computed(() => !selected.value ? '新建草稿' : dirty.value ? '草稿 · 未保存' : `r${selected.value.revision || '-'} · 已保存`)
+const statusLabel = computed(() => saving.value ? '保存中…' : saveFailed.value ? '保存失败 · 未运行，请修正后重试' : dirty.value ? '草稿 · 未保存' : pendingConversion.value ? '转换预览 · 未保存' : !selected.value ? '新建草稿' : '已保存')
+
+function cancelAutosave() { clearTimeout(saveTimer) }
+function clearPublishNotice() { clearTimeout(publishNoticeTimer); publishNotice.value = '' }
+function resetSaveState() { cancelAutosave(); clearPublishNotice(); editorSession++; dirty.value = false; saveFailed.value = false }
+function markDirty() {
+  dirty.value = true; saveFailed.value = false; editGeneration++; cancelAutosave()
+  if (authoringMode.value === 'advanced' && !pendingConversion.value && code.value.trim() && name.value.trim()) {
+    saveTimer = setTimeout(() => { if (dirty.value) save() }, 500)
+  }
+}
+onBeforeUnmount(resetSaveState)
 
 function outputFamily(value) { return value.startsWith('graph:') ? 'graph' : value }
 function outputSummary(item) { return templateOutputSummary(item, types.value) }
 
 async function edit(item) {
   if (dirty.value && selected.value?.id !== item.id && !window.confirm('当前画布有未保存修改，确定放弃并切换模板吗？')) return
+  resetSaveState()
   selected.value = item; code.value = item.code; name.value = item.name
   outputTypes.value = [...item.output_types].map(value => value === 'graph' ? 'graph:triple' : value)
   authoringMode.value = item.authoring_mode === 'standard' ? 'standard' : 'advanced'
@@ -43,6 +60,8 @@ async function edit(item) {
   if (authoringMode.value === 'advanced') { await nextTick(); advancedEditor.value?.loadDefinition(item.definition) }
 }
 function clearDraft() {
+  resetSaveState()
+  pendingConversion.value = null
   selected.value = null
   code.value = ''; name.value = ''; outputTypes.value = ['text']
   authoringMode.value = 'advanced'; stageDefinition.value = null
@@ -72,7 +91,7 @@ async function importBuiltin(item) {
   if (dirty.value && !window.confirm('当前画布有未保存修改，确定导入内置流程并放弃吗？')) return
   try {
     const derived = await api.materializeManagedFlow(item.managed_template_code || item.code)
-    selected.value = null
+    resetSaveState(); selected.value = null
     code.value = ''; name.value = ''; outputTypes.value = derived.output_types.map(value => value === 'graph' ? 'graph:triple' : value)
     authoringMode.value = 'advanced'; stageDefinition.value = null
     result.value = null; sampleResult.value = null; error.value = ''
@@ -82,7 +101,7 @@ async function importBuiltin(item) {
     advancedEditor.value?.loadDefinition(derived.definition)
   } catch (e) { error.value = e.message }
 }
-function onEditorDirty() { dirty.value = true; sampleResult.value = null }
+function onEditorDirty() { markDirty(); sampleResult.value = null }
 function onEditorError(message) { if (message) error.value = message }
 async function refreshSubflows() {
   try { subflows.value = await api.flowSubgraphs() } catch (e) { onEditorError(e.message) }
@@ -112,27 +131,63 @@ async function load() {
 function buildBody() {
   if (authoringMode.value === 'standard') {
     const managedCode = selected.value?.managed_template_code || stageDefinition.value?.template_code || ''
-    return { name: name.value, output_types: outputTypes.value, authoring_mode: 'standard', managed_template_code: managedCode, definition: stageDefinition.value || { schema_version: 1, template_code: managedCode, stages: {} } }
+    return { name: name.value, authoring_mode: 'standard', managed_template_code: managedCode, definition: stageDefinition.value || { schema_version: 1, template_code: managedCode, stages: {} } }
   }
   return { name: name.value, output_types: outputTypes.value, authoring_mode: 'advanced', managed_template_code: null, definition: advancedEditor.value?.serialize() || { schema_version: 3, nodes: [], edges: [] } }
 }
-function onStageDefinition(value) { stageDefinition.value = value; dirty.value = true }
+function onStageDefinition(value) { stageDefinition.value = value; markDirty() }
 async function convertToAdvanced() {
-  if (!selected.value || authoringMode.value !== 'standard') return
+  if (!selected.value || authoringMode.value !== 'standard' || converting.value) return
   if (dirty.value) { error.value = '请先保存当前标准配置，再转换为高级编排'; return }
+  const session = editorSession
+  converting.value = true
   try {
-    const converted = await api.detachFlowToAdvanced(selected.value.id)
-    await load()
-    const target = templates.value.find(item => item.id === converted.id)
-    if (target) await edit(target)
-    router.replace(`/developer/flow-templates?template_id=${converted.id}&edit=1`)
-  } catch (e) { handleFlowError(e) }
+    const converted = await api.previewFlowToAdvanced(selected.value.id)
+    if (session !== editorSession) return
+    clearDraft()
+    pendingConversion.value = converted
+    code.value = converted.code; name.value = converted.name
+    outputTypes.value = [...converted.output_types]
+    authoringMode.value = 'advanced'; stageDefinition.value = null
+    await nextTick()
+    advancedEditor.value?.loadDefinition(converted.definition)
+    router.replace('/developer/flow-templates')
+  } catch (e) { if (session === editorSession) handleFlowError(e) }
+  finally { converting.value = false }
 }
-function runDebug(item = selected.value) {
+async function runDebug(item = selected.value) {
+  if (editing.value && (!item || item.id === selected.value?.id)) {
+    // Flush the debounce AND any in-flight save before opening run preparation.
+    // A clean published custom flow gets a draft, never a published fallback.
+    if (dirty.value || saving.value || !item || (!item.is_builtin && item.revision_status !== 'draft')) {
+      if (!await save()) return
+    }
+    item = selected.value
+  }
   if (!item) return
-  router.push(`/developer/dataflow-debug?template_id=${encodeURIComponent(item.id)}&revision_kind=${item.revision_status === 'draft' ? 'draft' : 'published'}`)
+  const checksum = item.source_definition_checksum ? `&draft_checksum=${encodeURIComponent(item.source_definition_checksum)}` : ''
+  router.push(`/developer/dataflow-debug?template_id=${encodeURIComponent(item.id)}&revision_kind=${item.revision_status === 'draft' ? 'draft' : 'published'}${checksum}&prepare=1`)
 }
 async function save() {
+  cancelAutosave()
+  const session = editorSession
+  if (savePromise) {
+    const saved = await savePromise
+    if (session !== editorSession || !saved) return false
+    if (!dirty.value) return true
+  }
+  saving.value = true
+  savePromise = (async () => {
+    do {
+      if (!await saveOnce() || session !== editorSession) return false
+    } while (dirty.value)
+    return true
+  })()
+  try { return await savePromise }
+  finally { savePromise = null; saving.value = false; if (session === editorSession && !dirty.value) cancelAutosave() }
+}
+async function saveOnce() {
+  const session = editorSession, generation = editGeneration
   if (!code.value.trim() || !name.value.trim()) { error.value = '模板编码和名称不能为空'; return }
   if (selected.value?.is_builtin) {
     const saveAsCustom = window.confirm('当前编辑的是内置流程。\n\n点击「确定」另存为新的自定义流程（需填写新编码和名称）；\n点击「取消」覆盖内置流程。')
@@ -152,41 +207,65 @@ async function save() {
     }
   }
   try {
-    error.value = ''; const body = buildBody()
+    error.value = ''; const body = { ...buildBody(), expected_definition_checksum: selected.value?.source_definition_checksum }
+    const conversion = pendingConversion.value
+    if (conversion) {
+      body.derived_from_template_id = conversion.source_template_id
+      body.derived_from_revision_id = conversion.source_revision_id
+    }
     const response = selected.value ? await api.updateFlowTemplate(selected.value.id, body) : await api.createFlowTemplate({ ...body, code: code.value })
+    if (session !== editorSession) return false
     result.value = response
     const refreshed = { ...(selected.value || {}), id: selected.value?.id || response.id, code: code.value,
-      name: name.value, output_types: [...outputTypes.value], authoring_mode: authoringMode.value,
+      name: name.value, output_types: response.output_types || (authoringMode.value === 'standard' ? [...(managedTemplates.value.find(item => item.code === body.managed_template_code)?.output_types || [])] : [...outputTypes.value]), authoring_mode: authoringMode.value,
       managed_template_code: authoringMode.value === 'standard' ? body.managed_template_code : null,
       definition: response.definition || body.definition, revision: response.revision,
+      source_definition_checksum: response.source_definition_checksum,
       revision_status: response.status === 'published' ? 'published' : 'draft', status: response.status }
     const index = templates.value.findIndex(item => item.id === refreshed.id)
     if (index >= 0) templates.value.splice(index, 1, refreshed); else templates.value.push(refreshed)
-    selected.value = refreshed; dirty.value = false
-    if (authoringMode.value === 'standard') stageDefinition.value = refreshed.definition
-    if (authoringMode.value === 'advanced' && response.definition) advancedEditor.value?.applyNormalizedDefinition(response.definition)
+    selected.value = refreshed; saveFailed.value = false
+    if (conversion) {
+      pendingConversion.value = null
+      router.replace(`/developer/flow-templates?template_id=${refreshed.id}&edit=1`)
+    }
+    // Never let a slow save replace edits made after the request was sent.
+    if (generation === editGeneration) {
+      dirty.value = false
+      if (authoringMode.value === 'standard') stageDefinition.value = refreshed.definition
+      if (authoringMode.value === 'advanced' && response.definition) advancedEditor.value?.applyNormalizedDefinition(response.definition)
+    }
     return true
-  } catch (e) { handleFlowError(e) }
+  } catch (e) { if (session === editorSession) { saveFailed.value = true; handleFlowError(e) }; return false }
 }
 async function action(kind) {
+  clearPublishNotice()
+  if ((dirty.value || saving.value) && ['validate', 'publish'].includes(kind) && !await save()) return
   if (!selected.value) { error.value = '请先保存模板草稿'; return }
   if (kind === 'validate') {
     if (authoringMode.value === 'advanced' && !advancedEditor.value?.validate()) return
     if (dirty.value) { error.value = '当前画布尚未保存，请先保存草稿后再执行服务端编译校验'; return }
   }
   if (dirty.value && ['publish', 'default', 'sample'].includes(kind)) { error.value = '当前画布尚未保存，请先保存草稿，避免操作旧修订'; return }
+  const target = selected.value, session = editorSession
   try {
     error.value = ''
-    result.value = kind === 'validate' ? await api.validateFlowTemplate(selected.value.id)
-      : kind === 'publish' ? await api.publishFlowTemplate(selected.value.id)
-        : kind === 'default' ? await api.defaultFlowTemplate(selected.value.id)
-          : kind === 'sample' ? await api.sampleFlowTemplate(selected.value.id, sampleId.value)
-            : await api.archiveFlowTemplate(selected.value.id)
+    const response = kind === 'validate' ? await api.validateFlowTemplate(target.id)
+      : kind === 'publish' ? await api.publishFlowTemplate(target.id)
+        : kind === 'default' ? await api.defaultFlowTemplate(target.id)
+          : kind === 'sample' ? await api.sampleFlowTemplate(target.id, sampleId.value)
+            : await api.archiveFlowTemplate(target.id)
+    if (session !== editorSession) return
+    result.value = response
+    if (kind === 'publish') {
+      clearPublishNotice()
+      publishNotice.value = `发布成功：${target.name} · r${response.revision}。可在文档库中选择并绑定。`
+      publishNoticeTimer = setTimeout(clearPublishNotice, 5000)
+    }
     if (kind === 'sample') sampleResult.value = result.value
-    const selectedId = selected.value.id
     await load()
-    selected.value = templates.value.find(item => item.id === selectedId) || null
-  } catch (e) { handleFlowError(e) }
+    if (session === editorSession) selected.value = templates.value.find(item => item.id === target.id) || null
+  } catch (e) { if (session === editorSession) handleFlowError(e) }
 }
 onMounted(async () => {
   await load()
@@ -199,11 +278,18 @@ onMounted(async () => {
 
 <template>
   <section class="template-page">
+    <Transition name="toast">
+      <div v-if="publishNotice" class="toast publish-notice" role="status" aria-live="polite" aria-atomic="true">
+        <span aria-hidden="true">✓</span><span>{{ publishNotice }}</span>
+        <button type="button" aria-label="关闭发布成功提示" @click="clearPublishNotice">×</button>
+      </div>
+    </Transition>
     <UnsavedNavigationDialog v-if="pendingSubflow" :pending="navigationSaving" :error="error" @cancel="pendingSubflow=null" @discard="navigateSubflow(pendingSubflow)" @save="saveThenNavigate" />
     <header class="template-page-head">
-      <div><div class="title-row"><h2>知识流程</h2></div><p>通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。</p></div>
-      <div class="header-actions"><template v-if="editing"><span class="save-state" :class="{ dirty }"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button :disabled="!selected" @click="runDebug()">运行调试</button><button class="primary" :disabled="!selected" @click="action('publish')">发布</button></template></div>
+      <div><div class="title-row"><h2>知识流程</h2></div><p>通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。</p><p v-if="editing" class="template-revisions">{{ templateRevisionSummary(selected) }}</p></div>
+      <div class="header-actions"><template v-if="editing"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前草稿</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
     </header>
+    <p v-if="pendingConversion" class="conversion-notice">当前为转换预览，尚未创建草稿。首次保存或运行前保存后才创建独立流程，直接退出不会保留。</p>
     <template v-if="!editing">
         <section class="template-strip">
           <button class="new-template" @click="wizardOpen=true">＋ 新建知识流程</button>
@@ -214,7 +300,8 @@ onMounted(async () => {
                 <button v-for="item in templateGroups.builtin" :key="item.id" :class="{ active:selected?.id===item.id }" @click="edit(item)">
                   <span class="template-card-title"><b>{{ item.name }}</b><span class="builtin-tag">内置</span></span>
                   <small v-if="outputSummary(item)" class="output-summary">{{ outputSummary(item) }}</small>
-                  <small class="template-meta">标准配置 · {{ item.code }} · r{{ item.revision || '-' }}<template v-if="item.is_default"> · 默认</template></small>
+                  <small class="template-meta">标准配置 · {{ item.code }}<template v-if="item.is_default"> · 默认</template></small>
+                  <small class="template-revisions">{{ templateRevisionSummary(item) }}</small>
                   <span class="import-draft" role="button" tabindex="0" @click.stop.prevent="runDebug(item)" @keydown.enter.prevent="runDebug(item)">运行调试</span>
                 </button>
               </div>
@@ -225,7 +312,8 @@ onMounted(async () => {
                 <button v-for="item in templateGroups.custom" :key="item.id" :class="{ active:selected?.id===item.id }" @click="edit(item)">
                   <span class="template-card-title"><b>{{ item.name }}</b><span v-if="item.needs_review_upgrade" class="upgrade-tag">需升级审核入口</span></span>
                   <small v-if="outputSummary(item)" class="output-summary">{{ outputSummary(item) }}</small>
-                  <small class="template-meta">{{ item.authoring_mode === 'standard' ? '标准配置' : '高级编排' }} · {{ item.code }} · r{{ item.revision || '-' }}<template v-if="item.is_default"> · 默认</template></small>
+                  <small class="template-meta">{{ item.authoring_mode === 'standard' ? '标准配置' : '高级编排' }} · {{ item.code }}<template v-if="item.is_default"> · 默认</template></small>
+                  <small class="template-revisions">{{ templateRevisionSummary(item) }}</small>
                 </button>
               </div>
               <p v-else class="empty-template-group">尚无自定义流程，可通过“新建模板”创建。</p>
@@ -234,7 +322,7 @@ onMounted(async () => {
         </section>
     </template>
     <template v-else>
-        <form v-if="settingsOpen" class="template-settings" @submit.prevent="save"><label>模板编码<input v-model="code" :disabled="!!selected" required placeholder="template-code" @input="dirty=true"></label><label>模板名称<input v-model="name" required placeholder="模板名称" @input="dirty=true"></label><fieldset><legend>正式输出</legend><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="dirty=true">{{ item.name }}</label></fieldset><label>样例<select v-model="sampleId"><option value="guideline-md">指南 Markdown</option><option value="faq-csv">FAQ CSV</option><option value="case-txt">病例摘要</option></select></label><div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary">保存草稿</button></div></form>
+        <form v-if="settingsOpen" class="template-settings" @submit.prevent="save"><label>模板编码<input v-model="code" :disabled="!!selected" required placeholder="template-code" @input="markDirty"></label><label>模板名称<input v-model="name" required placeholder="模板名称" @input="markDirty"></label><fieldset><legend>正式输出</legend><p v-if="authoringMode === 'standard'" data-testid="managed-outputs">固定模板维护：{{ outputSummary({ output_types: managedTemplates.find(item => item.code === (stageDefinition?.template_code || selected?.managed_template_code))?.output_types || [] }) }}</p><template v-else><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="markDirty">{{ item.name }}</label></template></fieldset><label>样例<select v-model="sampleId"><option value="guideline-md">指南 Markdown</option><option value="faq-csv">FAQ CSV</option><option value="case-txt">病例摘要</option></select></label><div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary">保存草稿</button></div></form>
         <div class="flow-toolbar">
           <div class="authoring-mode-actions"><span class="selection-state">{{ authoringMode === 'standard' ? '标准配置 · 业务阶段' : '高级编排 · Authoring DAG' }}</span><template v-if="authoringMode==='standard' && selected"><button @click="convertToAdvanced">转换为高级编排</button><FieldHelp label="高级编排转换说明" :text="advancedConversionHelp" /></template><button class="exit toolbar-exit" @click="exitEditing">‹ 退出编辑</button></div>
           <div><button class="primary" @click="save">保存草稿</button></div>
@@ -248,6 +336,12 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.publish-notice{position:fixed;top:80px;right:24px;z-index:1000;display:flex;align-items:flex-start;gap:10px;max-width:460px;padding:14px 18px;border:1px solid #cfeadd;border-radius:10px;box-shadow:var(--shadow);color:var(--green);background:var(--green-soft);font-size:var(--font-body);line-height:1.5;overflow-wrap:anywhere}
+.publish-notice button{flex:none;min-height:0;padding:0 4px;border:0;background:transparent;color:inherit;font-size:20px;line-height:1.2}
+.toast-enter-active,.toast-leave-active{transition:opacity .18s,transform .18s}
+.toast-enter-from,.toast-leave-to{opacity:0;transform:translateY(-7px)}
+.conversion-notice{padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--blue-soft);color:var(--text-secondary,#536177);font-size:var(--font-assist,13px)}
+.template-page-head .template-revisions,.template-list .template-revisions{color:var(--text-secondary,#536177);font-size:var(--font-assist,13px);line-height:1.5;overflow-wrap:anywhere}
 .template-page{min-width:1164px}.template-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:12px}.title-row{display:flex;align-items:center;gap:9px}.title-row h2{margin:0;font-size:21px}.dsl-badge{padding:5px 8px;border:1px solid #d8e4ff;border-radius:999px;color:#2f6fed;background:#eaf1ff;font-size:8px;font-weight:850}.template-page-head p{margin:5px 0 0;color:#778499;font-size:10px}.header-actions{display:flex;align-items:center;gap:7px}.save-state{display:inline-flex;align-items:center;gap:6px;margin-right:4px;color:#627087;font-size:8px;font-weight:800}.save-state i{width:7px;height:7px;border-radius:50%;background:#1d8c65}.save-state.dirty i{background:#b97917}.page-tabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #dfe5ed}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:#2f6fed;color:#2f6fed}.template-strip{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:10px;margin-bottom:9px}.new-template{white-space:nowrap}.template-groups{display:grid;gap:9px;min-width:0}.template-group{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:start;gap:8px}.template-group>header{display:grid;gap:2px;padding-top:8px;color:#34445a}.template-group>header small{color:#8a97a8}.template-list{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.template-list button{display:grid;min-width:190px;max-width:250px;text-align:left}.template-list button.active{border-color:#b9cff7;color:#2f6fed;background:#eff5ff}.template-card-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.template-list b,.template-list small{display:block}.template-list small{margin-top:3px;color:#8290a3;font-size:7px}.builtin-tag{padding:2px 6px;border:1px solid #c9dafb;border-radius:999px;color:#2f6fed;background:#edf4ff;font-size:7px;font-weight:800}.template-list .output-summary{color:#6b7a8f;font-size:7px}.upgrade-tag{padding:2px 6px;border:1px solid #efcf91;border-radius:999px;color:#986316;background:#fff7e7;font-size:7px;font-weight:800}.template-settings{display:grid;grid-template-columns:minmax(180px,1fr) minmax(200px,1.4fr);gap:10px;padding:14px;border:1px solid var(--border);border-radius:11px;background:#fff;margin-bottom:9px}.template-settings>label{display:grid;gap:4px;color:#536177;font-weight:700}.template-settings input,.template-settings select{border:1px solid #dfe5ed}.template-settings fieldset{border:1px solid #dfe5ed;border-radius:8px}.template-settings fieldset legend{color:#536177;font-weight:700}.template-settings fieldset label{display:inline-flex;align-items:center;gap:5px;margin-right:12px;color:#536177;font-weight:400}.settings-actions{display:flex;gap:6px;align-items:center}.settings-actions .danger{color:#c0392b;border-color:#f0c4bc}.flow-toolbar{display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:9px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:12px;background:#fff}.flow-toolbar .mode-bar{display:flex;align-items:center}.selection-state{color:#66758a;font-size:12px;margin-right:8px}.action-result{margin-top:12px;padding:12px;background:#182231;color:#d9e2ee;border-radius:10px;font:11px monospace;max-height:300px;overflow:auto}
 .wizard-backdrop{position:fixed;z-index:40;inset:0;display:grid;place-items:center;background:rgba(16,24,40,.42)}.wizard{width:min(760px,90vw);padding:22px;border-radius:15px;background:#fff;box-shadow:0 24px 70px rgba(15,23,42,.24)}.wizard>header{display:flex;justify-content:space-between;gap:20px}.wizard h3{margin:0}.wizard p{color:#6d7b8e}.goal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px}.goal-grid button,.advanced-choice button{display:grid;gap:5px;padding:16px;text-align:left}.goal-grid small,.advanced-choice small{color:#748197}.advanced-choice{display:grid;grid-template-columns:80px 1fr;gap:10px;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid #e2e7ee}.advanced-choice>span{font-weight:800;color:#7a8799}
 .authoring-mode-actions{display:flex;align-items:center;gap:8px}.toolbar-exit{white-space:nowrap}

@@ -17,7 +17,7 @@ from copy import deepcopy
 import re
 from typing import Any
 
-from .catalog import builtin_flow_definition, catalog_by_code
+from .catalog import builtin_flow_definition, catalog_by_code, QA_EXTRACTION_SCHEMA
 from .operator_catalog import technical_projection
 from .flow import FlowCompiler, FlowValidationError
 from .entity_types import custom_type_code, entity_type_catalog, normalize_entity_types
@@ -29,14 +29,10 @@ _LLM_CONFIG_SCHEMA: dict[str, Any] = {
     "properties": {"llm_serving": {"type": "string", "title": "模型服务", "description": "已配置的 Model Serving ID", "x-dataforge-ui": {"widget": "llm-serving-selector"}}},
     "additionalProperties": False,
 }
-_QUALITY_CONFIG_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {"quality_profile_revision_id": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}},
-    "additionalProperties": False,
-}
 _QA_CONFIG_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
     **_LLM_CONFIG_SCHEMA["properties"],
     "questions_per_chunk": {"type": "integer", "title": "每块最多问题数", "minimum": 1, "maximum": 10, "default": 1},
+    "extraction_instructions": deepcopy(QA_EXTRACTION_SCHEMA),
 }}
 _GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -78,13 +74,9 @@ _TEXT_MAPPING_STAGE = ManagedStageDefinition(
     code="mapping", name="文本知识映射", input_contract="source_chunk_set",
     output_contract="candidate:text", operator_refs=("text-knowledge-mapper",),
 )
-_QUALITY_STAGE = ManagedStageDefinition(code="quality", name="质量治理", locked=True, configurable=True,
-                                        config_schema=_QUALITY_CONFIG_SCHEMA,
-                                        operator_refs=("quality-evaluator", "quality-filter", "schema-validator", "graph-quality-validator"))
-_BINDING_STAGE = ManagedStageDefinition(code="binding", name="来源绑定", locked=True,
-                                        operator_refs=("source-binding",))
-_SUBMIT_STAGE = ManagedStageDefinition(code="submit", name="知识提交", locked=True,
-                                       operator_refs=("knowledge-diff",))
+_QUALITY_STAGE = ManagedStageDefinition(code="quality", name="图谱校验", locked=True,
+                                        operator_refs=("schema-validator", "graph-quality-validator"))
+_SUBMIT_STAGE = ManagedStageDefinition(code="submit", name="知识提交", locked=True)
 
 
 def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA, operator_refs: tuple[str, ...]) -> ManagedStageDefinition:
@@ -95,33 +87,58 @@ def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA
 _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     ManagedFlowDefinition(code="standard-text", name="文本知识", output_types=("text",), stages=(
         _INPUT_STAGE, _TEXT_MAPPING_STAGE,
-        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+        _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
-        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-generator",)),
-        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("Text2QAGenerator",)),
+        _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
         _INPUT_STAGE,
         _generation("实体关系抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
                     operator_refs=("entity-extractor", "literal-detector", "relation-extractor", "triple-builder")),
-        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+        _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-semantic", name="语义图谱", output_types=("graph:semantic",), stages=(
         _INPUT_STAGE,
         _generation("语义图谱抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
                     operator_refs=("entity-extractor", "literal-detector", "entity-normalizer",
                                    "relation-extractor", "semantic-relation-builder", "evidence-binder")),
-        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+        _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
-    ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph"), stages=(
+    ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph:triple"), stages=(
         _INPUT_STAGE, _TEXT_MAPPING_STAGE,
-        _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], "questions_per_chunk": _QA_CONFIG_SCHEMA["properties"]["questions_per_chunk"]}},
-                    operator_refs=("qa-generator", "entity-extractor", "literal-detector",
+        _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_QA_CONFIG_SCHEMA["properties"]}},
+                    operator_refs=("Text2QAGenerator", "entity-extractor", "literal-detector",
                                    "relation-extractor", "triple-builder")),
-        _QUALITY_STAGE, _BINDING_STAGE, _SUBMIT_STAGE,
+        _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
 )
+
+
+class ManagedTemplateError(FlowValidationError):
+    def __init__(self, code: str, message: str, field: str):
+        super().__init__(message)
+        self.code, self.field = code, field
+
+    def payload(self):
+        return {"code": self.code, "message": str(self), "field": self.field}
+
+
+def normalise_output_key(value: str) -> str:
+    value = str(value or "").strip()
+    return "graph:triple" if value == "graph" else value
+
+
+def assert_normalized_output_types_match_managed_template(
+    managed_template_code: str, output_types: list[str] | None, *, catalog=None,
+) -> list[str]:
+    """Validate caller assertions, but always return the catalog's canonical outputs."""
+    expected = list((catalog or MANAGED_FLOW_CATALOG).get(managed_template_code).output_types)
+    if output_types is not None and {normalise_output_key(value) for value in output_types} != set(expected):
+        raise ManagedTemplateError("MANAGED_TEMPLATE_OUTPUT_MISMATCH",
+                                   f"标准模板 {managed_template_code} 的输出必须为 {expected}", "output_types")
+    return expected
 
 
 class ManagedFlowCatalog:
@@ -137,7 +154,7 @@ class ManagedFlowCatalog:
     def get(self, code: str) -> ManagedFlowDefinition:
         definition = self._by_code.get(code)
         if not definition:
-            raise ValueError(f"未知的标准模板：{code}")
+            raise ManagedTemplateError("MANAGED_TEMPLATE_CODE_INVALID", f"未知的标准模板：{code}", "managed_template_code")
         return definition
 
     def list_definitions(self, operator_catalog=None) -> list[dict[str, Any]]:
@@ -163,7 +180,7 @@ class ManagedFlowCatalog:
     def default_stage_config(self, code: str) -> dict[str, Any]:
         definition = self.get(code)
         stages = {}
-        if code in {"standard-graph-triple", "standard-graph-semantic"}:
+        if code in {"standard-graph-triple", "standard-graph-semantic", "standard-multi"}:
             stages["generation"] = {"config": {"entity_types": entity_type_catalog()["base"]}}
         return {"schema_version": 1, "template_code": definition.code, "stages": stages}
 
@@ -171,6 +188,8 @@ class ManagedFlowCatalog:
         """Validate and normalize a stage config for persistence (editor state)."""
         flow_definition = self.get(code)
         value = dict(definition or {})
+        if value.get("template_code") is not None and value["template_code"] != code:
+            raise ManagedTemplateError("MANAGED_TEMPLATE_CODE_MISMATCH", "标准模板标识不一致", "definition.template_code")
         stages = value.get("stages")
         if stages is None:
             stages = {}
@@ -222,11 +241,12 @@ class ManagedFlowCompiler:
     def __init__(self, catalog: ManagedFlowCatalog | None = None):
         self.catalog = catalog or ManagedFlowCatalog()
 
-    def materialize(self, definition: dict[str, Any], output_types: list[str]) -> dict[str, Any]:
+    def materialize(self, definition: dict[str, Any], output_types: list[str] | None = None) -> dict[str, Any]:
         template_code = (definition or {}).get("template_code")
         if not template_code:
-            raise FlowValidationError("标准配置缺少 template_code")
+            raise ManagedTemplateError("MANAGED_TEMPLATE_CODE_INVALID", "标准配置缺少 template_code", "definition.template_code")
         flow_definition = self.catalog.get(template_code)
+        output_types = assert_normalized_output_types_match_managed_template(template_code, output_types, catalog=self.catalog)
         normalized = self.catalog.normalize_config(template_code, definition)
         stages_config = normalized.get("stages") or {}
         baseline = builtin_flow_definition(list(output_types))
@@ -265,12 +285,12 @@ class ManagedFlowCompiler:
             params = node.setdefault("params", {})
             if "llm_serving" in config and "llm_serving" in params:
                 params["llm_serving"] = config["llm_serving"]
-            if ref == "qa-generator" and "questions_per_chunk" in config:
+            if ref == "Text2QAGenerator" and "questions_per_chunk" in config:
                 params["questions_per_chunk"] = config["questions_per_chunk"]
+            if ref == "Text2QAGenerator" and "extraction_instructions" in config:
+                params["extraction_instructions"] = config["extraction_instructions"]
             if ref == "prompt-generator" and "prompt_template_revision_id" in config:
                 params["prompt_template_revision_id"] = config["prompt_template_revision_id"]
-            if ref in {"quality-evaluator", "quality-filter"} and "quality_profile_revision_id" in config:
-                params["quality_profile_revision_id"] = config["quality_profile_revision_id"]
             if ref == "entity-extractor" and "entity_types" in config:
                 params["entity_types"] = [item["code"] for item in config["entity_types"]]
                 params["entity_type_scope"] = "all"
@@ -291,7 +311,7 @@ class FlowAuthoringCompiler:
         self.catalog = catalog or ManagedFlowCatalog()
         self.managed = ManagedFlowCompiler(self.catalog)
 
-    def materialize(self, definition: dict[str, Any], output_types: list[str]) -> dict[str, Any]:
+    def materialize(self, definition: dict[str, Any], output_types: list[str] | None = None) -> dict[str, Any]:
         return self.managed.materialize(definition, output_types)
 
     def compile(self, flow_compiler: FlowCompiler, *, authoring_mode: str, definition: dict[str, Any],

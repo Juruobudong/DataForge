@@ -84,7 +84,7 @@ function reset() {
 }
 function dragStart(event, item, kind) {
   event.dataTransfer.setData('application/dataforge-operator', JSON.stringify(subflowNodeDefinition(item, kind)))
-  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.effectAllowed = 'copy'
 }
 function addDefinition(raw, position) {
   if (raw.kind === 'subflow') {
@@ -144,12 +144,6 @@ function addSink(outputKey) {
   const family = outputFamily(outputKey), mode = outputKey.includes(':') ? outputKey.split(':')[1] : null
   const definition = { id: uniqueId(`sink-${outputKey.replace(':', '-')}`), kind: 'knowledge_sink', knowledge_type: family, graph_mode: mode, output_key: outputKey }
   nodes.value.push(makeCanvasNode(definition, { x: 760, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows))
-  const item = props.catalog.find(item => item.code === 'knowledge-diff')
-  if (item) {
-    const diff = { id: uniqueId('diff'), kind: 'operator', ref: item.code, operator_version: item.version, params: { knowledge_type: family, graph_mode: mode } }
-    nodes.value.push(makeCanvasNode(diff, { x: 460, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows))
-    edges.value.push({ id: `${diff.id}-${definition.id}`, source: diff.id, target: definition.id, sourceHandle: 'output', targetHandle: 'input', type: 'flow', data: {} })
-  }
 }
 function applyParameters(value) {
   if (!selectedNode.value) return
@@ -235,7 +229,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
     </div>
     <div ref="editor" class="flow-workspace">
       <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :candidate-codes="candidateCodes" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
-      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
+      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @change="markDirty" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
       <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :entity-types="graphConfig.entity_types" :issue="selectedIssue" :sample-result="sampleResult" @apply-parameters="applyParameters" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
     </div>

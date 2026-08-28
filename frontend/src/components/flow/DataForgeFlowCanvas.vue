@@ -20,7 +20,7 @@ import { beginEdgeInteraction, idleEdgeInteraction } from './edge/edgeInteractio
 const nodes = defineModel('nodes', { required: true })
 const edges = defineModel('edges', { required: true })
 const props = defineProps({ issue: Object, mode: { type: String, default: 'edit' }, height: { type: [String, Number], default: 720 }, canvasId: { type: String, default: 'dataforge-template-flow' }, showTechnicalCode: { type: Boolean, default: false }, flowContext: { type: Object, default: () => ({ schemaVersion: 3, outputTypes: [] }) } })
-const emit = defineEmits(['before-change', 'select-node', 'select-edge', 'connection-error', 'connection-source', 'add-definition', 'open-subflow'])
+const emit = defineEmits(['before-change', 'change', 'select-node', 'select-edge', 'connection-error', 'connection-source', 'add-definition', 'open-subflow'])
 const editable = computed(() => props.mode === 'edit')
 const compact = computed(() => props.mode === 'mini')
 const canvasHeight = computed(() => {
@@ -207,7 +207,7 @@ defineExpose({ autoLayout, deleteEdge, focusElement, fit, screenToFlowCoordinate
       :nodes-draggable="editable" :nodes-connectable="editable" elements-selectable zoom-on-scroll pan-on-drag :selection-on-drag="editable"
       @connect="connect" @connect-start="connectStart" @connect-end="connectEnd" @edge-update-start="edgeUpdateStart" @edge-update="edgeUpdate" @edge-update-end="edgeUpdateEnd" @edge-context-menu="openEdgeMenu" @nodes-initialized="nodesInitialized" @node-click="emit('select-node', $event.node)" @edge-click="emit('select-edge', $event.edge)"
       @node-double-click="$event.node.data.meta.kind === 'subflow' && emit('open-subflow', $event.node)"
-      @pane-click="emit('select-node', null); emit('select-edge', null); closeEdgeMenu(false)" @node-drag-start="editable && emit('before-change')">
+      @pane-click="emit('select-node', null); emit('select-edge', null); closeEdgeMenu(false)" @node-drag-start="editable && emit('before-change')" @node-drag-stop="editable && emit('change')">
       <Background :variant="BackgroundVariant.Dots" :gap="18" :size="1.1" pattern-color="#cad3df" bg-color="#f7f9fc" />
       <Controls v-if="!compact" position="bottom-right" />
       <MiniMap v-if="!compact" position="bottom-left" :pannable="true" :zoomable="true" :node-stroke-width="2" node-color="#dce8fa" mask-color="rgba(238,242,247,.72)" />

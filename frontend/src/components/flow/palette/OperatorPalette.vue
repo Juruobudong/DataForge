@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { makeCanvasNode, subflowPrimaryName, subflowSubtitle } from '../flowModel'
+import { makeCanvasNode, subflowPrimaryName, subflowSubtitle, operatorPrimaryName, operatorSubtitle } from '../flowModel'
 import { checkEdgeCompatibility } from '../edge/edgeCompatibility'
 
 const props = defineProps({ catalog: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, outputTypes: { type: Array, default: () => [] }, purpose: { type: String, default: 'knowledge' }, nodes: { type: Array, default: () => [] }, edges: { type: Array, default: () => [] }, source: { type: Object, default: null }, candidateCodes: { type: Array, default: null }, loading: Boolean, error: String })
@@ -46,7 +46,7 @@ function toggle(key) {
 
 <template>
   <aside class="operator-palette">
-    <div class="palette-title"><div><h3>添加节点</h3><small>{{ available.length }} 个{{ source ? '可连接' : '可用' }}算子</small></div><span>＋</span></div>
+    <div class="palette-title"><div><h3>添加节点</h3><small>{{ available.length }} 个{{ source ? '可连接' : '可用' }}算子</small></div></div>
     <label class="search"><span>⌕</span><input v-model="query" aria-label="搜索算子或子流程" placeholder="搜索名称或编码"></label>
     <p v-if="loading" class="hint">正在匹配端口与运行依赖…</p>
     <p v-if="error" class="hint" role="alert">{{ error }} <button @click="emit('retry')">重试</button></p>
@@ -56,16 +56,18 @@ function toggle(key) {
       <section v-for="([category, items]) in capabilityGroups" :key="category">
         <button class="capability-head" @click="toggle(category)"><span class="capability-name">{{ category }}</span><span class="capability-count">{{ items.length }}</span><span class="chev">{{ searching || expanded.has(category) ? '▾' : '▸' }}</span></button>
         <template v-if="searching || expanded.has(category)">
-          <div v-for="item in items" :key="item.code" class="palette-entry" draggable="true" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')"><b>{{ item.display_name_zh || item.name }}</b><small :title="item.description || item.code">{{ item.code }} · v{{ item.version }}</small><button @dblclick.stop @click.stop="emit('add-item', item, 'operator')">添加</button></div>
+          <div v-for="item in items" :key="item.code" class="palette-entry" draggable="true" role="button" tabindex="0" title="拖入画布添加；也可双击或按 Enter / 空格添加" @dragstart="emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')" @keydown.enter.self.prevent="emit('add-item', item, 'operator')" @keydown.space.self.prevent="emit('add-item', item, 'operator')">
+            <b>{{ operatorPrimaryName(item) }}</b>
+            <small :title="item.description || item.code">{{ operatorSubtitle(item, true) }} · v{{ item.version }}</small>
+          </div>
         </template>
       </section>
       <section class="subflow-section">
         <h3>可复用子流程</h3>
-        <div v-for="item in matchingSubflows" :key="item.id" class="palette-entry subflow-item" :draggable="!unavailable(item)" @dragstart="dragSubflow($event, item)" @dblclick="addSubflow(item)">
+        <div v-for="item in matchingSubflows" :key="item.id" class="palette-entry subflow-item" :draggable="!unavailable(item)" role="button" :tabindex="unavailable(item) ? -1 : 0" :aria-disabled="unavailable(item)" title="拖入画布添加；也可双击或按 Enter / 空格添加" @dragstart="dragSubflow($event, item)" @dblclick="addSubflow(item)" @keydown.enter.self.prevent="addSubflow(item)" @keydown.space.self.prevent="addSubflow(item)">
           <b>{{ subflowPrimaryName(item) }}</b><small>{{ subflowSubtitle(selected(item) || item, true) }}</small>
           <select v-if="published(item).length" :aria-label="`${subflowPrimaryName(item)}版本`" :value="versions[item.id] || selected(item)?.revision_id || selected(item)?.latest_revision_id" @change="versions[item.id] = $event.target.value" @dblclick.stop><option v-for="version in published(item)" :key="version.revision_id" :value="version.revision_id || version.latest_revision_id">r{{ version.revision }}</option></select>
           <small v-if="item.usage === 'source_preparation'">审核前 · 文档预处理</small><small v-else-if="!selected(item)">尚未发布</small>
-          <button :disabled="unavailable(item)" @dblclick.stop @click.stop="addSubflow(item)">添加</button>
         </div>
         <p v-if="!matchingSubflows.length">暂无匹配的子流程</p>
       </section>
@@ -74,7 +76,7 @@ function toggle(key) {
         <button v-for="item in outputTypes" :key="item" class="sink-item" @dblclick="emit('add-sink', item)"><span class="item-icon">✓</span><span><b>{{ item }}</b><small>Knowledge Sink</small></span><span class="grab">＋</span></button>
       </section>
     </div>
-    <p class="hint">拖入画布，或双击添加到视口中心</p>
+    <p class="hint">拖动卡片到画布，松开即可添加</p>
   </aside>
 </template>
 
@@ -83,7 +85,6 @@ function toggle(key) {
 .palette-title{display:flex;align-items:center;justify-content:space-between;padding:14px 13px 10px}
 .palette-title h3{margin:0;font-size:12px}
 .palette-title small{color:#8490a2;font-size:8px}
-.palette-title>span{color:#2f6fed;font-size:18px}
 .search{display:flex;align-items:center;gap:6px;margin:0 10px 8px;padding:0 8px;border:1px solid #dfe5ee;border-radius:8px;background:#f9fbfd}
 .search input{width:100%;min-width:0;border:0!important;background:transparent!important;outline:0!important;box-shadow:none!important}
 .search span{color:#8190a5}
@@ -107,5 +108,6 @@ function toggle(key) {
 .hint{margin:0;padding:9px 10px;border-top:1px solid #edf0f4;color:#8792a4;background:#fafbfd;font-size:7.5px;text-align:center}
 </style>
 <style scoped>
-.palette-scroll h3{margin:12px 4px 8px;font-size:15px}.palette-entry{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;margin:6px 0;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}.palette-entry b,.palette-entry small{grid-column:1/-1;white-space:normal;font-size:13px}.palette-entry small{font-size:12px}.palette-entry button{display:block;width:auto;min-height:30px;grid-column:2;padding:4px 10px;font-size:13px;color:#2f6fed}.palette-entry select{min-width:0;max-width:120px}.subflow-section{border-top:1px solid #e2e8f0}.subflow-section>p{font-size:13px;color:#748198}.palette-title h3{font-size:15px}.palette-title small,.hint,.palette-scroll h4{font-size:12px}
+.palette-scroll h3{margin:12px 4px 8px;font-size:15px}.palette-entry{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;margin:6px 0;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;cursor:grab}.palette-entry:hover{border-color:#c9d8f3;background:#f8fbff}.palette-entry:active{cursor:grabbing}.palette-entry:focus-visible{outline:2px solid #2f6fed;outline-offset:2px}.palette-entry b,.palette-entry small{grid-column:1/-1;white-space:normal;font-size:13px}.palette-entry small{font-size:12px}.palette-entry select{min-width:0;max-width:120px;cursor:default}.subflow-section{border-top:1px solid #e2e8f0}.subflow-section>p{font-size:13px;color:#748198}.palette-title h3{font-size:15px}.palette-title small,.hint,.palette-scroll h4{font-size:12px}
 </style>
+<style scoped>.palette-entry b,.palette-entry small{overflow-wrap:anywhere;overflow:visible;text-overflow:clip;white-space:normal}</style>

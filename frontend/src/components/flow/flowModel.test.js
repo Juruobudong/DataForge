@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { artifactMatches, connectionIssue, createsCycle, deserializeDefinition, deserializeRuntimeDag, groupOperatorCapabilities, hasEditableParameters, makeCanvasNode, operatorNodeSubtitle, removeElements, resolveNodeMetadata, runtimeArtifactLabel, serializeDefinition, subflowEnglishName, subflowPrimaryName, subflowSubtitle, validateFlow } from './flowModel.js'
 import { ref } from 'vue'
 import { useFlowHistory } from './composables/useFlowHistory.js'
+import { dataflowOperators } from './__tests__/flowFixtures.js'
 
 const catalog = [
   { code: 'source', name: 'Source', category: '文档', input_ports: { input: { artifact_type: 'source_file', cardinality: 'one' } }, output_ports: { output: { artifact_type: 'chunk_set', cardinality: 'many' } }, input_example: { input: [{ filename: 'guide.md' }] }, output_example: { output: [{ content: 'example' }] } },
@@ -54,6 +55,17 @@ test('operator metadata separates Chinese display name, English name, and techni
   assert.equal(fallback.code, 'legacy-cleaner')
   assert.equal(operatorNodeSubtitle(fallback), 'legacy-cleaner')
   assert.equal(operatorNodeSubtitle(fallback, true), 'legacy-cleaner')
+})
+
+test('DataFlow class identity is bilingual and is not duplicated as a technical code', () => {
+  for (const operator of dataflowOperators) {
+    const definition = { kind: 'operator', ref: operator.code, operator_version: operator.version, operator_spec: operator }
+    // Runtime uses the frozen name even if the current catalog is changed.
+    const meta = resolveNodeMetadata(definition, [{ ...operator, name: 'wrong latest name' }])
+    assert.equal(meta.name, operator.display_name_zh)
+    assert.equal(operatorNodeSubtitle(meta, true), `DataFlow · ${operator.code}`)
+    assert.equal(operatorNodeSubtitle(meta), `DataFlow · ${operator.code}`)
+  }
 })
 
 test('subflow presentation separates built-in Chinese, English, code, and revision', () => {
@@ -154,25 +166,25 @@ test('history records graph transactions and supports undo and redo', () => {
 
 test('capability-first grouping surfaces common capabilities and folds the rest by category', () => {
   const catalog = [
-    { code: 'qa-generator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'Text2QAGenerator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true, version: 3 },
     { code: 'prompt-generator', name: 'Prompt Generator', display_name_zh: '提示词生成器', category: '知识生成', exposure: 'canvas', enabled: true, version: 4 },
     { code: 'graph-extractor', name: 'Graph Extractor', display_name_zh: '图谱抽取器', category: '知识生成', exposure: 'canvas', enabled: true, version: 4 },
-    { code: 'quality-evaluator', name: 'Evaluator', display_name_zh: '知识质量评估器', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
-    { code: 'source-binding', name: 'Source Binding', display_name_zh: '来源绑定器', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'graph-quality-validator', name: 'Graph Validator', display_name_zh: '图谱质量校验器', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
+    { code: 'artifact-merge', name: 'Artifact Merge', display_name_zh: '候选合并', category: '质量治理', exposure: 'canvas', enabled: true, version: 3 },
     { code: 'internal-op', name: 'Internal', display_name_zh: '内部算子', category: 'Runtime', exposure: 'internal', enabled: true, version: 3 },
     { code: 'disabled-op', name: 'Disabled', display_name_zh: '禁用算子', category: '知识生成', exposure: 'canvas', enabled: false, version: 3 },
   ]
   const result = groupOperatorCapabilities(catalog)
-  assert.deepEqual(result.common.map(item => item._label), ['问答生成', '文本生成', '实体关系抽取', '质量检查'])
+  assert.deepEqual(result.common.map(item => item._label), ['问答生成', '文本生成', '实体关系抽取', '图谱校验'])
   assert.ok(result.common.every(item => item.version >= 3))
   assert.deepEqual(Object.keys(Object.fromEntries(result.groups)), ['质量治理'])
-  assert.deepEqual(result.groups[0][1].map(item => item.code), ['source-binding'])
+  assert.deepEqual(result.groups[0][1].map(item => item.code), ['artifact-merge'])
   assert.ok(result.groups[0][1].every(item => !result.common.some(c => c.code === item.code)))
 })
 
 test('capability-first grouping filters by query and excludes internal operators', () => {
   const catalog = [
-    { code: 'qa-generator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true },
+    { code: 'Text2QAGenerator', name: 'QA Generator', display_name_zh: '问答生成器', category: '知识生成', exposure: 'canvas', enabled: true },
     { code: 'source-binding', name: 'Source Binding', display_name_zh: '来源绑定器', category: '质量治理', exposure: 'canvas', enabled: true },
   ]
   assert.deepEqual(groupOperatorCapabilities(catalog, undefined, '来源').groups[0][1].map(item => item.code), ['source-binding'])
