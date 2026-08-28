@@ -32,8 +32,11 @@ def digest(value):
 
 
 def runtime_fingerprint(value):
-    return digest({"dependencies": value.get("dependencies", {}), "packages": value.get("packages", []),
-                   "python_version": value.get("python_version", "3.12"), "dependency_lock_digest": value.get("dependency_lock_digest")})
+    payload = {"dependencies": value.get("dependencies", {}), "packages": value.get("packages", []),
+               "python_version": value.get("python_version", "3.12"), "dependency_lock_digest": value.get("dependency_lock_digest")}
+    if value.get("resource_profiles"):
+        payload["resource_profiles"] = value["resource_profiles"]
+    return digest(payload)
 
 
 class OperatorRuntime:
@@ -48,6 +51,7 @@ class OperatorRuntime:
         match = next(((value, item) for value in manifest.get("runtimes", [manifest]) for item in value.get("packages", [])
                       if item["name"] == spec.get("package") and item["version"] == spec.get("package_version")
                       and item["digest"] == spec.get("package_digest")
+                      and (not spec.get("resource_profile") or spec["resource_profile"] in value.get("resource_profiles", {}))
                       and (not spec.get("dependency_lock_digest") or spec["dependency_lock_digest"] == value.get("dependency_lock_digest"))
                       and spec.get("environment_digest", runtime_fingerprint(value)) == runtime_fingerprint(value)), None)
         if match is None:
@@ -56,6 +60,9 @@ class OperatorRuntime:
         python = Path(value["python"])
         if not python.is_file():
             raise ValueError("OPERATOR_DEPENDENCY_MISSING: 算子 Python 不存在")
+        if spec.get("resource_profile"):
+            from .resource_bundle import verify_bundle
+            verify_bundle(value["resource_profiles"][spec["resource_profile"]])
         return value, package
 
     def status(self, spec):
@@ -90,12 +97,24 @@ class OperatorRuntime:
                    "uses_llm": bool(spec.get("uses_llm")), "records": records, "init": init or {},
                    "run_arguments": run_arguments or {}, "context": context or {}, "params": params or {}, "action": action,
                    "dependencies": runtime.get("dependencies", {}), "python_version": runtime.get("python_version")}
+        request.update(adapter_version=spec.get("adapter_version"), sensitive=bool(spec.get("sensitive")))
+        bundle = (runtime.get("resource_profiles") or {}).get(spec.get("resource_profile"))
+        if bundle:
+            request["resource_bundle"] = bundle
         environment = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "TEMP", "TMP") if key in os.environ}
         environment.update(PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         messages = queue.Queue(maxsize=16)
         stopped = threading.Event()
         deadline = time.monotonic() + (timeout if timeout is not None else spec.get("timeout_seconds", 300))
         with tempfile.TemporaryDirectory(prefix="dataforge-operator-") as cwd:
+            # NLTK initializes a downloader during import even for rules that
+            # never use corpora. Give it an existing disposable directory, not
+            # the user's home. This does not download any data or models.
+            environment["NLTK_DATA"] = cwd
+            if bundle:
+                resource_root = Path(bundle["root"])
+                environment.update(NLTK_DATA=str(resource_root / "nltk"), HF_HOME=str(resource_root / "hf"),
+                                   HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1")
             process = subprocess.Popen([runtime["python"], "-I", str(Path(__file__).with_name("process_worker.py"))],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                 cwd=cwd, env=environment, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -127,8 +146,12 @@ class OperatorRuntime:
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 try:
                     while chunk := process.stderr.buffer.read1(4096):
-                        diagnostics.append("stderr", decoder.decode(chunk))
-                    diagnostics.append("stderr", decoder.decode(b"", final=True))
+                        fragment = decoder.decode(chunk)
+                        if not spec.get("sensitive"):
+                            diagnostics.append("stderr", fragment)
+                    fragment = decoder.decode(b"", final=True)
+                    if not spec.get("sensitive"):
+                        diagnostics.append("stderr", fragment)
                 except (OSError, ValueError):
                     pass
 

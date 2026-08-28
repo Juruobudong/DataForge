@@ -1,6 +1,18 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-27
+更新日期：2026-08-28
+
+图谱业务抽取要求与规则编辑（2026-08-28）：实体/关系抽取器 v7 接入真实模型请求通道，版本化指令、统一只读提示词预览、实体名称/描述编辑和配置区定位已实现；本地验证统计见[实施记录](wiki/sources/graph-guidance-2026-08-28.md)。真实模型效果及远程验收仍为 CONNECT。
+
+四个内置流程原始高级 DAG（2026-08-28）：`DONE`。文本、问答、三元组、语义图谱转换后经过真实 Vue 编辑器保存、调试、发布及正式写入，本地受控模型回归通过；不修改默认拓扑或运行契约。真实模型效果和远程验收仍为 `CONNECT`。证据及测试隔离修正见[验收记录](wiki/sources/four-builtin-advanced-dags-2026-08-28.md)。
+
+PII完整资源离线导入（2026-08-28）：固定NER/NLTK归档与审核清单、资源构建层强制禁网、安全导入及真实本地离线推理回归已实现；需额外同步不入Git的443MB资源ZIP。详见[离线资源记录](wiki/sources/pii-offline-resources-2026-08-28.md)，尚未运行Docker验收。
+
+PII构建修复（2026-08-28）：新增跨平台v2锁、三个治理算子v2及spaCy模型wheel预下载/哈希校验复用，旧契约与旧环境保留。验证进展见[022修复记录](specs/022-dataflow-governance/build-repair.md)；不宣称Docker或`.34`验收完成。
+
+DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入口；新增11项过滤、英文匿名化、单Chunk多跳、QA四维评分及结构化条件过滤。派生正文保留来源与过滤回执，历史版本不改写；卡片hover用途和i详情统一落地。本地真实包/英文CPU模型、前端和浏览器验证见[022记录](specs/022-dataflow-governance/validation.md)，不代表Docker/`.34`或真实LLM效果验收。来源：[治理基线](wiki/sources/dataflow-governance-2026-08-28.md)。
+
+知识流程执行契约与精选扩充（2026-08-28）：本地实现 CAS发布、Revision/Snapshot写保护、Debug/Published身份分域、Published冻结内容调试、原子替换及十个真实DataFlow精选算子；新旧环境并存。全量验证状态以[021记录](specs/021-flow-execution-curated-expansion/validation.md)为准，不代表`.34`或真实模型验收。来源：[本轮基线](wiki/sources/flow-execution-curated-expansion-2026-08-28.md)。
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
 
 本文件只记录能力完成度与外部验收状态；当前系统结构见 [`docs/architecture/`](docs/architecture/overview.md)，设计原因见 [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md)，历史方案见 [`docs/archive/`](docs/archive/old-plan.md)。
@@ -20,6 +32,10 @@
 
 ## 页面与操作
 
+DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、DAG ref 与英文名称使用 `Text2QAGenerator` v6、`PromptedRefiner` v4、`HashDeduplicateFilter` v4、`MinHashDeduplicateFilter` v4。两个去重节点固定策略，旧编码仅保留历史内部执行；目录、画布与调试统一中英文对照。QA、来源与 Sink 行为保持不变。来源：[批准基线](wiki/sources/dataflow-upstream-names-2026-08-28.md)。
+
+自定义流程当前草稿执行（2026-08-28）：`DONE`。Advanced 完整 DSL 直接编译；500ms 自动保存、运行前排空保存队列、草稿 checksum 冲突保护、不可变 Run DAG/来源/校验和展示已实现。删除必要转换节点返回端口错误，不补节点；正式 Job 仍使用发布快照。真实 `.34` 服务验收为 `CONNECT`。来源：[批准基线](wiki/sources/current-draft-execution-2026-08-28.md)。
+
 | 范围 | 页面或操作 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | 业务工作区 | 工作台：文档、任务、知识库、Vector Ready、项目统计 | `DONE` | 使用现有列表接口汇总。 |
@@ -36,9 +52,10 @@
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
 | 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
-| 流程开发区 | 知识流程 / 开发者资源 | `DONE` | Standard 文本三阶段、无模型 Mapper；QA/图谱/Multi 按 Managed generation 合同展示生成。转 Advanced 保留 Mapper，显式选择 v6 Prompt/Structured Generator 才生成文本；历史 v4/v5 保留旧行为。开发者资源不可折叠，真实 `.34` 模型验收为 `CONNECT`。 |
-| 流程开发区 | 五类 Standard 透明算子与精选 DataFlow / Custom | `LOCAL` | 固定模板只读算子链、Advanced 版本目录与上下文候选、真实 DataFlow QA v5/去重 v4/修订 v4、可信插件验证发布及包/环境/Serving 冻结；实际包 + stub 模型本地验证，`.34` 容器与真实模型效果待验收。 |
+| 流程开发区 | 知识流程 / 开发者资源 | `DONE` | 五固定模板只保留真实执行节点；Text/QA 直接接 Sink，Graph 保留独立校验。QA v6 支持冻结的多行提取要求，合法无匹配为成功零产出；失败保留旧知识。Standard/Advanced/Multi 共用参数与执行链；旧版本不改写。真实 `.34` 模型验收为 `CONNECT`。 |
+| 流程开发区 | 五类 Standard 透明算子与精选 DataFlow / Custom | `LOCAL` | Standard 输出由目录强制推导，Multi 规范 graph:triple/默认实体；技术视图区分真实算子与 Sink 平台治理。DataFlow/Custom 的有界脱敏双流日志贯通正式/Debug/派生节点与事件。保留版本目录、候选、真实精选算子及可信插件；实际包 + stub 模型本地验证，`.34` 容器与真实模型效果待验收。 |
 | 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision 可使用内置审核 Sample + 虚拟空库 Diff，或同库多审核输入 + 真实 Sink Diff；Runtime DAG 只读，真实 `.34` E2E 为 `CONNECT`。 |
+| 流程开发区 | 知识流程最终结果 | `LOCAL` | 冻结 DAG 输出驱动文本、QA、三元组、语义图谱及扩展类型分页；读取本次 Sink 候选，保留来源与按节点处理诊断。无正式写入；本地 API、组件与浏览器检查通过，真实 `.34` 验收待完成。 |
 | 流程开发区 | 独立“向量索引”导航页 | `REMOVE` | 已收口进 DataFlow 调试台；旧链接重定向，仍只读。 |
 | 原型能力 | DataFlow WebUI、Shell、任意 Python、运行时改图 | `REMOVE` | 与受控 Flow 和 Runner 安全边界冲突。 |
 | 原型能力 | 任意上游算子、KCenterGreedy、MultiHop Batch、Reference Remover、训练/代码/Text2SQL/Agentic-RAG | `REMOVE` | 不在 V7 Catalog；MultiHop/PII 等未适配能力仍需专门批准；文本/QA Refiner v4 已单独接入。 |

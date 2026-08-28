@@ -24,3 +24,14 @@ test('empty structured error does not mask real errors or fabricate causes', () 
   assert.equal(failure.explanation, '')
   assert.equal(nodeFailureInfo({ status: 'completed', logs: [{ stream: 'stderr', message: 'INFO Results saved to dataforge-memory' }] }).hasFailure, false)
 })
+
+test('triple chunk failure keeps exact counts and endpoint diagnostics', () => {
+  const reason = 'GRAPH_ENDPOINT_UNRESOLVED: subject 端点不在已抽取实体中 [source_chunk_id=bad]'
+  const failure = nodeFailureInfo({ status: 'completed',
+    metrics: { chunk_processing: [{ output_key: 'graph:triple', attempted_chunks: 2, successful_chunks: 1, failed_chunks: 1 }] },
+    logs: [{ stream: 'stderr', message: `${reason}\n${reason}` }] })
+  assert.equal(failure.failed, false)
+  assert.equal(failure.chunkFailure, true)
+  assert.equal(failure.processing[0].failed_chunks, 1)
+  assert.deepEqual(failure.reasons, [reason])
+})

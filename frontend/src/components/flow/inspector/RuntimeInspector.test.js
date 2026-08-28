@@ -24,7 +24,7 @@ describe('operator diagnostic rendering', () => {
   it('shows frozen bilingual identity separately from the runtime node id', () => {
     const wrapper = mount(RuntimeInspector, { props: { operator: dataflowOperators[0], node: { node_id: 'generate-qa', status: 'completed' } } })
     expect(wrapper.get('h3').text()).toBe('文本转问答生成器')
-    expect(wrapper.get('.operator-bilingual').text()).toBe('DataFlow · Text2QAGenerator')
+    expect(wrapper.get('.operator-bilingual').text()).toBe('Text2QAGenerator')
     expect(wrapper.get('header').text()).toContain('generate-qa')
     wrapper.unmount()
   })

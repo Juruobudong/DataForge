@@ -8,7 +8,7 @@ import EdgeInspector from '../inspector/EdgeInspector.vue'
 import GraphSchemaEditor from '../../graph/GraphSchemaEditor.vue'
 import PromptPreview from '../../graph/PromptPreview.vue'
 import SubflowExtractionDialog from '../SubflowExtractionDialog.vue'
-import { deserializeDefinition, makeCanvasNode, serializeDefinition, validateFlow, validateSubflow, subflowNodeDefinition, resolveSubflow } from '../flowModel'
+import { deserializeDefinition, makeCanvasNode, serializeDefinition, validateFlow, validateSubflow, subflowNodeDefinition, resolveSubflow, operatorAvailable, keepCompatibleParams, connectionIssue } from '../flowModel'
 import { useFlowHistory } from '../composables/useFlowHistory'
 import { removeEntityReferences } from '../../graph/entityTypeModel'
 
@@ -24,6 +24,14 @@ const emit = defineEmits(['dirty', 'error', 'open-subflow', 'subflow-created'])
 const extraction = ref(null)
 
 const selectedNode = ref(null), selectedEdge = ref(null)
+const evaluationNodes = computed(() => {
+  const ancestors = new Set(), queue = [selectedNode.value?.id]
+  while (queue.length) {
+    const id = queue.pop()
+    for (const edge of edges.value.filter(edge => edge.target === id)) if (!ancestors.has(edge.source)) { ancestors.add(edge.source); queue.push(edge.source) }
+  }
+  return nodes.value.filter(node => ancestors.has(node.id) && node.data.definition.ref === 'Text2QASampleEvaluator').map(node => ({ id: node.id, label: `${node.data.meta.name} · ${node.id}` }))
+})
 const connectionSource = ref(null)
 const candidateCodes = ref(null), candidateError = ref(''), candidatesLoading = ref(false)
 let candidateTimer, candidateSequence = 0
@@ -32,6 +40,30 @@ const nodes = ref([]), edges = ref([])
 const canvas = ref(null), editor = ref(null)
 const graphConfig = ref({ entity_types: [], relation_types: [], literal_policy: { enabled_datatypes: [] }, unknown_entity_policy: 'reject', unknown_relation_policy: 'reject', prompt: { mode: 'generated', body: null } })
 const graphConfigOpen = ref(false)
+const graphConfigPanel = ref(null), graphSchemaEditor = ref(null), graphConfigButton = ref(null), promptPanel = ref(null)
+const promptNodeId = ref('')
+const promptDefinition = computed(() => serialize())
+let graphNavigation = 0
+
+function scrollToSection(target) {
+  target?.focus?.({ preventScroll: true })
+  target?.scrollIntoView?.({ block: 'start', behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches ? 'instant' : 'smooth' })
+}
+async function openGraphConfig({ part = 'entities', nodeId = '' } = {}) {
+  if (!hasGraphOutput.value) return
+  const sequence = ++graphNavigation
+  graphConfigOpen.value = true
+  if (nodeId) promptNodeId.value = nodeId
+  await nextTick()
+  if (sequence !== graphNavigation || !graphConfigOpen.value || !hasGraphOutput.value) return
+  scrollToSection(part === 'prompt' ? promptPanel.value : part === 'relations' ? graphSchemaEditor.value?.section(part) : graphConfigPanel.value)
+}
+async function returnToCanvas(collapse = false) {
+  const sequence = ++graphNavigation
+  if (collapse) graphConfigOpen.value = false
+  await nextTick()
+  if (sequence === graphNavigation) scrollToSection(graphConfigButton.value)
+}
 const { canUndo, canRedo, remember, undo: historyUndo, redo: historyRedo, clear: clearHistory } = useFlowHistory(nodes, edges, 40, graphConfig)
 
 const hasGraphOutput = computed(() => props.outputTypes.some(value => value === 'graph' || value.startsWith('graph:')))
@@ -66,6 +98,7 @@ function validate() {
   return issues.value.length === 0
 }
 function loadDefinition(value) {
+  graphNavigation++; promptNodeId.value = ''
   connectionSource.value = null
   const graph = deserializeDefinition(value, props.catalog, props.subflows)
   nodes.value = graph.nodes; edges.value = graph.edges
@@ -76,6 +109,7 @@ function loadDefinition(value) {
   nextTick(() => canvas.value?.fit())
 }
 function reset() {
+  graphNavigation++; promptNodeId.value = ''
   connectionSource.value = null
   selectedNode.value = null; selectedEdge.value = null
   nodes.value = []; edges.value = []
@@ -171,6 +205,30 @@ function changeOperatorVersion(version) {
   selectedNode.value.data.meta = makeCanvasNode(definition, selectedNode.value.position, props.catalog, props.subflows).data.meta
   validate()
 }
+function replaceOperator(item) {
+  const old = selectedNode.value
+  if (!old || old.data.meta.nodeRole !== 'operator' || old.data.definition.kind !== 'operator' || !item) return
+  if (item.node_role === 'flow_input' || item.code === 'reviewed-source-chunk-input' || !operatorAvailable(item, props.purpose, props.outputTypes)) return
+  if (old.data.definition.ref === item.code && old.data.definition.operator_version === item.version) return
+  const definition = { id: old.id, kind: 'operator', node_role: 'operator', ref: item.code,
+    operator_version: item.version, params: keepCompatibleParams(old.data.definition.params, item.parameter_schema) }
+  const next = { ...makeCanvasNode(definition, old.position, props.catalog, props.subflows), selected: true }
+  const nextNodes = nodes.value.map(node => node.id === old.id ? next : node)
+  let nextEdges = [...edges.value]
+  const removed = []
+  for (const edge of edges.value.filter(edge => edge.source === old.id || edge.target === old.id)) {
+    const issue = connectionIssue(edge, nextNodes, nextEdges.filter(item => item.id !== edge.id))
+    if (issue) { nextEdges = nextEdges.filter(item => item.id !== edge.id); removed.push(`${edge.source} → ${edge.target}：${issue.message}`) }
+  }
+  remember()
+  nodes.value = nextNodes; edges.value = nextEdges; selectedNode.value = next; selectedEdge.value = null
+  focusedIssue.value = null; connectionSource.value = null
+  markDirty()
+  // Focus uses the child canvas's models; wait until both graph props have
+  // committed so validation cannot write the previous graph back into state.
+  nextTick(() => validate())
+  if (removed.length) emit('error', `替换完成，已删除 ${removed.length} 条不兼容连线：${removed.join('；')}`)
+}
 function applyNormalizedDefinition(value) {
   if (value?.graph_config) graphConfig.value = normalizeGraphConfig(value.graph_config)
   const normalized = Object.fromEntries((value?.nodes || []).map(node => [node.id, node]))
@@ -190,7 +248,7 @@ function applyGraphConfig(value) {
   nodes.value = cleaned.nodes
   if (selectedNode.value) selectedNode.value = nodes.value.find(node => node.id === selectedNode.value.id) || null
 }
-function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null; connectionSource.value = { nodeId: node.id, port: 'output' } }
+function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null; connectionSource.value = node ? { nodeId: node.id, port: 'output' } : null }
 function selectEdge(edge) { selectedEdge.value = edge; selectedNode.value = null; connectionError.value = null }
 function deleteEdge(edgeId) { canvas.value?.deleteEdge(edgeId) }
 function reportConnectionError(issue) { connectionError.value = issue; if (issue) emit('error', issue.message) }
@@ -218,29 +276,36 @@ function shortcut(event) {
 defineExpose({ serialize, validate, loadDefinition, applyNormalizedDefinition, focusBackendProblem, reset, nodes, edges })
 
 onMounted(() => window.addEventListener('keydown', shortcut))
-onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
+onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown', shortcut) })
 </script>
 
 <template>
-  <div class="advanced-editor">
+  <div class="advanced-editor" :class="{ 'knowledge-flow-editor': !fragment }">
     <div class="flow-toolbar">
       <div><button :disabled="!canUndo" title="Ctrl+Z" @click="undo">↶ 撤销</button><button :disabled="!canRedo" title="Ctrl+Shift+Z" @click="redo">↷ 重做</button><span></span><button @click="autoLayout">自动布局</button><button @click="canvas?.fit()">适应画布</button></div>
-      <div><span class="selection-state">{{ nodes.length }} 节点 · {{ edges.length }} 连线</span><button v-if="!fragment" :disabled="!nodes.some(node => node.selected)" @click="extractSelection">另存为可复用子流程</button><button v-if="hasGraphOutput" :class="{ active: graphConfigOpen }" @click="graphConfigOpen = !graphConfigOpen">图谱抽取配置</button></div>
+      <div><span class="selection-state">{{ nodes.length }} 节点 · {{ edges.length }} 连线</span><button v-if="!fragment" :disabled="!nodes.some(node => node.selected)" @click="extractSelection">另存为可复用子流程</button><button v-if="hasGraphOutput" ref="graphConfigButton" :class="{ active: graphConfigOpen }" :aria-expanded="graphConfigOpen" aria-controls="graph-config-panel" @click="openGraphConfig()">图谱抽取配置</button></div>
     </div>
     <div ref="editor" class="flow-workspace">
       <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :candidate-codes="candidateCodes" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
-      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @change="markDirty" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
+      <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" height="var(--flow-canvas-height)" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @change="markDirty" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
-      <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :entity-types="graphConfig.entity_types" :issue="selectedIssue" :sample-result="sampleResult" @apply-parameters="applyParameters" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
+      <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :purpose="purpose" :output-types="outputTypes" :entity-types="graphConfig.entity_types" :evaluation-nodes="evaluationNodes" :issue="selectedIssue" :sample-result="sampleResult" @replace-operator="replaceOperator" @apply-parameters="applyParameters" @open-graph-config="openGraphConfig" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
     </div>
-    <section v-if="graphConfigOpen && hasGraphOutput" class="graph-config-panel"><GraphSchemaEditor :model-value="graphConfig" @update:model-value="applyGraphConfig" /><PromptPreview :graph-config="graphConfig" /></section>
+    <section v-if="graphConfigOpen && hasGraphOutput" id="graph-config-panel" ref="graphConfigPanel" class="graph-config-panel" tabindex="-1" aria-label="全流程图谱规则">
+      <header class="graph-config-heading"><div><h3>全流程图谱规则</h3><p>实体与关系抽取器共用的类型定义；结果仍经过图谱结构、质量校验。业务抽取要求在各节点中编辑。</p></div><div><button type="button" @click="returnToCanvas()">返回画布</button><button type="button" @click="returnToCanvas(true)">收起</button></div></header>
+      <GraphSchemaEditor ref="graphSchemaEditor" :model-value="graphConfig" @update:model-value="applyGraphConfig" />
+      <div ref="promptPanel" tabindex="-1" class="graph-prompt-panel"><PromptPreview :definition="promptDefinition" v-model:selected-node-id="promptNodeId" /></div>
+    </section>
     <section v-if="issues.length" class="validation-panel"><div><h3>画布校验</h3><span>{{ issues.length }} 个问题</span></div><button v-for="(issue,index) in issues" :key="`${issue.code}-${index}`" @click="focusIssue(issue)"><b>{{ issue.code }}</b><span>{{ issue.message }}</span><small>定位 →</small></button></section>
     <SubflowExtractionDialog v-if="extraction" :definition="extraction.definition" :output-types="outputTypes" :selected-node-ids="extraction.ids" @close="extraction=null" @created="emit('subflow-created', $event)" @open="extraction=null; emit('open-subflow', $event)" />
   </div>
 </template>
 
 <style scoped>
-.advanced-editor { display: grid; gap: 10px; }
+.advanced-editor { --flow-canvas-height: 720px; display: grid; gap: 10px; }
+.knowledge-flow-editor { --flow-canvas-height: max(720px, calc(100dvh - 240px)); }
+.knowledge-flow-editor :deep(.operator-palette), .knowledge-flow-editor :deep(.edge-inspector) { height: var(--flow-canvas-height); min-height: 0; }
+.knowledge-flow-editor :deep(.edge-inspector) { overflow: auto; }
 .flow-toolbar { display: flex; align-items: center; justify-content: space-between; min-height: 54px; padding: 9px 12px; border: 1px solid var(--border); border-radius: 12px; background: #fff; }
 .flow-toolbar > div { display: flex; align-items: center; gap: 6px; }
 .selection-state { color: #66758a; font-size: 12px; margin-right: 6px; }
@@ -255,4 +320,7 @@ onBeforeUnmount(() => window.removeEventListener('keydown', shortcut))
 .validation-panel button b { color: #986316; }
 .validation-panel button span { color: #6b5a3a; }
 .validation-panel button small { color: #a8842e; }
+</style>
+<style scoped>
+.graph-config-panel,.graph-prompt-panel,.flow-toolbar button,.graph-config-panel :deep(.schema-block){scroll-margin-top:88px}.graph-config-heading{grid-column:1/-1;display:flex;justify-content:space-between;gap:16px;align-items:start}.graph-config-heading h3{margin:0;font-size:18px}.graph-config-heading p{margin:8px 0 0;color:var(--muted);font-size:13px}.graph-config-heading>div:last-child{display:flex;gap:8px;flex-shrink:0}.graph-prompt-panel{min-width:0}
 </style>

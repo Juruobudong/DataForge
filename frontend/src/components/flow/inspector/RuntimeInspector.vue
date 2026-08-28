@@ -36,6 +36,8 @@ const payload = computed(() => {
   const error = (typeof props.node.error_detail === 'string' ? props.node.error_detail : props.node.error_detail?.message) || props.node.error || null
   return { overview: { status: props.node.status, operator: `${props.node.operator_code || ''}@${props.node.operator_version || ''}`, duration_ms: props.node.duration_ms, error }, parameters: props.node.resolved_parameters, input: props.node.input_artifact_ids, output: props.node.output_artifact_ids, logs: props.node.logs, metrics: props.node.metrics, lineage: props.node.lineage }
 })
+const derivedItems = computed(() => (props.content?.items || []).filter(item => item.source_chunk && typeof item.effective_text === 'string'))
+const evaluatedItems = computed(() => (props.content?.items || []).filter(item => item.evaluation_results))
 </script>
 
 <template>
@@ -56,6 +58,11 @@ const payload = computed(() => {
         <p v-if="!node.logs?.length">暂无算子日志。日志在节点结束后显示。</p>
         <article v-for="(log, index) in node.logs || []" :key="index"><h4>{{ log.stream || '日志' }} <span v-if="log.truncated" class="truncated">已截断（每流最多 32 KiB）</span></h4><pre>{{ log.message }}</pre></article>
       </section>
+      <section v-else-if="artifact && derivedItems.length" class="derived-preview" aria-label="派生正文">
+        <p>保留 {{ derivedItems.filter(item=>item.disposition==='keep').length }} 条 · 过滤 {{ derivedItems.filter(item=>item.disposition==='filtered').length }} 条（当前页）</p>
+        <article v-for="(item,index) in derivedItems" :key="index"><h4>{{ item.disposition === 'keep' ? '保留' : '正常过滤' }}</h4><h4>原始正文 · Evidence 保留</h4><pre>{{ item.source_chunk.content }}</pre><h4>处理后正文</h4><pre>{{ item.effective_text }}</pre><details><summary>来源与处理记录</summary><pre>{{ JSON.stringify(item,null,2) }}</pre></details></article>
+      </section>
+      <section v-else-if="artifact && evaluatedItems.length" aria-label="QA质量评估"><p>以下为模型评分，不等于原始证据事实核验。</p><pre>{{ JSON.stringify(payload,null,2) }}</pre></section>
       <pre v-else>{{ JSON.stringify(artifact ? payload : payload[tab], null, 2) }}</pre>
       <template v-if="node && ['input','output'].includes(tab)"><button v-for="id in payload[tab] || []" :key="id" class="artifact-link" @click="emit('inspect-artifact', id)">{{ id }}</button></template>
     </div>

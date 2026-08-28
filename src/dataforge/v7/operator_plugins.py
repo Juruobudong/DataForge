@@ -35,6 +35,8 @@ def validate_manifest(raw):
     if not re.fullmatch(r"[a-f0-9]{64}", value["package_digest"]):
         raise ValueError("package_digest 必须是 SHA-256")
     for field, port in (("input_ports", "input"), ("output_ports", "output")):
+        if any(key in value[field].get(port, {}) for key in ("accepted_types", "output_by_input")):
+            raise ValueError("自定义算子不能声明平台多态正文端口")
         if set(value[field]) != {port} or value[field][port].get("artifact_type") not in ARTIFACT_TYPES:
             raise ValueError("首版仅支持一个已知类型的 input/output 端口")
         if value[field][port].get("binding", "edge") != "edge":

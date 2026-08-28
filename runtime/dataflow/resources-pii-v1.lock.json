@@ -1,0 +1,9 @@
+{
+  "archive_sha256": "71d1db9d9e8fd0f5839d9f2c0e187c27e20da681e9cb1b104e346e4665fe3267",
+  "content_digest": "41fa288b6a56cbc9ba7ded2710210762f373db2c4bea128912add6083a3a2c7f",
+  "file_count": 132,
+  "ner_revision": "d1a3e8f13f8c3566299d95fcfc9a8d2382a9affc",
+  "nltk_revision": "550b6625bcef1f2abff2ff770a5a0d272c9c6b2a",
+  "schema": "dataforge.operator-resources.v1",
+  "unpacked_bytes": 500533691
+}

@@ -799,6 +799,7 @@ class MigrationImporter:
                 return [rewrite_refs(child) for child in value]
             return value
 
+        pending_publications = {}
         for raw in metadata.get("knowledge_flow_template_revisions", []):
             payload = dict(raw)
             payload["definition_json"] = rewrite_refs(payload.get("definition_json") or {})
@@ -812,7 +813,11 @@ class MigrationImporter:
                     raise ValueError(f"KnowledgeFlowTemplateRevision v{payload['revision_no']} 定义不兼容")
                 revision_id = current.id
             else:
-                revision_id = _upsert(session, KnowledgeFlowTemplateRevision, payload).id
+                if payload.get("status") == "published":
+                    pending_publications[payload["id"]] = _model_values(KnowledgeFlowTemplateRevision, raw).get("published_at") or utc_now()
+                    payload["status"], payload["published_at"] = "draft", None
+                revision_id = _upsert(session, KnowledgeFlowTemplateRevision, payload,
+                    immutable=("knowledge_flow_template_id", "revision_no", "definition_json")).id
             id_maps["template_revisions"][raw["id"]] = revision_id
 
         for payload in metadata.get("operator_versions", []):
@@ -834,8 +839,10 @@ class MigrationImporter:
             payload["knowledge_flow_template_revision_id"] = id_maps["template_revisions"].get(
                 source_revision_id, source_revision_id,
             )
-            payload["compiled_definition_json"] = rewrite_refs(payload.get("compiled_definition_json") or {})
-            rewritten = payload["knowledge_flow_template_revision_id"] != source_revision_id
+            source_definition = payload.get("compiled_definition_json") or {}
+            payload["compiled_definition_json"] = rewrite_refs(source_definition)
+            rewritten = (payload["knowledge_flow_template_revision_id"] != source_revision_id
+                         or payload["compiled_definition_json"] != source_definition)
             if rewritten:
                 compiled_checksum = hashlib.sha256(json.dumps(
                     payload["compiled_definition_json"], ensure_ascii=False, sort_keys=True,
@@ -843,15 +850,24 @@ class MigrationImporter:
                 ).encode("utf-8")).hexdigest()
                 payload["dependency_json"] = dict(payload.get("dependency_json") or {})
                 payload["dependency_json"]["source_checksum"] = compiled_checksum
-                payload["checksum"] = hashlib.sha256(
-                    f"{payload['knowledge_flow_template_revision_id']}:{compiled_checksum}".encode("utf-8")
-                ).hexdigest()
+                payload["checksum"] = V7Store._snapshot_checksum(payload.get("status", "published"),
+                    payload["knowledge_flow_template_revision_id"], compiled_checksum)
+            revision = session.get(KnowledgeFlowTemplateRevision, payload["knowledge_flow_template_revision_id"])
+            if revision and revision.status == "published" and payload.get("status", "published") == "published":
+                bound = V7Store._published_execution_snapshot(session, revision)
+                if (bound.compiled_definition_json != payload["compiled_definition_json"]
+                        or bound.dependency_json != payload.get("dependency_json")):
+                    raise ValueError("已发布 Flow Revision 的导入快照不兼容，禁止重新绑定")
+                id_maps["execution_snapshots"][source_snapshot_id] = bound.id
+                continue
             current = session.scalar(select(FlowExecutionSnapshot).where(
                 FlowExecutionSnapshot.checksum == payload["checksum"],
             ))
             if current:
                 if (current.compiled_definition_json != payload.get("compiled_definition_json") or
-                        current.dependency_json != payload.get("dependency_json")):
+                        current.dependency_json != payload.get("dependency_json") or
+                        current.knowledge_flow_template_revision_id != payload["knowledge_flow_template_revision_id"] or
+                        current.status != payload.get("status", "published")):
                     raise ValueError(f"FlowExecutionSnapshot {payload['checksum']} 定义不兼容")
                 snapshot_id = current.id
             else:
@@ -859,16 +875,23 @@ class MigrationImporter:
                 if by_id and by_id.checksum != payload["checksum"]:
                     payload["id"] = new_id("flowsnap")
                 current = _upsert(session, FlowExecutionSnapshot, payload, immutable=(
-                    "knowledge_flow_template_revision_id", "checksum",
+                    "knowledge_flow_template_revision_id", "checksum", "status",
                     "compiled_definition_json", "dependency_json",
                 ))
                 snapshot_id = current.id
             id_maps["execution_snapshots"][source_snapshot_id] = snapshot_id
-            revision = session.get(
-                KnowledgeFlowTemplateRevision, payload["knowledge_flow_template_revision_id"],
-            )
-            if revision:
-                revision.execution_snapshot_id = snapshot_id
+        session.flush()
+        for raw in metadata.get("knowledge_flow_template_revisions", []):
+            revision_id = id_maps["template_revisions"][raw["id"]]
+            if revision_id not in pending_publications:
+                continue
+            revision = session.get(KnowledgeFlowTemplateRevision, revision_id)
+            snapshot_id = id_maps["execution_snapshots"].get(raw.get("execution_snapshot_id"))
+            snapshot = session.get(FlowExecutionSnapshot, snapshot_id) if snapshot_id else None
+            if not snapshot or snapshot.status != "published" or snapshot.knowledge_flow_template_revision_id != revision.id:
+                raise ValueError("导入 Published Revision 缺少正确绑定的 Published Snapshot")
+            revision.execution_snapshot_id = snapshot.id
+            revision.status, revision.published_at = "published", pending_publications[revision_id]
 
     @staticmethod
     def _runtime_bindings_and_baselines(session, metadata: dict[str, list[dict[str, Any]]],

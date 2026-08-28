@@ -1,8 +1,59 @@
 # 精选算子运行环境
 
-API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中调用 `open-dataflow==1.0.10`，当前支持 QA v5、去重 v4、修订 v4，不扫描上游 Registry。
+API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中调用 `open-dataflow==1.0.10`，当前为21个精选算子，不扫描全Registry。原四个和六个扩充算子的历史版本/环境保留；新增11项治理能力，QA v7、三项正文过滤器v2及原生生成器新版本支持派生正文。MinHash的同Chunk/短文本保护不变。
+
+## 英文治理资源环境
+
+当前使用 `requirements-pii-v2.in/lock`：保持v1既有依赖版本，重新生成跨平台哈希，补充HuggingFace声明的Linux `hf-xet==1.6.0` 条件依赖。Windows/Linux各安装83项。PresidioFilter、PIIAnonymizeRefiner、BlocklistFilter发布v2；三项v1与原锁/已安装环境保持不变，供历史快照执行，其余轻量算子继续使用curated-v2。
+
+在有网络的本机先下载固定spaCy wheel，再新建环境；不得向已登记环境追加依赖：
+
+```powershell
+conda activate sun
+$env:UV_LINK_MODE = 'copy'
+python scripts/prepare-operator-model-wheel.py
+python scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl --environment .dataforge/operator-env-governance-v2 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-pii-v2.lock --torch-backend cpu --model-wheel-dir runtime/dataflow/vendor
+.dataforge/operator-env-governance-v2/Scripts/python.exe scripts/prepare-operator-resources.py --resources .dataforge/operator-resources-pii-v1 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-pii-v2.lock --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl
+```
+
+使用 `--torch-backend cpu` 仅为PyTorch选择CPU包源，其他包仍从配置的PyPI源安装；不要设置全局 `UV_EXTRA_INDEX_URL` 或 `unsafe-best-match`。所有依赖保持SHA-256校验。锁通过uv0.9.9的 `--universal --python-version 3.12 --torch-backend cpu --generate-hashes` 生成，命令见锁文件头；当前验证目标是Windows AMD64与Linux x86_64/Python3.12，不承诺其他架构。
+
+### GitHub模型包超时与构建复用
+
+预下载产物：`runtime/dataflow/vendor/en_core_web_sm-3.7.1-py3-none-any.whl`，SHA-256为 `86cc141f63942d4b2c5fcee06630fd6f904788d2f0ab005cce45aadb8fb73889`。**需将此wheel随源码同步到服务器，Git不跟踪它，仅git pull不够。** `python scripts/prepare-operator-model-wheel.py --offline` 可检查已准备包。
+
+Docker构建优先校验并复用vendor内wheel，无需连接GitHub；未预置时使用独立BuildKit模型缓存及官方地址，默认120秒超时/4次尝试。错误哈希拒绝使用且不覆盖已有文件；临时签名URL不写日志。不通过关闭证书或哈希校验解决网络问题。
+
+安装时只将spaCy下载位置投影为已验证本地文件，保留版本及SHA-256；运行清单登记原始v2审核锁的指纹，不登记临时文件路径。模型包不会复制进最终Runner下载目录。
+
+NER固定 `dslim/bert-base-NER@d1a3e8f13f8c3566299d95fcfc9a8d2382a9affc`，NLTK固定 `550b6625bcef1f2abff2ff770a5a0d272c9c6b2a` 的punkt/punkt_tab，spaCy固定3.7.1。维护人员首次准备原始资源需网络；当前Docker资源层已改为强制离线导入完整包，不再连接HuggingFace/NLTK源。已登记资源目录只读复用，漂移拒绝运行。
+
+### 完整NER/NLTK离线资源包
+
+除spaCy wheel，还必须同步`runtime/dataflow/vendor-resources/pii-en-v1.zip`（443,016,588 bytes，约443 MB）及`runtime/dataflow/resources-pii-v1.lock.json`。ZIP不入Git，须额外同步；审核清单随源码管理。归档SHA-256为`71d1db9d9e8fd0f5839d9f2c0e187c27e20da681e9cb1b104e346e4665fe3267`，包含132个固定资源文件，解压共500,533,691 bytes。导出命令见[资源包说明](vendor-resources/README.md)。
+
+Docker的`operator-governance-resources`阶段使用`RUN --network=none`，校验固定修订、ZIP哈希、文件数量/体积及跨平台内容摘要后导入。缺包、损坏、路径穿越或链接立即拒绝，不回退下载。内容摘要以POSIX相对路径字符串排序，原运行时摘要算法与旧快照不变；导入到容器路径后按原算法生成本机描述符并离线登记。资源包只进入资源层，不使Python依赖层重装。完整镜像首次安装其他依赖仍可能访问PyPI，这里不宣称整个镜像离线构建。
+
+资源脚本支持 `--download-only` 和 `--register-only`；镜像独立资源层准备后，在 `RUN --network=none` 登记。新PII环境为 `dataflow-1.0.10-pii-v2`；旧轻量环境镜像路径不变。历史PII v1快照仍需保留其原运行环境/Runner，不能用v2冒充v1；v1 Linux构建此前未成功。
+
+执行阶段HF/NLTK与Python子进程继续离线；LLM经宿主Serving代理。PII仅英文CPU，不承诺中文病历识别，原始Chunk/Evidence仍保留。
 
 ## 安装
+
+### 历史与轻量精选环境
+
+原四个算子版本和 `requirements.lock` 不变。新增 ContentNullFilter、CharNumberFilter、SpecialCharacterFilter、NgramHashDeduplicateFilter、SimHashDeduplicateFilter、PromptedFilter v1 使用 `requirements-curated-v2.lock`，补齐 nltk/simhash 最小CPU依赖。上游仍为同一 `open-dataflow==1.0.10` wheel；不得原地升级旧环境。
+
+完成下文原环境安装后，另建扩充环境并登记到同一 Manifest（自动保留旧记录）：
+
+```powershell
+conda activate sun
+.dataforge/operator-env/Scripts/python.exe scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl --environment .dataforge/operator-env-curated-v2 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-curated-v2.lock
+```
+
+Runner镜像在旧 `operator-deps` 之后增加独立 `operator-expanded-deps`，扩充锁变更只影响扩充依赖层。注册阶段离线登记两个环境，Runner同时保留原路径与 `dataflow-1.0.10-curated-v2`。旧版本继续按旧锁匹配；不修改历史Snapshot。
+
+规则过滤仅导入NLTK，不使用语料；子进程的 NLTK_DATA 指向一次性临时目录，不下载任何语料/模型。PromptedFilter只能使用冻结Prompt/Serving；PromptedEvaluator只是它的上游内部依赖，不作为独立卡片开放。范围与参数见[执行契约基线](../../wiki/sources/flow-execution-curated-expansion-2026-08-28.md)。
 
 所有本地 Python/uv 命令先激活 sun，但不要在 sun 中安装 DataFlow。维护人员使用 Python 3.12 执行：
 
@@ -12,11 +63,39 @@ python -m pip download --no-deps --only-binary=:all: --require-hashes -r runtime
 python scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl --environment .dataforge/operator-env --manifest .dataforge/operator-runtime.json
 ```
 
-安装脚本拒绝覆盖已有环境，校验 wheel 摘要并按 `requirements.lock` 安装依赖。Runner 镜像执行同样步骤，环境在 `/opt/dataforge-operators/dataflow-1.0.10`。本次未在本机运行 Docker。
+安装脚本拒绝覆盖已有环境，先校验 wheel 摘要，再通过 `uv pip sync --require-hashes --only-binary=:all:` 按 `requirements.lock` 安装依赖，最后以 `--no-deps` 安装上游 wheel 并登记 Manifest。缺少匹配的 wheel 或哈希不符会失败，不回退源码构建；安装失败不会登记 Manifest。Runner 镜像采用相同安装顺序，环境在 `/opt/dataforge-operators/dataflow-1.0.10`。
 
 `requirements.in/lock` 只包含精选 CPU 算子的导入依赖集合及其固定传递依赖。上游 wheel 以 `--no-deps` 安装，**未安装它声明的完整 GPU、音频、训练和 Agent 依赖**，不能据此声称支持整个 DataFlow。新增精选算子要同时审核依赖锁、映射、适配版本与真实包契约测试。
 
 运行时只读 `DATAFORGE_OPERATOR_RUNTIME_MANIFEST`，本地默认 `.dataforge/operator-runtime.json`，容器默认 `/opt/dataforge-operators/operator-runtime.json`；不下载或安装包。API 通过已认证 Runner 查询依赖，本地无独立 Runner 时可以查询本地环境。Runner 使用与 API 相同的 `DATAFORGE_CONFIG_ENCRYPTION_KEY` 读取数据库模型配置，不把凭据传给插件。
+
+## Runner 构建与缓存
+
+根 Dockerfile 将算子环境与应用源码分开构建：
+
+```text
+python-base
+├─ app-common → app / runner
+└─ operator-deps → operator-expanded-deps → operator-governance-deps
+   → operator-governance-resources → operator-runtime → 复制到 runner
+```
+
+- `operator-deps` 只复制 `upstream.lock` 和 `requirements.lock`，复用 pip/uv 缓存。当前依赖锁已有 26 个固定版本及 SHA-256，不需要在构建时重新生成；上游依然单独锁定，不能解析它的完整依赖集合。
+- `operator-runtime` 才复制注册脚本，在 `RUN --network=none` 下生成 Manifest。Runner 只接收 `/opt/dataforge-operators`，不接收下载 wheel，并保留相同绝对路径。
+- 仅修改应用源码、Adapter、安装脚本、注册脚本或此说明，不会使算子依赖阶段失效；修改锁文件、Python/uv 基础层或相应构建指令会使其重建。修改注册脚本只重做登记和后续镜像组装。
+- 缓存减少重复安装，不能保证首次下载速度；保留缓存也不保证所有包都已缓存。`Resolved` 日志不表示版本未锁定，不以日志是否出现作为验收标准。
+
+默认源保留 `https://pypi.org/simple`。部署环境可在 `.env.docker` 设置 `PYPI_INDEX_URL`；例如选择清华镜像时使用 `https://pypi.tuna.tsinghua.edu.cn/simple`。也可在部署主机临时覆盖：
+
+```bash
+docker compose --env-file .env.docker build \
+  --build-arg PYPI_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+  dataforge-runner
+```
+
+pip 和 uv 共用该构建源，版本及哈希校验保持不变；哪个源更快应由部署环境实测。换源会影响构建缓存，不应反复换源或默认使用 `--no-cache`。日常构建不要清理 builder 缓存。
+
+部署验收需分别确认首次构建成功、仅改源码或注册脚本时 `operator-deps` 显示 `CACHED`、更改审核锁后依赖层重新安装且仍执行哈希校验。本机不运行 Docker；同步到 `.34` 后先执行 `docker compose down -v` 清空测试数据，完整部署顺序见 [运行与测试](../../wiki/pages/operations-and-testing.md)。
 
 ## 冻结与维护
 

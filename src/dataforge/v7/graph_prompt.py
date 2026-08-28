@@ -1,14 +1,55 @@
 """Schema-driven extraction prompts for graph operators.
 
-The default (generated) prompt is assembled from the template graph schema so
-that the schema is never hand-maintained twice.  Advanced templates may supply a
-custom prompt body; its output still passes through the Schema Validator.
+The default prompt is assembled from the template graph schema. Version 7 adds
+per-node business guidance while retaining system-owned inputs and JSON format.
+Legacy versions retain their custom-body contract and Schema Validator.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from .graph_schema import GraphExtractionConfig, prompt_blocks
+from .graph_schema import GraphExtractionConfig, normalize_graph_config, prompt_blocks
+
+GRAPH_GUIDANCE_VERSIONS = {"entity-extractor": 7, "relation-extractor": 7}
+
+
+def graph_config_for_node(config: GraphExtractionConfig, params: dict[str, Any], *, relation: bool = False,
+                          governed_prompt: bool = False) -> GraphExtractionConfig:
+    """Shared effective Schema for execution and stateless preview."""
+    raw = config.to_dict()
+    selected_entities = {str(item) for item in (params.get("entity_types") or []) if str(item)}
+    if selected_entities and params.get("entity_type_scope") != "all":
+        raw["entity_types"] = [item for item in raw["entity_types"] if item["code"] in selected_entities]
+        if not relation:
+            raw["relation_types"] = []
+    selected_relations = {str(item) for item in (params.get("relation_types") or []) if str(item)}
+    if selected_relations:
+        raw["relation_types"] = [item for item in raw["relation_types"] if item["code"] in selected_relations]
+    if relation and params.get("unknown_relation_policy"):
+        raw["unknown_relation_policy"] = params["unknown_relation_policy"]
+    if not relation and params.get("unknown_entity_policy"):
+        raw["unknown_entity_policy"] = params["unknown_entity_policy"]
+    if governed_prompt:
+        raw["prompt"] = {"mode": "generated", "body": None}
+    elif not relation and params.get("prompt_mode"):
+        raw.setdefault("prompt", {})["mode"] = params["prompt_mode"]
+    constraints = {str(item.get("relation_type")): item for item in (params.get("relation_constraints") or [])
+                   if isinstance(item, dict) and item.get("relation_type")}
+    for item in raw.get("relation_types") or []:
+        constraint = constraints.get(str(item.get("code")))
+        if constraint:
+            item["source_types"] = list(constraint.get("source_types") or [])
+            item["target_types"] = list(constraint.get("target_types") or [])
+    return normalize_graph_config(raw)
+
+
+def _instruction_block(instructions: str) -> str:
+    if not isinstance(instructions, str):
+        raise ValueError("抽取要求必须是字符串")
+    if not instructions.strip():
+        return ""
+    return ("节点业务抽取要求（在上述类型、原文语言及系统输出格式约束内执行；无匹配内容时返回空数组）：\n"
+            + instructions.strip() + "\n\n")
 
 _ENTITY_SYSTEM = (
     "你是严谨的医学/业务知识实体抽取器。实体名称、描述和别名必须使用当前来源分块的原文语言，"
@@ -73,7 +114,7 @@ def _literal_rules(enabled: tuple[str, ...]) -> str:
     return "、".join(names.get(item, item) for item in enabled) or "（无）"
 
 
-def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str) -> str:
+def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str, *, instructions: str = "") -> str:
     """Generated prompt requesting typed entities from one source chunk."""
     blocks = prompt_blocks(config)
     forbidden = (
@@ -105,6 +146,7 @@ def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str) -> st
         f"{type_note}"
         "除 Graph Schema 要求的 type 技术 code 外，所有实体文本字段必须保持当前来源分块的原文语言，不得翻译；"
         "中文原文用中文，英文原文用英文。\n\n"
+        f"{_instruction_block(instructions)}"
         "当前来源分块：\n"
         f"{source_chunk}\n\n"
         "返回 JSON 对象，其 entities 数组的每一项都符合以下 JSON Schema：\n"
@@ -112,7 +154,7 @@ def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str) -> st
     )
 
 
-def render_relation_prompt(config: GraphExtractionConfig, entities: list[str], source_chunk: str) -> str:
+def render_relation_prompt(config: GraphExtractionConfig, entities: list[str], source_chunk: str, *, instructions: str = "") -> str:
     """Generated prompt requesting relations between already-extracted entities."""
     blocks = prompt_blocks(config)
     entity_list = "、".join(entities) if entities else "（无）"
@@ -142,6 +184,7 @@ def render_relation_prompt(config: GraphExtractionConfig, entities: list[str], s
         "关系 description 和 keywords 同样保持原文语言，不得翻译；"
         "中文原文用中文，英文原文用英文。"
         "禁止把数字、范围、剂量等字面值作为关系的 target。\n\n"
+        f"{_instruction_block(instructions)}"
         "当前来源分块：\n"
         f"{source_chunk}\n\n"
         "返回 JSON 对象，其 relations 数组的每一项都符合以下 JSON Schema：\n"
@@ -185,3 +228,19 @@ def relation_prompt_for(config: GraphExtractionConfig, entities: list[str], sour
     else:
         body = render_relation_prompt(config, entities, source_chunk)
     return _RELATION_SYSTEM, body
+
+
+def graph_node_prompt(config: GraphExtractionConfig, params: dict[str, Any], operator_code: str,
+                      operator_version: int | None, source_chunk: str,
+                      entities: list[str] | None = None) -> tuple[str, str]:
+    """Render the actual request; only the new version accepts business guidance."""
+    governed = GRAPH_GUIDANCE_VERSIONS.get(operator_code) == operator_version
+    if operator_code == "entity-extractor":
+        if governed:
+            return _ENTITY_SYSTEM, render_entity_prompt(config, source_chunk, instructions=params.get("extraction_instructions", ""))
+        return entity_prompt_for(config, source_chunk)
+    if operator_code == "relation-extractor":
+        if governed:
+            return _RELATION_SYSTEM, render_relation_prompt(config, entities or [], source_chunk, instructions=params.get("extraction_instructions", ""))
+        return relation_prompt_for(config, entities or [], source_chunk)
+    raise ValueError("仅实体抽取器、关系抽取器支持图谱提示词预览")

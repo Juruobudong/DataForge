@@ -3,8 +3,9 @@ import ServingSelector from './ServingSelector.vue'
 import PromptRevisionSelector from './PromptRevisionSelector.vue'
 import QualityProfileSelector from './QualityProfileSelector.vue'
 import EntityTypeEditor from '../../graph/EntityTypeEditor.vue'
+import FilterRulesEditor from './FilterRulesEditor.vue'
 
-const props = defineProps({ schema: { type: Object, default: () => ({}) }, modelValue: { type: Object, default: () => ({}) }, entityTypes: { type: Array, default: () => [] }, disabled: Boolean })
+const props = defineProps({ schema: { type: Object, default: () => ({}) }, modelValue: { type: Object, default: () => ({}) }, entityTypes: { type: Array, default: () => [] }, evaluationNodes: { type: Array, default: () => [] }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue'])
 const widget = spec => spec?.['x-dataforge-ui']?.widget || ''
 function patch(name, value) { emit('update:modelValue', { ...props.modelValue, [name]: value }) }
@@ -29,6 +30,12 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
   <div class="parameter-form">
     <template v-for="(spec,name) in schema.properties || {}" :key="name">
       <template v-if="widget(spec)==='hidden'"></template>
+      <section v-else-if="widget(spec)==='extraction-instructions'" class="extraction-instructions">
+        <label>{{ spec.title }}<textarea :aria-label="spec.title" rows="6" :value="modelValue[name] ?? ''" :disabled="disabled" placeholder="例如：只抽取原文明示的内容，不推断原文未提到的信息。" @input="patch(name,$event.target.value)"></textarea></label>
+        <button type="button" :disabled="disabled || !modelValue[name]" @click="patch(name,'')">恢复默认</button>
+        <small>{{ spec.description }} 业务指令指导模型；严格限制请使用图谱规则。</small>
+      </section>
+      <FilterRulesEditor v-else-if="widget(spec)==='filter-rules'" :model-value="modelValue[name] || []" :evaluation-nodes="evaluationNodes" :disabled="disabled" @update:model-value="patch(name,$event)" />
       <EntityTypeEditor v-else-if="widget(spec)==='entity-type-editor'" :model-value="modelValue[name] || []" :disabled="disabled" @update:model-value="patch(name,$event)" />
       <section v-else-if="widget(spec)==='entity-type-subset'" class="entity-subset">
         <b>{{ spec.title }}</b>
@@ -55,4 +62,7 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
 
 <style scoped>
 .parameter-form{display:grid;gap:12px}.parameter-form>label,.constraints{display:grid;gap:6px;color:#617087;font-size:9px;font-weight:800}.parameter-form small{color:#8190a5;font-weight:500;line-height:1.5}.constraints{padding:10px;border:1px solid #e5eaf1;border-radius:9px}.constraints article{display:grid;gap:6px;padding:8px;border-radius:7px;background:#f7f9fc}.constraints button{justify-self:start}
+</style>
+<style scoped>
+.extraction-instructions,.extraction-instructions label{display:grid;gap:8px}.extraction-instructions label{font-size:14px;color:#34445b}.extraction-instructions textarea{font-size:14px;line-height:1.6;width:100%;resize:vertical}.extraction-instructions button{justify-self:start}.extraction-instructions small{font-size:12px}
 </style>

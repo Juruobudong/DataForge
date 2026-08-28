@@ -1,0 +1,5 @@
+# Expanded CPU operators. Keep the original lock/environment for old versions.
+-r requirements.in
+-c requirements.lock
+nltk==3.9.2
+simhash==2.1.2

@@ -20,6 +20,8 @@ htmlcov
 
 frontend/node_modules
 frontend/dist
+runtime/dataflow/vendor/*.part
+runtime/dataflow/vendor-resources/*.part
 
 secrets/dataforge_admin_password_hash
 secrets/dataforge_session_secret

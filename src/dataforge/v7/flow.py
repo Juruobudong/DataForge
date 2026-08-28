@@ -45,6 +45,7 @@ class ResolvedPortContract:
     knowledge_type: str | None = None
     graph_mode: str | None = None
     resolved_type: str = ""
+    accepted_types: tuple[str, ...] = ()
 
 
 def _edge(value: Any) -> dict[str, str]:
@@ -57,6 +58,8 @@ def _edge(value: Any) -> dict[str, str]:
 
 
 def _type_matches(actual: str, expected: str) -> bool:
+    if isinstance(expected, (list, tuple)):
+        return any(_type_matches(actual, value) for value in expected)
     return actual == expected or expected.endswith(":*") and actual.startswith(expected[:-1])
 
 
@@ -121,6 +124,15 @@ def resolve_port_contract(flow_context: dict[str, Any], node: dict[str, Any],
                           port: dict[str, Any]) -> ResolvedPortContract:
     """Resolve polymorphic candidate ports against normalized Flow context."""
     raw_type = str(port.get("artifact_type") or "")
+    alternatives = tuple(port.get("accepted_types") or ())
+    mapping = port.get("output_by_input") or {}
+    if mapping:
+        raw_type = mapping.get(flow_context.get("input_type"), raw_type)
+        if raw_type == "text_record_set":
+            alternatives = tuple(dict.fromkeys(mapping.values()))
+    if alternatives:
+        return ResolvedPortContract(raw_type=raw_type, kind=raw_type, resolved_type=raw_type,
+                                    accepted_types=alternatives)
     if not raw_type.startswith("candidate:"):
         return ResolvedPortContract(raw_type=raw_type, kind=raw_type,
                                     resolved_type=raw_type)
@@ -150,6 +162,11 @@ def validate_edge_compatibility(source_contract: ResolvedPortContract,
                                 target_contract: ResolvedPortContract, *,
                                 details: dict[str, str]) -> None:
     """Validate two already-resolved port contracts using stable error semantics."""
+    if source_contract.accepted_types or target_contract.accepted_types:
+        sources = source_contract.accepted_types or (source_contract.resolved_type,)
+        targets = target_contract.accepted_types or (target_contract.resolved_type,)
+        if any(_type_matches(source, targets) for source in sources):
+            return
     if source_contract.kind != target_contract.kind:
         raise FlowEdgeValidationError(
             "PORT_TYPE_MISMATCH",
@@ -287,6 +304,23 @@ def _would_create_cycle(edges: list[dict[str, str]], candidate: dict[str, str]) 
     return False
 
 
+def input_type_for_node(node_id, definition, catalog, subflows, trail=frozenset()):
+    """Resolve type-preserving processing ports from actual ancestors, not Sink intent."""
+    if node_id in trail:
+        return None
+    by_id = {node["id"]: node for node in definition.get("nodes", [])}
+    incoming = [edge for edge in map(_edge, definition.get("edges", [])) if edge["target"] == node_id]
+    if len(incoming) != 1 or incoming[0]["source"] not in by_id:
+        return None
+    edge = incoming[0]; source = by_id[edge["source"]]
+    port = _node_ports(source, direction="output", catalog=catalog, subflows=subflows).get(edge["source_port"], {})
+    parent_type = input_type_for_node(source["id"], definition, catalog, subflows, trail | {node_id}) if port.get("output_by_input") else None
+    outgoing = defaultdict(list)
+    for link in map(_edge, definition.get("edges", [])):
+        outgoing[link["source"]].append(link["target"])
+    return resolve_port_contract({"input_type": parent_type, "contexts": _reachable_sink_contexts(source["id"], by_id, outgoing)}, source, port).resolved_type
+
+
 def validate_flow_edges(definition: dict[str, Any], *, catalog: dict[str, dict[str, Any]],
                         subflows: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
     """Validate the authoring graph before subflow expansion and return normalized edges."""
@@ -346,7 +380,8 @@ def validate_flow_edges(definition: dict[str, Any], *, catalog: dict[str, dict[s
         if _would_create_cycle(accepted, edge):
             raise _edge_error("EDGE_WOULD_CREATE_CYCLE", "该连接会形成循环依赖，Flow 必须是有向无环图", edge)
 
-        source_context = {"contexts": _reachable_sink_contexts(edge["source"], by_id, outgoing)}
+        source_context = {"contexts": _reachable_sink_contexts(edge["source"], by_id, outgoing),
+                          "input_type": input_type_for_node(edge["source"], definition, catalog, subflows)}
         target_context = {"contexts": _reachable_sink_contexts(edge["target"], by_id, outgoing)}
         source_contract = resolve_port_contract(source_context, source, source_port)
         target_contract = resolve_port_contract(target_context, target, target_port)
@@ -387,6 +422,10 @@ class FlowCompiler:
             node_id = str(node["id"])
             if node.get("kind") != "subflow":
                 node["id"] = f"{prefix}{node_id}"
+                if node.get("ref") == "GeneralFilter":
+                    for rule in (node.get("params") or {}).get("rules", []):
+                        if isinstance(rule.get("evaluation_node"), str) and rule["evaluation_node"].split("::", 1)[0] in ids:
+                            rule["evaluation_node"] = f"{prefix}{rule['evaluation_node']}"
                 node["node_role"] = node_role(node)
                 node["origin_path"] = [part for part in f"{prefix}{node_id}".split("::") if part]
                 if definition.get("_subgraph_code"):
@@ -521,7 +560,7 @@ class FlowCompiler:
             node["node_role"] = node_role(node)
             source_types = [outputs[source] for source in incoming[node_id]]
             port_spec = (item.get("input_ports") or {}).get("input") or {"artifact_type": item["input"], "cardinality": "one", "required": True}
-            expected = port_spec.get("artifact_type", item["input"])
+            expected = port_spec.get("accepted_types") or port_spec.get("artifact_type", item["input"])
             cardinality = port_spec.get("cardinality", "one")
             binding = str(port_spec.get("binding") or (
                 "runtime_input" if node_role(node) == "flow_input"
@@ -538,12 +577,27 @@ class FlowCompiler:
                 params = {}
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
+            if code == "GeneralFilter":
+                from .governance_catalog import RULE_SCHEMA, SCORES
+                from jsonschema import Draft202012Validator
+                errors = list(Draft202012Validator(RULE_SCHEMA).iter_errors(params.get("rules")))
+                if errors:
+                    raise FlowValidationError(f"节点 {node_id} 保留条件非法：{errors[0].message}")
+                ancestors, pending = set(), list(incoming[node_id])
+                while pending:
+                    parent = pending.pop()
+                    if parent in ancestors:
+                        continue
+                    ancestors.add(parent); pending.extend(incoming[parent])
+                for rule in params["rules"]:
+                    if rule["field"] in SCORES and (rule.get("evaluation_node") not in ancestors or by_id[rule["evaluation_node"]].get("ref") != "Text2QASampleEvaluator"):
+                        raise FlowValidationError(f"节点 {node_id} 必须选择上游QA评估节点")
             if code == "schema-validator":
                 if not source_types or any(value not in {"candidate:graph:triple", "candidate:graph:semantic"} for value in source_types):
                     raise FlowValidationError("schema-validator 仅支持 Graph Candidate")
                 params.setdefault("knowledge_type", "graph")
                 params.setdefault("graph_mode", source_types[0].split(":")[2])
-            if code == "Text2QAGenerator" and item.get("version") == 6:
+            if code == "Text2QAGenerator" and item.get("version") in {6, 7}:
                 instructions = params.get("extraction_instructions", "")
                 if not isinstance(instructions, str):
                     raise FlowValidationError("QA 提取要求必须是字符串")
@@ -578,6 +632,13 @@ class FlowCompiler:
                 "input_ports", "output_ports", "parameter_schema")})
             output_spec = (item.get("output_ports") or {}).get("output") or {"artifact_type": item["output"]}
             output = str(output_spec.get("artifact_type", item["output"]))
+            if output_spec.get("output_by_input"):
+                output = output_spec["output_by_input"].get(source_types[0] if len(source_types) == 1 else "")
+                if not output:
+                    raise FlowValidationError(f"节点 {node_id} 无法解析正文处理的实际输出类型")
+            if "derived_text_set" in source_types and str(params.get("knowledge_type", "text")) not in {"text", "qa"}:
+                raise FlowValidationError("派生正文仅支持Text/QA生成")
+            node["resolved_input_type"] = source_types[0] if len(source_types) == 1 else None
             knowledge_type = str(params.get("knowledge_type", ""))
             if knowledge_type and item.get("knowledge_types") and knowledge_type not in item["knowledge_types"] and "*" not in item["knowledge_types"]:
                 raise FlowValidationError(f"算子 {code} 不支持知识类型 {knowledge_type}")
@@ -603,6 +664,7 @@ class FlowCompiler:
                 params.setdefault("graph_mode", contract.graph_mode)
                 output = contract.resolved_type
             outputs[node_id] = output
+            node["resolved_output_type"] = output
             dependencies.append({"kind": "operator", "code": code, "version": item.get("version", 1), "adapter": item["adapter_code"], "runtime_requirements": deepcopy(item.get("runtime_requirements") or {})})
         root_refs = {str(by_id[node_id].get("ref") or "") for node_id in ordered if not incoming[node_id]}
         node_refs = {str(node.get("ref") or "") for node in by_id.values() if node.get("kind") == "operator"}

@@ -1,0 +1,4 @@
+# Repair only: keep reviewed v1 versions; resolve hashes across platforms.
+# Compile/install with --torch-backend cpu, never a global PyTorch extra index.
+-r requirements-pii-v1.in
+-c requirements-pii-v1.lock

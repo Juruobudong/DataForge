@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, event, inspect, select
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
 
 def utc_now() -> datetime:
@@ -688,6 +688,51 @@ class FlowExecutionSnapshot(Timestamped, Base):
     dependency_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     checksum: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="published", nullable=False)
+
+
+@event.listens_for(KnowledgeFlowTemplateRevision, "before_update")
+def _protect_published_flow_revision(mapper, connection, target):
+    fields = ("id", "knowledge_flow_template_id", "revision_no", "definition_json", "status", "published_at",
+              "execution_snapshot_id", "purpose", "authoring_mode", "managed_template_code")
+    previous = connection.execute(select(KnowledgeFlowTemplateRevision.__table__).where(
+        KnowledgeFlowTemplateRevision.id == inspect(target).identity[0])).mappings().one()
+    if previous["status"] == "published" and any(previous[key] != getattr(target, key) for key in fields):
+        # SQLite returns naive datetimes even for timezone=True; unchanged fields
+        # must not be treated as edits just because of that representation.
+        if any(inspect(target).attrs[key].history.has_changes() for key in fields):
+            raise ValueError("PUBLISHED_REVISION_IMMUTABLE")
+    if previous["execution_snapshot_id"] and previous["execution_snapshot_id"] != target.execution_snapshot_id:
+        raise ValueError("REVISION_SNAPSHOT_ALREADY_BOUND")
+    if target.status == "published" and previous["status"] != "published":
+        snapshot = connection.execute(select(FlowExecutionSnapshot.__table__).where(
+            FlowExecutionSnapshot.id == target.execution_snapshot_id)).mappings().first()
+        if (not snapshot or snapshot["status"] != "published"
+                or snapshot["knowledge_flow_template_revision_id"] != target.id or not target.published_at):
+            raise ValueError("PUBLISHED_REVISION_REQUIRES_SNAPSHOT")
+
+
+@event.listens_for(FlowExecutionSnapshot, "before_update")
+def _protect_execution_snapshot(mapper, connection, target):
+    fields = ("id", "knowledge_flow_template_revision_id", "compiled_definition_json", "dependency_json", "checksum", "status")
+    if any(inspect(target).attrs[key].history.has_changes() for key in fields):
+        raise ValueError("EXECUTION_SNAPSHOT_IMMUTABLE")
+
+
+@event.listens_for(FlowExecutionSnapshot, "before_delete")
+@event.listens_for(KnowledgeFlowTemplateRevision, "before_delete")
+def _protect_flow_publication_delete(mapper, connection, target):
+    if isinstance(target, FlowExecutionSnapshot) or target.status == "published":
+        raise ValueError("FLOW_PUBLICATION_IMMUTABLE")
+
+
+@event.listens_for(Session, "do_orm_execute")
+def _prevent_bulk_flow_publication_writes(state):
+    # Bulk ORM/Core statements bypass mapper before_update/before_delete.
+    # Flow writes must go through the checked instance lifecycle above.
+    if state.is_update or state.is_delete:
+        table = getattr(state.statement, "table", None)
+        if getattr(table, "name", None) in {"knowledge_flow_template_revisions", "flow_execution_snapshots"}:
+            raise ValueError("FLOW_PUBLICATION_BULK_WRITE_FORBIDDEN")
 
 
 class DebugRunInputSnapshot(Timestamped, Base):

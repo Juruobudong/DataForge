@@ -24,9 +24,9 @@ describe('Standard technical responsibilities', () => {
     const wrapper = mount(StandardTechnicalFlow, { props: { value } })
     const node = wrapper.findAll('.operator-step').find(item => item.text().includes('Text2QAGenerator'))
     expect(node.text()).toContain('文本转问答生成器')
-    expect(node.text()).toContain('DataFlow · Text2QAGenerator')
+    expect(node.text()).toContain('Text2QAGenerator')
     await node.trigger('click')
-    expect(wrapper.get('.operator-detail').text()).toContain('DataFlow · Text2QAGenerator · v6')
+    expect(wrapper.get('.operator-detail').text()).toContain('Text2QAGenerator · v6')
     wrapper.unmount()
   })
   it.each([['text'], ['qa'], ['graph:triple'], ['graph:semantic'], ['text', 'qa', 'graph:triple']])('projects %s without inventing runtime operators', (...outputs) => {

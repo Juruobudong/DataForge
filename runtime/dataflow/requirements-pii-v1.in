@@ -1,0 +1,10 @@
+# Reviewed isolated English Presidio CPU runtime, not the full DataFlow extras.
+-r requirements-curated-v2.in
+appdirs==1.4.4
+presidio-analyzer==2.2.360
+presidio-anonymizer==2.2.360
+spacy==3.7.5
+spacy-huggingface-pipelines==0.0.4
+transformers==4.51.3
+torch==2.7.1+cpu
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl

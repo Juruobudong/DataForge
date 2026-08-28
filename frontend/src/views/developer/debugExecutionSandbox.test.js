@@ -39,7 +39,7 @@ test('DataFlow console labels show both languages from the frozen operator spec'
   const operator = dataflowOperators[0]
   const graph = deserializeRuntimeDag({ nodes: [{ id: 'qa-run-node', kind: 'operator', ref: operator.code, operator_version: operator.version, operator_spec: operator }] }, [])
   assert.deepEqual(consoleNodePresentation('qa-run-node', consoleNodeLabels(graph.nodes)), {
-    label: '文本转问答生成器 / DataFlow · Text2QAGenerator', technicalId: 'qa-run-node',
+    label: '文本转问答生成器 / Text2QAGenerator', technicalId: 'qa-run-node',
   })
 })
 

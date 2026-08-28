@@ -60,8 +60,19 @@ function candidateParts(rawType) {
 }
 
 /** @returns {ResolvedPortContract} */
-export function resolvePortContract({ node, port, nodes = [], edges = [], flowContext = {} }) {
-  const rawType = String(port?.artifact_type || '')
+export function resolvePortContract({ node, port, nodes = [], edges = [], flowContext = {}, trail = new Set() }) {
+  let rawType = String(port?.artifact_type || '')
+  let acceptedTypes = port?.accepted_types
+  if (port?.output_by_input && !trail.has(node.id)) {
+    const incoming = edges.filter(edge => edge.target === node.id)
+    const edge = incoming.length === 1 ? incoming[0] : null
+    const parent = edge && nodes.find(item => item.id === edge.source)
+    const parentPort = parent && metaOf(parent).outputs?.[edge.sourceHandle || edge.source_port || 'output']
+    const inputType = parentPort && resolvePortContract({ node: parent, port: parentPort, nodes, edges, flowContext, trail: new Set([...trail, node.id]) }).resolvedType
+    rawType = port.output_by_input[inputType] || rawType
+    if (rawType === 'text_record_set') acceptedTypes = [...new Set(Object.values(port.output_by_input))]
+  }
+  if (acceptedTypes) return { rawType, kind: rawType, resolvedType: rawType, acceptedTypes }
   if (!rawType.startsWith('candidate:')) return { rawType, kind: rawType, resolvedType: rawType }
   const declared = candidateParts(rawType), params = paramsOf(node)
   let knowledgeType = declared.knowledgeType || params.knowledge_type || undefined
@@ -88,6 +99,10 @@ function issue(reasonCode, data = {}) {
 }
 
 function contractIssue(source, target) {
+  if (source.acceptedTypes || target.acceptedTypes) {
+    const sources = source.acceptedTypes || [source.resolvedType], targets = target.acceptedTypes || [target.resolvedType]
+    if (sources.some(actual => targets.some(expected => actual === expected || expected.endsWith(':*') && actual.startsWith(expected.slice(0, -1))))) return null
+  }
   if (source.kind === 'candidate' && target.kind === 'candidate') {
     source.knowledgeType ||= target.knowledgeType
     target.knowledgeType ||= source.knowledgeType

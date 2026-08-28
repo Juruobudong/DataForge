@@ -23,6 +23,8 @@ const ARTIFACT_TYPE_LABELS = {
   document_ir: '文档解析结果',
   chunk_set: '文档块',
   source_chunk_set: '来源文档块',
+  derived_text_set: '派生正文与处理回执',
+  text_record_set: '来源正文或文本/问答候选',
   'candidate:*': '候选知识',
   'candidate:text': '文本候选',
   'candidate:qa': '问答候选',
@@ -53,6 +55,8 @@ function catalogItem(catalog, code, version = null) {
 
 function normalizedPorts(raw, fallback) {
   return Object.fromEntries(Object.entries(raw || fallback).map(([name, value]) => [name, {
+    ...(value?.accepted_types ? { accepted_types: [...value.accepted_types] } : {}),
+    ...(value?.output_by_input ? { output_by_input: { ...value.output_by_input } } : {}),
     artifact_type: typeof value === 'string' ? value : value?.artifact_type || '',
     cardinality: typeof value === 'string' ? (fallback === DEFAULT_INPUT ? 'one' : 'many') : value?.cardinality || (fallback === DEFAULT_INPUT ? 'one' : 'many'),
     required: typeof value === 'string' ? fallback === DEFAULT_INPUT : value?.required ?? (fallback === DEFAULT_INPUT),
@@ -73,9 +77,8 @@ export function operatorPrimaryName(item = {}) {
 
 export function operatorSubtitle(item = {}, showTechnicalCode = false) {
   const englishName = item.englishName || (item.display_name_zh ? item.name : '') || ''
-  const provider = item.runtime_requirements?.provider || item.provider
-  const base = englishName && (englishName !== operatorPrimaryName(item) || provider === 'dataflow') ? englishName : item.code || ''
-  const parts = provider === 'dataflow' ? ['DataFlow', base] : [base]
+  const base = englishName && englishName !== operatorPrimaryName(item) ? englishName : item.code || ''
+  const parts = [base]
   if (showTechnicalCode && item.code && item.code !== base) parts.push(item.code)
   return parts.filter(Boolean).join(' · ')
 }
@@ -87,6 +90,61 @@ export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
 export function operatorLabel(item = {}) {
   const title = operatorPrimaryName(item)
   return (item.runtime_requirements?.provider || item.provider) === 'dataflow' ? `${title} / ${operatorSubtitle(item)}` : title
+}
+
+export function operatorAvailable(item, purpose = 'knowledge', outputTypes = []) {
+  if (item.enabled === false || item.approved === false || ['internal', 'disabled'].includes(item.exposure)) return false
+  if (['deprecated', 'disabled', 'draft'].includes(item.status) || (item.version_status && item.version_status !== 'published')) return false
+  if (item.surfaces && !item.surfaces.includes(purpose === 'knowledge' ? 'advanced-canvas' : 'system-internal')) return false
+  if (item.dependency_status && item.dependency_status.status !== 'ready') return false
+  if (['dataflow', 'custom'].includes(item.provider || item.runtime_requirements?.provider) && item.dependency_status?.status !== 'ready') return false
+  if (outputTypes.length && item.knowledge_types?.length && !item.knowledge_types.includes('*') && !outputTypes.some(kind => item.knowledge_types.includes(kind.split(':')[0]))) return false
+  if (outputTypes.length && item.graph_modes?.length && !outputTypes.some(kind => kind.startsWith('graph') && item.graph_modes.includes(kind.split(':')[1] || 'triple'))) return false
+  return true
+}
+
+// Conservative compatibility check for moving business values between schemas.
+// The backend remains the authoritative complete JSON Schema validator.
+export function compatibleParameter(value, schema = {}) {
+  if (schema.enum && !schema.enum.some(item => JSON.stringify(item) === JSON.stringify(value))) return false
+  if ('const' in schema && JSON.stringify(schema.const) !== JSON.stringify(value)) return false
+  const types = Array.isArray(schema.type) ? schema.type : schema.type ? [schema.type] : []
+  const actual = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value
+  if (types.length && !types.includes(actual) && !(types.includes('integer') && typeof value === 'number' && Number.isInteger(value))) return false
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return false
+    if (schema.minimum !== undefined && value < schema.minimum || schema.maximum !== undefined && value > schema.maximum) return false
+    if (schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum || schema.exclusiveMaximum !== undefined && value >= schema.exclusiveMaximum) return false
+    if (schema.multipleOf && Math.abs(value / schema.multipleOf - Math.round(value / schema.multipleOf)) > 1e-9) return false
+  }
+  if (typeof value === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength || schema.maxLength !== undefined && value.length > schema.maxLength) return false
+    if (schema.pattern) { try { if (!new RegExp(schema.pattern).test(value)) return false } catch { return false } }
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems || schema.maxItems !== undefined && value.length > schema.maxItems) return false
+    if (schema.items && !value.every(item => compatibleParameter(item, schema.items))) return false
+    if (schema.uniqueItems && new Set(value.map(item => JSON.stringify(item))).size !== value.length) return false
+  }
+  if (actual === 'object') {
+    if ((schema.required || []).some(key => !(key in value))) return false
+    for (const [key, item] of Object.entries(value)) {
+      if (schema.properties?.[key]) { if (!compatibleParameter(item, schema.properties[key])) return false }
+      else if (schema.additionalProperties === false) return false
+    }
+  }
+  if (schema.allOf && !schema.allOf.every(item => compatibleParameter(value, item))) return false
+  if (schema.anyOf && !schema.anyOf.some(item => compatibleParameter(value, item))) return false
+  if (schema.oneOf && schema.oneOf.filter(item => compatibleParameter(value, item)).length !== 1) return false
+  if (schema.not && compatibleParameter(value, schema.not)) return false
+  return true
+}
+
+export function keepCompatibleParams(params = {}, schema = {}) {
+  return Object.fromEntries(Object.entries(schema.properties || {}).flatMap(([key, spec]) => {
+    if (key in params && compatibleParameter(params[key], spec)) return [[key, cloneValue(params[key])]]
+    return 'default' in spec ? [[key, cloneValue(spec.default)]] : []
+  }))
 }
 
 export function subflowRevisions(items = []) {

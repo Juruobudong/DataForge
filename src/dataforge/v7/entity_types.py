@@ -83,7 +83,8 @@ def normalize_entity_types(raw: Any, *, allow_legacy_strings: bool = False) -> l
     return normalize_graph_config({"entity_types": items}).to_dict()["entity_types"]
 
 
-def resolve_entity_types(raw: Any, action: str, *, label: str | None = None) -> list[dict[str, Any]]:
+def resolve_entity_types(raw: Any, action: str, *, label: str | None = None, code: str | None = None,
+                         description: str | None = None) -> list[dict[str, Any]]:
     items = normalize_entity_types(raw, allow_legacy_strings=True)
     if action == "normalize":
         return items
@@ -91,7 +92,20 @@ def resolve_entity_types(raw: Any, action: str, *, label: str | None = None) -> 
         items.append({"label": normalize_entity_label(label), "source": "custom"})
     elif action == "add_medical":
         names = {item["label"] for item in items}
-        items.extend(item for item in entity_type_catalog()["presets"][0]["entity_types"] if item["label"] not in names)
+        codes = {item["code"] for item in items}
+        items.extend(item for item in entity_type_catalog()["presets"][0]["entity_types"]
+                     if item["label"] not in names and item["code"] not in codes)
+    elif action == "update":
+        item = next((item for item in items if item["code"] == code), None)
+        if item is None:
+            raise ValueError("待编辑实体类型不存在")
+        name = normalize_entity_label(label)
+        if not isinstance(description, str):
+            raise ValueError("实体类型描述必须是字符串")
+        description = description.strip()
+        if item["label"] != name or item["description"] != description:
+            item.update(label=name, description=description, source="custom")
+            item.pop("preset", None)
     elif action == "remove_medical":
         items = [item for item in items if not (item["source"] == "preset" and item.get("preset") == "medical")]
     else:

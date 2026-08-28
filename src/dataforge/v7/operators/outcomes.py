@@ -46,12 +46,12 @@ def capture_generation_metrics(execute):
             result = execute(self, inputs=inputs, params=params, context=context)
         except Exception as exc:
             metrics = collect(False)
-            if metrics:
+            if metrics and "chunk_processing" not in getattr(exc, "operator_metrics", {}):
                 exc.operator_metrics = {**getattr(exc, "operator_metrics", {}), "chunk_processing": metrics}
             raise
         else:
             metrics = collect(True)
-            if metrics:
+            if metrics and "chunk_processing" not in result.metrics:
                 result.metrics = {**result.metrics, "chunk_processing": metrics}
             return result
 

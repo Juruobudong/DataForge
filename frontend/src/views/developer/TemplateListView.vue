@@ -158,11 +158,12 @@ async function convertToAdvanced() {
 async function runDebug(item = selected.value) {
   if (editing.value && (!item || item.id === selected.value?.id)) {
     // Flush the debounce AND any in-flight save before opening run preparation.
-    // A clean published custom flow gets a draft, never a published fallback.
-    if (dirty.value || saving.value || !item || (!item.is_builtin && item.revision_status !== 'draft')) {
+    if (dirty.value || saving.value || !item) {
       if (!await save()) return
     }
     item = selected.value
+    if (saveFailed.value || dirty.value) { error.value = '最新画布尚未保存，不能运行'; return }
+    if (item?.revision_status === 'draft' && authoringMode.value === 'advanced' && !advancedEditor.value?.validate()) return
   }
   if (!item) return
   const checksum = item.source_definition_checksum ? `&draft_checksum=${encodeURIComponent(item.source_definition_checksum)}` : ''
@@ -178,8 +179,15 @@ async function save() {
   }
   saving.value = true
   savePromise = (async () => {
+    let retriedNewerGeneration = false
     do {
-      if (!await saveOnce() || session !== editorSession) return false
+      const generation = editGeneration
+      const saved = await saveOnce()
+      if (session !== editorSession) return false
+      if (!saved) {
+        if (editGeneration > generation && !retriedNewerGeneration) { retriedNewerGeneration = true; cancelAutosave(); continue }
+        cancelAutosave(); return false
+      }
     } while (dirty.value)
     return true
   })()
@@ -207,7 +215,9 @@ async function saveOnce() {
     }
   }
   try {
-    error.value = ''; const body = { ...buildBody(), expected_definition_checksum: selected.value?.source_definition_checksum }
+    error.value = ''
+    if (authoringMode.value === 'advanced' && !advancedEditor.value?.validate()) { saveFailed.value = true; error.value = '当前画布存在校验问题，尚未保存'; return false }
+    const body = { ...buildBody(), expected_definition_checksum: selected.value?.source_definition_checksum }
     const conversion = pendingConversion.value
     if (conversion) {
       body.derived_from_template_id = conversion.source_template_id
@@ -219,9 +229,9 @@ async function saveOnce() {
     const refreshed = { ...(selected.value || {}), id: selected.value?.id || response.id, code: code.value,
       name: name.value, output_types: response.output_types || (authoringMode.value === 'standard' ? [...(managedTemplates.value.find(item => item.code === body.managed_template_code)?.output_types || [])] : [...outputTypes.value]), authoring_mode: authoringMode.value,
       managed_template_code: authoringMode.value === 'standard' ? body.managed_template_code : null,
-      definition: response.definition || body.definition, revision: response.revision,
+      definition: response.definition || body.definition, revision: response.revision, revision_id: response.revision_id,
       source_definition_checksum: response.source_definition_checksum,
-      revision_status: response.status === 'published' ? 'published' : 'draft', status: response.status }
+      revision_status: response.revision_status || (response.status === 'published' ? 'published' : 'draft'), status: response.status }
     const index = templates.value.findIndex(item => item.id === refreshed.id)
     if (index >= 0) templates.value.splice(index, 1, refreshed); else templates.value.push(refreshed)
     selected.value = refreshed; saveFailed.value = false
@@ -247,11 +257,11 @@ async function action(kind) {
     if (dirty.value) { error.value = '当前画布尚未保存，请先保存草稿后再执行服务端编译校验'; return }
   }
   if (dirty.value && ['publish', 'default', 'sample'].includes(kind)) { error.value = '当前画布尚未保存，请先保存草稿，避免操作旧修订'; return }
-  const target = selected.value, session = editorSession
+  const target = selected.value, session = editorSession, generation = editGeneration
   try {
     error.value = ''
     const response = kind === 'validate' ? await api.validateFlowTemplate(target.id)
-      : kind === 'publish' ? await api.publishFlowTemplate(target.id)
+      : kind === 'publish' ? await api.publishFlowTemplate(target.id, { revision_id: target.revision_id, expected_definition_checksum: target.source_definition_checksum })
         : kind === 'default' ? await api.defaultFlowTemplate(target.id)
           : kind === 'sample' ? await api.sampleFlowTemplate(target.id, sampleId.value)
             : await api.archiveFlowTemplate(target.id)
@@ -263,6 +273,8 @@ async function action(kind) {
       publishNoticeTimer = setTimeout(clearPublishNotice, 5000)
     }
     if (kind === 'sample') sampleResult.value = result.value
+    // A publish response must never replace edits made while the request was in flight.
+    if (generation !== editGeneration) return
     await load()
     if (session === editorSession) selected.value = templates.value.find(item => item.id === target.id) || null
   } catch (e) { if (session === editorSession) handleFlowError(e) }
@@ -287,7 +299,7 @@ onMounted(async () => {
     <UnsavedNavigationDialog v-if="pendingSubflow" :pending="navigationSaving" :error="error" @cancel="pendingSubflow=null" @discard="navigateSubflow(pendingSubflow)" @save="saveThenNavigate" />
     <header class="template-page-head">
       <div><div class="title-row"><h2>知识流程</h2></div><p>通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。</p><p v-if="editing" class="template-revisions">{{ templateRevisionSummary(selected) }}</p></div>
-      <div class="header-actions"><template v-if="editing"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前草稿</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
+      <div class="header-actions"><template v-if="editing"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前流程</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
     </header>
     <p v-if="pendingConversion" class="conversion-notice">当前为转换预览，尚未创建草稿。首次保存或运行前保存后才创建独立流程，直接退出不会保留。</p>
     <template v-if="!editing">

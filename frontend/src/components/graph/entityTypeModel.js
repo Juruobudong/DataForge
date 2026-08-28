@@ -11,8 +11,10 @@ export function displayedEntityTypes(items, catalog) {
 
 export function medicalCoverage(items, catalog) {
   const medical = catalog?.presets?.find(item => item.code === 'medical')?.entity_types || []
-  const labels = new Set(displayedEntityTypes(items, catalog).map(item => entityLabel(item.label)))
-  return { count: medical.filter(item => labels.has(item.label)).length, total: medical.length }
+  const types = displayedEntityTypes(items, catalog)
+  const labels = new Set(types.map(item => entityLabel(item.label)))
+  const codes = new Set(types.map(item => item.code))
+  return { count: medical.filter(item => labels.has(item.label) || codes.has(item.code)).length, total: medical.length }
 }
 
 export function removeEntityReferences(graphConfig, nodes, removedCodes) {

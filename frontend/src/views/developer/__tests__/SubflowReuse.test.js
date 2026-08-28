@@ -38,7 +38,7 @@ describe('reusable subflow production and consumption', () => {
     wrapper = mount(OperatorPalette, { props: { catalog: operators, subflows: [] } })
     for (const [index, card] of wrapper.findAll('.palette-entry').entries()) {
       expect(card.text()).toContain(operators[index].display_name_zh)
-      expect(card.text()).toContain(`DataFlow · ${operators[index].code}`)
+      expect(card.text()).toContain(`${operators[index].code}`)
       await card.trigger('dblclick')
       expect(wrapper.emitted('add-item').at(-1)[0].code).toBe(operators[index].code)
     }
@@ -117,7 +117,7 @@ describe('reusable subflow production and consumption', () => {
   it('drags an operator without an add button and inserts only on canvas drop with undo', async () => {
     wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [], outputTypes: ['text'] } })
     const card = wrapper.get('.palette-entry')
-    expect(card.find('button').exists()).toBe(false)
+    expect(card.findAll('button').map(item => item.text())).toEqual(['i'])
     await card.trigger('click')
     const dataTransfer = { setData: vi.fn(), effectAllowed: '' }
     await card.trigger('dragstart', { dataTransfer })
@@ -135,7 +135,7 @@ describe('reusable subflow production and consumption', () => {
 
   it('keeps keyboard insertion on cards without hijacking subflow revision selection', async () => {
     wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset] } })
-    await wrapper.get('.palette-entry').trigger('keydown', { key: 'Enter' })
+    await wrapper.get('.palette-entry .entry-body').trigger('keydown', { key: 'Enter' })
     expect(wrapper.emitted('add-item')[0]).toEqual([catalog[0], 'operator'])
     await wrapper.get('.subflow-item select').setValue('r1')
     await wrapper.get('.subflow-item select').trigger('keydown', { key: 'Enter' })

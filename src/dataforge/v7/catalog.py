@@ -300,6 +300,7 @@ DATAFLOW_PACKAGE = "open-dataflow"
 DATAFLOW_VERSION = "1.0.10"
 DATAFLOW_DIGEST = "75dd8e03fd96875472c11bd9fdf8af30e66d76a6b2d59b6b426d998db25e8790"
 DATAFLOW_LOCK_DIGEST = "d575faf7e20b1bf75725fa15a4d29de17168c957d09f99f5b2cd5053df257a28"
+DATAFLOW_CURATED_LOCK_DIGEST = "dcd3a3c0858ee2af3790255b435885fd50f5ef649fc18a6b26a250d84a0890e8"
 
 
 def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[str]:
@@ -431,6 +432,99 @@ for _item in LEGACY_CATALOG_SEEDS:
 for _item in CATALOG_SEEDS:
     for _key in ("recommended_predecessors", "recommended_successors"):
         _item[_key] = [new for code in _item.get(_key, []) for new in RENAMED_DATAFLOW_OPERATORS.get(code, (code,))]
+
+DATAFLOW_CURATED_SPECS = {
+    "ContentNullFilter": {"name": "空内容过滤器", "category": "内容清洗", "adapter": "candidate-row-filter-v1", "properties": {}},
+    "CharNumberFilter": {"name": "字符长度过滤器", "category": "内容清洗", "adapter": "candidate-row-filter-v1",
+        "properties": {"threshold": {"type": "integer", "minimum": 1, "default": 100, "title": "最小字符数", "description": "按上游规则去除空格、换行和制表符后计数。"}}},
+    "SpecialCharacterFilter": {"name": "特殊字符过滤器", "category": "内容清洗", "adapter": "candidate-row-filter-v1", "properties": {}},
+    "NgramHashDeduplicateFilter": {"name": "N-gram 相似去重过滤器", "category": "内容去重", "adapter": "candidate-ngram-deduplicate-v1",
+        "properties": {
+            "n_gram": {"type": "integer", "minimum": 1, "default": 3, "title": "分段数量", "description": "上游按字符长度等分，尾部不足整段的字符不参与比较；短于分段数时使用 Hash 精确去重。"},
+            "hash_func": {"type": "string", "enum": ["md5", "sha256", "xxh3"], "default": "md5", "title": "哈希算法"},
+            "diff_size": {"type": "integer", "minimum": 1, "default": 1, "title": "重复片段阈值", "description": "上游实际比较哈希集合交集：共同片段数达到阈值即视为重复。"}}},
+    "SimHashDeduplicateFilter": {"name": "SimHash 相似去重过滤器", "category": "内容去重", "adapter": "candidate-simhash-deduplicate-v1",
+        "properties": {
+            "fingerprint_size": {"type": "integer", "minimum": 8, "maximum": 128, "multipleOf": 8, "default": 64, "title": "指纹长度"},
+            "bound": {"type": "number", "minimum": 0, "exclusiveMaximum": 1, "default": 0.1, "title": "相似度容差"}}},
+    "PromptedFilter": {"name": "智能内容过滤器", "category": "智能过滤", "adapter": "candidate-prompted-filter-v1", "uses_llm": True,
+        "properties": {
+            "llm_serving": {"type": "string", "title": "模型服务", "x-dataforge-ui": {"widget": "llm-serving-selector"}},
+            "prompt_template_revision_id": {"type": "string", "default": "promptrev_candidate_filter", "title": "评分 Prompt", "x-dataforge-ui": {"widget": "prompt-template-selector"}},
+            "min_score": {"type": "integer", "minimum": 1, "maximum": 5, "default": 4, "title": "最低保留分"},
+            "max_score": {"type": "integer", "minimum": 1, "maximum": 5, "default": 5, "title": "最高保留分"}}},
+}
+
+
+def _new_curated_entries():
+    base = next(item for item in CATALOG_SEEDS if item["code"] == "HashDeduplicateFilter")
+    for code, spec in DATAFLOW_CURATED_SPECS.items():
+        item = deepcopy(base)
+        uses_llm = spec.get("uses_llm", False)
+        namespace = "core_text" if uses_llm else "general_text"
+        description = ("同来源 Chunk 内对文本/问答候选相似去重，保留原候选与完整 Evidence。" if "deduplicate" in spec["adapter"]
+                       else "通过真实 DataFlow 过滤文本/问答候选，只决定保留或删除，不改变正文和 Evidence。")
+        item.update(code=code, name=code, display_name_zh=spec["name"], subcategory=spec["category"],
+                    summary=description, description=description, version=1, knowledge_types=["text", "qa"],
+                    scenarios=[description], upstream=[code], adapter_code=spec["adapter"], surfaces=["advanced-canvas"],
+                    parameter_schema={"type": "object", "properties": deepcopy(spec["properties"]), "additionalProperties": False},
+                    parameter_docs={key: value.get("description", value["title"]) for key, value in spec["properties"].items()})
+        if uses_llm:
+            item["parameter_schema"]["required"] = ["prompt_template_revision_id"]
+        example = {"source_knowledge_id": "candidate-example", "canonical_content": "高血压患者应规范随访，遵医嘱用药并定期复查。" * 6,
+                   "source_version_ids": ["version-example"], "source_chunk_id": "chunk-example",
+                   "source_chunk_revision_id": "revision-example", "source_review_snapshot_id": "review-example",
+                   "anchor_json": {"page": 1}, "evidence_text": "审核后的来源正文", "data_json": {}}
+        item["input_example"], item["output_example"] = {"input": [example]}, {"output": [deepcopy(example)]}
+        item["runtime_requirements"] = {
+            "provider": "dataflow", "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
+            "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
+            "dependency_lock_digest": DATAFLOW_CURATED_LOCK_DIGEST, "uses_llm": uses_llm,
+            "implementation": f"dataflow.operators.{namespace}:{code}", "adapter_version": spec["adapter"],
+            "preserve_fields": deepcopy(base["runtime_requirements"]["preserve_fields"]),
+        }
+        if code == "NgramHashDeduplicateFilter":
+            item["runtime_requirements"]["implementations"] = {"short_text": "dataflow.operators.general_text:HashDeduplicateFilter"}
+        yield item
+
+
+CATALOG_SEEDS += tuple(_new_curated_entries())
+for _item in CATALOG_SEEDS:
+    if _item["code"] in {"Text2QAGenerator", "PromptedRefiner", "HashDeduplicateFilter", "MinHashDeduplicateFilter"}:
+        _item["subcategory"] = {"Text2QAGenerator": "内容生成", "PromptedRefiner": "内容处理"}.get(_item["code"], "内容去重")
+
+from .governance_catalog import extend_catalog
+
+CATALOG_SEEDS, _governance_legacy = extend_catalog(
+    CATALOG_SEEDS, DATAFLOW_PACKAGE, DATAFLOW_VERSION, DATAFLOW_DIGEST, DATAFLOW_CURATED_LOCK_DIGEST,
+)
+LEGACY_CATALOG_SEEDS += _governance_legacy
+
+# Triple chunk isolation is a new execution contract; published versions stay intact.
+from .operators.graph_chunks import TRIPLE_CHUNK_VERSIONS
+
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in TRIPLE_CHUNK_VERSIONS)
+for _item in CATALOG_SEEDS:
+    if _item["code"] in TRIPLE_CHUNK_VERSIONS:
+        _item["version"] = TRIPLE_CHUNK_VERSIONS[_item["code"]]
+        _item["runtime_requirements"] = {**_item["runtime_requirements"], "triple_chunk_isolation": True}
+        _item["description"] = _item["summary"] = _item["description"] + "；三元组按分块隔离错误，保留失败块旧知识，其他分块继续。"
+
+from .graph_prompt import GRAPH_GUIDANCE_VERSIONS
+
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in GRAPH_GUIDANCE_VERSIONS)
+for _item in CATALOG_SEEDS:
+    if _item["code"] in GRAPH_GUIDANCE_VERSIONS:
+        _item["version"] = GRAPH_GUIDANCE_VERSIONS[_item["code"]]
+        _item["parameter_schema"]["properties"].pop("prompt_mode", None)
+        _item["parameter_docs"].pop("prompt_mode", None)
+        _title = "实体抽取要求" if _item["code"] == "entity-extractor" else "关系抽取要求"
+        _item["parameter_schema"]["properties"]["extraction_instructions"] = {
+            "type": "string", "title": _title, "default": "",
+            "description": "业务要求会进入实际模型提示词；空白使用系统默认。类型、原文与 JSON 输出格式由系统维护。",
+            "x-dataforge-ui": {"widget": "extraction-instructions"},
+        }
+        _item["parameter_docs"]["extraction_instructions"] = _item["parameter_schema"]["properties"]["extraction_instructions"]["description"]
 
 PLATFORM_RESERVED_OPERATOR_CODES = frozenset(
     {item["code"].casefold() for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)} | {"knowledge-sink"}

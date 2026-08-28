@@ -31,11 +31,21 @@ Parser 同时建立 `SourceAnchorV2`：PDF 从 MinerU 内容块保留页码和 `
 
 ## 文本映射与显式生成
 
-Standard 文本和 Multi 的 text 分支使用 `text-knowledge-mapper`，将审核 Chunk 原样映射为 `candidate:text`，无 LLM、Embedding 或二次 Chunk。正文和 Evidence 逐字符保留，候选继承原 SourceAnchor 和审核血缘，并进入原有 Quality/Binding/Diff/Sink。每个非空 Chunk 一对一输出，空块记录成功零候选，重试和替换范围继续以分块处理状态为准。
+Standard 文本和 Multi 的 text 分支使用 `text-knowledge-mapper`，将审核 Chunk 原样映射为 `candidate:text`，无 LLM、Embedding 或二次 Chunk。正文和 Evidence 逐字符保留，候选继承原 SourceAnchor 和审核血缘，直接进入 Knowledge Sink，由其事务保证 Schema、来源、Diff 与提交。每个非空 Chunk 一对一输出，空块记录成功零候选，重试和替换范围继续以分块处理状态为准。
 
 Standard 转 Advanced 只展开相同 Mapper DAG。显式使用 `prompt-generator` 或 `structured-knowledge-generator` v6 时，文本才按该节点冻结的 Prompt 与 Serving 生成；结构化输出须含有效 canonical 内容，最多一次 Schema 修复，来源和 Evidence 仍由服务器绑定。执行器精确解析版本，已知 v4/v5 保持原文本复制行为，未知版本拒绝回退；不回写历史快照或批量改写 Advanced 定义。
 
-来源：[文本默认映射与 Advanced 显式生成批准基线](../../wiki/sources/text-knowledge-mapping-2026-08-27.md)；前端仅将有 generation 的 Managed 模板显示为四阶段。
+来源：[文本默认映射与 Advanced 显式生成批准基线](../../wiki/sources/text-knowledge-mapping-2026-08-27.md)。前端阶段按 Managed Catalog 实际顺序展示，不再统一追加治理链。
+
+## 固定模板与 QA 提取要求
+
+每个内置节点必须执行实际转换、模型/算法、独立校验、必要拓扑、提交或输入输出边界。四类占位算子退出新编排；Graph 保留真实 Schema/Quality。Sink 按展开后 Candidate Contract 接收，不要求 Diff 节点。
+
+QA v6 继续使用锁定 DataFlow 两阶段算法，单个 `extraction_instructions` 配置控制业务提取方向，由适配器注入两个阶段并随快照冻结。合法无匹配是成功零产出；响应错误和调用失败不能成为空成功。前者沿用 Diff 撤销旧结果，后者保留旧结果；旧 v5 固定提示词执行语义不变。
+
+来源：[固定模板实际执行语义与 QA 提取要求](../../wiki/sources/fixed-template-qa-guidance-2026-08-28.md)。
+
+真实 DataFlow 算子内部编码及英文名称采用上游类名：Text2QAGenerator v6、PromptedRefiner v4、HashDeduplicateFilter v4、MinHashDeduplicateFilter v4。两个去重节点固定各自策略，MinHash 保留短文本 Hash 保护；新编排拒绝旧编码，历史精确版本不重写。目录、画布和调试统一中英文对照，原生 DataForge 算子保持自身身份。来源：[原名编码与展示基线](../../wiki/sources/dataflow-upstream-names-2026-08-28.md)。
 
 ## 单一当前态
 
@@ -53,7 +63,7 @@ KnowledgeLibrary 保存业务查询使用的单一当前知识集合，不要求
 
 - `node_only` 只执行目标节点；`from_node` 执行目标及可达下游，并复用同一 Debug 系列父 Artifact。
 - 临时参数按祖先到子 Run 合并；只有 schema-valid 且可映射回源节点的配置能进入流程定义。
-- “应用到当前草稿”要求来源仍是未变化的当前自定义 Advanced Draft；“保存为自定义流程”和 Standard 转 Advanced 都从冻结/来源定义 materialize 为新的 Advanced Draft，不修改 Standard 来源。
+- “应用到当前草稿”要求来源仍是未变化的当前自定义 Advanced Draft；“保存为自定义流程”从冻结定义创建新的 Advanced Draft。Standard 转 Advanced 先从来源配置物化临时预览，首次显式保存或运行前保存才创建独立 Advanced Draft，直接退出不落盘，不修改 Standard 来源。
 - Runtime 输入、KnowledgeLibrary 绑定、Artifact、日志、指标和 Preview 都不进入流程定义；旧业务 Run 派生/提交开关仅保留兼容。
 
 ## 向量化、发布与删除

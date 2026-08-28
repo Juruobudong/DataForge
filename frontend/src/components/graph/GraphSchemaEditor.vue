@@ -1,10 +1,12 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { literalDatatypeLabels } from '../../constants/knowledgeLabels'
 import EntityTypeEditor from './EntityTypeEditor.vue'
 
 const props = defineProps({ modelValue: { type: Object, required: true } })
 const emit = defineEmits(['update:modelValue'])
+const entitySection = ref(null), relationSection = ref(null)
+defineExpose({ section: part => part === 'relations' ? relationSection.value : entitySection.value })
 
 const literalOptions = Object.entries(literalDatatypeLabels).map(([key, label]) => ({ key, label }))
 
@@ -38,17 +40,19 @@ function datatypeEnabled(key) {
 
 <template>
   <div class="schema-editor">
-    <section class="schema-block">
+    <section ref="entitySection" class="schema-block" tabindex="-1" aria-label="实体类型规则">
       <EntityTypeEditor :model-value="entityTypes" @update:model-value="updateEntityTypes" />
+      <p class="muted">用于实体抽取器；节点可以选择全部类型或其中的子集。</p>
     </section>
 
-    <section class="schema-block">
+    <section ref="relationSection" class="schema-block" tabindex="-1" aria-label="关系类型规则">
       <header><h4>关系类型</h4><button type="button" @click="addRelationType">+ 新增关系类型</button></header>
+      <p class="muted">用于关系抽取器；图谱结构与质量校验器共用这些约束。</p>
       <div v-if="relationTypes.length" class="type-list">
         <div v-for="(item, index) in relationTypes" :key="index" class="relation-row">
           <div class="relation-line">
-            <input v-model="item.label" placeholder="中文名称（如：使用药物）" @input="updateRelationType(index, 'label', $event.target.value)">
-            <input v-model="item.code" placeholder="代码 code（如：uses_drug）" @input="updateRelationType(index, 'code', $event.target.value)">
+            <input :value="item.label" placeholder="中文名称（如：使用药物）" @input="updateRelationType(index, 'label', $event.target.value)">
+            <input :value="item.code" placeholder="代码 code（如：uses_drug）" @input="updateRelationType(index, 'code', $event.target.value)">
             <button type="button" class="danger" @click="removeRelationType(index)">删除</button>
           </div>
           <div class="relation-constraints">

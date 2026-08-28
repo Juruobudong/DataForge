@@ -63,8 +63,8 @@ test('DataFlow class identity is bilingual and is not duplicated as a technical 
     // Runtime uses the frozen name even if the current catalog is changed.
     const meta = resolveNodeMetadata(definition, [{ ...operator, name: 'wrong latest name' }])
     assert.equal(meta.name, operator.display_name_zh)
-    assert.equal(operatorNodeSubtitle(meta, true), `DataFlow · ${operator.code}`)
-    assert.equal(operatorNodeSubtitle(meta), `DataFlow · ${operator.code}`)
+    assert.equal(operatorNodeSubtitle(meta, true), `${operator.code}`)
+    assert.equal(operatorNodeSubtitle(meta), `${operator.code}`)
   }
 })
 

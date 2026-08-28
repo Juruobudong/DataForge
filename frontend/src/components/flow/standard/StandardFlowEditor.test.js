@@ -86,7 +86,7 @@ describe('Standard business stages follow the managed contract', () => {
   it.each(['standard-qa', 'standard-multi'])('%s saves and reloads multiline extraction instructions', async code => {
     await render(code)
     expect(wrapper.get('.stage-operator').text()).toContain('文本转问答生成器')
-    expect(wrapper.get('.stage-operator').text()).toContain('DataFlow · Text2QAGenerator')
+    expect(wrapper.get('.stage-operator').text()).toContain('Text2QAGenerator')
     const requirements = '只提取就诊准备事项\n使用患者口吻，保留原文条件。'
     await wrapper.get('textarea[aria-label="QA 提取要求"]').setValue(requirements)
     const definition = wrapper.emitted('update:definition').at(-1)[0]

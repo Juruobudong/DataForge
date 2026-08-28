@@ -149,6 +149,12 @@ class FlowTemplateRequest(BaseModel):
     derived_from_revision_id: str | None = None
 
 
+class FlowPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision_id: str = Field(min_length=1, max_length=64, pattern=r"^\S+$")
+    expected_definition_checksum: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class FlowCompilerPreviewRequest(BaseModel):
     authoring_mode: Literal["standard", "advanced"] = "advanced"
     managed_template_code: str | None = None
@@ -223,8 +229,16 @@ class SaveDebugRunAsFlowRequest(BaseModel):
 class EntityTypesResolveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entity_types: list[dict | str] = Field(default_factory=list)
-    action: Literal["normalize", "add_custom", "add_medical", "remove_medical"] = "normalize"
+    action: Literal["normalize", "add_custom", "add_medical", "remove_medical", "update"] = "normalize"
     label: str | None = None
+    code: str | None = None
+    description: str | None = None
+
+
+class GraphPromptPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    definition: dict
+    node_id: str
 
 
 class CommitDerivedRunRequest(BaseModel):
@@ -1439,7 +1453,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def resolve_graph_entity_types(body: EntityTypesResolveRequest):
         # A pure editor operation: no template, revision or database is written.
         try:
-            return {"entity_types": resolve_entity_types(body.entity_types, body.action, label=body.label)}
+            return {"entity_types": resolve_entity_types(body.entity_types, body.action, label=body.label,
+                                                         code=body.code, description=body.description)}
         except ValueError as exc:
             raise _error(exc) from exc
 
@@ -1485,8 +1500,14 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-flow-templates/{template_id}/publish")
-    def publish_flow_template(template_id: str):
-        try: return store.publish_flow_template(template_id)
+    def publish_flow_template(template_id: str, payload: FlowPublishRequest):
+        try: return store.publish_flow_template(template_id, **payload.model_dump())
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/graph-prompts/preview")
+    def preview_graph_prompt(body: GraphPromptPreviewRequest):
+        try: return store.preview_graph_prompt(body.definition, body.node_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-flow-templates/{template_id}/sample-run")

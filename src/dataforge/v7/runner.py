@@ -30,9 +30,10 @@ from ..config import Settings
 from .catalog import catalog_by_code, normalize_chunker_params
 from .operators import OperatorExecutionContext, build_builtin_registry
 from .operators.factory import build_runtime_registry
+from .operators.graph_chunks import GraphChunkError, TripleEndpoints, chunk_identity
 from .operator_catalog import load_catalog
 from .graph_literal import classify_object, detect_literal
-from .graph_prompt import entity_prompt_for, relation_prompt_for
+from .graph_prompt import GRAPH_GUIDANCE_VERSIONS, graph_node_prompt, graph_config_for_node as _graph_config_for_node
 from .graph_quality import evaluate_graph_quality
 from .graph_schema import GraphExtractionConfig, normalize_graph_config
 from .llm_serving import DEFAULT_LLM_SERVING_ID, configure_llm_serving_registry, get_llm_serving_registry
@@ -939,40 +940,14 @@ def _literal_entity(name: str) -> dict[str, Any] | None:
     }
 
 
-def _graph_config_for_node(config: GraphExtractionConfig, params: dict[str, Any], *, relation: bool = False) -> GraphExtractionConfig:
-    raw = config.to_dict()
-    selected_entities = {str(item) for item in (params.get("entity_types") or []) if str(item)}
-    if selected_entities and params.get("entity_type_scope") != "all":
-        raw["entity_types"] = [item for item in raw["entity_types"] if item["code"] in selected_entities]
-        # Entity extraction does not consume relation definitions. Keeping them
-        # here would leave references to types excluded by this node's subset.
-        if not relation:
-            raw["relation_types"] = []
-    selected_relations = {str(item) for item in (params.get("relation_types") or []) if str(item)}
-    if selected_relations:
-        raw["relation_types"] = [item for item in raw["relation_types"] if item["code"] in selected_relations]
-    if relation and params.get("unknown_relation_policy"):
-        raw["unknown_relation_policy"] = params["unknown_relation_policy"]
-    if not relation and params.get("unknown_entity_policy"):
-        raw["unknown_entity_policy"] = params["unknown_entity_policy"]
-    if not relation and params.get("prompt_mode"):
-        raw.setdefault("prompt", {})["mode"] = params["prompt_mode"]
-    constraints = {str(item.get("relation_type")): item for item in (params.get("relation_constraints") or [])
-                   if isinstance(item, dict) and item.get("relation_type")}
-    for item in raw.get("relation_types") or []:
-        constraint = constraints.get(str(item.get("code")))
-        if constraint:
-            item["source_types"] = list(constraint.get("source_types") or [])
-            item["target_types"] = list(constraint.get("target_types") or [])
-    return normalize_graph_config(raw)
 
 
 def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_serving: str,
-                      params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                      params: dict[str, Any] | None = None, *, operator_version: int | None = None) -> list[dict[str, Any]]:
     """One LLM call extracting typed entities from a single source chunk."""
     if (params or {}).get("entity_type_scope") == "subset" and not params.get("entity_types"):
         return []
-    system, prompt = entity_prompt_for(config, str(chunk.get("content", "")))
+    system, prompt = graph_node_prompt(config, params or {}, "entity-extractor", operator_version, str(chunk.get("content", "")))
     response = _llm_json(prompt, llm_serving=llm_serving, system=system)
     raw_entities = response.get("entities") if isinstance(response, dict) else None
     if not isinstance(raw_entities, list):
@@ -1012,21 +987,35 @@ def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_
     return entities
 
 
-def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str) -> list[dict[str, Any]]:
+def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str, *, strict_endpoints: bool = False, params: dict[str, Any] | None = None, operator_version: int | None = None) -> list[dict[str, Any]]:
     """One LLM call extracting relations between already-extracted entities."""
     entity_names = [item["name"] for item in entities if item.get("object_kind") != "literal"]
-    system, prompt = relation_prompt_for(config, entity_names, str(chunk.get("content", "")))
-    response = _llm_json(prompt, llm_serving=llm_serving, system=system)
+    system, prompt = graph_node_prompt(config, params or {}, "relation-extractor", operator_version, str(chunk.get("content", "")), entity_names)
+    try:
+        response = _llm_json(prompt, llm_serving=llm_serving, system=system)
+    except ValueError as exc:
+        if strict_endpoints:
+            raise GraphChunkError("GRAPH_RELATION_INVALID: 关系抽取响应格式不合法") from exc
+        raise
     raw_relations = response.get("relations") if isinstance(response, dict) else None
     if not isinstance(raw_relations, list):
+        if strict_endpoints:
+            raise GraphChunkError("GRAPH_RELATION_INVALID: LLM 关系抽取未返回 relations 数组")
         raise ValueError("LLM 关系抽取未返回 relations 数组")
+    endpoints = TripleEndpoints(entities, config, _normalized_name) if strict_endpoints else None
     relations: list[dict[str, Any]] = []
     for raw in raw_relations:
         if not isinstance(raw, dict):
+            if strict_endpoints:
+                raise GraphChunkError("GRAPH_RELATION_INVALID: 关系必须是对象")
             continue
+        if strict_endpoints and (not isinstance(raw.get("type"), str) or not raw["type"].strip()):
+            raise GraphChunkError("GRAPH_RELATION_INVALID: 关系缺少类型")
         source = str(raw.get("source") or "").strip()
         target = str(raw.get("target") or "").strip()
         if not source or not target:
+            if strict_endpoints:
+                raise GraphChunkError("GRAPH_ENDPOINT_INVALID: 关系缺少 source 或 target")
             continue
         resolved = _resolve_type(config, raw.get("type"), relation=True)
         if resolved is None:
@@ -1041,6 +1030,9 @@ def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], co
             # The schema code remains the stable identity; the extracted label
             # is the source-language relationship shown to business users.
             label = str(raw.get("label") or schema_label).strip()
+        if endpoints:
+            resolved_relation = endpoints.relation({**raw, "type": code})
+            source, target = resolved_relation["source"], resolved_relation["target"]
         definition = config.relation_by_code(code)
         if definition and (definition.source_types or definition.target_types):
             entity_types = {str(item.get("name")): str(item.get("type") or "") for item in entities}
@@ -1113,8 +1105,11 @@ def _candidate_meta(source: Source, version: SourceVersion, chunk: dict[str, Any
     }
 
 
-def _build_triples(record: dict[str, Any], config: GraphExtractionConfig, library_id: str, sources: dict[str, Source], versions: dict[str, SourceVersion]) -> list[dict[str, Any]]:
+def _build_triples(record: dict[str, Any], config: GraphExtractionConfig, library_id: str, sources: dict[str, Source], versions: dict[str, SourceVersion], *, strict_endpoints: bool = False) -> list[dict[str, Any]]:
     """Triple Builder: assemble entity→entity relations and entity→literal facts."""
+    if strict_endpoints:
+        endpoints = TripleEndpoints(record.get("entities") or [], config, _normalized_name)
+        record = {**record, "relations": [endpoints.relation(rel) for rel in record.get("relations") or []]}
     entities = {_normalized_name(item["name"]): item for item in record.get("entities") or []}
     source = sources[record["source_id"]]
     version = versions[record["source_version_id"]]
@@ -1245,10 +1240,49 @@ def _validate_graph_item(data: dict[str, Any], config: GraphExtractionConfig, gr
                 raise ValueError(f"三元组 object_type 非法：{data.get('object_type')}")
 
 
-def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None, operator_version: int | None = None) -> list[dict[str, Any]]:
+def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None, operator_version: int | None = None, graph_chunk_stage=None) -> list[dict[str, Any]]:
     """Execute only DataForge adapters; DataFlow class names never enter a Flow."""
     cfg = graph_config or _graph_config_from_contracts(type_contracts)
     library_id = str((sink_libraries or {}).get(_graph_output_key(params)) or "")
+    if graph_chunk_stage is not None:
+        if ref == "relation-extractor":
+            llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
+            _initialize_llm_servings().require(llm_serving)
+            node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
+            def process(records):
+                return [{**record, "relations": _extract_relations(record, record.get("entities") or [], node_config,
+                                                                   llm_serving, strict_endpoints=True, params=params, operator_version=operator_version)} for record in records]
+        elif ref == "triple-builder":
+            def process(records):
+                return [candidate for record in records for candidate in _build_triples(
+                    record, cfg, library_id, sources, versions, strict_endpoints=True)]
+        elif ref == "schema-validator":
+            def process(records):
+                for record in records:
+                    if not isinstance(record.get("data_json"), dict):
+                        raise GraphChunkError("GRAPH_SCHEMA_INVALID: 三元组 data_json 必须是对象")
+                    data = record["data_json"]
+                    if not isinstance(data.get("data"), dict) or data["data"].get("object_kind") not in ("entity", "literal") or any(not isinstance(data.get(field), str) or not data[field].strip() for field in ("subject", "predicate", "object")):
+                        raise GraphChunkError("GRAPH_SCHEMA_INVALID: 三元组缺少合法主体、关系、客体或对象元数据")
+                    type_fields = ("subject_type", "object_type") if data["data"]["object_kind"] == "entity" else ("subject_type",)
+                    if any(not isinstance(data.get(field), str) or not data[field].strip() for field in type_fields):
+                        raise GraphChunkError("GRAPH_SCHEMA_INVALID: 三元组实体端点缺少合法类型")
+                    try:
+                        _validate_graph_item(data, cfg, "triple")
+                    except ValueError as exc:
+                        raise GraphChunkError(f"GRAPH_SCHEMA_INVALID: {exc}") from exc
+                    if detect_literal(str(data.get("subject") or "")) is not None:
+                        raise GraphChunkError("GRAPH_SUBJECT_LITERAL: 三元组主体不能是字面值")
+                    relation = cfg.relation_by_code(str(data.get("predicate_code") or ""))
+                    if cfg.relation_types and relation is None:
+                        raise GraphChunkError("GRAPH_RELATION_INVALID: 三元组关系不在声明的 Schema 中")
+                    if relation and (relation.source_types and data.get("subject_type") not in relation.source_types
+                                     or relation.target_types and data.get("object_type") not in relation.target_types):
+                        raise GraphChunkError("GRAPH_RELATION_CONSTRAINT_INVALID: 三元组关系端点类型不符合方向约束")
+                return [dict(record) for record in records]
+        else:
+            raise ValueError(f"未登记的三元组分块算子：{ref}")
+        return graph_chunk_stage.run(values, process, store=store, job_id=job_id)
     if ref == "document-parser":
         return root_documents
     if ref == "reviewed-source-chunk-input":
@@ -1434,7 +1468,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
         outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
-        node_config = _graph_config_for_node(cfg, params)
+        node_config = _graph_config_for_node(cfg, params, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
         result: list[dict[str, Any]] = []
         for chunk in values:
             scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
@@ -1442,7 +1476,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             outcome["targeted"].append(chunk)
             try:
-                entities = _extract_entities(chunk, node_config, llm_serving, params)
+                entities = _extract_entities(chunk, node_config, llm_serving, params, operator_version=operator_version)
                 result.append({**chunk, "entities": entities})
                 outcome["successful"].append(chunk)
                 if store and job_id:
@@ -1456,12 +1490,12 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         output_key = _graph_output_key(params)
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
-        node_config = _graph_config_for_node(cfg, params, relation=True)
+        node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
         outcome = (generation if generation is not None else {}).get(output_key)
         result = []
         for record in values:
             try:
-                relations = _extract_relations(record, record.get("entities") or [], node_config, llm_serving)
+                relations = _extract_relations(record, record.get("entities") or [], node_config, llm_serving, params=params, operator_version=operator_version)
                 result.append({**record, "relations": relations})
             except Exception as exc:
                 if outcome is not None:
@@ -1548,6 +1582,7 @@ def _builtin_dispatch(ref: str, params: dict[str, Any], inputs: list[dict[str, A
         graph_config=runtime.get("graph_config"),
         sink_libraries=runtime.get("sink_libraries"),
         operator_version=runtime.get("operator_version"),
+        graph_chunk_stage=runtime.get("graph_chunk_stage"),
     )
 
 
@@ -1684,7 +1719,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 values = result.outputs
             except Exception as exc:
                 node_errors[node_id] = str(exc); outputs[node_id] = []
-                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), logs=getattr(exc, "operator_logs", []), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
+                artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), logs=getattr(exc, "operator_logs", []), metrics=getattr(exc, "operator_metrics", {}), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
             if ref == "document-parser":
                 store.record_document_irs(flow_run["id"], values)
@@ -1692,7 +1727,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 store.record_source_chunks(flow_run["id"], values)
                 current_source_chunks = [dict(value) for value in values]
             outputs[node_id] = values
-            artifact_type = "execution"
+            artifact_type = node.get("resolved_output_type") or "execution"
             if values:
                 values = [{**value, "_artifact_type": artifact_type} for value in values]
                 outputs[node_id] = values
@@ -1720,7 +1755,8 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 if failed_upstream:
                     raise ValueError("上游节点失败，Sink 已跳过：" + "、".join(failed_upstream))
                 outcomes = generation.get(output_key, {"successful": [], "failed": [], "targeted": []})
-                successful = outcomes["successful"]
+                input_values, successful = (_sink_successful_inputs(input_values, generation, output_key)
+                                            if output_key in generation else (input_values, []))
                 if successful:
                     changes[output_key] = store.apply_knowledge_output(
                         job_id, output_key, input_values, successful_chunks=successful,
@@ -1819,6 +1855,25 @@ def _candidate_chunks(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(result.values())
 
 
+def _sink_successful_inputs(values, generation, output_key):
+    outcome = generation.get(output_key)
+    if outcome is None:
+        return values, _candidate_chunks(values)
+    successful = outcome.get("successful", [])
+    if outcome.get("chunk_isolation"):
+        failed = {chunk_identity(item) for item in outcome.get("failed", [])}
+        successful = [item for item in successful if chunk_identity(item) not in failed]
+        keys = {chunk_identity(item) for item in successful}
+        values = [item for item in values if chunk_identity(item) in keys]
+    return values, successful
+
+
+def _graph_chunk_errors(generation):
+    return {f"{key}/{item['source_version_id']}/{item['source_chunk_id']}": item["error"]
+            for key, outcome in generation.items() if outcome.get("chunk_isolation")
+            for item in outcome.get("failed", [])}
+
+
 def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, Any]:
     """Execute a full or derived Debug Run without mutating formal knowledge."""
     context = store.debug_run_context(flow_run_id)
@@ -1885,7 +1940,13 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                     message = "Sink 缺少预览目标知识库"; failed[node_id] = message
                     artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=message)
                     continue
-                successful = generation.get(output_key, {}).get("successful") or _candidate_chunks(input_values)
+                input_values, successful = _sink_successful_inputs(input_values, generation, output_key)
+                outcome = generation.get(output_key, {})
+                if outcome.get("chunk_isolation") and outcome.get("failed") and not successful:
+                    message = "GRAPH_CHUNKS_FAILED: 所有目标分块均失败，未创建空结果预览"
+                    failed[node_id] = message
+                    artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=message, status="skipped")
+                    continue
                 preview = store.stage_sink_preview(
                     flow_run_id, output_key, library_id, input_values, successful,
                     quality={"candidate_count": len(input_values), "status": "preview_only"},
@@ -1908,7 +1969,7 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                 )
                 outputs[node_id] = result.outputs
                 item = catalog.get(ref) or {}
-                recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in result.outputs]
+                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or item.get("output", "execution")} for value in result.outputs]
                 artifact_ids[node_id] = store.record_flow_node(
                     flow_run_id, node_id, input_ids, recorded, operator_code=ref,
                     operator_version=operator_version, resolved_parameters=params, logs=getattr(result, "logs", []),
@@ -1921,11 +1982,13 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                     operator_version=operator_version, resolved_parameters=params, logs=getattr(exc, "operator_logs", []),
                     metrics=getattr(exc, "operator_metrics", {}),
                 )
-        if failed:
-            status = "completed_with_warnings" if previews else "failed"
-            detail = "；".join(f"{node_id}: {message}" for node_id, message in failed.items())
+        chunk_errors = _graph_chunk_errors(generation)
+        if failed or chunk_errors:
+            partial_node = not failed and any(outcome.get("successful") for outcome in generation.values())
+            status = "completed_with_warnings" if previews or partial_node else "failed"
+            detail = "；".join(f"{node_id}: {message}" for node_id, message in list({**failed, **chunk_errors}.items())[:20])
             store.finish_flow_run(flow_run_id, detail, status=status)
-            return {"id": flow_run_id, "status": status, "previews": previews, "errors": failed}
+            return {"id": flow_run_id, "status": status, "previews": previews, "errors": {**failed, **chunk_errors}}
         store.finish_flow_run(flow_run_id, status="completed")
         return {"id": flow_run_id, "status": "completed", "previews": previews}
     except Exception as exc:
@@ -1973,7 +2036,12 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                 output_key = str(node.get("output_key") or node.get("knowledge_type")); library_id = context["sink_libraries"].get(output_key)
                 if not library_id:
                     failed.add(node_id); artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error="Sink 缺少目标知识库"); continue
-                successful = generation.get(output_key, {}).get("successful") or _candidate_chunks(input_values)
+                input_values, successful = _sink_successful_inputs(input_values, generation, output_key)
+                outcome = generation.get(output_key, {})
+                if outcome.get("chunk_isolation") and outcome.get("failed") and not successful:
+                    failed.add(node_id)
+                    artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error="GRAPH_CHUNKS_FAILED: 所有目标分块均失败", status="skipped")
+                    continue
                 preview = store.stage_sink_preview(flow_run_id, output_key, library_id, input_values, successful); previews.append(preview)
                 outputs[node_id] = [{"_artifact_type": f"knowledge_preview:{output_key}", **preview}]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, outputs[node_id], status="awaiting_commit"); continue
@@ -1992,18 +2060,20 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                 )
                 values = result.outputs
                 outputs[node_id] = values; item = catalog.get(ref) or {}
-                recorded = [{**value, "_artifact_type": item.get("output", "execution")} for value in values]
+                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or item.get("output", "execution")} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
                                                                operator_version=int(node.get("operator_version") or item.get("version", 1)), resolved_parameters=params, logs=getattr(result, "logs", []),
-                                                               metrics={"input_records": len(input_values), "output_records": len(values)})
+                                                               metrics={**getattr(result, "metrics", {}), "input_records": len(input_values), "output_records": len(values)})
             except Exception as exc:
                 failed.add(node_id); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=str(exc), operator_code=ref,
-                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params, logs=getattr(exc, "operator_logs", []))
+                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params, logs=getattr(exc, "operator_logs", []), metrics=getattr(exc, "operator_metrics", {}))
+        chunk_errors = _graph_chunk_errors(generation)
+        warning = "；".join(list(chunk_errors.values())[:20]) or None
         if previews:
-            store.finish_flow_run(flow_run_id, status="awaiting_commit"); return {"id": flow_run_id, "status": "awaiting_commit", "previews": previews}
-        status = "failed" if context["start_node_id"] in failed else "completed"
-        store.finish_flow_run(flow_run_id, "派生节点执行失败" if status == "failed" else None, status=status); return {"id": flow_run_id, "status": status}
+            store.finish_flow_run(flow_run_id, warning, status="awaiting_commit"); return {"id": flow_run_id, "status": "awaiting_commit", "previews": previews}
+        status = "failed" if failed else "completed_with_warnings" if chunk_errors else "completed"
+        store.finish_flow_run(flow_run_id, "派生节点执行失败" if status == "failed" else warning, status=status); return {"id": flow_run_id, "status": status}
     except Exception as exc:
         store.finish_flow_run(flow_run_id, str(exc), status="failed"); raise
 

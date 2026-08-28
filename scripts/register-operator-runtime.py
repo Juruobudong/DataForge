@@ -7,8 +7,15 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import sys
+
+
+def environment_path(value):
+    # POSIX venv executables commonly symlink to the same base interpreter.
+    # Resolving symlinks would collapse distinct, immutable environments.
+    return os.path.normcase(os.path.abspath(value))
 
 
 def installed_digest(dist):
@@ -43,7 +50,7 @@ def main():
     if target.exists():
         previous = json.loads(target.read_text(encoding="utf-8"))
         runtimes = previous.get("runtimes", [previous])
-        runtimes = [entry for entry in runtimes if Path(entry["python"]).resolve() != Path(sys.executable).resolve()]
+        runtimes = [entry for entry in runtimes if environment_path(entry["python"]) != environment_path(sys.executable)]
         if runtimes:
             value = {"schema_version": 2, "runtimes": [*runtimes, value]}
     temporary = target.with_suffix(".json.tmp")

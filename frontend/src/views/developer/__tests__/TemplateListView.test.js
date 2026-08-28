@@ -13,12 +13,12 @@ vi.mock('../../../api/platform', () => ({ api: Object.fromEntries([
 vi.mock('../../../components/flow/advanced/AdvancedFlowEditor.vue', () => ({ default: {
   template: '<div class="advanced-editor-test"></div>',
   data: () => ({ definition: { schema_version: 3, nodes: [], edges: [] } }),
-  methods: { loadDefinition(value) { this.definition = value }, reset() {}, serialize() { return this.definition }, applyNormalizedDefinition(value) { this.definition = value } },
+  methods: { loadDefinition(value) { this.definition = value }, reset() {}, validate() { return true }, serialize() { return this.definition }, applyNormalizedDefinition(value) { this.definition = value } },
 } }))
 
 let wrapper
 const advanced = { id: 'custom', code: 'custom', name: '自定义高级', authoring_mode: 'advanced', output_types: ['text'],
-  definition: { schema_version: 3, nodes: [], edges: [] }, revision: 1 }
+  definition: { schema_version: 3, nodes: [], edges: [] }, revision: 1, revision_id: 'r1', source_definition_checksum: 'checksum1' }
 const conversionPreview = { code: 'custom-converted', name: '转换后的高级流程', output_types: ['text'],
   definition: advanced.definition, source_template_id: 'standard-text', source_revision_id: 'standard-text-r1' }
 beforeEach(() => {
@@ -30,7 +30,7 @@ beforeEach(() => {
   api.detachFlowToAdvanced.mockResolvedValue(advanced)
   api.previewFlowToAdvanced.mockResolvedValue(conversionPreview)
   api.createFlowTemplate.mockResolvedValue({ id: 'converted', revision: 1, status: 'draft' })
-  api.updateFlowTemplate.mockResolvedValue({ revision: 2, status: 'draft' })
+  api.updateFlowTemplate.mockResolvedValue({ revision: 2, revision_id: 'r2', source_definition_checksum: 'checksum2', status: 'draft' })
 })
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.useRealTimers() })
 async function render() {
@@ -79,7 +79,7 @@ describe('knowledge flow draft and published versions', () => {
     api.publishFlowTemplate.mockImplementationOnce(() => new Promise(resolve => { finishPublish = resolve }))
     api.flowTemplates.mockResolvedValue([{ ...published, revision: 2, published_revision: 2 }])
     await button('发布').trigger('click')
-    expect(api.publishFlowTemplate).toHaveBeenCalledWith(advanced.id)
+    expect(api.publishFlowTemplate).toHaveBeenCalledWith(advanced.id, { revision_id: 'r2', expected_definition_checksum: 'checksum2' })
     expect(wrapper.find('.publish-notice').exists()).toBe(false)
     expect(wrapper.get('.template-page-head .template-revisions').text()).toBe('最新草稿：r2 · 已发布版本：r1')
     finishPublish({ id: advanced.id, revision: 2, status: 'published' })
@@ -174,7 +174,7 @@ describe('temporary Advanced conversion', () => {
     expect(api.updateFlowTemplate).not.toHaveBeenCalled()
   })
 
-  it.each(['保存草稿', '运行当前草稿'])('creates the preview only on %s and resumes autosave', async action => {
+  it.each(['保存草稿', '运行当前流程'])('creates the preview only on %s and resumes autosave', async action => {
     vi.useFakeTimers()
     await convert()
     await button(action).trigger('click'); await flushPromises()
@@ -187,7 +187,7 @@ describe('temporary Advanced conversion', () => {
     }))
     expect(wrapper.find('.conversion-notice').exists()).toBe(false)
     expect(wrapper.get('.template-page-head .template-revisions').text()).toBe('最新草稿：r1 · 已发布版本：未发布')
-    if (action === '运行当前草稿') expect(router.push).toHaveBeenCalledWith(expect.stringContaining('template_id=converted'))
+    if (action === '运行当前流程') expect(router.push).toHaveBeenCalledWith(expect.stringContaining('template_id=converted'))
     wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
     await vi.advanceTimersByTimeAsync(500); await flushPromises()
     expect(api.updateFlowTemplate).toHaveBeenCalledWith('converted', expect.any(Object))
@@ -221,6 +221,54 @@ describe('temporary Advanced conversion', () => {
 })
 
 describe('knowledge flow editing toolbar', () => {
+  it('runs a clean published flow without manufacturing a new draft', async () => {
+    api.flowTemplates.mockResolvedValue([{ ...advanced, revision_status: 'published' }])
+    await render(); await wrapper.get('.template-list button').trigger('click')
+    await button('运行当前流程').trigger('click'); await flushPromises()
+    expect(api.updateFlowTemplate).not.toHaveBeenCalled()
+    expect(api.createFlowTemplate).not.toHaveBeenCalled()
+    expect(router.push).toHaveBeenCalledWith(expect.stringContaining('revision_kind=published'))
+  })
+  it('retries a failed old generation once for newer edits, without an endless timer retry', async () => {
+    vi.useFakeTimers()
+    let fail
+    api.updateFlowTemplate.mockImplementationOnce(() => new Promise((resolve, reject) => { fail = reject }))
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+    const editor = wrapper.findComponent('.advanced-editor-test')
+    editor.vm.$emit('dirty'); await vi.advanceTimersByTimeAsync(500)
+    editor.vm.definition = { nodes: [{ id: 'newest' }], edges: [] }
+    editor.vm.$emit('dirty')
+    fail(new Error('old request failed')); await flushPromises()
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
+    expect(api.updateFlowTemplate.mock.calls[1][1].definition.nodes).toEqual([{ id: 'newest' }])
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
+  })
+  it('does not retry a failed unchanged generation and never announces a 409 publish as success', async () => {
+    vi.useFakeTimers()
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+    api.updateFlowTemplate.mockRejectedValueOnce(new Error('network failed'))
+    wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
+    await vi.advanceTimersByTimeAsync(2500); await flushPromises()
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
+    api.publishFlowTemplate.mockRejectedValueOnce(Object.assign(new Error('STALE_FLOW_DRAFT'), { status: 409 }))
+    await button('发布').trigger('click'); await flushPromises()
+    expect(wrapper.find('.publish-notice').exists()).toBe(false)
+    expect(wrapper.text()).toContain('STALE_FLOW_DRAFT')
+  })
+  it('keeps edits made while a publish request is in flight', async () => {
+    vi.useFakeTimers()
+    let finish
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+    api.publishFlowTemplate.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    await button('发布').trigger('click')
+    const editor = wrapper.findComponent('.advanced-editor-test')
+    editor.vm.definition = { nodes: [{ id: 'after-publish-request' }], edges: [] }
+    editor.vm.$emit('dirty')
+    finish({ revision: 1, status: 'published' }); await flushPromises()
+    expect(editor.vm.definition.nodes).toEqual([{ id: 'after-publish-request' }])
+    expect(wrapper.get('.save-state').text()).toContain('未保存')
+  })
   it('debounces Advanced edits and flushes the latest DAG before running', async () => {
     vi.useFakeTimers()
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
@@ -229,7 +277,7 @@ describe('knowledge flow editing toolbar', () => {
     editor.vm.$emit('dirty')
     await vi.advanceTimersByTimeAsync(499)
     expect(api.updateFlowTemplate).not.toHaveBeenCalled()
-    await button('运行当前草稿').trigger('click'); await flushPromises()
+    await button('运行当前流程').trigger('click'); await flushPromises()
     expect(api.updateFlowTemplate.mock.calls[0][1].definition.nodes).toEqual([{ id: 'latest' }])
     expect(router.push).toHaveBeenCalledWith(expect.stringContaining('revision_kind=draft'))
     await vi.advanceTimersByTimeAsync(501)
@@ -245,7 +293,7 @@ describe('knowledge flow editing toolbar', () => {
     await vi.advanceTimersByTimeAsync(500)
     editor.vm.definition = { schema_version: 3, nodes: [{ id: 'new-node' }], edges: [] }
     editor.vm.$emit('dirty')
-    await button('运行当前草稿').trigger('click')
+    await button('运行当前流程').trigger('click')
     expect(router.push).not.toHaveBeenCalled()
     finish({ revision: 2, status: 'draft', definition: { nodes: [] } })
     await flushPromises()
@@ -261,7 +309,7 @@ describe('knowledge flow editing toolbar', () => {
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
     wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
     api.updateFlowTemplate.mockRejectedValueOnce(new Error('PORT_TYPE_MISMATCH'))
-    await button('运行当前草稿').trigger('click'); await flushPromises()
+    await button('运行当前流程').trigger('click'); await flushPromises()
     expect(router.push).not.toHaveBeenCalled()
     expect(wrapper.get('.save-state').text()).toContain('保存失败')
     expect(wrapper.text()).toContain('PORT_TYPE_MISMATCH')

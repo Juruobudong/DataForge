@@ -85,6 +85,12 @@ def load_approved_class(implementation, package_name):
 
 
 def execute(request):
+    governance = None
+    if str(request.get("adapter_version", "")).startswith("governance-"):
+        spec = importlib.util.spec_from_file_location("governance_worker", Path(__file__).with_name("governance_worker.py"))
+        governance = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(governance)
+        governance.lock_network()
     if request.get("python_version") and request["python_version"] != ".".join(map(str, sys.version_info[:3])):
         raise ValueError("OPERATOR_DEPENDENCY_DRIFT: Python version changed")
     for name, version in request.get("dependencies", {}).items():
@@ -115,9 +121,13 @@ def execute(request):
 
     cls = load_approved_class(request["implementation"], package["name"])
     init = dict(request.get("init") or {})
+    if governance:
+        init = governance.prepare_init(request, init)
     if request.get("uses_llm") and request["executor"] != "custom-native":
         init["llm_serving"] = Serving()
     operator = cls(**init)
+    if governance:
+        governance.configure_operator(request, operator)
     if request["executor"] == "custom-native":
         ctx = SimpleNamespace(**request["context"])
         if request.get("uses_llm"):
@@ -151,16 +161,20 @@ def execute(request):
 
 def main():
     diagnostics = OperatorDiagnostics()
+    sensitive = False
     try:
         request = json.loads(sys.stdin.readline())
+        sensitive = bool(request.get("sensitive"))
         diagnostics.add_secrets({"init": request.get("init"), "params": request.get("params"), "context": request.get("context")})
-        with contextlib.redirect_stdout(LogWriter("stdout", diagnostics)), contextlib.redirect_stderr(LogWriter("stderr", diagnostics)):
+        class DiscardWriter(io.TextIOBase):
+            def write(self, value): return len(value)
+        with contextlib.redirect_stdout(DiscardWriter() if sensitive else LogWriter("stdout", diagnostics)), contextlib.redirect_stderr(DiscardWriter() if sensitive else LogWriter("stderr", diagnostics)):
             result = execute(request)
         send({"type": "result", "ok": True, "error": None, "logs_streamed": True,
               "operator_logs": diagnostics.snapshot(), **result})
         return 0
     except Exception as exc:
-        message = diagnostics.error(f"{type(exc).__name__}: {exc}")
+        message = "PII_EXECUTION_FAILED: 英文PII模型执行失败，请检查受控环境与资源" if sensitive else diagnostics.error(f"{type(exc).__name__}: {exc}")
         send({"type": "error", "ok": False, "message": message, "error": message,
               "logs_streamed": True, "operator_logs": diagnostics.snapshot()})
         return 1

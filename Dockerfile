@@ -24,6 +24,89 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install "uv==${UV_VERSION}"
 
 # -----------------------------------------------------------------------------
+# 精选算子依赖层：仅依赖 Python/uv 基础层和审核后的两个锁文件。
+# 独立于 app-common，业务源码、Adapter 和注册脚本变更不会重装依赖。
+# -----------------------------------------------------------------------------
+FROM python-base AS operator-deps
+
+COPY runtime/dataflow/upstream.lock runtime/dataflow/requirements.lock ./runtime/dataflow/
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    /usr/local/bin/python -c 'import sys; sys.version_info[:2] == (3, 12) or sys.exit("Operator runtime requires Python 3.12")' \
+    && /usr/local/bin/python -m pip download --no-deps --only-binary=:all: --require-hashes \
+        -r runtime/dataflow/upstream.lock -d /tmp/operator-wheels \
+    && uv venv --python /usr/local/bin/python /opt/dataforge-operators/dataflow-1.0.10 \
+    && uv pip sync --python /opt/dataforge-operators/dataflow-1.0.10/bin/python \
+        --require-hashes --only-binary=:all: runtime/dataflow/requirements.lock \
+    && uv pip install --no-deps --python /opt/dataforge-operators/dataflow-1.0.10/bin/python \
+        /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+# 新精选环境使用独立审核锁，旧依赖层与旧环境保持不变。
+FROM operator-deps AS operator-expanded-deps
+
+COPY runtime/dataflow/requirements-curated-v2.lock ./runtime/dataflow/
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv venv --python /usr/local/bin/python /opt/dataforge-operators/dataflow-1.0.10-curated-v2 \
+    && uv pip sync --python /opt/dataforge-operators/dataflow-1.0.10-curated-v2/bin/python \
+        --require-hashes --only-binary=:all: runtime/dataflow/requirements-curated-v2.lock \
+    && uv pip install --no-deps --python /opt/dataforge-operators/dataflow-1.0.10-curated-v2/bin/python \
+        /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+# 英文PII依赖和固定模型资源独立缓存，不改变已有两个环境。
+FROM operator-expanded-deps AS operator-governance-deps
+
+COPY runtime/dataflow/requirements-pii-v2.lock ./runtime/dataflow/
+COPY scripts/prepare-operator-model-wheel.py ./scripts/
+COPY runtime/dataflow/vendor/ /tmp/operator-model-wheels/
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    --mount=type=cache,target=/root/.cache/dataforge-models,sharing=locked \
+    /usr/local/bin/python scripts/prepare-operator-model-wheel.py \
+        --wheel-dir /tmp/operator-model-wheels --cache-dir /root/.cache/dataforge-models \
+        --dependency-lock runtime/dataflow/requirements-pii-v2.lock --output-lock /tmp/operator-pii-install.lock \
+    && uv venv --python /usr/local/bin/python /opt/dataforge-operators/dataflow-1.0.10-pii-v2 \
+    && uv pip sync --python /opt/dataforge-operators/dataflow-1.0.10-pii-v2/bin/python \
+        --torch-backend cpu \
+        --require-hashes --only-binary=:all: /tmp/operator-pii-install.lock \
+    && uv pip install --no-deps --python /opt/dataforge-operators/dataflow-1.0.10-pii-v2/bin/python \
+        /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+FROM operator-governance-deps AS operator-governance-resources
+COPY scripts/prepare-operator-resources.py ./scripts/
+COPY scripts/operator-resource-bundle.py ./scripts/
+COPY src/dataforge/v7/operators/resource_bundle.py ./src/dataforge/v7/operators/
+COPY runtime/dataflow/resources-pii-v1.lock.json ./runtime/dataflow/
+COPY runtime/dataflow/vendor-resources/ /tmp/operator-resource-bundle/
+RUN --network=none /opt/dataforge-operators/dataflow-1.0.10-pii-v2/bin/python scripts/prepare-operator-resources.py \
+    --download-only \
+    --offline-bundle /tmp/operator-resource-bundle/pii-en-v1.zip \
+    --resource-lock runtime/dataflow/resources-pii-v1.lock.json \
+    --resources /opt/dataforge-operators/resources-pii-v1 \
+    --manifest /opt/dataforge-operators/operator-runtime.json \
+    --dependency-lock runtime/dataflow/requirements-pii-v2.lock \
+    --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+# 旧环境注册只读取已安装环境与审核wheel，禁止网络和再次安装。
+FROM operator-governance-resources AS operator-runtime
+
+COPY scripts/register-operator-runtime.py ./scripts/
+
+RUN --network=none \
+    /opt/dataforge-operators/dataflow-1.0.10/bin/python scripts/register-operator-runtime.py \
+        --output /opt/dataforge-operators/operator-runtime.json \
+        --dependency-lock runtime/dataflow/requirements.lock \
+        --package open-dataflow 1.0.10 /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
+    && /opt/dataforge-operators/dataflow-1.0.10-curated-v2/bin/python scripts/register-operator-runtime.py \
+        --output /opt/dataforge-operators/operator-runtime.json \
+        --dependency-lock runtime/dataflow/requirements-curated-v2.lock \
+        --package open-dataflow 1.0.10 /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
+    && /opt/dataforge-operators/dataflow-1.0.10-pii-v2/bin/python scripts/prepare-operator-resources.py \
+        --register-only --resources /opt/dataforge-operators/resources-pii-v1 \
+        --manifest /opt/dataforge-operators/operator-runtime.json \
+        --dependency-lock runtime/dataflow/requirements-pii-v2.lock \
+        --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+# -----------------------------------------------------------------------------
 # API / Worker 公共层：仅安装基础依赖和 web extra。
 # 先复制锁文件，代码变更不会让第三方依赖层失效。
 # -----------------------------------------------------------------------------
@@ -71,24 +154,12 @@ FROM app-common AS runner
 
 USER root
 
-RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv sync --frozen --no-editable --extra web
-
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update \
     && apt-get install -y --no-install-recommends antiword
 
-COPY runtime/dataflow ./runtime/dataflow
-COPY scripts/install-operator-runtime.py scripts/register-operator-runtime.py ./scripts/
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    /usr/local/bin/python -m pip download --no-deps --only-binary=:all: --require-hashes \
-        -r runtime/dataflow/upstream.lock -d /tmp/operator-wheels \
-    && /usr/local/bin/python scripts/install-operator-runtime.py \
-        --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
-        --environment /opt/dataforge-operators/dataflow-1.0.10 \
-        --manifest /opt/dataforge-operators/operator-runtime.json
+COPY --from=operator-runtime /opt/dataforge-operators /opt/dataforge-operators
 
 ENV DATAFORGE_OPERATOR_RUNTIME_MANIFEST=/opt/dataforge-operators/operator-runtime.json
 
