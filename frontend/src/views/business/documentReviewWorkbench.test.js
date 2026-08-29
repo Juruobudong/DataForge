@@ -8,6 +8,7 @@ const workbench = readFileSync(new URL('./DocumentReviewWorkbenchView.vue', impo
 const preview = readFileSync(new URL('../../components/source-review/SourcePreviewPane.vue', import.meta.url), 'utf8')
 const pdfPreview = readFileSync(new URL('../../components/source-review/PdfSourcePreview.vue', import.meta.url), 'utf8')
 const docxPreview = readFileSync(new URL('../../components/source-review/DocxSourcePreview.vue', import.meta.url), 'utf8')
+const structuredPreview = readFileSync(new URL('../../components/source-review/StructuredSourcePreview.vue', import.meta.url), 'utf8')
 const previewScroll = readFileSync(new URL('../../components/source-review/sourcePreviewScroll.js', import.meta.url), 'utf8')
 const chunkCard = readFileSync(new URL('../../components/source-review/ChunkCard.vue', import.meta.url), 'utf8')
 const styles = readFileSync(new URL('../../styles-v7.css', import.meta.url), 'utf8')
@@ -51,6 +52,10 @@ test('PDF.js and DOCX evidence viewers expose multi-position highlights and expl
   assert.match(docxPreview, /highlighted/)
   assert.match(preview, /PdfSourcePreview/)
   assert.match(preview, /DocxSourcePreview/)
+  assert.match(preview, /StructuredSourcePreview/)
+  assert.match(structuredPreview, /json_pointer/)
+  assert.match(structuredPreview, /line_start/)
+  assert.match(structuredPreview, /scrollTargetWithin/)
 })
 
 test('review workbench constrains the viewport and keeps both columns independently scrollable', () => {
@@ -66,7 +71,15 @@ test('review workbench constrains the viewport and keeps both columns independen
   assert.match(preview, /grid-template-rows:minmax\(0,1fr\)/)
   assert.match(pdfPreview, /height:100%;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable/)
   assert.match(docxPreview, /height:100%;min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable/)
-  assert.doesNotMatch([preview, pdfPreview, docxPreview].join('\n'), /height:720px/)
+  assert.doesNotMatch([preview, pdfPreview, docxPreview, structuredPreview].join('\n'), /height:720px/)
+})
+
+test('document replacement confirms historical activation and reports success accessibly', () => {
+  assert.match(listing, /SOURCE_VERSION_REACTIVATION_REQUIRED/)
+  assert.match(listing, /reactivateSourceVersion/)
+  assert.match(listing, /未创建新版本/)
+  assert.match(listing, /role="status" aria-live="polite"/)
+  assert.match(listing, /\.json,.jsonl/)
 })
 
 test('review chrome is compact, metadata is folded and downloads remain in document management only', () => {

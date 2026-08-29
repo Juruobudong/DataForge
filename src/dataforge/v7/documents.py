@@ -26,6 +26,7 @@ class DocumentDeletionService:
         try:
             for object_key in job.object_keys:
                 self.objects.delete_key(object_key)
+            self.store.delete_unreferenced_blobs(job.id, self.objects.delete_blob)
             return self.store.finish_document_deletion(job.id)
         except Exception as exc:
             return self.store.finish_document_deletion(job.id, str(exc))

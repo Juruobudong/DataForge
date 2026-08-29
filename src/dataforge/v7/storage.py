@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,25 @@ class StoredObject:
     key: str
     sha256: str
     size_bytes: int
+
+    @property
+    def blob_uri(self) -> str:
+        return f"blob://{self.sha256}"
+
+
+_BLOB_URI = re.compile(r"blob://([0-9a-f]{64})\Z")
+
+
+def blob_object_key(uri: str) -> str:
+    match = _BLOB_URI.fullmatch(str(uri or ""))
+    if not match:
+        raise ValueError("Blob URI 必须为 blob://<64位小写SHA256>")
+    digest = match.group(1)
+    return f"blobs/{digest[:2]}/{digest[2:4]}/{digest}"
+
+
+def blob_uri_for_payload(payload: bytes) -> str:
+    return f"blob://{hashlib.sha256(payload).hexdigest()}"
 
 
 class MinioObjectStore:
@@ -26,6 +46,19 @@ class MinioObjectStore:
     def put_bytes(self, key: str, payload: bytes, content_type: str = "application/octet-stream") -> StoredObject:
         self.client.put_object(self.bucket, key, io.BytesIO(payload), len(payload), content_type=content_type)
         return StoredObject(key, hashlib.sha256(payload).hexdigest(), len(payload))
+
+    def put_blob(self, payload: bytes, media_type: str = "application/octet-stream") -> StoredObject:
+        uri = blob_uri_for_payload(payload)
+        return self.put_bytes(blob_object_key(uri), payload, media_type)
+
+    def get_blob(self, uri: str) -> bytes:
+        return self.get_bytes(blob_object_key(uri))
+
+    def delete_blob(self, uri: str) -> None:
+        self.delete_key(blob_object_key(uri))
+
+    def copy_blob_to(self, uri: str, target: Path, chunk_size: int = 1024 * 1024) -> StoredObject:
+        return self.copy_to(blob_object_key(uri), target, chunk_size)
 
     def get_bytes(self, key: str) -> bytes:
         response = self.client.get_object(self.bucket, key)
@@ -67,6 +100,28 @@ class LocalObjectStore:
     def put_bytes(self, key: str, payload: bytes, content_type: str = "application/octet-stream") -> StoredObject:
         target = self.root / key; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(payload)
         return StoredObject(key, hashlib.sha256(payload).hexdigest(), len(payload))
+
+    def put_blob(self, payload: bytes, media_type: str = "application/octet-stream") -> StoredObject:
+        uri = blob_uri_for_payload(payload)
+        key = blob_object_key(uri)
+        target = self._safe_target(key)
+        if target.exists():
+            existing = target.read_bytes()
+            if hashlib.sha256(existing).hexdigest() != uri.removeprefix("blob://"):
+                raise ValueError(f"内容寻址 Blob 已损坏：{uri}")
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(payload)
+        return StoredObject(key, uri.removeprefix("blob://"), len(payload))
+
+    def get_blob(self, uri: str) -> bytes:
+        return self.get_bytes(blob_object_key(uri))
+
+    def delete_blob(self, uri: str) -> None:
+        self.delete_key(blob_object_key(uri))
+
+    def copy_blob_to(self, uri: str, target: Path, chunk_size: int = 1024 * 1024) -> StoredObject:
+        return self.copy_to(blob_object_key(uri), target, chunk_size)
 
     def get_bytes(self, key: str) -> bytes:
         return (self.root / key).read_bytes()

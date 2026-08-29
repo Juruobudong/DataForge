@@ -7,6 +7,7 @@ import os
 import secrets
 import threading
 import uuid
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path, PurePath
@@ -30,6 +31,7 @@ from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
 from .llm_serving import configure_llm_serving_registry
 from .servings import ServingManager
+from .retrieval import RetrievalDebugRequest, RetrievalDebugService
 from .entity_types import entity_type_catalog, resolve_entity_types
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
@@ -44,7 +46,15 @@ from .vector_inventory import INVENTORY_STATUSES, MilvusInventoryService
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-SUPPORTED_EXTENSIONS = {".pdf", ".csv", ".xlsx", ".md", ".doc", ".docx", ".txt"}
+MEDIA_TYPES = {
+    ".pdf": "application/pdf", ".csv": "text/csv",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".md": "text/markdown", ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain", ".json": "application/json", ".jsonl": "application/x-ndjson",
+}
+SUPPORTED_EXTENSIONS = set(MEDIA_TYPES)
+SUPPORTED_FORMAT_MESSAGE = "仅支持 PDF、CSV、XLSX、Markdown、DOC、DOCX、TXT、JSON 和 JSONL"
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +66,11 @@ class DocumentLibraryRequest(BaseModel):
 
 class SourceImportPreflightRequest(BaseModel):
     entries: list[dict] = Field(min_length=1)
+
+
+class SourceVersionReactivationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_current_version_id: str
 
 
 class SelectedDocumentSourcesRequest(BaseModel):
@@ -390,6 +405,16 @@ class DeploymentTaskRequest(BaseModel):
     index_profile_id: str
     qa_embedding_mode: Literal["question", "full"] | None = None
     top_k: int = 10
+    final_top_k: int | None = None
+    reranker_serving_code: str | None = None
+    enabled: bool = True
+
+
+class DeploymentTaskPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    top_k: int = Field(default=10, ge=1, le=200)
+    final_top_k: int = Field(default=5, ge=1, le=200)
+    reranker_serving_code: str | None = None
     enabled: bool = True
 
 
@@ -522,6 +547,36 @@ class EmbeddingServingPatch(BaseModel):
     is_enabled: bool | None = None
 
 
+class RerankerServingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    serving_code: str
+    name: str
+    provider_type: Literal["cohere-compatible-rerank"] = "cohere-compatible-rerank"
+    model_name: str
+    base_url: str = ""
+    api_key: str = ""
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_retries: int = Field(default=2, ge=0, le=10)
+    max_batch_size: int = Field(default=32, ge=1, le=200)
+    max_concurrency: int = Field(default=4, ge=1, le=64)
+    is_enabled: bool = True
+
+
+class RerankerServingPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = None
+    provider_type: Literal["cohere-compatible-rerank"] | None = None
+    model_name: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_credential: bool = False
+    timeout_seconds: int | None = Field(default=None, ge=1)
+    max_retries: int | None = Field(default=None, ge=0, le=10)
+    max_batch_size: int | None = Field(default=None, ge=1, le=200)
+    max_concurrency: int | None = Field(default=None, ge=1, le=64)
+    is_enabled: bool | None = None
+
+
 def _objects(settings: Settings):
     if settings.minio_endpoint and settings.minio_access_key and settings.minio_secret_key:
         return MinioObjectStore(settings.minio_endpoint, settings.minio_access_key, settings.minio_secret_key, settings.minio_bucket)
@@ -535,6 +590,18 @@ def _error(exc: ValueError) -> HTTPException:
 
 def _review_error(exc: ReviewGateError) -> HTTPException:
     return HTTPException(status_code=409, detail=exc.payload())
+
+
+def _source_error(exc: ValueError) -> HTTPException:
+    message = str(exc)
+    if "同目录下已存在" in message or message == "SOURCE_VERSION_REACTIVATION_STALE":
+        return HTTPException(status_code=409, detail={"code": "SOURCE_PATH_CONFLICT", "message": message})
+    return _error(exc)
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    safe = quote(Path(filename).name, safe="")
+    return f"{disposition}; filename*=UTF-8''{safe}"
 
 
 async def _read_upload(upload: UploadFile) -> bytes:
@@ -569,6 +636,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     app.state.serving_manager = serving_manager
     app.state.serving_startup_check_future = None
     app.state.routing_publications = set()
+    app.state.retrieval_debug = RetrievalDebugService(store, serving_manager)
     app.state.routing_publications_lock = threading.RLock()
 
     @app.on_event("startup")
@@ -781,6 +849,44 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return serving_manager.references("embedding", serving_id)
         except ValueError as exc: raise _error(exc) from exc
 
+    @app.get("/api/reranker-servings")
+    def reranker_servings(): return serving_manager.list("reranker")
+
+    @app.post("/api/reranker-servings", status_code=201)
+    def create_reranker_serving(payload: RerankerServingRequest):
+        try: return serving_manager.create("reranker", new_id("rerankerserving"), payload.model_dump())
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/reranker-servings/{serving_id}")
+    def reranker_serving(serving_id: str):
+        try: return serving_manager.get("reranker", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/reranker-servings/{serving_id}")
+    def patch_reranker_serving(serving_id: str, payload: RerankerServingPatch):
+        try: return serving_manager.update("reranker", serving_id, payload.model_dump(exclude_none=True))
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/reranker-servings/{serving_id}")
+    def delete_reranker_serving(serving_id: str):
+        try: return serving_manager.delete("reranker", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/reranker-servings/{serving_id}/test")
+    def test_reranker_serving(serving_id: str):
+        try: return serving_manager.test("reranker", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/reranker-servings/{serving_id}/set-default")
+    def default_reranker_serving(serving_id: str):
+        try: return serving_manager.set_default("reranker", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/reranker-servings/{serving_id}/references")
+    def reranker_serving_references(serving_id: str):
+        try: return serving_manager.references("reranker", serving_id)
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/document-libraries")
     def document_libraries(keyword: str = "", status: str | None = None):
         return store.list_document_libraries(keyword, status)
@@ -867,31 +973,24 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         results = []
 
-        def discard_stored_object(stored: object | None) -> None:
-            if stored is None:
-                return
-            try:
-                objects.delete_key(stored.key)
-            except Exception:
-                logger.exception("Failed to remove object after source upload persistence failure", extra={"object_key": stored.key})
-
         for index, upload in enumerate(files):
             filename = Path(upload.filename or "upload.txt").name; suffix = Path(filename).suffix.lower()
             if suffix not in SUPPORTED_EXTENSIONS:
-                results.append({"filename": filename, "status": "failed", "error": "仅支持 PDF、CSV、XLSX、Markdown、DOC、DOCX 和 TXT"}); continue
+                results.append({"filename": filename, "status": "failed", "error": SUPPORTED_FORMAT_MESSAGE}); continue
             stored = None
             try:
                 data = await _read_upload(upload)
-                object_key = f"sources/{library_id}/{secrets.token_hex(16)}/source{suffix}"
-                stored = objects.put_bytes(object_key, data, upload.content_type or "application/octet-stream")
-                source = store.create_source(library_id=library_id, name=(names[index] if names and index < len(names) else Path(filename).stem), filename=filename, object_key=stored.key, sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type=upload.content_type or "application/octet-stream", relative_path=filename)
+                stored = objects.put_blob(data, MEDIA_TYPES[suffix])
+                source = store.create_source(
+                    library_id=library_id, name=(names[index] if names and index < len(names) else Path(filename).stem),
+                    filename=filename, blob_uri=stored.blob_uri, sha256=stored.sha256,
+                    size_bytes=stored.size_bytes, media_type=MEDIA_TYPES[suffix], relative_path=filename,
+                )
                 results.append({"filename": filename, "status": "created", "source": source})
             except (ValueError, HTTPException) as exc:
-                discard_stored_object(stored)
                 results.append({"filename": filename, "status": "failed", "error": str(getattr(exc, "detail", exc))})
             except SQLAlchemyError:
                 logger.exception("Source upload database persistence failed", extra={"upload_filename": filename, "document_library_id": library_id})
-                discard_stored_object(stored)
                 results.append({"filename": filename, "status": "failed", "error": "文件记录保存失败，请稍后重试"})
         return {"document_library_id": library_id, "results": results}
 
@@ -918,7 +1017,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                     raise ValueError("relative_path 的文件名必须与上传文件一致")
                 suffix = Path(filename).suffix.lower()
                 if suffix not in SUPPORTED_EXTENSIONS:
-                    raise ValueError("仅支持 PDF、CSV、XLSX、Markdown、DOC、DOCX 和 TXT")
+                    raise ValueError(SUPPORTED_FORMAT_MESSAGE)
                 current = store.source_by_relative_path(library_id, relative_path)
                 if current and current.status not in {"deleted", "deleting"}:
                     if duplicate_policy == "skip":
@@ -926,23 +1025,25 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                     if duplicate_policy == "keep_both":
                         relative_path = store.available_relative_path(library_id, relative_path)
                 data = await _read_upload(upload)
-                stored = objects.put_bytes(f"sources/{library_id}/{secrets.token_hex(16)}/source{suffix}", data, upload.content_type or "application/octet-stream")
+                stored = objects.put_blob(data, MEDIA_TYPES[suffix])
                 if current and duplicate_policy == "replace":
-                    source = store.replace_source(source_id=current.id, filename=filename, object_key=stored.key, sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type=upload.content_type or "application/octet-stream")
-                    results.append({"filename": filename, "relative_path": relative_path, "status": "replaced", "source": source})
+                    source = store.replace_source(
+                        source_id=current.id, filename=filename, blob_uri=stored.blob_uri,
+                        sha256=stored.sha256, size_bytes=stored.size_bytes, media_type=MEDIA_TYPES[suffix],
+                    )
+                    action = source["version_action"]
+                    results.append({"filename": filename, "relative_path": relative_path,
+                                    "status": action, "source": source})
                 else:
-                    source = store.create_source(library_id=library_id, name=Path(filename).stem, filename=filename, object_key=stored.key, sha256=stored.sha256,
-                                                 size_bytes=stored.size_bytes, mime_type=upload.content_type or "application/octet-stream", relative_path=relative_path)
+                    source = store.create_source(
+                        library_id=library_id, name=Path(filename).stem, filename=filename,
+                        blob_uri=stored.blob_uri, sha256=stored.sha256,
+                        size_bytes=stored.size_bytes, media_type=MEDIA_TYPES[suffix], relative_path=relative_path,
+                    )
                     results.append({"filename": filename, "relative_path": relative_path, "status": "renamed" if relative_path != str(entry.get("relative_path")) else "created", "source": source})
             except (ValueError, HTTPException) as exc:
-                if stored:
-                    try: objects.delete_key(stored.key)
-                    except Exception: logger.exception("Failed to remove rejected import object")
                 results.append({"filename": filename, "relative_path": relative_path, "status": "failed", "error": str(getattr(exc, "detail", exc))})
             except SQLAlchemyError:
-                if stored:
-                    try: objects.delete_key(stored.key)
-                    except Exception: logger.exception("Failed to remove failed import object")
                 logger.exception("Batch source import persistence failed", extra={"upload_filename": filename})
                 results.append({"filename": filename, "relative_path": relative_path, "status": "failed", "error": "文件记录保存失败，请稍后重试"})
         return {"document_library_id": library_id, "results": results}
@@ -956,24 +1057,38 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.source_versions(source_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/sources/{source_id}/replace", status_code=201)
+    @app.post("/api/sources/{source_id}/replace")
     async def replace_source(source_id: str, file: Annotated[UploadFile, File()]):
         try: source = store.source_for_upload(source_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         filename = Path(file.filename or "replacement.txt").name; suffix = Path(filename).suffix.lower()
-        if suffix not in SUPPORTED_EXTENSIONS: raise HTTPException(status_code=422, detail="仅支持 PDF、CSV、XLSX、Markdown、DOC、DOCX 和 TXT")
-        if filename != PurePath(source.relative_path).name:
-            raise HTTPException(status_code=422, detail="替换文件名称必须与原相对路径的文件名一致")
-        data = await _read_upload(file); stored = objects.put_bytes(f"sources/{source.document_library_id}/{source_id}/{secrets.token_hex(16)}/replacement{suffix}", data, file.content_type or "application/octet-stream")
+        if suffix not in SUPPORTED_EXTENSIONS: raise HTTPException(status_code=422, detail=SUPPORTED_FORMAT_MESSAGE)
+        data = await _read_upload(file); stored = objects.put_blob(data, MEDIA_TYPES[suffix])
         try:
-            return store.replace_source(source_id=source_id, filename=filename, object_key=stored.key, sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type=file.content_type or "application/octet-stream")
+            result = store.replace_source(
+                source_id=source_id, filename=filename, blob_uri=stored.blob_uri,
+                sha256=stored.sha256, size_bytes=stored.size_bytes, media_type=MEDIA_TYPES[suffix],
+            )
+            if result["version_action"] == "confirmation_required":
+                return JSONResponse(status_code=409, content=result)
+            return JSONResponse(status_code=201 if result["version_action"] == "created" else 200, content=result)
         except (ValueError, SQLAlchemyError) as exc:
-            try: objects.delete_key(stored.key)
-            except Exception: logger.exception("Failed to remove object after source replacement failure", extra={"object_key": stored.key})
             if isinstance(exc, ValueError):
-                raise _error(exc) from exc
+                raise _source_error(exc) from exc
             logger.exception("Source replacement database persistence failed", extra={"source_id": source_id})
             raise HTTPException(status_code=500, detail="文件记录保存失败，请稍后重试") from exc
+
+    @app.post("/api/sources/{source_id}/versions/{version_id}/reactivate")
+    def reactivate_source_version(source_id: str, version_id: str, payload: SourceVersionReactivationRequest):
+        try:
+            return store.reactivate_source_version(
+                source_id=source_id, version_id=version_id,
+                expected_current_version_id=payload.expected_current_version_id,
+            )
+        except ValueError as exc:
+            if str(exc) == "SOURCE_VERSION_REACTIVATION_STALE":
+                raise HTTPException(status_code=409, detail={"code": str(exc), "message": "当前版本已变化，请刷新后重试"}) from exc
+            raise _source_error(exc) from exc
 
     @app.delete("/api/sources/{source_id}")
     def delete_source(source_id: str):
@@ -1061,16 +1176,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def download_source(source_id: str, version_id: str):
         try: version = store.source_version_for_download(source_id, version_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(content=objects.get_bytes(version.object_key), media_type=version.mime_type, headers={"Content-Disposition": f'attachment; filename="{version_id}"'})
+        return Response(content=objects.get_blob(version.blob_uri), media_type=version.media_type, headers={
+            "Content-Disposition": _content_disposition("attachment", version.original_filename),
+        })
 
     @app.get("/api/sources/{source_id}/versions/{version_id}/preview")
     def preview_source(source_id: str, version_id: str):
         try: version = store.source_version_for_download(source_id, version_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
-        if version.mime_type != "application/pdf" and not version.object_key.lower().endswith(".pdf"):
+        if version.media_type != "application/pdf" or not version.original_filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=415, detail="原文件内联预览仅支持 PDF；其他格式请使用 DocumentIR")
-        return Response(content=objects.get_bytes(version.object_key), media_type="application/pdf", headers={
-            "Content-Disposition": f'inline; filename="{version_id}.pdf"',
+        return Response(content=objects.get_blob(version.blob_uri), media_type="application/pdf", headers={
+            "Content-Disposition": _content_disposition("inline", version.original_filename),
             "X-Content-Type-Options": "nosniff",
         })
 
@@ -2009,7 +2126,34 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try:
             app.state.instance.require_deployment(store, deployment_id)
             return store.create_deployment_task(deployment_id, payload.project_task_id, payload.index_profile_id,
-                qa_embedding_mode=payload.qa_embedding_mode, top_k=payload.top_k, enabled=payload.enabled)
+                qa_embedding_mode=payload.qa_embedding_mode, top_k=payload.top_k, enabled=payload.enabled,
+                final_top_k=payload.final_top_k, reranker_serving_code=payload.reranker_serving_code)
+        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/project-deployments/{deployment_id}/tasks/{task_id}")
+    def patch_deployment_task(deployment_id: str, task_id: str, payload: DeploymentTaskPatch):
+        try:
+            app.state.instance.require_deployment(store, deployment_id)
+            return store.patch_deployment_task(deployment_id, task_id, payload.model_dump(exclude_unset=True))
+        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/project-deployments/{deployment_id}/retrieval-debug/options")
+    def retrieval_debug_options(deployment_id: str, release_stage: Literal["test", "production"],
+                                route_mode: Literal["draft", "published", "historical"] = "draft",
+                                version_no: int | None = None):
+        try:
+            app.state.instance.require_deployment(store, deployment_id)
+            return app.state.retrieval_debug.options(deployment_id, release_stage, route_mode, version_no)
+        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/project-deployments/{deployment_id}/retrieval-debug")
+    def retrieval_debug(deployment_id: str, payload: RetrievalDebugRequest):
+        try:
+            app.state.instance.require_deployment(store, deployment_id)
+            return app.state.retrieval_debug.run(deployment_id, payload, instance_mode=app.state.instance.mode)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 

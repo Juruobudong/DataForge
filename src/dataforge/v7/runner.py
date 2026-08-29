@@ -30,10 +30,11 @@ from ..config import Settings
 from .catalog import catalog_by_code, normalize_chunker_params
 from .operators import OperatorExecutionContext, build_builtin_registry
 from .operators.factory import build_runtime_registry
-from .operators.graph_chunks import GraphChunkError, TripleEndpoints, chunk_identity
+from .operators.graph_chunks import GraphChunkError, GraphEndpointUnresolved, TripleEndpoints, chunk_identity
 from .operator_catalog import load_catalog
 from .graph_literal import classify_object, detect_literal
-from .graph_prompt import GRAPH_GUIDANCE_VERSIONS, graph_node_prompt, graph_config_for_node as _graph_config_for_node
+from .graph_prompt import (RELATION_REPAIR_VERSION, uses_graph_guidance, relation_repair_prompt,
+                           graph_node_prompt, graph_config_for_node as _graph_config_for_node)
 from .graph_quality import evaluate_graph_quality
 from .graph_schema import GraphExtractionConfig, normalize_graph_config
 from .llm_serving import DEFAULT_LLM_SERVING_ID, configure_llm_serving_registry, get_llm_serving_registry
@@ -82,33 +83,97 @@ def _objects(settings: Settings):
 
 
 def _extract_text(filename: str, payload: bytes) -> str:
+    return _native_source_blocks(filename, payload)[0]
+
+
+def _decode_utf8(payload: bytes, filename: str) -> str:
+    try:
+        return payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{filename} 不是有效的 UTF-8 文本：字节位置 {exc.start}") from exc
+
+
+def _text_blocks(text: str, prefix: str = "text") -> tuple[str, list[dict[str, Any]]]:
+    raw = []
+    for index, value in enumerate(re.split(r"\n\s*\n|\n", text.replace("\r\n", "\n").replace("\r", "\n"))):
+        if value.strip():
+            raw.append({"block_id": f"{prefix}:{index}", "block_type": "text_range", "text": value.strip()})
+    return finalize_source_blocks(raw)
+
+
+def _native_source_blocks(filename: str, payload: bytes) -> tuple[str, list[dict[str, Any]], str]:
     suffix = Path(filename).suffix.lower()
-    if suffix in {".txt", ".md"}: return payload.decode("utf-8-sig", errors="replace")
+    if suffix in {".txt", ".md"}:
+        text, blocks = _text_blocks(_decode_utf8(payload, filename), suffix.removeprefix("."))
+        return text, blocks, suffix.removeprefix(".")
     if suffix == ".csv":
-        rows = csv.reader(io.StringIO(payload.decode("utf-8-sig", errors="replace")))
-        return "\n".join(" | ".join(cell.strip() for cell in row if cell.strip()) for row in rows)
+        reader = csv.reader(io.StringIO(_decode_utf8(payload, filename), newline=""))
+        raw, previous_line = [], 0
+        for index, row in enumerate(reader):
+            line_end = reader.line_num
+            values = [cell.strip() for cell in row]
+            if any(values):
+                raw.append({"block_id": f"csv:{index}", "block_type": "record",
+                            "line_number": previous_line + 1, "line_start": previous_line + 1,
+                            "line_end": line_end, "cells": values, "text": " | ".join(values)})
+            previous_line = line_end
+        text, blocks = finalize_source_blocks(raw)
+        return text, blocks, "csv"
     if suffix == ".xlsx":
         from openpyxl import load_workbook
         workbook = load_workbook(io.BytesIO(payload), read_only=True, data_only=True)
-        lines: list[str] = []
-        for sheet in workbook.worksheets:
-            lines.append(f"[Sheet: {sheet.title}]")
-            for row in sheet.iter_rows(values_only=True):
+        raw = []
+        for sheet_index, sheet in enumerate(workbook.worksheets):
+            for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
                 values = [str(value).strip() for value in row if value is not None and str(value).strip()]
                 if values:
-                    lines.append(" | ".join(values))
-        return "\n".join(lines)
+                    raw.append({"block_id": f"xlsx:{sheet_index}:{row_number}", "block_type": "record",
+                                "sheet": sheet.title, "sheet_index": sheet_index, "row": row_number,
+                                "cells": values, "text": " | ".join(values)})
+        text, blocks = finalize_source_blocks(raw)
+        return text, blocks, "xlsx"
     if suffix == ".docx":
-        text, _ = _docx_source_blocks(payload)
-        return text
+        text, blocks = _docx_source_blocks(payload)
+        return text, blocks, "docx"
     if suffix == ".doc":
         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as handle:
             handle.write(payload); name = handle.name
         try:
             import subprocess
-            return subprocess.run(["antiword", name], capture_output=True, check=True, text=True, encoding="utf-8", errors="replace").stdout
+            output = subprocess.run(["antiword", name], capture_output=True, check=True, text=True,
+                                    encoding="utf-8", errors="strict").stdout
+            text, blocks = _text_blocks(output, "doc")
+            return text, blocks, "doc"
         finally:
             Path(name).unlink(missing_ok=True)
+    if suffix == ".json":
+        try:
+            value = json.loads(_decode_utf8(payload, filename))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON 第 {exc.lineno} 行第 {exc.colno} 列无效：{exc.msg}") from exc
+        records = value if isinstance(value, list) else [value] if isinstance(value, dict) else None
+        if records is None:
+            raise ValueError("JSON 顶层必须是对象或数组")
+        raw = [{"block_id": f"json:{index}", "block_type": "record",
+                "json_pointer": f"/{index}" if isinstance(value, list) else "/",
+                "text": json.dumps(record, ensure_ascii=False, sort_keys=True)}
+               for index, record in enumerate(records)]
+        text, blocks = finalize_source_blocks(raw)
+        return text, blocks, "json"
+    if suffix == ".jsonl":
+        raw = []
+        for line_number, line in enumerate(_decode_utf8(payload, filename).splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"JSONL 第 {line_number} 行无效：第 {exc.colno} 列 {exc.msg}") from exc
+            raw.append({"block_id": f"jsonl:{line_number}", "block_type": "record",
+                        "line_number": line_number,
+                        "text": json.dumps(value, ensure_ascii=False, sort_keys=True)})
+        text, blocks = finalize_source_blocks(raw)
+        return text, blocks, "jsonl"
     raise ValueError("不支持的文档类型")
 
 
@@ -332,6 +397,22 @@ def split_document_blocks(document: dict[str, Any], raw_params: dict[str, Any] |
                         "block_type": block.get("block_type", "paragraph"),
                         "block_index": block.get("block_index"), "chunk_range": chunk_range,
                     })
+                else:
+                    source_type = str(document.get("source_type") or "text")
+                    position = {
+                        "kind": {
+                            "csv": "csv_record", "xlsx": "xlsx_row", "json": "json_record",
+                            "jsonl": "jsonl_record", "txt": "text_range", "md": "text_range",
+                            "doc": "text_range",
+                        }.get(source_type, "source_block"),
+                        "block_id": block["block_id"], "block_type": block.get("block_type"),
+                        "block_index": block.get("block_index"), "chunk_range": chunk_range,
+                        "character_start": global_start, "character_end": global_end,
+                    }
+                    for key in ("line_number", "line_start", "line_end", "sheet", "sheet_index", "row", "json_pointer"):
+                        if block.get(key) is not None:
+                            position[key] = block[key]
+                    positions.append(position)
             positions = sort_positions(positions)
             pages = [int(position["page"]) for position in positions if isinstance(position.get("page"), int)]
             precision = "block" if positions and any(position.get("kind") != "pdf_page" for position in positions) else (
@@ -383,7 +464,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
         "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
         "evidence_text": content, "is_primary": True,
     }
-    kind = "qa" if ref in {"Text2QAGenerator", "qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
+    kind = "qa" if ref in {"qa-extractor", "Text2QAGenerator", "qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
     mode = str(params.get("graph_mode") or "")
     if ref == "triple-builder" or kind == "graph" and mode != "semantic":
         data = {"subject": "高血压", "predicate": "需要", "object": "规范随访"}
@@ -453,7 +534,7 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
                                        for index, item in enumerate((value.get("entities") or [])) if item.get("object_kind") != "literal"]} for value in values]
     if ref in {"triple-builder", "semantic-relation-builder", "evidence-binder"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
-    if ref in {"prompt-generator", "Text2QAGenerator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+    if ref in {"prompt-generator", "qa-extractor", "Text2QAGenerator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
     if ref == "graph-quality-validator":
         return [{**value, "graph_quality": {"hard_fail": False, "warnings": []}} for value in values]
@@ -600,7 +681,7 @@ def _initialize_llm_servings():
     return get_llm_serving_registry()
 
 
-def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system: str = "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。") -> dict[str, Any]:
+def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system: str = "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。", temperature: float | None = None) -> dict[str, Any]:
     """Call one configured Model Serving and parse its structured response."""
     registry = _initialize_llm_servings()
     serving, client = registry.client(llm_serving)
@@ -609,7 +690,7 @@ def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system:
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     started = time.monotonic()
     try:
-        response = client.chat.completions.create(
+        request = dict(
             model=serving.model_name,
             messages=[
                 {"role": "system", "content": system},
@@ -619,6 +700,9 @@ def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system:
             max_tokens=serving.max_tokens,
             extra_body=extra_body,
         )
+        if temperature is not None:
+            request["temperature"] = temperature
+        response = client.chat.completions.create(**request)
     except APITimeoutError as exc:
         elapsed = time.monotonic() - started
         logger.error(
@@ -706,7 +790,7 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
         errors = _item_errors(items, contract["schema"])
     if errors:
         raise ValueError("LLM 一次修复后仍未通过 Schema 校验：" + "；".join(errors))
-    anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
     result: list[dict] = []
     for data in items:
         if output_type == "graph:semantic":
@@ -727,7 +811,7 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
             "data_json": data,
             "source_version_ids": [version.id],
             "source_chunk_id": chunk["source_chunk_id"],
-            "source_anchor": f"{source.original_filename}#chunk-{chunk['chunk_index']}",
+            "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}",
             "anchor_json": anchor,
             "evidence_text": chunk["content"],
             "is_primary": True,
@@ -791,9 +875,9 @@ def _generated_text_candidates(source: Source, version: SourceVersion, chunk: di
 
 
 def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
-    anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
     if output_type == "text":
-        return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": source.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "source_chunk_id": chunk["source_chunk_id"], "source_anchor": f"{source.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
+        return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": version.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "source_chunk_id": chunk["source_chunk_id"], "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
     if not contract:
         raise ValueError(f"不支持的知识类型或缺少已发布契约：{output_type}")
     return _structured_candidates(source, version, output_type, chunk, contract, llm_serving=llm_serving)
@@ -812,7 +896,7 @@ def select_parser_adapter(filename: str, profile: str, environ: dict[str, str] |
     suffix = Path(filename).suffix.lower()
     if suffix in {".doc", ".docx"}:
         return "dataforge-word-parser"
-    if suffix in {".csv", ".xlsx"}:
+    if suffix in {".csv", ".xlsx", ".json", ".jsonl"}:
         return "dataforge-structured-table-parser"
     if suffix in {".md", ".txt"}:
         return "dataforge-text-parser"
@@ -836,14 +920,14 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
     documents: list[dict[str, Any]] = []
     for version in versions:
         source = sources[version.source_id]
-        payload = objects.get_bytes(version.object_key)
-        suffix = Path(source.original_filename).suffix.lower()
+        payload = objects.get_blob(version.blob_uri)
+        suffix = Path(version.original_filename).suffix.lower()
         parser_artifacts: list[dict[str, Any]] = []
         page_segments: list[dict[str, Any]] = []
         source_blocks: list[dict[str, Any]] = []
         source_type: str | None = None
         if suffix == ".pdf":
-            parsed = parse_with_mineru(filename=source.original_filename, payload=payload, parse_method="ocr" if force_ocr else "auto")
+            parsed = parse_with_mineru(filename=version.original_filename, payload=payload, parse_method="ocr" if force_ocr else "auto")
             text = parsed.markdown
             source_blocks = content_list_blocks(parsed.content_list)
             page_segments = _page_segments_from_blocks(source_blocks)
@@ -863,21 +947,17 @@ def _documents_for_versions(objects, versions: list[SourceVersion], sources: dic
             })
             profile = "pipeline:auto"
         else:
-            if suffix == ".docx":
-                text, source_blocks = _docx_source_blocks(payload)
-                source_type = "docx"
-            else:
-                text = _extract_text(source.original_filename, payload)
+            text, source_blocks, source_type = _native_source_blocks(version.original_filename, payload)
             profile = "native"
-        faq_table_rows = parse_table_rows(source.original_filename, payload) \
-            if FAQ_FILENAME_PATTERN.fullmatch(Path(source.original_filename).name) else []
-        documents.append({"source_id": source.id, "source_version_id": version.id, "filename": source.original_filename,
+        faq_table_rows = parse_table_rows(version.original_filename, payload) \
+            if FAQ_FILENAME_PATTERN.fullmatch(Path(version.original_filename).name) else []
+        documents.append({"source_id": source.id, "source_version_id": version.id, "filename": version.original_filename,
                           "text": text, "parser_strategy": "auto", "runtime_profile": profile,
-                          "parser_adapter": select_parser_adapter(source.original_filename, profile),
+                          "parser_adapter": select_parser_adapter(version.original_filename, profile),
                           "page_segments": page_segments, "source_blocks": source_blocks,
                           "source_type": source_type, "_parser_artifacts": parser_artifacts,
                           "_faq_table_rows": faq_table_rows,
-                          "anchor": {"file": source.original_filename, "page": None, "section": None,
+                          "anchor": {"file": version.original_filename, "page": None, "section": None,
                                      "anchor_version": 2 if source_type else 1,
                                      "source_version_id": version.id, "source_type": source_type,
                                      "blocks": source_blocks if source_type else []}})
@@ -987,16 +1067,31 @@ def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_
     return entities
 
 
-def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str, *, strict_endpoints: bool = False, params: dict[str, Any] | None = None, operator_version: int | None = None) -> list[dict[str, Any]]:
-    """One LLM call extracting relations between already-extracted entities."""
+def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str, *, strict_endpoints: bool = False, params: dict[str, Any] | None = None, operator_version: int | None = None, graph_chunk_stage=None) -> list[dict[str, Any]]:
+    """Extract relations; v8 Triple can repair an unknown endpoint once per chunk."""
     entity_names = [item["name"] for item in entities if item.get("object_kind") != "literal"]
     system, prompt = graph_node_prompt(config, params or {}, "relation-extractor", operator_version, str(chunk.get("content", "")), entity_names)
+    def extract(request):
+        try:
+            response = _llm_json(request, llm_serving=llm_serving, system=system,
+                                 temperature=0 if operator_version == RELATION_REPAIR_VERSION and strict_endpoints else None)
+        except ValueError as exc:
+            if strict_endpoints:
+                raise GraphChunkError("GRAPH_RELATION_INVALID: 关系抽取响应格式不合法") from exc
+            raise
+        return _relations_from_response(response, entities, config, strict_endpoints=strict_endpoints)
+
     try:
-        response = _llm_json(prompt, llm_serving=llm_serving, system=system)
-    except ValueError as exc:
-        if strict_endpoints:
-            raise GraphChunkError("GRAPH_RELATION_INVALID: 关系抽取响应格式不合法") from exc
-        raise
+        return extract(prompt)
+    except GraphEndpointUnresolved as exc:
+        if (operator_version != RELATION_REPAIR_VERSION or not strict_endpoints or graph_chunk_stage is None
+                or not graph_chunk_stage.claim_relation_repair(chunk, exc)):
+            raise
+        return extract(relation_repair_prompt(prompt, entity_names, role=exc.role, name=exc.name))
+
+
+def _relations_from_response(response, entities, config, *, strict_endpoints=False):
+    """Validate a complete response before any relations leave the chunk boundary."""
     raw_relations = response.get("relations") if isinstance(response, dict) else None
     if not isinstance(raw_relations, list):
         if strict_endpoints:
@@ -1092,13 +1187,13 @@ def _normalize_entities(record: dict[str, Any], library_id: str, config: GraphEx
 
 
 def _candidate_meta(source: Source, version: SourceVersion, chunk: dict[str, Any], canonical: str, data_json: dict[str, Any]) -> dict[str, Any]:
-    anchor = {"file": source.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
     return {
         "canonical_content": canonical,
         "data_json": data_json,
         "source_version_ids": [version.id],
         "source_chunk_id": chunk["source_chunk_id"],
-        "source_anchor": f"{source.original_filename}#chunk-{chunk['chunk_index']}",
+        "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}",
         "anchor_json": anchor,
         "evidence_text": chunk["content"],
         "is_primary": True,
@@ -1248,10 +1343,12 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         if ref == "relation-extractor":
             llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
             _initialize_llm_servings().require(llm_serving)
-            node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
+            node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=uses_graph_guidance(ref, operator_version))
+            graph_chunk_stage.relation_repair_enabled = operator_version == RELATION_REPAIR_VERSION
             def process(records):
                 return [{**record, "relations": _extract_relations(record, record.get("entities") or [], node_config,
-                                                                   llm_serving, strict_endpoints=True, params=params, operator_version=operator_version)} for record in records]
+                                                                   llm_serving, strict_endpoints=True, params=params, operator_version=operator_version,
+                                                                   graph_chunk_stage=graph_chunk_stage)} for record in records]
         elif ref == "triple-builder":
             def process(records):
                 return [candidate for record in records for candidate in _build_triples(
@@ -1468,7 +1565,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
         outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
-        node_config = _graph_config_for_node(cfg, params, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
+        node_config = _graph_config_for_node(cfg, params, governed_prompt=uses_graph_guidance(ref, operator_version))
         result: list[dict[str, Any]] = []
         for chunk in values:
             scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
@@ -1490,7 +1587,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         output_key = _graph_output_key(params)
         llm_serving = str(params.get("llm_serving") or DEFAULT_LLM_SERVING_ID).strip()
         _initialize_llm_servings().require(llm_serving)
-        node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=GRAPH_GUIDANCE_VERSIONS.get(ref) == operator_version)
+        node_config = _graph_config_for_node(cfg, params, relation=True, governed_prompt=uses_graph_guidance(ref, operator_version))
         outcome = (generation if generation is not None else {}).get(output_key)
         result = []
         for record in values:

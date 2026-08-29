@@ -1,11 +1,13 @@
 # DataForge 当前架构概览
 
-> 当前状态：已实现架构，更新于 2026-08-27。
+> 当前状态：已实现架构，更新于 2026-08-29。
 > 本目录只描述当前系统事实；完成度与外部环境验收状态以 [`V7-CAPABILITY-MATRIX.md`](../../V7-CAPABILITY-MATRIX.md) 为准，设计原因以 [`docs/adr/`](../adr/ADR-001-single-current-knowledge.md) 为准。
 
 ## 系统定位
 
-DataForge V7 是面向医疗资料的受控知识生产与发布平台。它从 V7 新上传的 PDF、CSV、XLSX、Markdown、DOC、DOCX、TXT 等资料生成文本、问答、图谱及已发布扩展类型知识；逻辑知识库保存单一当前态，来源版本、执行快照、知识变更和不可变资产版本承担溯源、发布与回滚。
+DataForge V7 是面向跨领域资料的通用文档处理、受控知识生产与发布平台。它从 V7 新上传的 PDF、CSV、XLSX、Markdown、DOC、DOCX、TXT 等资料生成文本、问答、图谱及已发布扩展类型知识；逻辑知识库保存单一当前态，来源版本、执行快照、知识变更和不可变资产版本承担溯源、发布与回滚。
+
+通用主链不依赖具体行业词表、文档内容或部署主体。医疗实体预设、医院 Deployment、qa_agent 接入及医疗样例是可选领域配置与集成，用来复用同一套 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 和 Routing 契约，不定义平台范围。新增能力默认先验证跨领域文档语义，再按需增加领域预设。
 
 平台不是通用脚本编排器。生产流程只能使用已登记的 Operator、强类型端口、已发布修订和不可变 `FlowExecutionSnapshot`；任意 Python、Shell、循环与运行时改图不属于 V7 能力。
 
@@ -38,7 +40,7 @@ PC 浏览器
 
 - MySQL 与 MinIO 使用 `dataforge` 名称，只接受空环境或已有 V7 schema 的常规 Alembic 升级。
 - V7 常规流程不读取、迁移或自动清理 DataForge V2 数据、旧 MinIO 对象、legacy/external Milvus Collection。
-- Source 是逻辑文件，替换创建不可变 SourceVersion；正式 SourceChunk、Evidence、Artifact 与 Flow Run 保留执行溯源。
+- Source 是逻辑资料；SourceVersion 以 `(source_id, sha256)` 唯一并引用全局内容寻址 Blob。历史版本经确认可重新启用，但每次 activation 都由 Dispatch/Job/Sink Gate 独立复验；正式 SourceChunk、Evidence、Artifact 与 Flow Run 保留执行溯源。
 - KnowledgeLibrary 是逻辑当前态；正式向量资产是不可变 `KnowledgeAssetVersion`，物理 Partition 为 `kl_<knowledge_library_id>__v<asset_version_no>`。
 - 发布的 RoutingSnapshot 只引用通过校验的 Ready AssetVersion，不对运行中的 Partition 执行 reset 或 upsert。
 - 删除知识库只清理其 V7 Partition；整库删除是独立治理流程，仅适用于 ownership 与引用门禁全部通过的 DataForge 受管 Collection。

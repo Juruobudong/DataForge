@@ -26,6 +26,7 @@ from ..models import (
     SourceReviewSnapshot, SourceReviewSnapshotChunk, SourceVersion,
     PromptTemplate, PromptTemplateRevision, QualityProfile, QualityProfileRevision,
     StorageContract, StorageContractRevision,
+    KnowledgeAssetItem,
 )
 from ..store import V7Store, new_id
 from ..vector import V7Milvus
@@ -164,7 +165,7 @@ class MigrationExporter:
             "minimum_dataforge_version": DATAFORGE_VERSION,
             "maximum_dataforge_version": DATAFORGE_VERSION,
             "source_instance_version": DATAFORGE_VERSION,
-            "required_features": ["immutable_asset_versions", "multi_project_release", "resumable_import"],
+            "required_features": ["immutable_asset_versions", "multi_project_release", "resumable_import", "asset_item_snapshots"],
             "release_id": plan.get("release_id"),
             "operator_versions": list(plan.get("operator_versions") or []),
             "storage_contract_versions": sorted({str(item.get("storage_contract_revision_id"))
@@ -278,12 +279,12 @@ class MigrationExporter:
                 SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
             ))) if review_snapshot_ids and chunk_ids else []
             for name, values in metadata.items(): builder.add_bytes(f"metadata/{name}.jsonl", jsonl(values))
-            for version in metadata["source_versions"]:
-                target = work / "objects" / version.id
-                copied = self.objects.copy_to(version.object_key, target)
+            for version in {item.sha256: item for item in metadata["source_versions"]}.values():
+                target = work / "blobs" / version.sha256
+                copied = self.objects.copy_blob_to(version.blob_uri, target)
                 if copied.sha256 != version.sha256 or copied.size_bytes != version.size_bytes:
                     raise ValueError(f"对象文件导出期间发生变化：{version.id}")
-                builder.add_file(f"objects/{version.id}", target)
+                builder.add_file(f"blobs/{version.sha256}", target)
 
     def _add_metadata_v2(self, builder: MigrationPackageBuilder, plan: dict[str, Any], work: Path) -> None:
         builder.add_bytes("control/release.json", json.dumps({
@@ -345,15 +346,23 @@ class MigrationExporter:
                 SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
             ))) if review_snapshot_ids and chunk_ids else []
             self._add_runtime_closure(session, metadata, plan)
+            asset_ids = [item.get("asset_version_id") or item.get("id") for item in plan.get("asset_versions", [])]
+            metadata["knowledge_asset_items"] = list(session.scalars(select(KnowledgeAssetItem).where(
+                KnowledgeAssetItem.asset_version_id.in_(asset_ids)).order_by(
+                    KnowledgeAssetItem.asset_version_id, KnowledgeAssetItem.source_knowledge_id)))
+            for asset in plan.get("asset_versions", []):
+                asset_id = asset.get("asset_version_id") or asset.get("id")
+                if sum(item.asset_version_id == asset_id for item in metadata["knowledge_asset_items"]) != asset["item_count"]:
+                    raise ValueError("导出资产条目快照数量不完整")
             for name, values in metadata.items():
                 payload = jsonl_payloads(values) if values and isinstance(values[0], dict) else jsonl(values)
                 builder.add_bytes(f"metadata/{name}.jsonl", payload)
-            for version in metadata["source_versions"]:
-                target = work / "objects" / version.id
-                copied = self.objects.copy_to(version.object_key, target)
+            for version in {item.sha256: item for item in metadata["source_versions"]}.values():
+                target = work / "blobs" / version.sha256
+                copied = self.objects.copy_blob_to(version.blob_uri, target)
                 if copied.sha256 != version.sha256 or copied.size_bytes != version.size_bytes:
                     raise ValueError(f"对象文件导出期间发生变化：{version.id}")
-                builder.add_file(f"objects/{version.id}", target)
+                builder.add_file(f"blobs/{version.sha256}", target)
 
     @staticmethod
     def _referenced_revision_ids(value: Any, key: str) -> set[str]:

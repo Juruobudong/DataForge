@@ -26,6 +26,9 @@ from .models import (
     KnowledgeIndexProfile,
     KnowledgeIndexProfileRevision,
     ModelServing,
+    RerankerServing,
+    ProjectDeploymentTask,
+    ProjectRouteVersion,
     utc_now,
 )
 
@@ -35,8 +38,9 @@ DEFAULT_EMBEDDING_SERVING_ID = "bce_base_768"
 SERVING_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 SUPPORTED_LLM_TYPES = {"openai-compatible-chat"}
 SUPPORTED_EMBEDDING_TYPES = {"openai-compatible-embedding"}
+SUPPORTED_RERANKER_TYPES = {"cohere-compatible-rerank"}
 SERVING_CATEGORIES: tuple[str, ...] = ("llm", "embedding", "reranker", "ocr-vision")
-AVAILABLE_SERVING_CATEGORIES: frozenset[str] = frozenset({"llm", "embedding"})
+AVAILABLE_SERVING_CATEGORIES: frozenset[str] = frozenset({"llm", "embedding", "reranker"})
 PLACEHOLDER_KEYS = {"", "EMPTY", "fake"}
 LOGGER = logging.getLogger(__name__)
 
@@ -59,6 +63,8 @@ def _safe_error(exc: Exception) -> str:
 
 
 def _classify_error(exc: Exception) -> str:
+    if getattr(exc, "code", None) == "connection_error":
+        return "connection_error"
     if "待配置" in str(exc):
         return "pending_configuration"
     status = getattr(exc, "status_code", None)
@@ -102,6 +108,8 @@ class ServingManager:
         self.sessions = sessions
         self.cipher = ConfigCipher(encryption_key)
         self.client_factory = client_factory
+        from .reranker import RerankerServingRegistry
+        self.reranker_registry = RerankerServingRegistry(self)
 
     @staticmethod
     def _model(kind: str):
@@ -109,6 +117,8 @@ class ServingManager:
             return ModelServing
         if kind == "embedding":
             return EmbeddingServing
+        if kind == "reranker":
+            return RerankerServing
         raise ValueError("Serving 类型无效")
 
     @staticmethod
@@ -144,7 +154,7 @@ class ServingManager:
     def _payload(value: ModelServing | EmbeddingServing) -> dict[str, Any]:
         result = {
             "id": value.id, "serving_code": value.serving_code, "name": value.name,
-            "category": "llm" if isinstance(value, ModelServing) else "embedding",
+            "category": "llm" if isinstance(value, ModelServing) else "reranker" if isinstance(value, RerankerServing) else "embedding",
             "model_name": value.model_name, "base_url": value.base_url,
             "credential_configured": bool(value.credential_configured),
             "timeout_seconds": value.timeout_seconds, "max_retries": value.max_retries,
@@ -158,6 +168,9 @@ class ServingManager:
         if isinstance(value, ModelServing):
             result.update({"serving_type": value.serving_type, "max_tokens": value.max_tokens,
                            "disable_thinking": value.disable_thinking})
+        elif isinstance(value, RerankerServing):
+            result.update({"provider_type": value.provider_type, "max_batch_size": value.max_batch_size,
+                           "max_concurrency": value.max_concurrency})
         else:
             result.update({"provider_type": value.provider_type, "dimension": value.dimension,
                            "batch_size": value.batch_size,
@@ -204,6 +217,11 @@ class ServingManager:
                                 "disable_thinking": value.disable_thinking})
                 if include_credentials:
                     payload["credential_digest"] = hashlib.sha256(str(value.credential_ciphertext or "").encode("utf-8")).hexdigest()
+            elif isinstance(value, RerankerServing):
+                payload.update({"provider_type": value.provider_type, "max_batch_size": value.max_batch_size,
+                                "max_concurrency": value.max_concurrency})
+                if include_credentials:
+                    payload["credential_digest"] = hashlib.sha256(str(value.credential_ciphertext or "").encode()).hexdigest()
             else:
                 payload.update({"provider_type": value.provider_type, "dimension": value.dimension,
                                 "batch_size": value.batch_size,
@@ -215,7 +233,8 @@ class ServingManager:
         payload = dict(payload)
         self._validate_common(payload)
         provider_type = payload.get("serving_type") if kind == "model" else payload.get("provider_type")
-        supported = SUPPORTED_LLM_TYPES if kind == "model" else SUPPORTED_EMBEDDING_TYPES
+        supported = {"model": SUPPORTED_LLM_TYPES, "embedding": SUPPORTED_EMBEDDING_TYPES,
+                     "reranker": SUPPORTED_RERANKER_TYPES}[kind]
         if provider_type not in supported:
             raise ValueError("Serving 协议不受支持")
         if kind == "model" and int(payload.get("max_tokens", 0)) <= 0:
@@ -223,6 +242,8 @@ class ServingManager:
         if kind == "embedding" and (int(payload.get("dimension", 0)) <= 0 or int(payload.get("batch_size", 0)) <= 0):
             raise ValueError("dimension 和 batch_size 必须为正整数")
         base_url = self._validate_base_url(payload.get("base_url"))
+        if kind == "reranker":
+            self._validate_reranker(payload)
         api_key = str(payload.pop("api_key", "") or "").strip()
         with self.sessions.begin() as session:
             if session.scalar(select(model.id).where(model.serving_code == payload["serving_code"].strip())):
@@ -237,6 +258,9 @@ class ServingManager:
             if kind == "model":
                 values.update({"serving_type": provider_type, "max_tokens": int(payload["max_tokens"]),
                                "disable_thinking": bool(payload.get("disable_thinking", True))})
+            elif kind == "reranker":
+                values.update({"provider_type": provider_type, "max_batch_size": int(payload["max_batch_size"]),
+                               "max_concurrency": int(payload["max_concurrency"])})
             else:
                 values.update({"provider_type": provider_type, "dimension": int(payload["dimension"]),
                                "batch_size": int(payload["batch_size"])})
@@ -260,6 +284,12 @@ class ServingManager:
                 raise ValueError("Serving 不存在")
             if changes.get("is_enabled") is False and value.is_default:
                 raise ValueError("默认 Serving 不能停用，请先设置其他默认 Serving")
+            if kind == "reranker":
+                self._validate_reranker({**self._payload(value), **changes})
+                identity_changed = any(key in changes and changes[key] != getattr(value, key)
+                                       for key in ("model_name", "provider_type"))
+                if identity_changed and self._reranker_versions(session, value.serving_code):
+                    raise ValueError("Reranker Serving 已被冻结或发布版本引用，不能原地修改协议或模型")
             if kind == "embedding" and {"provider_type", "model_name", "dimension"} & set(changes):
                 published = session.scalar(select(KnowledgeIndexProfileRevision.id).where(
                     KnowledgeIndexProfileRevision.embedding_serving_id == value.serving_code,
@@ -271,7 +301,8 @@ class ServingManager:
                 if published or asset:
                     raise ValueError("Embedding Serving 已被正式 Profile 或 Asset 引用，不能原地修改协议、模型或维度")
             connection_fields = {"base_url", "model_name", "serving_type", "provider_type", "dimension",
-                                 "timeout_seconds", "max_retries", "max_tokens", "disable_thinking", "batch_size"}
+                                 "timeout_seconds", "max_retries", "max_tokens", "disable_thinking", "batch_size",
+                                 "max_batch_size", "max_concurrency"}
             changed_connection = bool(connection_fields & set(changes)) or bool(api_key) or clear_credential
             for key, raw in changes.items():
                 if key == "base_url":
@@ -326,6 +357,10 @@ class ServingManager:
                 snapshots = [item.id for item in session.scalars(select(FlowExecutionSnapshot))
                              if _contains_llm_serving(item.compiled_definition_json, value.serving_code)]
                 result = {"templates": templates, "revisions": revisions, "snapshots": snapshots}
+            elif kind == "reranker":
+                result = {"tasks": list(session.scalars(select(ProjectDeploymentTask.id).where(
+                    ProjectDeploymentTask.reranker_serving_code == value.serving_code))),
+                    "route_versions": self._reranker_versions(session, value.serving_code)}
             else:
                 profiles = list(session.scalars(select(KnowledgeIndexProfile.id).where(
                     KnowledgeIndexProfile.embedding_serving_id == value.serving_code)))
@@ -363,7 +398,7 @@ class ServingManager:
             query = select(model).where(model.serving_code == serving_code) if serving_code else select(model).where(model.is_default.is_(True))
             value = session.scalar(query)
             if not value:
-                raise ValueError(f"{'LLM' if kind == 'model' else 'Embedding'} Serving 未配置：{serving_code or '<default>'}")
+                raise ValueError(f"{kind} Serving 未配置：{serving_code or '<default>'}")
             if not value.is_enabled:
                 raise ValueError(f"Serving 已停用：{value.serving_code}")
             if require_configured and not value.base_url:
@@ -385,8 +420,9 @@ class ServingManager:
         status, error, observed = "healthy", None, None
         try:
             value, credential = self.resolved(kind, code)
-            client = self.client_factory(base_url=value.base_url, api_key=credential,
-                                         timeout=value.timeout_seconds, max_retries=value.max_retries)
+            if kind != "reranker":
+                client = self.client_factory(base_url=value.base_url, api_key=credential,
+                                             timeout=value.timeout_seconds, max_retries=value.max_retries)
             if kind == "model":
                 extra_body = {"app_id": "dataforge"}
                 if value.disable_thinking:
@@ -397,6 +433,9 @@ class ServingManager:
                 )
                 if not getattr(response, "choices", None) or not getattr(response.choices[0].message, "content", None):
                     raise ValueError("chat/completions 响应缺少有效 choices")
+            elif kind == "reranker":
+                self.reranker_registry.rerank(code, "Which city is the capital of France?",
+                                              ["Paris is the capital of France.", "Tokyo is the capital of Japan."])
             else:
                 response = client.embeddings.create(model=value.model_name, input=["DataForge embedding connectivity test"])
                 data = list(getattr(response, "data", None) or [])
@@ -425,7 +464,7 @@ class ServingManager:
     def check_configured_on_startup(self) -> list[dict[str, Any]]:
         """Check every enabled, configured Serving once without blocking peers on failure."""
         results: list[dict[str, Any]] = []
-        for kind in ("model", "embedding"):
+        for kind in ("model", "embedding", "reranker"):
             candidates = [item for item in self.list(kind) if item["is_enabled"] and item["base_url"]]
             for item in candidates:
                 try:
@@ -448,6 +487,25 @@ class ServingManager:
                         "status": "check_failed", "error_type": type(exc).__name__,
                     })
         return results
+
+    @staticmethod
+    def _validate_reranker(payload):
+        ServingManager._validate_common(payload)
+        parsed = urlsplit(str(payload.get("base_url") or ""))
+        if parsed.query or parsed.fragment:
+            raise ValueError("Reranker Base URL 不允许 query 或 fragment")
+        if payload.get("provider_type") not in SUPPORTED_RERANKER_TYPES:
+            raise ValueError("Reranker 协议不受支持")
+        for key, maximum in (("max_batch_size", 200), ("max_concurrency", 64), ("max_retries", 10)):
+            value = payload.get(key, -1)
+            if type(value) is not int or not (0 if key == "max_retries" else 1) <= value <= maximum:
+                raise ValueError(f"{key} 超出允许范围")
+
+    @staticmethod
+    def _reranker_versions(session, serving_code):
+        return [version.id for version in session.scalars(select(ProjectRouteVersion))
+                if any(task.get("reranker_serving_code") == serving_code
+                       for task in (version.snapshot_json or {}).get("tasks", []))]
 
 
 class DatabaseLLMServingRegistry:

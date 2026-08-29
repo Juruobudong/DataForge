@@ -21,11 +21,21 @@ SAMPLE_METADATA: tuple[dict[str, Any], ...] = (
     },
     {
         "code": "reviewed-medical-v1",
-        "name": "DataForge 示例审核数据",
+        "name": "DataForge 示例审核数据（历史 5 块）",
         "version": "1",
         "purpose": "knowledge_flow",
         "readonly": True,
+        "listed": False,
         "resource": "knowledge-flow/reviewed-chunks-v1.json",
+        "content_type": "application/json",
+    },
+    {
+        "code": "reviewed-medical-v2",
+        "name": "DataForge 医疗知识生产示例 · 审核结果",
+        "version": "2",
+        "purpose": "knowledge_flow",
+        "readonly": True,
+        "resource": "knowledge-flow/reviewed-chunks-v2.json",
         "content_type": "application/json",
     },
 )
@@ -42,12 +52,11 @@ class SampleDataService:
     def list(self, purpose: str = "") -> list[dict[str, Any]]:
         values = []
         for item in self._metadata.values():
-            if purpose and item["purpose"] != purpose:
+            if not item.get("listed", True) or purpose and item["purpose"] != purpose:
                 continue
-            raw = self._read(item["resource"])
-            values.append({key: value for key, value in item.items() if key != "resource"} | {
-                "digest": hashlib.sha256(raw).hexdigest(),
-            })
+            digest = hashlib.sha256(self._read(item["resource"])).hexdigest()
+            values.append({key: value for key, value in item.items()
+                           if key not in {"resource", "listed"}} | {"digest": digest})
         return values
 
     def get(self, code: str) -> dict[str, Any]:
@@ -56,7 +65,7 @@ class SampleDataService:
             raise ValueError("内置示例不存在")
         raw = self._read(item["resource"])
         payload: Any = json.loads(raw.decode("utf-8")) if item["content_type"] == "application/json" else raw.decode("utf-8")
-        result = {key: value for key, value in item.items() if key != "resource"}
+        result = {key: value for key, value in item.items() if key not in {"resource", "listed"}}
         result["digest"] = hashlib.sha256(raw).hexdigest()
         if item["purpose"] == "preprocessing":
             result.update({"filename": "dataforge-sample.md", "content": payload})
@@ -64,7 +73,7 @@ class SampleDataService:
             result.update(payload)
         return result
 
-    def reviewed_chunks(self, code: str = "reviewed-medical-v1") -> dict[str, Any]:
+    def reviewed_chunks(self, code: str = "reviewed-medical-v2") -> dict[str, Any]:
         value = self.get(code)
         if value["purpose"] != "knowledge_flow":
             raise ValueError("示例用途不是知识流程")
@@ -77,7 +86,7 @@ class SampleDataService:
                 "source_id": f"sample-source:{code}",
                 "source_version_id": f"sample-version:{code}:{value['version']}",
                 "source_chunk_id": str(raw.get("chunk_key") or f"sample-{index + 1:03d}"),
-                "filename": value["name"],
+                "filename": value.get("source_filename") or value["name"],
                 "content": content,
                 "text": content,
                 "chunk_index": index,

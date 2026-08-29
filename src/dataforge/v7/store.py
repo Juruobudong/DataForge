@@ -65,6 +65,8 @@ from .models import (
     DebugRunReviewInput,
     EmbeddingProfile,
     EmbeddingServing,
+    RerankerServing,
+    KnowledgeAssetItem,
     KnowledgeChange,
     KnowledgeDispatch,
     KnowledgeFlowTemplate,
@@ -144,6 +146,7 @@ from .source_anchor import (
     sequential_part_ranges,
     split_source_anchor,
 )
+from .asset_items import freeze_asset_items, vector_items
 
 
 V7_TYPE_META = {
@@ -701,6 +704,25 @@ class V7Store:
                 bce.credential_key_version = self.llm_serving_registry.manager.cipher.key_version
                 bce.credential_configured = True
             session.add(bce)
+
+        if not session.scalar(select(RerankerServing.id).where(RerankerServing.serving_code == "bge_reranker_large")):
+            manager = self.llm_serving_registry.manager
+            base_url = manager._validate_base_url(os.getenv("DATAFORGE_DEFAULT_RERANKER_BASE_URL", ""))
+            reranker = RerankerServing(
+                id="rerankerserving_bge_large", serving_code="bge_reranker_large", name="BGE Reranker Large",
+                provider_type="cohere-compatible-rerank",
+                model_name=os.getenv("DATAFORGE_DEFAULT_RERANKER_MODEL", "bge-reranker-large").strip() or "bge-reranker-large",
+                base_url=base_url, timeout_seconds=120, max_retries=2, max_batch_size=32, max_concurrency=4,
+                is_enabled=True,
+                is_default=not bool(session.scalar(select(RerankerServing.id).where(RerankerServing.is_default.is_(True)))),
+                last_check_status="not_checked" if base_url else "pending_configuration",
+            )
+            api_key = os.getenv("DATAFORGE_DEFAULT_RERANKER_API_KEY", "").strip()
+            if api_key not in {"", "EMPTY", "fake"}:
+                reranker.credential_ciphertext = manager.cipher.encrypt(api_key, manager._aad("reranker", reranker.id))
+                reranker.credential_key_version = manager.cipher.key_version
+                reranker.credential_configured = True
+            session.add(reranker)
 
     @staticmethod
     def _backfill_embedding_servings(session: Session) -> None:
@@ -1969,11 +1991,15 @@ class V7Store:
     def _source_payload(source: Source, version: SourceVersion | None = None) -> dict[str, Any]:
         return {
             "id": source.id, "document_library_id": source.document_library_id, "name": source.name,
-            "original_filename": source.original_filename, "relative_path": source.relative_path,
+            "original_filename": version.original_filename if version else "", "relative_path": source.relative_path,
             "directory_path": source.directory_path, "source_kind": source.source_kind,
             "status": source.status, "current_version_id": source.current_version_id,
             "metadata": source.metadata_json, "updated_at": source.updated_at.isoformat(),
-            "version": None if not version else {"id": version.id, "version_no": version.version_no, "sha256": version.sha256, "size_bytes": version.size_bytes, "mime_type": version.mime_type, "status": version.status, "extraction_status": version.extraction_status, "error": version.extraction_error,
+            "version": None if not version else {"id": version.id, "version_no": version.version_no,
+                "blob_uri": version.blob_uri, "sha256": version.sha256, "size_bytes": version.size_bytes,
+                "media_type": version.media_type, "original_filename": version.original_filename,
+                "activation_no": version.activation_no, "status": version.status,
+                "extraction_status": version.extraction_status, "error": version.extraction_error,
                 "preparation_status": version.preparation_status, "review_status": version.review_status,
                 "current_review_snapshot_id": version.current_review_snapshot_id,
                 "active_chunk_set_id": version.active_chunk_set_id,
@@ -2019,16 +2045,18 @@ class V7Store:
             return value
 
     def create_source(
-        self, *, library_id: str, name: str, filename: str, object_key: str, sha256: str,
-        size_bytes: int, mime_type: str, metadata: dict[str, Any] | None = None, relative_path: str | None = None,
+        self, *, library_id: str, name: str, filename: str, blob_uri: str, sha256: str,
+        size_bytes: int, media_type: str, metadata: dict[str, Any] | None = None, relative_path: str | None = None,
     ) -> dict[str, Any]:
         if not name.strip() or size_bytes <= 0:
             raise ValueError("文件名称不能为空且文件必须非空")
+        if blob_uri != f"blob://{sha256}" or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("Blob URI 与 SHA-256 内容身份不一致")
         with self.sessions.begin() as session:
             if not session.get(DocumentLibrary, library_id):
                 raise ValueError("文档库不存在")
             relative_path, directory_path = normalise_relative_path(relative_path or filename)
-            source = Source(id=new_id("src"), document_library_id=library_id, name=name.strip(), original_filename=filename,
+            source = Source(id=new_id("src"), document_library_id=library_id, name=name.strip(),
                             relative_path=relative_path, relative_path_hash=relative_path_hash(relative_path),
                             directory_path=directory_path, directory_path_hash=relative_path_hash(directory_path), metadata_json=metadata or {})
             # SQLAlchemy has no ORM relationship that expresses the child-row
@@ -2036,27 +2064,63 @@ class V7Store:
             # flushes a library member before its Source exists.
             session.add(source)
             session.flush()
-            version = SourceVersion(id=new_id("srcv"), source_id=source.id, version_no=1, object_key=object_key, sha256=sha256, size_bytes=size_bytes, mime_type=mime_type)
+            version = SourceVersion(
+                id=new_id("srcv"), source_id=source.id, version_no=1, blob_uri=blob_uri,
+                sha256=sha256, size_bytes=size_bytes, media_type=media_type, original_filename=filename,
+            )
             source.current_version_id = version.id
             session.add_all([version, DocumentLibraryMember(id=new_id("dlm"), document_library_id=library_id, source_id=source.id)])
             session.flush(); self._enqueue_source_preparation(session, version)
             self.audit(session, "source.uploaded", "source", source.id, {"source_version_id": version.id})
             session.flush()
-            return self._source_payload(source, version)
+            return {**self._source_payload(source, version), "version_action": "created"}
 
     def replace_source(
-        self, *, source_id: str, filename: str, object_key: str, sha256: str, size_bytes: int, mime_type: str,
+        self, *, source_id: str, filename: str, blob_uri: str, sha256: str, size_bytes: int, media_type: str,
     ) -> dict[str, Any]:
+        if blob_uri != f"blob://{sha256}" or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("Blob URI 与 SHA-256 内容身份不一致")
         with self.sessions.begin() as session:
-            source = session.get(Source, source_id)
+            source = session.scalar(select(Source).where(Source.id == source_id).with_for_update())
             if not source or source.status == "deleted":
                 raise ValueError("待替换文件不存在或已删除")
             current = session.get(SourceVersion, source.current_version_id)
+            if not current:
+                raise ValueError("待替换文件缺少当前版本")
+            if Path(filename).suffix.lower() != Path(current.original_filename).suffix.lower():
+                raise ValueError("替换文件必须与当前版本保持相同格式")
+            existing = session.scalar(select(SourceVersion).where(
+                SourceVersion.source_id == source.id, SourceVersion.sha256 == sha256,
+            ))
+            if existing:
+                payload = self._source_payload(source, current)
+                if existing.id == current.id:
+                    return {**payload, "version_action": "unchanged"}
+                return {
+                    **payload, "version_action": "confirmation_required",
+                    "code": "SOURCE_VERSION_REACTIVATION_REQUIRED",
+                    "expected_current_version_id": current.id,
+                    "reactivation_version": self._source_payload(source, existing)["version"],
+                }
+            next_path = "/".join(filter(None, (source.directory_path, filename)))
+            conflict = session.scalar(select(Source.id).where(
+                Source.document_library_id == source.document_library_id,
+                Source.relative_path_hash == relative_path_hash(next_path),
+                Source.relative_path == next_path,
+                Source.id != source.id,
+                Source.status.not_in(("deleted", "deleting")),
+            ))
+            if conflict:
+                raise ValueError("同目录下已存在同名资料")
             if current:
                 current.status = "superseded"
             version_no = (session.scalar(select(func.max(SourceVersion.version_no)).where(SourceVersion.source_id == source.id)) or 0) + 1
-            version = SourceVersion(id=new_id("srcv"), source_id=source.id, version_no=version_no, object_key=object_key, sha256=sha256, size_bytes=size_bytes, mime_type=mime_type)
-            source.current_version_id, source.original_filename, source.status = version.id, filename, "uploaded"
+            version = SourceVersion(
+                id=new_id("srcv"), source_id=source.id, version_no=version_no, blob_uri=blob_uri,
+                sha256=sha256, size_bytes=size_bytes, media_type=media_type, original_filename=filename,
+            )
+            source.current_version_id, source.status = version.id, "uploaded"
+            source.relative_path, source.relative_path_hash = next_path, relative_path_hash(next_path)
             session.add(version)
             session.flush(); self._enqueue_source_preparation(session, version)
             document_library = session.get(DocumentLibrary, source.document_library_id)
@@ -2073,7 +2137,50 @@ class V7Store:
             # prevents a brief no-knowledge window for multi-source graph data.
             self.audit(session, "source.replaced", "source", source.id, {"source_version_id": version.id})
             session.flush()
-            return self._source_payload(source, version)
+            return {**self._source_payload(source, version), "version_action": "created"}
+
+    def reactivate_source_version(
+        self, *, source_id: str, version_id: str, expected_current_version_id: str,
+    ) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            source = session.scalar(select(Source).where(Source.id == source_id).with_for_update())
+            target = session.get(SourceVersion, version_id)
+            if not source or source.status in {"deleted", "deleting"} or not target or target.source_id != source_id:
+                raise ValueError("待重新启用的文件版本不存在")
+            if source.current_version_id != expected_current_version_id:
+                raise ValueError("SOURCE_VERSION_REACTIVATION_STALE")
+            current = session.get(SourceVersion, source.current_version_id)
+            if not current:
+                raise ValueError("当前文件版本不存在")
+            if target.id == current.id:
+                return {**self._source_payload(source, current), "version_action": "unchanged"}
+            if Path(target.original_filename).suffix.lower() != Path(current.original_filename).suffix.lower():
+                raise ValueError("历史版本格式与当前版本不一致")
+            next_path = "/".join(filter(None, (source.directory_path, target.original_filename)))
+            conflict = session.scalar(select(Source.id).where(
+                Source.document_library_id == source.document_library_id,
+                Source.relative_path_hash == relative_path_hash(next_path),
+                Source.relative_path == next_path,
+                Source.id != source.id,
+                Source.status.not_in(("deleted", "deleting")),
+            ))
+            if conflict:
+                raise ValueError("同目录下已存在历史版本文件名对应的资料")
+            current.status = "superseded"
+            target.status, target.activation_no = "active", int(target.activation_no or 0) + 1
+            source.current_version_id, source.status = target.id, "uploaded"
+            source.relative_path, source.relative_path_hash = next_path, relative_path_hash(next_path)
+            if target.review_status == "approved" and target.current_review_snapshot_id:
+                self._queue_review_dispatch(session, target.current_review_snapshot_id, target.activation_no)
+            self.audit(session, "source.version_reactivated", "source", source.id, {
+                "previous_version_id": current.id, "source_version_id": target.id,
+                "activation_no": target.activation_no,
+            })
+            session.flush()
+            return {
+                **self._source_payload(source, target), "version_action": "reactivated",
+                "notice": f"已重新启用 v{target.version_no}，未创建新版本",
+            }
 
     @staticmethod
     def _create_candidate_chunk_set(session: Session, version: SourceVersion,
@@ -2299,11 +2406,13 @@ class V7Store:
 
     def list_sources(self, library_id: str | None = None, keyword: str = "", status: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            query = select(Source).order_by(Source.updated_at.desc())
+            query = select(Source).outerjoin(
+                SourceVersion, SourceVersion.id == Source.current_version_id,
+            ).order_by(Source.updated_at.desc())
             if library_id:
                 query = query.where(Source.document_library_id == library_id)
             if keyword:
-                query = query.where((Source.name.contains(keyword)) | (Source.original_filename.contains(keyword)))
+                query = query.where((Source.name.contains(keyword)) | (SourceVersion.original_filename.contains(keyword)))
             if status:
                 query = query.where(Source.status == status)
             items = []
@@ -2343,7 +2452,9 @@ class V7Store:
         with self.sessions() as session:
             if not session.get(DocumentLibrary, library_id):
                 raise ValueError("文档库不存在")
-            query = select(Source).where(Source.document_library_id == library_id).order_by(Source.updated_at.desc())
+            query = select(Source).outerjoin(
+                SourceVersion, SourceVersion.id == Source.current_version_id,
+            ).where(Source.document_library_id == library_id).order_by(Source.updated_at.desc())
             if path is not None:
                 normalized, _ = normalise_relative_path(f"{path}/placeholder") if path else ("", "")
                 directory = normalized.rsplit("/", 1)[0] if normalized else ""
@@ -2352,11 +2463,11 @@ class V7Store:
                     Source.directory_path == directory,
                 )
             if keyword:
-                query = query.where((Source.name.contains(keyword)) | (Source.original_filename.contains(keyword)) | (Source.relative_path.contains(keyword)))
+                query = query.where((Source.name.contains(keyword)) | (SourceVersion.original_filename.contains(keyword)) | (Source.relative_path.contains(keyword)))
             if status:
                 query = query.where(Source.status == status)
             if file_type:
-                query = query.where(Source.original_filename.ilike(f"%.{file_type.lstrip('.').lower()}"))
+                query = query.where(SourceVersion.original_filename.ilike(f"%.{file_type.lstrip('.').lower()}"))
             total = int(session.scalar(select(func.count()).select_from(query.subquery())) or 0)
             rows = session.scalars(query.offset((page - 1) * page_size).limit(page_size)).all()
             items = []
@@ -2399,7 +2510,9 @@ class V7Store:
             if not session.get(Source, source_id):
                 raise ValueError("文件不存在")
             values = session.scalars(select(SourceVersion).where(SourceVersion.source_id == source_id).order_by(SourceVersion.version_no.desc())).all()
-            return [{"id": item.id, "version_no": item.version_no, "sha256": item.sha256, "object_key": item.object_key,
+            return [{"id": item.id, "version_no": item.version_no, "sha256": item.sha256,
+                     "blob_uri": item.blob_uri, "media_type": item.media_type,
+                     "original_filename": item.original_filename, "activation_no": item.activation_no,
                      "status": item.status, "size_bytes": item.size_bytes, "extraction_status": item.extraction_status,
                      "preparation_status": item.preparation_status, "review_status": item.review_status,
                      "current_review_snapshot_id": item.current_review_snapshot_id,
@@ -2531,7 +2644,7 @@ class V7Store:
     def _binding_pending_versions(self, session: Session, binding: DocumentLibraryTemplateBinding,
                                   revision: KnowledgeFlowTemplateRevision) -> list[str]:
         active_pairs = list(session.execute(select(
-            Source.current_version_id, SourceVersion.current_review_snapshot_id,
+            Source.current_version_id, SourceVersion.current_review_snapshot_id, SourceVersion.activation_no,
         ).join(
             SourceVersion, SourceVersion.id == Source.current_version_id,
         ).where(
@@ -2543,6 +2656,7 @@ class V7Store:
         processed_pairs = set(session.execute(select(
             DocumentLibraryProcessingRecord.source_version_id,
             DocumentLibraryProcessingRecord.source_review_snapshot_id,
+            DocumentLibraryProcessingRecord.activation_no,
         ).where(
             DocumentLibraryProcessingRecord.document_library_template_binding_id == binding.id,
             DocumentLibraryProcessingRecord.knowledge_flow_template_revision_id == revision.id,
@@ -2552,7 +2666,7 @@ class V7Store:
             DocumentLibraryProcessingBaseline.knowledge_flow_template_revision_id == revision.id,
             DocumentLibraryProcessingBaseline.last_success_status == "completed",
         )))
-        in_flight_pairs: set[tuple[str, str]] = set()
+        in_flight_pairs: set[tuple[str, str, int]] = set()
         for job in session.scalars(select(KnowledgeJob).where(
             KnowledgeJob.document_library_template_binding_id == binding.id,
             KnowledgeJob.knowledge_flow_template_revision_id == revision.id,
@@ -2561,7 +2675,7 @@ class V7Store:
             for item in session.scalars(select(KnowledgeJobReviewInput).where(
                 KnowledgeJobReviewInput.knowledge_job_id == job.id,
             )):
-                in_flight_pairs.add((item.source_version_id, item.source_review_snapshot_id))
+                in_flight_pairs.add((item.source_version_id, item.source_review_snapshot_id, item.activation_no))
         # A published template revision supersedes prior successful records, so
         # all current versions become pending once; queued/running jobs still
         # suppress duplicate dispatch before that run succeeds.
@@ -2569,8 +2683,8 @@ class V7Store:
             item for item in active_pairs
             if item not in processed_pairs and item[0] not in baseline_versions
         ]
-        return [version_id for version_id, snapshot_id in candidates
-                if (version_id, snapshot_id) not in in_flight_pairs]
+        return [version_id for version_id, snapshot_id, activation_no in candidates
+                if (version_id, snapshot_id, activation_no) not in in_flight_pairs]
 
     def _document_binding_payload(self, session: Session, binding: DocumentLibraryTemplateBinding) -> dict[str, Any]:
         document_library = session.get(DocumentLibrary, binding.document_library_id)
@@ -3233,7 +3347,11 @@ class V7Store:
                 source.status = "deleting"
             for library in session.scalars(select(DocumentLibrary).where(DocumentLibrary.id.in_(check["document_library_ids"]))):
                 library.status = "deleting"
-            job = DocumentDeletionJob(id=new_id("deldoc"), target_kind="sources" if source_ids else "libraries", source_ids=check["source_ids"], document_library_ids=check["document_library_ids"], object_keys=[item.object_key for item in versions] + parser_keys, status="queued")
+            job = DocumentDeletionJob(
+                id=new_id("deldoc"), target_kind="sources" if source_ids else "libraries",
+                source_ids=check["source_ids"], document_library_ids=check["document_library_ids"],
+                blob_uris=sorted({item.blob_uri for item in versions}), object_keys=parser_keys, status="queued",
+            )
             session.add(job); self.audit(session, "document.deletion_queued", "document_deletion_job", job.id, {"source_count": len(check["source_ids"])})
             return {"id": job.id, "status": job.status, **check}
 
@@ -3301,6 +3419,41 @@ class V7Store:
             if not job: return None
             job.status, job.lease_owner, job.lease_expires_at = "running", owner, utc_now() + timedelta(minutes=5)
             return job
+
+    def unreferenced_blobs_for_deletion(self, job_id: str) -> list[str]:
+        """Return only blobs whose every SourceVersion reference belongs to this deletion job."""
+        with self.sessions() as session:
+            job = session.get(DocumentDeletionJob, job_id)
+            if not job:
+                raise ValueError("文档删除任务不存在")
+            candidates = set(job.blob_uris or [])
+            if not candidates:
+                return []
+            referenced = set(session.scalars(select(SourceVersion.blob_uri).where(
+                SourceVersion.blob_uri.in_(candidates),
+                SourceVersion.source_id.not_in(set(job.source_ids or []) or {""}),
+            )))
+            return sorted(candidates - referenced)
+
+    def delete_unreferenced_blobs(self, job_id: str, delete_blob) -> list[str]:
+        """Recheck and physically remove orphan blobs while holding the indexed reference range."""
+        with self.sessions.begin() as session:
+            job = session.scalar(select(DocumentDeletionJob).where(
+                DocumentDeletionJob.id == job_id,
+            ).with_for_update())
+            if not job:
+                raise ValueError("文档删除任务不存在")
+            candidates = set(job.blob_uris or [])
+            if not candidates:
+                return []
+            referenced = set(session.scalars(select(SourceVersion.blob_uri).where(
+                SourceVersion.blob_uri.in_(candidates),
+                SourceVersion.source_id.not_in(set(job.source_ids or []) or {""}),
+            ).with_for_update()))
+            deleted = sorted(candidates - referenced)
+            for blob_uri in deleted:
+                delete_blob(blob_uri)
+            return deleted
 
     def finish_document_deletion(self, job_id: str, error: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -3910,6 +4063,8 @@ class V7Store:
                 self.audit(session, "knowledge_library.deletion_failed", "knowledge_library", job.knowledge_library_id, {"job_id": job.id, "error": error})
                 return {"id": job.id, "status": job.status, "error": error}
             library.status = "deleted"
+            session.execute(delete(KnowledgeAssetItem).where(KnowledgeAssetItem.asset_version_id.in_(
+                select(KnowledgeAssetVersion.id).where(KnowledgeAssetVersion.knowledge_library_id == library.id))))
             for item in session.scalars(select(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library.id, KnowledgeItem.status == "active")):
                 item.status = "inactive"
             for item in session.scalars(select(VectorRecordState).join(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library.id)):
@@ -4350,7 +4505,7 @@ class V7Store:
             if not document or not document.text:
                 raise ValueError("业务文档尚无可用于预览的 DocumentIR")
             return {
-                "type": "source_version", "name": source.name, "filename": source.original_filename,
+                "type": "source_version", "name": source.name, "filename": version.original_filename,
                 "text": document.text, "source_version_id": version.id,
                 "anchor": dict(document.anchor_json or {}),
             }
@@ -4806,7 +4961,7 @@ class V7Store:
                 review_options.append({
                     "source_review_snapshot_id": snapshot.id, "source_version_id": row["version"].id,
                     "source_id": row["source"].id, "source_name": row["source"].name,
-                    "filename": row["source"].original_filename, "review_no": snapshot.review_no,
+                    "filename": row["version"].original_filename, "review_no": snapshot.review_no,
                     "review_digest": snapshot.content_digest, "chunk_count": row["chunk_count"],
                     "approved_at": snapshot.approved_at.isoformat(),
                     "document_library_id": row["library"].id, "document_library_name": row["library"].name,
@@ -4830,7 +4985,7 @@ class V7Store:
                 "review_inputs": review_options,
                 "sink_requirements": list(bundle["sink_requirements"].values()), "sink_options": sink_options,
                 "builtin_samples": SampleDataService().list("knowledge_flow"),
-                "default_input": {"input_source": "builtin_sample", "sample_code": "reviewed-medical-v1"},
+                "default_input": {"input_source": "builtin_sample", "sample_code": "reviewed-medical-v2"},
             }
 
     def _debug_preflight_with_session(self, session: Session, *, template_id: str, revision_id: str,
@@ -4843,7 +4998,7 @@ class V7Store:
         if bundle["compiled"]["checksum"] != expected_compiled_checksum:
             raise RuntimeError("流程定义已变化，请重新执行调试预检")
         if input_source == "builtin_sample":
-            sample = SampleDataService().reviewed_chunks(sample_code or "reviewed-medical-v1")
+            sample = SampleDataService().reviewed_chunks(sample_code or "reviewed-medical-v2")
             if sink_library_bindings:
                 raise ValueError("内置示例使用虚拟空库 Diff，不接受 KnowledgeLibrary 绑定")
             reviews: list[dict[str, Any]] = []
@@ -4937,6 +5092,7 @@ class V7Store:
                     id=new_id("debugreview"), debug_input_snapshot_id=debug_input.id,
                     source_version_id=review["version"].id,
                     source_review_snapshot_id=review["snapshot"].id,
+                    activation_no=review["version"].activation_no,
                     review_digest=review["snapshot"].content_digest, ordinal=ordinal,
                 ))
             session.flush()
@@ -5204,7 +5360,7 @@ class V7Store:
     def preview_graph_prompt(self, definition: dict[str, Any], node_id: str) -> dict[str, Any]:
         """Read Catalog only; never compile/freeze, create assets or contact a model."""
         from jsonschema import Draft202012Validator
-        from .graph_prompt import GRAPH_GUIDANCE_VERSIONS, graph_config_for_node, graph_node_prompt
+        from .graph_prompt import GRAPH_GUIDANCE_VERSIONS, graph_config_for_node, graph_node_prompt, uses_graph_guidance
         from .graph_schema import normalize_graph_config
 
         nodes = definition.get("nodes")
@@ -5242,7 +5398,7 @@ class V7Store:
                                          node_id=node_id, field="entity_types")
         config = graph_config_for_node(config, params,
                                        relation=code == "relation-extractor",
-                                       governed_prompt=version == GRAPH_GUIDANCE_VERSIONS[code])
+                                       governed_prompt=uses_graph_guidance(code, version))
         empty_subset = code == "entity-extractor" and params.get("entity_type_scope") == "subset" and not params.get("entity_types")
         system, user = ("", "") if empty_subset else graph_node_prompt(
             config, params, code, version, "{{source_chunk}}", ["{{entities}}"],
@@ -5392,6 +5548,7 @@ class V7Store:
                     KnowledgeJob.document_library_template_binding_id == document_library_template_binding_id,
                     KnowledgeJob.knowledge_flow_template_revision_id == revision.id,
                     KnowledgeJobReviewInput.source_review_snapshot_id == review_inputs[0][1].id,
+                    KnowledgeJobReviewInput.activation_no == review_inputs[0][0].activation_no,
                     KnowledgeJob.status.in_(("queued", "running", "completed", "completed_with_warnings")),
                 ).order_by(KnowledgeJob.created_at.desc()))
                 if existing_job:
@@ -5419,6 +5576,7 @@ class V7Store:
                 session.add(KnowledgeJobReviewInput(
                     id=new_id("jobreview"), knowledge_job_id=job.id, source_version_id=source_version.id,
                     source_review_snapshot_id=review.id, review_digest=review.content_digest,
+                    activation_no=source_version.activation_no,
                 ))
             self.audit(session, "knowledge_job.created", "knowledge_job", job.id, {
                 "outputs": normalized_outputs,
@@ -5427,12 +5585,19 @@ class V7Store:
             return self.job_payload(job)
 
     @staticmethod
-    def _queue_review_dispatch(session: Session, snapshot_id: str) -> KnowledgeDispatch:
+    def _queue_review_dispatch(session: Session, snapshot_id: str, activation_no: int | None = None) -> KnowledgeDispatch:
+        if activation_no is None:
+            snapshot = session.get(SourceReviewSnapshot, snapshot_id)
+            version = session.get(SourceVersion, snapshot.source_version_id) if snapshot else None
+            activation_no = int(version.activation_no if version else 1)
         dispatch = session.scalar(select(KnowledgeDispatch).where(
             KnowledgeDispatch.source_review_snapshot_id == snapshot_id,
+            KnowledgeDispatch.activation_no == activation_no,
         ))
         if not dispatch:
-            dispatch = KnowledgeDispatch(id=new_id("dispatch"), source_review_snapshot_id=snapshot_id)
+            dispatch = KnowledgeDispatch(
+                id=new_id("dispatch"), source_review_snapshot_id=snapshot_id, activation_no=activation_no,
+            )
             session.add(dispatch)
         elif dispatch.status not in {"queued", "running"}:
             dispatch.status, dispatch.error = "queued", None
@@ -5458,7 +5623,8 @@ class V7Store:
             source = session.get(Source, version.source_id) if version else None
             if not dispatch or dispatch.status != "running" or not snapshot or not version or not source:
                 raise ValueError("知识自动调度上下文不完整")
-            if version.current_review_snapshot_id != snapshot.id or version.review_status != "approved":
+            if (source.current_version_id != version.id or version.current_review_snapshot_id != snapshot.id
+                    or version.review_status != "approved" or version.activation_no != dispatch.activation_no):
                 dispatch.status, dispatch.error = "failed", "人工审核快照已失效"
                 dispatch.lease_owner, dispatch.lease_expires_at = None, None
                 return {"id": dispatch.id, "status": dispatch.status, "error": dispatch.error}
@@ -5505,7 +5671,9 @@ class V7Store:
         for item in inputs:
             version = session.get(SourceVersion, item.source_version_id)
             snapshot = session.get(SourceReviewSnapshot, item.source_review_snapshot_id)
-            if (not version or not snapshot or snapshot.status != "approved"
+            source = session.get(Source, version.source_id) if version else None
+            if (not version or not source or source.current_version_id != version.id
+                    or item.activation_no != version.activation_no or not snapshot or snapshot.status != "approved"
                     or version.current_review_snapshot_id != snapshot.id
                     or snapshot.content_digest != item.review_digest):
                 raise ReviewGateError("REVIEW_SNAPSHOT_STALE", "知识任务引用的人工审核快照已失效",
@@ -5537,7 +5705,7 @@ class V7Store:
                     anchor = dict(revision.anchor_json or {})
                     values.append({
                         "source_id": source.id, "source_version_id": version.id,
-                        "filename": source.original_filename, "source_chunk_id": chunk.source_chunk_id,
+                        "filename": version.original_filename, "source_chunk_id": chunk.source_chunk_id,
                         "source_chunk_revision_id": revision.id, "source_review_snapshot_id": snapshot.id,
                         "chunk_index": mapping.ordinal, "content": revision.content, "anchor": anchor,
                         **({"faq": dict(anchor.get("faq") or {})} if anchor.get("faq") else {}),
@@ -6212,11 +6380,15 @@ class V7Store:
                             DocumentLibraryProcessingRecord.source_review_snapshot_id == (
                                 review_input.source_review_snapshot_id if review_input else None
                             ),
+                            DocumentLibraryProcessingRecord.activation_no == (
+                                review_input.activation_no if review_input else 1
+                            ),
                         )):
                             session.add(DocumentLibraryProcessingRecord(
                                 id=new_id("docproc"), document_library_template_binding_id=binding.id,
                                 source_version_id=version_id, knowledge_flow_template_revision_id=job.knowledge_flow_template_revision_id,
                                 source_review_snapshot_id=review_input.source_review_snapshot_id if review_input else None,
+                                activation_no=review_input.activation_no if review_input else 1,
                                 knowledge_job_id=job.id,
                             ))
                     binding.last_successful_revision_id = job.knowledge_flow_template_revision_id
@@ -6435,6 +6607,11 @@ class V7Store:
             # explicitly in the newly exposed run timestamps.
             def timestamp(value):
                 return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).isoformat() if value else None
+            input_context = None if debug_input is None else {
+                "input_source": debug_input.input_source,
+                "sample_code": descriptor.get("sample_code") if debug_input.input_source == "builtin_sample" else None,
+                "sample_version": descriptor.get("sample_version") if debug_input.input_source == "builtin_sample" else None,
+            }
             return {"id": run.id, "knowledge_job_id": run.knowledge_job_id,
                     "source_preparation_job_id": run.source_preparation_job_id,
                     "debug_input_snapshot_id": run.debug_input_snapshot_id,
@@ -6448,6 +6625,7 @@ class V7Store:
                     "created_at": timestamp(run.created_at), "started_at": timestamp(started_at),
                     "parent_flow_run_id": run.parent_flow_run_id, "run_mode": run.run_mode, "start_node_id": run.start_node_id,
                     "parameter_overrides": run.parameter_overrides, "sink_policy": run.sink_policy,
+                    "input_context": input_context,
                      "template_id": template.id if template else None,
                      "template_name": template.name if template else None,
                      "template_revision_id": debug_input.knowledge_flow_template_revision_id if debug_input else None,
@@ -6595,8 +6773,9 @@ class V7Store:
             if resolved.get("force_ocr") and node.get("ref") != "document-parser": raise ValueError("force_ocr 仅适用于 Document Parser")
             if resolved.get("force_ocr"):
                 job = session.get(KnowledgeJob, parent.knowledge_job_id); assert job
-                sources = session.execute(select(Source.original_filename).join(SourceVersion, SourceVersion.source_id == Source.id)
-                                          .where(SourceVersion.id.in_(job.source_version_ids))).scalars().all()
+                sources = session.scalars(select(SourceVersion.original_filename).where(
+                    SourceVersion.id.in_(job.source_version_ids),
+                )).all()
                 if not sources or any(not name.lower().endswith(".pdf") for name in sources): raise ValueError("强制 OCR 仅适用于全部输入均为 PDF 的 Run")
             incoming = self._incoming_nodes(definition)
             parent_nodes = {item.node_id: item for item in session.scalars(select(FlowNodeRun).where(FlowNodeRun.flow_run_id == parent.id)).all()}
@@ -6730,7 +6909,7 @@ class V7Store:
                 anchor = dict(revision.anchor_json or {})
                 values.append({
                     "source_id": source.id, "source_version_id": version.id,
-                    "filename": source.original_filename, "source_chunk_id": chunk.source_chunk_id,
+                    "filename": version.original_filename, "source_chunk_id": chunk.source_chunk_id,
                     "source_chunk_revision_id": revision.id, "source_review_snapshot_id": snapshot.id,
                     "chunk_index": mapping.ordinal, "content": revision.content, "anchor": anchor,
                     **({"faq": dict(anchor.get("faq") or {})} if anchor.get("faq") else {}),
@@ -6751,8 +6930,8 @@ class V7Store:
             ).order_by(DebugRunReviewInput.ordinal)))
             if debug_input.input_source == "builtin_sample":
                 descriptor = dict(debug_input.input_descriptor_json or {})
-                source_id = f"sample-source:{descriptor.get('sample_code', 'reviewed-medical-v1')}"
-                version_id = f"sample-version:{descriptor.get('sample_code', 'reviewed-medical-v1')}:{descriptor.get('sample_version', '1')}"
+                source_id = f"sample-source:{descriptor.get('sample_code', 'reviewed-medical-v2')}"
+                version_id = f"sample-version:{descriptor.get('sample_code', 'reviewed-medical-v2')}:{descriptor.get('sample_version', '2')}"
                 versions_list = [SimpleNamespace(id=version_id, source_id=source_id)]
                 sources = {source_id: SimpleNamespace(
                     id=source_id, name="DataForge 示例审核数据", original_filename="builtin-reviewed-sample",
@@ -6955,7 +7134,8 @@ class V7Store:
         resource is discovered from infrastructure and then deleted by guess.
         """
         with self.sessions() as session:
-            keys = list(session.scalars(select(SourceVersion.object_key)))
+            blob_uris = list(session.scalars(select(SourceVersion.blob_uri)))
+            keys: list[str] = []
             keys.extend(
                 str(item.data_json.get("object_key")) for item in session.scalars(select(Artifact).where(Artifact.type_code.like("parser.%")))
                 if item.data_json.get("object_key")
@@ -6968,7 +7148,8 @@ class V7Store:
             for library in session.scalars(select(KnowledgeLibrary)):
                 for profile in self._index_profile_snapshots_for_library(session, library):
                     bindings.append({"collection_name": profile.collection_name, "partition_name": library.partition_name})
-            return {"object_keys": sorted(set(keys)), "partition_names": sorted(set(partitions)), "collections": collections,
+            return {"blob_uris": sorted(set(blob_uris)), "object_keys": sorted(set(keys)),
+                    "partition_names": sorted(set(partitions)), "collections": collections,
                     "partition_bindings": sorted(bindings, key=lambda item: (item["collection_name"], item["partition_name"]))}
 
     def rebuild_v7_database_state(self) -> dict[str, int]:
@@ -6976,7 +7157,7 @@ class V7Store:
         # Order is intentional for MySQL foreign keys.  Never issue DDL here.
         tables = (
             DebugRunFlowMaterialization, FlowRunSinkPreview, FlowRunEvent, FlowNodeArtifactBinding, ArtifactLineage, Artifact, FlowNodeRun,
-            KnowledgeItemSource, KnowledgeJobReviewInput, KnowledgeDispatch, SourceReviewSnapshotChunk,
+            KnowledgeAssetItem, KnowledgeItemSource, KnowledgeJobReviewInput, KnowledgeDispatch, SourceReviewSnapshotChunk,
             SourceChunkRevision, FlowRun, DebugRunReviewInput, DebugRunInputSnapshot,
             SourceReviewSnapshot, SourceChunk, SourceChunkSet, DocumentIR, SourcePreparationJob,
             FlowExecutionSnapshot, KnowledgeChunkGeneration,
@@ -7395,7 +7576,7 @@ class V7Store:
             ).all()
             return [{"id": link.id, "is_primary": link.is_primary, "evidence_text": link.evidence_text,
                      "anchor": link.anchor_json or {"label": link.source_anchor},
-                     "source": {"id": source.id, "name": source.name, "original_filename": source.original_filename},
+                     "source": {"id": source.id, "name": source.name, "original_filename": version.original_filename},
                      "source_version": {"id": version.id, "version_no": version.version_no, "sha256": version.sha256}}
                     for link, version, source in rows]
 
@@ -7772,6 +7953,7 @@ class V7Store:
                     index_profile_id=profile.id, total_count=count, asset_version_id=asset.id,
                 )
                 session.add(asset); session.add(job); assets.append(asset); jobs.append(job)
+                freeze_asset_items(session, asset, active_items)
             self.audit(session, "vector_sync.queued", "knowledge_library", library.id, {
                 "jobs": [item.id for item in jobs], "asset_versions": [item.id for item in assets],
             })
@@ -7808,7 +7990,14 @@ class V7Store:
                 raise ValueError("向量同步任务引用的已发布 Index Profile 不存在")
             embedding = session.get(EmbeddingProfile, profile.embedding_profile_id)
             storage_contract = session.get(StorageContractRevision, profile.storage_contract_revision_id) if profile.storage_contract_revision_id else None
-            items = session.scalars(select(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == library.id, KnowledgeItem.status == "active")).all()
+            items = vector_items(session, asset.id)
+            if len(items) != job.total_count:
+                raise ValueError("AssetVersion 冻结条目数量与向量任务不一致")
+            live_ids = set(session.scalars(select(KnowledgeItem.id).where(
+                KnowledgeItem.id.in_([item.id for item in items]), KnowledgeItem.status == "active",
+            )))
+            if library.status != "active" or len(live_ids) != len(items):
+                raise ValueError("候选资产的知识输入已撤回或删除，禁止重新写入向量")
             if job.asset_version_id and not asset:
                 raise ValueError("向量同步任务引用的 AssetVersion 不存在")
             return {"job": job, "library": library, "profile": profile, "embedding": embedding,
@@ -8277,6 +8466,7 @@ class V7Store:
                         continue
                     if asset.id in deleted:
                         asset.status = "deleted"
+                        session.execute(delete(KnowledgeAssetItem).where(KnowledgeAssetItem.asset_version_id == asset.id))
                     elif asset.status == "delete_pending":
                         asset.status, asset.error = "ready", error
                 return {"id": job.id, "status": job.status, "error": error}
@@ -8284,6 +8474,7 @@ class V7Store:
                 asset = session.get(KnowledgeAssetVersion, asset_id)
                 if asset:
                     asset.status = "deleted"
+                    session.execute(delete(KnowledgeAssetItem).where(KnowledgeAssetItem.asset_version_id == asset.id))
             job.status, job.error = "completed", None
             self.audit(session, "knowledge_asset_gc.completed", "knowledge_asset_gc_job", job.id,
                        {"deleted_asset_version_ids": deleted_ids})
@@ -8986,7 +9177,8 @@ class V7Store:
 
     def create_deployment_task(self, deployment_id: str, project_task_id: str, index_profile_id: str,
                                *, qa_embedding_mode: str | None = None, top_k: int = 10,
-                               enabled: bool = True) -> dict[str, Any]:
+                               enabled: bool = True, final_top_k: int | None = None,
+                               reranker_serving_code: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
             deployment = session.get(ProjectDeployment, deployment_id)
             task = session.get(ProjectTask, project_task_id)
@@ -9003,7 +9195,8 @@ class V7Store:
                 qa_embedding_mode = qa_embedding_mode or expected
             elif qa_embedding_mode is not None:
                 raise ValueError("非 QA 任务不能配置 qa_embedding_mode")
-            if top_k <= 0: raise ValueError("top_k 必须大于 0")
+            final_top_k = min(5, top_k) if final_top_k is None else final_top_k
+            self._validate_retrieval_settings(session, top_k, final_top_k, reranker_serving_code)
             existing = session.scalar(select(ProjectDeploymentTask).where(
                 ProjectDeploymentTask.project_deployment_id == deployment_id,
                 ProjectDeploymentTask.project_task_id == project_task_id,
@@ -9011,7 +9204,8 @@ class V7Store:
             if existing: raise ValueError("DeploymentTask 已存在")
             value = ProjectDeploymentTask(id=new_id("dtask"), project_deployment_id=deployment_id,
                                           project_task_id=project_task_id, index_profile_id=index_profile_id,
-                                          qa_embedding_mode=qa_embedding_mode, top_k=top_k, enabled=enabled)
+                                          qa_embedding_mode=qa_embedding_mode, top_k=top_k, enabled=enabled,
+                                          final_top_k=final_top_k, reranker_serving_code=reranker_serving_code)
             session.add(value); session.flush(); return self._deployment_task_payload(session, value)
 
     def _deployment_task_payload(self, session: Session, value: ProjectDeploymentTask) -> dict[str, Any]:
@@ -9021,7 +9215,33 @@ class V7Store:
                 "project_task_id": value.project_task_id, "task": self._task_payload(task) if task else None,
                 "index_profile_id": value.index_profile_id,
                 "index_profile": {"id": profile.id, "code": profile.code, "knowledge_type": profile.knowledge_type} if profile else None,
-                "qa_embedding_mode": value.qa_embedding_mode, "top_k": value.top_k, "enabled": value.enabled}
+                "qa_embedding_mode": value.qa_embedding_mode, "top_k": value.top_k, "enabled": value.enabled,
+                "final_top_k": value.final_top_k, "reranker_serving_code": value.reranker_serving_code}
+
+    @staticmethod
+    def _validate_retrieval_settings(session, top_k, final_top_k, reranker_serving_code):
+        if type(top_k) is not int or type(final_top_k) is not int or not 1 <= final_top_k <= top_k <= 200:
+            raise ValueError("检索数量必须满足 1 ≤ final_top_k ≤ top_k ≤ 200")
+        if reranker_serving_code is not None:
+            value = session.scalar(select(RerankerServing).where(RerankerServing.serving_code == reranker_serving_code))
+            if not value or not value.is_enabled:
+                raise ValueError("Reranker Serving 不存在或已停用")
+
+    def patch_deployment_task(self, deployment_id: str, task_id: str, changes: dict) -> dict:
+        with self.sessions.begin() as session:
+            value = session.get(ProjectDeploymentTask, task_id, with_for_update=True)
+            if not value or value.project_deployment_id != deployment_id:
+                raise LookupError("DeploymentTask 不存在")
+            settings = {key: changes.get(key, getattr(value, key))
+                        for key in ("top_k", "final_top_k", "reranker_serving_code")}
+            self._validate_retrieval_settings(session, **settings)
+            for key, item in settings.items():
+                setattr(value, key, item)
+            if "enabled" in changes:
+                value.enabled = changes["enabled"]
+            self.audit(session, "routing.task_updated", "project_deployment_task", value.id, settings)
+            session.flush()
+            return self._deployment_task_payload(session, value)
 
     def list_deployment_tasks(self, deployment_id: str) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -9209,6 +9429,14 @@ class V7Store:
                         "storage_spec_hash": contract.storage_spec_hash},
                 }
                 org_routes = []
+                reranker = session.scalar(select(RerankerServing).where(
+                    RerankerServing.serving_code == deployment_task.reranker_serving_code,
+                )) if deployment_task.reranker_serving_code else None
+                retrieval = {"final_top_k": deployment_task.final_top_k,
+                             "reranker_serving_code": deployment_task.reranker_serving_code,
+                             "reranker": None if not reranker else {
+                                 "serving_code": reranker.serving_code, "provider_type": reranker.provider_type,
+                                 "model_name": reranker.model_name}}
                 for route in session.scalars(select(ProjectOrgRoute).where(
                         ProjectOrgRoute.project_deployment_task_id == deployment_task.id,
                         ProjectOrgRoute.enabled.is_(True)).order_by(ProjectOrgRoute.org_code)):
@@ -9239,11 +9467,11 @@ class V7Store:
                                    "libraries": libraries}
                     org_routes.append(org_payload)
                     flat_routes.append({"task_code": task.code, "org_code": route.org_code,
-                                        "top_k": deployment_task.top_k, "libraries": libraries})
+                                        "top_k": deployment_task.top_k, "libraries": libraries, **retrieval})
                 tasks.append({"deployment_task_id": deployment_task.id, "task_id": task.id, "task_code": task.code,
                               "task_name": task.name, "knowledge_type": task.knowledge_type,
                               "qa_embedding_mode": deployment_task.qa_embedding_mode, "top_k": deployment_task.top_k,
-                              "index_profile": profile_payload, "org_routes": org_routes})
+                              "index_profile": profile_payload, "org_routes": org_routes, **retrieval})
             return {"schema": "dataforge.routing-snapshot.v7", "schema_version": 3,
                     "release_stage": release_stage,
                     "project": {"id": project.id, "code": project.code, "name": project.name},
@@ -9283,6 +9511,14 @@ class V7Store:
                 configuration_issues.append("Deployment 没有授权路由")
             for task in snapshot["tasks"]:
                 deployment_task = session.get(ProjectDeploymentTask, task["deployment_task_id"])
+                try:
+                    self._validate_retrieval_settings(session, task["top_k"], task["final_top_k"], task.get("reranker_serving_code"))
+                    add_check("RETRIEVAL.CONFIGURATION", True, subject={"task_code": task["task_code"]},
+                              message="检索数量及 Reranker 引用有效")
+                except ValueError as exc:
+                    configuration_issues.append(str(exc))
+                    add_check("RETRIEVAL.CONFIGURATION", False, subject={"task_code": task["task_code"]},
+                              message=str(exc))
                 profile = session.get(
                     KnowledgeIndexProfile, deployment_task.index_profile_id,
                 ) if deployment_task and deployment_task.index_profile_id else None
@@ -10045,6 +10281,10 @@ class V7Store:
             for task_payload in snapshot.get("tasks", []):
                 deployment_task = tasks.get(task_payload.get("deployment_task_id"))
                 if not deployment_task: raise ValueError("历史 RoutingSnapshot 引用的 DeploymentTask 不存在")
+                deployment_task.top_k = task_payload["top_k"]
+                deployment_task.final_top_k = task_payload.get("final_top_k", min(5, deployment_task.top_k))
+                deployment_task.reranker_serving_code = task_payload.get("reranker_serving_code")
+                deployment_task.enabled = True
                 for route in session.scalars(select(ProjectOrgRoute).where(
                         ProjectOrgRoute.project_deployment_task_id == deployment_task.id)):
                     session.delete(route)

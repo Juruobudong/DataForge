@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
 import StandardTechnicalFlow from './StandardTechnicalFlow.vue'
-import { dataflowOperators } from '../__tests__/flowFixtures'
+import { nativeQaOperator } from '../__tests__/flowFixtures'
 
 function projection(outputs) {
   const nodes = [{ node_id: 'input', code: 'reviewed-source-chunk-input', kind: 'operator', display_name_zh: '已审核文档块' }], edges = []
@@ -17,16 +17,16 @@ function projection(outputs) {
 }
 
 describe('Standard technical responsibilities', () => {
-  it('shows the actual upstream QA name in the chain and its detail', async () => {
+  it('shows the actual native QA name in the chain and its detail', async () => {
     const value = projection(['qa'])
     const generator = value.resolved_operators.find(node => node.code === 'generator')
-    Object.assign(generator, dataflowOperators[0], { node_id: generator.node_id })
+    Object.assign(generator, nativeQaOperator, { node_id: generator.node_id })
     const wrapper = mount(StandardTechnicalFlow, { props: { value } })
-    const node = wrapper.findAll('.operator-step').find(item => item.text().includes('Text2QAGenerator'))
-    expect(node.text()).toContain('文本转问答生成器')
-    expect(node.text()).toContain('Text2QAGenerator')
+    const node = wrapper.findAll('.operator-step').find(item => item.text().includes('QA Extractor'))
+    expect(node.text()).toContain('问答提取器')
+    expect(node.text()).toContain('QA Extractor')
     await node.trigger('click')
-    expect(wrapper.get('.operator-detail').text()).toContain('Text2QAGenerator · v6')
+    expect(wrapper.get('.operator-detail').text()).toContain('QA Extractor · qa-extractor · v1')
     wrapper.unmount()
   })
   it.each([['text'], ['qa'], ['graph:triple'], ['graph:semantic'], ['text', 'qa', 'graph:triple']])('projects %s without inventing runtime operators', (...outputs) => {

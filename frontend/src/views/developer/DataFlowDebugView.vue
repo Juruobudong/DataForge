@@ -22,7 +22,7 @@ const consoleEvents = computed(() => events.value.map(event => ({
 })))
 const error = ref(''), dagError = ref(''), loading = ref(false), actionBusy = ref(false), viewMode = ref('dag')
 const drawerOpen = ref(false), revisionKind = ref('draft'), debugOptions = ref(null), selectedReviewIds = ref([]), sinkBindings = ref({}), preflight = ref(null)
-const inputSource = ref('builtin_sample'), sampleCode = ref('reviewed-medical-v1')
+const inputSource = ref('builtin_sample'), sampleCode = ref('reviewed-medical-v2')
 const optionsLoading = ref(false), preflightLoading = ref(false)
 const preparationBusy = computed(() => actionBusy.value || optionsLoading.value || preflightLoading.value)
 let optionsVersion = 0, preflightVersion = 0
@@ -134,7 +134,7 @@ async function loadDebugOptions() {
     }
     debugOptions.value = options
     inputSource.value = debugOptions.value.default_input?.input_source || 'builtin_sample'
-    sampleCode.value = debugOptions.value.default_input?.sample_code || debugOptions.value.builtin_samples?.[0]?.code || 'reviewed-medical-v1'
+    sampleCode.value = debugOptions.value.default_input?.sample_code || debugOptions.value.builtin_samples?.[0]?.code || 'reviewed-medical-v2'
     selectedReviewIds.value = []
     sinkBindings.value = Object.fromEntries((debugOptions.value.sink_requirements || []).map(item => [item.output_key, '']))
   } catch (e) {

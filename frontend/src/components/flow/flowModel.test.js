@@ -175,7 +175,7 @@ test('capability-first grouping surfaces common capabilities and folds the rest 
     { code: 'disabled-op', name: 'Disabled', display_name_zh: '禁用算子', category: '知识生成', exposure: 'canvas', enabled: false, version: 3 },
   ]
   const result = groupOperatorCapabilities(catalog)
-  assert.deepEqual(result.common.map(item => item._label), ['问答生成', '文本生成', '实体关系抽取', '图谱校验'])
+  assert.deepEqual(result.common.map(item => item._label), ['上游两阶段问答生成', '文本生成', '实体关系抽取', '图谱校验'])
   assert.ok(result.common.every(item => item.version >= 3))
   assert.deepEqual(Object.keys(Object.fromEntries(result.groups)), ['质量治理'])
   assert.deepEqual(result.groups[0][1].map(item => item.code), ['artifact-merge'])

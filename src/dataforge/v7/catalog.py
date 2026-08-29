@@ -19,7 +19,13 @@ RENAMED_DATAFLOW_OPERATORS = {
     "prompted-refiner": ("PromptedRefiner",),
     "deduplicate": ("HashDeduplicateFilter", "MinHashDeduplicateFilter"),
 }
-DEFAULT_QA_EXTRACTION_INSTRUCTIONS = "基于审核原文提取有明确答案的问答，保持原文语言，不补充来源以外的信息。"
+DEFAULT_QA_EXTRACTION_INSTRUCTIONS = (
+    "仅基于审核通过的原文生成问答。"
+    "问题应清晰、具体且可独立理解，避免依赖上下文的模糊指代。"
+    "答案必须能够从原文直接得到或由原文明确归纳，不使用外部知识，不猜测或补充原文未提供的信息。"
+    "优先提取定义、事实、条件、步骤、规则、结论和数值等具有明确答案的知识。"
+    "答案保持原文语言，简洁但信息完整；文本不足以形成可靠问答时不生成。"
+)
 QA_EXTRACTION_SCHEMA = {
     "type": "string", "title": "QA 提取要求", "default": DEFAULT_QA_EXTRACTION_INSTRUCTIONS,
     "description": "填写提取主题、对象、问法和答案要求；空白使用通用提取规则。无匹配内容时正常产出零条问答。",
@@ -74,6 +80,7 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "deduplicate": "移除重复的候选知识",
     "prompt-generator": "按受控提示生成结构化知识",
     "qa-generator": "从来源文本块生成问答知识",
+    "qa-extractor": "基于业务要求从审核原文直接提取完整问答；DataForge 原生单阶段生成",
     "graph-extractor": "从来源文本块提取图谱知识",
     "entity-extractor": "识别文本中的实体候选",
     "relation-extractor": "识别实体之间的关系候选",
@@ -111,6 +118,7 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "text-normalizer": "文本规范器", "semantic-chunker": "结构化分块器", "source-chunk-builder": "来源切片构建器",
     "reviewed-source-chunk-input": "已审核来源切片",
     "text-knowledge-mapper": "文本知识映射器",
+    "qa-extractor": "问答提取器",
     "deduplicate": "候选去重器", "prompt-generator": "提示词生成器", "qa-generator": "问答生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
     "triple-builder": "三元组构建器", "entity-normalizer": "实体规范器", "semantic-relation-builder": "语义关系构建器",
@@ -306,7 +314,7 @@ DATAFLOW_CURATED_LOCK_DIGEST = "dcd3a3c0858ee2af3790255b435885fd50f5ef649fc18a6b
 def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[str]:
     if code in RETIRED_KNOWLEDGE_OPERATORS or code in RENAMED_DATAFLOW_OPERATORS or exposure == "internal" or source in {"source_file", "document_ir", "chunk_set"}:
         return ["system-internal"]
-    standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "Text2QAGenerator",
+    standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "Text2QAGenerator", "qa-extractor",
                 "entity-extractor", "literal-detector", "relation-extractor", "triple-builder",
                 "entity-normalizer", "semantic-relation-builder", "evidence-binder",
                 "schema-validator", "graph-quality-validator"}
@@ -526,6 +534,38 @@ for _item in CATALOG_SEEDS:
         }
         _item["parameter_docs"]["extraction_instructions"] = _item["parameter_schema"]["properties"]["extraction_instructions"]["description"]
 
+# A bounded endpoint repair belongs to a new relation execution version.
+from .graph_prompt import RELATION_REPAIR_VERSION
+
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "relation-extractor")
+for _item in CATALOG_SEEDS:
+    if _item["code"] == "relation-extractor":
+        _item["version"] = RELATION_REPAIR_VERSION
+        _item["runtime_requirements"] = {**_item["runtime_requirements"], "triple_endpoint_repair_attempts": 1}
+        _item["description"] = _item["summary"] = _item["description"] + "；Triple 未知实体端点最多重抽取一次，仍不合法则隔离整块；Semantic 不变。"
+
+# Separate provider identities; frozen v7 specifications remain unchanged.
+LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "Text2QAGenerator")
+for _item in CATALOG_SEEDS:
+    if _item["code"] == "Text2QAGenerator":
+        _item["version"] = 8
+        _item["adapter_code"] = _item["runtime_requirements"]["adapter_version"] = "source-chunk-to-qa-v4"
+        _item["parameter_schema"]["properties"].pop("extraction_instructions", None)
+        _item["parameter_docs"].pop("extraction_instructions", None)
+        _item["surfaces"] = ["advanced-canvas"]
+        _item["summary"] = _item["description"] = "上游两阶段生成：先生成提问方向，再生成问答；保留 RL 短答案提示词，不支持业务提取要求。"
+
+_native_qa = _entry("qa-extractor", "QA Extractor", "知识生成", "source_chunk_set", "candidate:qa", "native_qa_extractor",
+                    uses_llm=True, version=1, extra_params={
+                        "questions_per_chunk": {"schema": {"type": "integer", "title": "每块最多问题数", "minimum": 1, "maximum": 10, "default": 1}},
+                        "extraction_instructions": {"schema": deepcopy(QA_EXTRACTION_SCHEMA)},
+                    })
+_native_qa.update(provider="dataforge", subcategory="知识生成", surfaces=["standard-template", "advanced-canvas"])
+_native_qa["input_ports"]["input"]["accepted_types"] = ["source_chunk_set", "derived_text_set"]
+_native_qa["parameter_schema"]["properties"]["llm_serving"].pop("default", None)
+_native_qa["parameter_schema"]["required"] = []
+CATALOG_SEEDS += (_native_qa,)
+
 PLATFORM_RESERVED_OPERATOR_CODES = frozenset(
     {item["code"].casefold() for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)} | {"knowledge-sink"}
 )
@@ -549,7 +589,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
         {"id": "reviewed-input", "kind": "operator", "node_role": "flow_input", "ref": "reviewed-source-chunk-input"},
     ]
     edges: list[list[str]] = []
-    generators = {"text": "text-knowledge-mapper", "qa": "Text2QAGenerator", "graph": "graph-extractor"}
+    generators = {"text": "text-knowledge-mapper", "qa": "qa-extractor", "graph": "graph-extractor"}
     for raw_kind in output_types:
         kind = "graph:triple" if raw_kind == "graph" else raw_kind
         family, _, mode = kind.partition(":")
@@ -581,7 +621,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             generator_ref = "evidence-binder"
         if generator_ref in {"prompt-generator", "structured-knowledge-generator"}:
             generator_params["prompt_template_revision_id"] = "promptrev_default"
-        if generator_ref in {"prompt-generator", "Text2QAGenerator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+        if generator_ref in {"prompt-generator", "qa-extractor", "Text2QAGenerator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
             generator_params["llm_serving"] = DEFAULT_LLM_SERVING_ID
         nodes.extend(graph_prefix)
         nodes.extend((

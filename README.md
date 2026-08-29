@@ -1,6 +1,6 @@
 # DataForge V7
 
-DataForge V7 是医疗文档知识生产与发布平台。本文件只提供开发、运行和验证入口；系统事实见 [Architecture](docs/architecture/overview.md)，能力完成度见 [Capability Matrix](V7-CAPABILITY-MATRIX.md)。
+DataForge V7 是通用文档处理、知识生产与发布平台，支持从跨领域资料生成可追溯的文本、问答、图谱及扩展类型知识。医疗实体预设、医院 Deployment 与医疗业务接入是可选领域能力，不构成平台的默认边界。本文件只提供开发、运行和验证入口；系统事实见 [Architecture](docs/architecture/overview.md)，能力完成度见 [Capability Matrix](V7-CAPABILITY-MATRIX.md)。
 
 ## 环境要求
 

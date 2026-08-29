@@ -3,6 +3,7 @@ import { computed } from 'vue'
 import { api } from '../../api/platform'
 import DocxSourcePreview from './DocxSourcePreview.vue'
 import PdfSourcePreview from './PdfSourcePreview.vue'
+import StructuredSourcePreview from './StructuredSourcePreview.vue'
 
 const props = defineProps({ source: Object, version: Object, documentIr: Object, selectedAnchor: Object })
 const isPdf = computed(() => (props.source?.original_filename || '').toLowerCase().endsWith('.pdf'))
@@ -14,7 +15,7 @@ const previewUrl = computed(() => isPdf.value && props.source?.id && props.versi
   <section class="source-preview">
     <PdfSourcePreview v-if="isPdf && previewUrl" :url="previewUrl" :anchor="selectedAnchor || {}" />
     <DocxSourcePreview v-else-if="isDocx" :document-ir="documentIr || {}" :anchor="selectedAnchor || {}" />
-    <pre v-else>{{ documentIr?.text || '解析完成后将在此显示结构化原文。' }}</pre>
+    <StructuredSourcePreview v-else :document-ir="documentIr || {}" :anchor="selectedAnchor || {}" />
   </section>
 </template>
 

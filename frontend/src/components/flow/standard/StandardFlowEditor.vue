@@ -51,9 +51,9 @@ function updateStage(stageCode, value) { stageConfig.value.stages[stageCode] = {
         <template v-else-if="stage.code === 'mapping'"><h3>文本知识映射</h3><p>审核正文直接映射为文本知识，保留原文和来源，不调用模型。</p></template>
         <template v-else-if="stage.code === 'generation'">
           <h3>知识生成</h3>
-          <p v-for="operator in (stage.operators || []).filter(item => item.provider === 'dataflow')" :key="operator.node_id" class="stage-operator"><b>{{ operatorPrimaryName(operator) }}</b><small>{{ operatorSubtitle(operator) }}</small></p>
+          <p v-for="operator in (stage.operators || []).filter(item => item.provider === 'dataflow' || item.code === 'qa-extractor')" :key="operator.node_id" class="stage-operator"><b>{{ operatorPrimaryName(operator) }}</b><small>{{ operatorSubtitle(operator) }}</small></p>
           <div v-if="stage.configurable && stage.config_schema" class="config-sections"><section><h4>{{ stage.name }}</h4><OperatorParameterForm :key="`${managedCode}:${template?.id || 'new'}`" :schema="stage.config_schema" :model-value="configOf(stage.code)" @update:model-value="updateStage(stage.code,$event)" /></section></div>
-          <small v-if="managedCode === 'standard-qa' || managedCode === 'standard-multi'">QA 提取要求用于两阶段问答生成；输出格式和来源由系统维护。没有匹配内容时产出零条，重跑会按 Diff 撤销该切片旧问答。要求随流程版本冻结。</small>
+          <small v-if="managedCode === 'standard-qa' || managedCode === 'standard-multi'">DataForge 原生问答提取器根据业务要求直接生成完整问答；输出格式和来源由系统维护。没有匹配内容时产出零条，要求随流程版本冻结。高级编排可另选 DataFlow 上游两阶段生成器。</small>
           <small v-else>图谱 Prompt 由系统根据目标和 Schema 生成。</small>
         </template>
         <template v-else-if="stage.code === 'quality'"><h3>图谱校验</h3><div class="checks"><span>✓ Graph Schema</span><span>✓ Graph Quality</span></div><p>仅校验图谱分支的实体、关系和 Evidence；硬失败阻止该分支提交。</p></template>

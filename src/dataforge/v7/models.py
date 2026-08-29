@@ -49,7 +49,6 @@ class Source(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_library_id: Mapped[str] = mapped_column(ForeignKey("document_libraries.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
     relative_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     relative_path_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     directory_path: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
@@ -62,14 +61,19 @@ class Source(Timestamped, Base):
 
 class SourceVersion(Timestamped, Base):
     __tablename__ = "source_versions"
-    __table_args__ = (UniqueConstraint("source_id", "version_no", name="uq_source_version_number"),)
+    __table_args__ = (
+        UniqueConstraint("source_id", "version_no", name="uq_source_version_number"),
+        UniqueConstraint("source_id", "sha256", name="uq_source_version_sha256"),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"), nullable=False, index=True)
     version_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    object_key: Mapped[str] = mapped_column(String(768), nullable=False, unique=True)
+    blob_uri: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(255), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(512), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     extraction_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
     extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -78,6 +82,16 @@ class SourceVersion(Timestamped, Base):
     current_review_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     active_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     candidate_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+@event.listens_for(SourceVersion, "before_update")
+def _protect_source_version_content(_mapper, _connection, target: SourceVersion) -> None:
+    """Keep content identity immutable while allowing lifecycle state transitions."""
+    state = inspect(target)
+    immutable = ("source_id", "version_no", "blob_uri", "sha256", "size_bytes", "media_type", "original_filename")
+    changed = [name for name in immutable if state.attrs[name].history.has_changes()]
+    if changed:
+        raise ValueError(f"SourceVersion 内容字段不可修改：{', '.join(changed)}")
 
 
 class DocumentIR(Timestamped, Base):
@@ -205,11 +219,14 @@ class SourceChunkSet(Timestamped, Base):
 
 class KnowledgeDispatch(Timestamped, Base):
     __tablename__ = "knowledge_dispatches"
-    __table_args__ = (UniqueConstraint("source_review_snapshot_id", name="uq_knowledge_dispatch_snapshot"),)
+    __table_args__ = (UniqueConstraint(
+        "source_review_snapshot_id", "activation_no", name="uq_knowledge_dispatch_snapshot_activation"
+    ),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_review_snapshot_id: Mapped[str] = mapped_column(
         ForeignKey("source_review_snapshots.id"), nullable=False, index=True
     )
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -253,7 +270,7 @@ class DocumentLibraryProcessingRecord(Timestamped, Base):
     __tablename__ = "document_library_processing_records"
     __table_args__ = (UniqueConstraint(
         "document_library_template_binding_id", "source_version_id", "knowledge_flow_template_revision_id",
-        "source_review_snapshot_id", name="uq_doc_processing_review_revision",
+        "source_review_snapshot_id", "activation_no", name="uq_doc_processing_review_activation",
     ),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_library_template_binding_id: Mapped[str] = mapped_column(ForeignKey("document_library_template_bindings.id"), nullable=False, index=True)
@@ -262,6 +279,7 @@ class DocumentLibraryProcessingRecord(Timestamped, Base):
     source_review_snapshot_id: Mapped[str | None] = mapped_column(
         ForeignKey("source_review_snapshots.id"), nullable=True, index=True
     )
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
 
 
@@ -433,6 +451,7 @@ class KnowledgeJobReviewInput(Timestamped, Base):
         ForeignKey("source_review_snapshots.id"), nullable=False, index=True
     )
     review_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
 
 class KnowledgeLibraryWorkLease(Timestamped, Base):
@@ -777,6 +796,7 @@ class DebugRunReviewInput(Timestamped, Base):
     source_review_snapshot_id: Mapped[str] = mapped_column(
         ForeignKey("source_review_snapshots.id"), nullable=False, index=True
     )
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     review_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
 
@@ -964,6 +984,29 @@ class EmbeddingServing(Timestamped, Base):
     last_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class RerankerServing(Timestamped, Base):
+    __tablename__ = "reranker_servings"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    serving_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    credential_configured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    credential_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
+    max_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    max_batch_size: Mapped[int] = mapped_column(Integer, default=32, nullable=False)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    last_check_status: Mapped[str] = mapped_column(String(64), default="not_checked", nullable=False)
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class EmbeddingProfile(Timestamped, Base):
     __tablename__ = "embedding_profiles"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1122,6 +1165,20 @@ class KnowledgeAssetVersion(Timestamped, Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class KnowledgeAssetItem(Timestamped, Base):
+    """Immutable content and evidence used to build one physical asset."""
+    __tablename__ = "knowledge_asset_items"
+    __table_args__ = (UniqueConstraint("asset_version_id", "source_knowledge_id", name="uq_asset_item_source"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    asset_version_id: Mapped[str] = mapped_column(ForeignKey("knowledge_asset_versions.id"), nullable=False, index=True)
+    knowledge_item_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_knowledge_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    canonical_content: Mapped[str] = mapped_column(Text, nullable=False)
+    data_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+
+
 class VectorRecordState(Timestamped, Base):
     __tablename__ = "vector_record_states"
     __table_args__ = (UniqueConstraint("knowledge_item_id", "index_profile_id", name="uq_vector_item_profile"),)
@@ -1166,6 +1223,7 @@ class DocumentDeletionJob(Timestamped, Base):
     source_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     document_library_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     object_keys: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    blob_uris: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
     lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -1259,6 +1317,8 @@ class ProjectDeploymentTask(Timestamped, Base):
     index_profile_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_index_profiles.id"), nullable=True, index=True)
     qa_embedding_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     top_k: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    final_top_k: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    reranker_serving_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
 
 

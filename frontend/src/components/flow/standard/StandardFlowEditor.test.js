@@ -12,7 +12,7 @@ beforeEach(() => {
   api.graphEntityTypes.mockResolvedValue(entityTypeCatalog)
   api.resolveStandardFlow.mockResolvedValue({ resolved_operators: [
     { node_id: 'input', kind: 'operator', code: 'reviewed-source-chunk-input', display_name_zh: '已审核来源切片', name: 'Reviewed SourceChunk Input', version: 3, provider: 'dataforge', input_ports: {}, output_ports: { output: { artifact_type: 'source_chunk_set' } }, parameters: {}, locked: true },
-    { node_id: 'qa', kind: 'operator', code: 'Text2QAGenerator', display_name_zh: '问答生成器', name: 'QA Generator', version: 5, provider: 'dataflow', stage_label: '问答生成', uses_llm: true, input_ports: { input: { artifact_type: 'source_chunk_set' } }, output_ports: { output: { artifact_type: 'candidate:qa' } }, parameters: { questions_per_chunk: 1 }, output_key: 'qa', locked: true },
+    { node_id: 'qa', kind: 'operator', code: 'qa-extractor', display_name_zh: '问答生成器', name: 'QA Extractor', version: 1, provider: 'dataforge', stage_label: '问答生成', uses_llm: true, input_ports: { input: { artifact_type: 'source_chunk_set' } }, output_ports: { output: { artifact_type: 'candidate:qa' } }, parameters: { questions_per_chunk: 1 }, output_key: 'qa', locked: true },
     { node_id: 'sink', kind: 'knowledge_sink', code: 'knowledge-sink', display_name_zh: '知识输出', name: 'Knowledge Sink', version: 1, provider: 'dataforge', input_ports: {}, output_ports: {}, parameters: {}, output_key: 'qa', locked: true },
   ], edges: [{ source: 'input', target: 'qa' }, { source: 'qa', target: 'sink' }], issues: [] })
 })
@@ -79,14 +79,14 @@ describe('Standard business stages follow the managed contract', () => {
     expect(api.resolveStandardFlow.mock.calls.at(-1)[0]).not.toHaveProperty('output_types')
     expect(wrapper.findAll('.operator-step')).toHaveLength(3)
     await wrapper.findAll('.operator-step')[1].trigger('click')
-    expect(wrapper.get('[aria-label="算子详情"]').text()).toMatch(/DataFlow.*使用 LLM/s)
+    expect(wrapper.get('[aria-label="算子详情"]').text()).toMatch(/DataForge.*使用 LLM/s)
     expect(wrapper.text()).not.toMatch(/删除算子|替换算子|添加分支/)
   })
 
   it.each(['standard-qa', 'standard-multi'])('%s saves and reloads multiline extraction instructions', async code => {
     await render(code)
-    expect(wrapper.get('.stage-operator').text()).toContain('文本转问答生成器')
-    expect(wrapper.get('.stage-operator').text()).toContain('Text2QAGenerator')
+    expect(wrapper.get('.stage-operator').text()).toContain('问答提取器')
+    expect(wrapper.get('.stage-operator').text()).toContain('QA Extractor')
     const requirements = '只提取就诊准备事项\n使用患者口吻，保留原文条件。'
     await wrapper.get('textarea[aria-label="QA 提取要求"]').setValue(requirements)
     const definition = wrapper.emitted('update:definition').at(-1)[0]

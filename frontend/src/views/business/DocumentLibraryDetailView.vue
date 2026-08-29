@@ -7,7 +7,7 @@ import { documentProductionStage, reviewActionLabel } from './documentReviewMode
 const route = useRoute(), router = useRouter(), libraryId = route.params.libraryId
 const library = ref(null), tree = ref({ children: [] }), listing = ref({ items: [], total: 0 }), selectedPath = ref(null)
 const keyword = ref(''), status = ref(''), fileType = ref(''), page = ref(1), selectedSources = ref([])
-const queued = ref([]), preview = ref(null), results = ref([]), error = ref(''), dragging = ref(false), duplicatePolicy = ref('skip'), bindings = ref([]), templates = ref([]), templateIds = ref([]), bindingTemplates = ref(false)
+const queued = ref([]), preview = ref(null), results = ref([]), error = ref(''), notice = ref(''), dragging = ref(false), duplicatePolicy = ref('skip'), bindings = ref([]), templates = ref([]), templateIds = ref([]), bindingTemplates = ref(false)
 const directoryInput = ref(null), fileInput = ref(null), replaceInput = ref(null), replaceTarget = ref(null)
 const files = computed(() => listing.value.items || [])
 const hasActiveBinding = computed(() => bindings.value.some(item => item.status === 'active'))
@@ -103,7 +103,20 @@ async function upload() {
     const pool = [...batches], workers = Array.from({ length: Math.min(3, pool.length) }, async () => {
       while (pool.length) { const batch = pool.shift(); const form = new FormData(); batch.forEach(item => form.append('files', item.file)); form.append('manifest', JSON.stringify(batch.map(item => ({ relative_path: item.relative_path, size_bytes: item.file.size })))); form.append('duplicate_policy', policy); const response = await api.importSources(libraryId, form); results.value.push(...response.results) }
     })
-    await Promise.all(workers); queued.value = []; preview.value = null; await load()
+    await Promise.all(workers)
+    const confirmations = results.value.filter(item => item.status === 'confirmation_required' && item.source?.reactivation_version)
+    if (confirmations.length && confirm(`${confirmations.length} 个文件内容命中历史版本。确认重新启用历史版本且不创建新版本吗？`)) {
+      const activated = []
+      for (const item of confirmations) {
+        const result = await api.reactivateSourceVersion(
+          item.source.id, item.source.reactivation_version.id, item.source.expected_current_version_id,
+        )
+        activated.push(result.notice)
+        item.status = 'reactivated'
+      }
+      notice.value = activated.join('；')
+    }
+    queued.value = []; preview.value = null; await load()
   } catch (e) { error.value = e.message }
 }
 
@@ -117,7 +130,23 @@ function chooseReplace(source) { replaceTarget.value = source; replaceInput.valu
 async function replaceFile(event) {
   const file = event.target.files?.[0]; event.target.value = ''
   if (!file || !replaceTarget.value) return
-  try { const form = new FormData(); form.append('file', file); await api.replaceSource(replaceTarget.value.id, form); replaceTarget.value = null; await load() } catch (e) { error.value = e.message }
+  try {
+    const target = replaceTarget.value, form = new FormData(); form.append('file', file)
+    const result = await api.replaceSource(target.id, form)
+    notice.value = result.version_action === 'unchanged' ? '文件内容与当前版本相同，未创建新版本。' : '已创建新的文件版本。'
+    replaceTarget.value = null; await load()
+  } catch (e) {
+    const problem = e.problem
+    if (e.status === 409 && problem?.code === 'SOURCE_VERSION_REACTIVATION_REQUIRED' &&
+        confirm(`该内容已存在于 v${problem.reactivation_version.version_no}。确认重新启用该历史版本且不创建新版本吗？`)) {
+      try {
+        const result = await api.reactivateSourceVersion(
+          replaceTarget.value.id, problem.reactivation_version.id, problem.expected_current_version_id,
+        )
+        notice.value = result.notice; replaceTarget.value = null; await load()
+      } catch (reactivationError) { error.value = reactivationError.message }
+    } else error.value = e.message
+  }
 }
 async function hardDelete() {
   if (!selectedSources.value.length) return
@@ -138,9 +167,10 @@ onMounted(load)
 <template>
   <section>
     <div class="page-head"><div><button @click="router.push('/business/documents')">← 文档库</button><h2>{{ library?.name || '文档库文件' }}</h2><p>上传后自动解析与分块；人工审核通过后，系统自动运行已绑定知识模板。</p></div><div class="page-actions"><button @click="fileInput?.click()">上传文件</button><button class="primary" @click="directoryInput?.click()">上传文件夹</button></div></div>
-    <input ref="fileInput" class="sr-only" type="file" multiple accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt" @change="chooseFiles">
-    <input ref="directoryInput" class="sr-only" type="file" multiple webkitdirectory accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt" @change="chooseFolder">
-    <input ref="replaceInput" class="sr-only" type="file" accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt" @change="replaceFile">
+    <input ref="fileInput" class="sr-only" type="file" multiple accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="chooseFiles">
+    <input ref="directoryInput" class="sr-only" type="file" multiple webkitdirectory accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="chooseFolder">
+    <input ref="replaceInput" class="sr-only" type="file" accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="replaceFile">
+    <p v-if="notice" role="status" aria-live="polite" class="copy-notice">{{ notice }}</p>
     <div class="document-browser"><aside class="panel directory-tree"><b>目录</b><button :class="{ active: selectedPath === null }" @click="selectedPath=null; page=1; load()">▾ 全部文件</button><button v-for="node in flatTree" :key="node.path" :class="{ active: selectedPath === node.path }" :style="{ paddingLeft: `${12 + node.depth * 16}px` }" @click="selectedPath=node.path; page=1; load()">▸ {{ node.name }} <small>{{ node.file_count }}</small></button></aside>
       <div class="panel file-area" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop="onDrop"><div class="actions"><input v-model="keyword" placeholder="搜索文件" @keyup.enter="page=1; load()"><select v-model="status" @change="page=1; load()"><option value="">全部状态</option><option value="uploaded">已上传</option><option value="deleted">已删除</option></select><select v-model="fileType" @change="page=1; load()"><option value="">全部格式</option><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="xlsx">XLSX</option></select><button @click="load">刷新 / 筛选</button><span class="badge amber">已选当前页 {{ selectedSources.length }} 个</span><button class="danger" :disabled="!selectedSources.length" @click="hardDelete">彻底删除</button></div><div v-if="dragging" class="drop-zone">拖拽文件或文件夹到此处</div><div v-else-if="!files.length" class="drop-zone">拖拽文件或文件夹到此处，或使用顶部上传入口</div><table><thead><tr><th><input type="checkbox" :checked="allPageSourcesSelected" :disabled="!files.length" aria-label="全选当前页文件" @click.stop @change="toggleAllPageSources"> 全选当前页</th><th>名称</th><th>类型</th><th>生产阶段</th><th>Chunk</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="source in files" :key="source.id" class="source-row" tabindex="0" @click="openReviewWorkbench(source)" @keydown.enter="openReviewWorkbench(source)"><td @click.stop><input v-model="selectedSources" type="checkbox" :value="source.id"></td><td><b>{{ source.original_filename }}</b><small>{{ source.relative_path }}</small></td><td>{{ source.original_filename.split('.').pop()?.toUpperCase() }}</td><td><span class="badge" :class="source.version?.review_status === 'approved' ? 'green' : source.version?.preparation_status === 'failed' || source.version?.review_status === 'rejected' ? 'red' : 'amber'">{{ stageLabel(source) }}</span></td><td>{{ source.version?.preparation_status === 'completed' ? source.version?.chunk_count || 0 : '—' }}</td><td>{{ source.updated_at }}</td><td><button class="primary" @click.stop="openReviewWorkbench(source)">{{ reviewActionLabel(source) }}</button><button @click.stop="chooseReplace(source)">替换</button><a :href="api.sourceDownloadUrl(source.id, source.version?.id)" @click.stop>下载</a></td></tr></tbody></table><p>共 {{ listing.total }} 个文件；全选仅作用于当前页。</p></div></div>
     <section class="panel">

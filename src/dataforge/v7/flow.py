@@ -597,7 +597,7 @@ class FlowCompiler:
                     raise FlowValidationError("schema-validator 仅支持 Graph Candidate")
                 params.setdefault("knowledge_type", "graph")
                 params.setdefault("graph_mode", source_types[0].split(":")[2])
-            if code == "Text2QAGenerator" and item.get("version") in {6, 7}:
+            if code == "qa-extractor" or (code == "Text2QAGenerator" and item.get("version") in {6, 7}):
                 instructions = params.get("extraction_instructions", "")
                 if not isinstance(instructions, str):
                     raise FlowValidationError("QA 提取要求必须是字符串")

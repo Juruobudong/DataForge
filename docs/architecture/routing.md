@@ -50,3 +50,7 @@ RouteVersion 按 `(project_deployment_id, release_stage)` 独立编号。冻结�
 - 实现：`src/dataforge/v7/routing.py`、`routing_delivery.py`、`store.py`、`web.py`，以及 qa_agent 的 DataForge Routing 客户端。
 - 详细事实：[`wiki/pages/deployment-and-migration.md`](../../wiki/pages/deployment-and-migration.md)、[`wiki/pages/domain-model.md`](../../wiki/pages/domain-model.md)。
 - 决策：[ADR-003 RoutingSnapshot](../adr/ADR-003-routing-snapshot.md)。
+
+## 检索调试扩展（2026-08-28）
+
+任务的 final_top_k、reranker_serving_code 及重排模型身份增量冻结到 Snapshot v3；现有消费端字段不变。管理员检索调试复用授权边界，Draft 只生成内存快照，Published/Historical 只读取指定快照；检索执行不写 Routing/Asset/Milvus。正文与 Evidence 使用 knowledge_asset_items，Query Embedding 使用资产冻结的模型/维度；临时覆盖不保存。中心到机构仍仅解析 Routing。详见 [实施基线](../../wiki/sources/reranker-retrieval-debug-2026-08-28.md)。

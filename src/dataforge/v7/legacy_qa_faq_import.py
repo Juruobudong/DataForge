@@ -421,18 +421,17 @@ def _ensure_document_source(store: V7Store, objects, org_code: str, payload: byt
         source_payload = {"id": source.id, "current_version_id": current.id, "sha256": current.sha256}
         changed = False
     else:
-        key = f"legacy-import/qa-agent-faq/{org_code}/{sha256}.csv"
-        stored = objects.put_bytes(key, payload, "text/csv; charset=utf-8")
+        stored = objects.put_blob(payload, "text/csv")
         if source:
             source_payload = store.replace_source(
-                source_id=source.id, filename=filename, object_key=stored.key,
-                sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="text/csv",
+                source_id=source.id, filename=filename, blob_uri=stored.blob_uri,
+                sha256=stored.sha256, size_bytes=stored.size_bytes, media_type="text/csv",
             )
         else:
             source_payload = store.create_source(
                 library_id=library_id, name=f"FAQ {org_code}", filename=filename,
-                object_key=stored.key, sha256=stored.sha256, size_bytes=stored.size_bytes,
-                mime_type="text/csv", metadata={"org_code": org_code, "legacy_collection": FAQ_SOURCE_COLLECTION},
+                blob_uri=stored.blob_uri, sha256=stored.sha256, size_bytes=stored.size_bytes,
+                media_type="text/csv", metadata={"org_code": org_code, "legacy_collection": FAQ_SOURCE_COLLECTION},
                 relative_path=filename,
             )
         changed = True

@@ -32,6 +32,6 @@ test('standard authoring is business configuration while advanced and runtime DA
 test('preprocessing and debug default to versioned builtin samples', () => {
   assert.match(preprocessing, /preprocessing-document-v1/)
   assert.match(preprocessing, /previewSourcePreparation/)
-  assert.match(debug, /reviewed-medical-v1/)
+  assert.match(debug, /reviewed-medical-v2/)
   assert.match(debug, /虚拟空库 Diff/)
 })

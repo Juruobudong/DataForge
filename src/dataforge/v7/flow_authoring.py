@@ -90,7 +90,7 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
         _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
-        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("Text2QAGenerator",)),
+        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-extractor",)),
         _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
@@ -109,7 +109,7 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph:triple"), stages=(
         _INPUT_STAGE, _TEXT_MAPPING_STAGE,
         _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_QA_CONFIG_SCHEMA["properties"]}},
-                    operator_refs=("Text2QAGenerator", "entity-extractor", "literal-detector",
+                    operator_refs=("qa-extractor", "entity-extractor", "literal-detector",
                                    "relation-extractor", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
@@ -285,9 +285,9 @@ class ManagedFlowCompiler:
             params = node.setdefault("params", {})
             if "llm_serving" in config and "llm_serving" in params:
                 params["llm_serving"] = config["llm_serving"]
-            if ref == "Text2QAGenerator" and "questions_per_chunk" in config:
+            if ref == "qa-extractor" and "questions_per_chunk" in config:
                 params["questions_per_chunk"] = config["questions_per_chunk"]
-            if ref == "Text2QAGenerator" and "extraction_instructions" in config:
+            if ref == "qa-extractor" and "extraction_instructions" in config:
                 params["extraction_instructions"] = config["extraction_instructions"]
             if ref == "prompt-generator" and "prompt_template_revision_id" in config:
                 params["prompt_template_revision_id"] = config["prompt_template_revision_id"]

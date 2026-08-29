@@ -9,6 +9,11 @@ export function serviceStatus(item) {
 }
 
 export function blankServiceForm(kind) {
+  if (kind === 'reranker') return {
+    serving_code: '', name: '', provider_type: 'cohere-compatible-rerank', model_name: '',
+    base_url: '', api_key: '', timeout_seconds: 120, max_retries: 2,
+    max_batch_size: 32, max_concurrency: 4, is_enabled: true, clear_credential: false,
+  }
   return kind === 'model'
     ? { serving_code: '', name: '', serving_type: 'openai-compatible-chat', model_name: '', base_url: '', api_key: '', timeout_seconds: 120, max_retries: 2, max_tokens: 16384, disable_thinking: true, is_enabled: true, clear_credential: false }
     : { serving_code: '', name: '', provider_type: 'openai-compatible-embedding', model_name: '', base_url: '', api_key: '', dimension: 768, batch_size: 32, timeout_seconds: 120, max_retries: 2, is_enabled: true, clear_credential: false }
@@ -26,5 +31,6 @@ export function editServiceForm(item, kind) {
   delete form.updated_at
   delete form.is_default
   delete form.id
+  delete form.category
   return form
 }

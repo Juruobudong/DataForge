@@ -42,7 +42,7 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
         <label><input type="checkbox" :checked="allEntities()" :disabled="disabled" @change="subset([], $event.target.checked ? 'all' : 'subset')"> 使用全部已定义类型</label>
         <select v-if="!allEntities() && entityTypes.length" multiple aria-label="实体类型子集" :disabled="disabled" :value="modelValue.entity_types || []" @change="subset([...$event.target.selectedOptions].map(option => option.value))"><option v-for="item in entityTypes" :key="item.code" :value="item.code">{{ item.label }}</option></select>
         <small v-if="!allEntities() && !(modelValue.entity_types || []).length">未选择类型，此节点不抽取实体。</small>
-        <small>类型定义与医疗预设在流程的“图谱抽取配置”中维护。</small>
+        <small>类型定义与领域预设在流程的“图谱抽取配置”中维护；医疗是当前可选预设之一。</small>
       </section>
       <ServingSelector v-else-if="widget(spec)==='llm-serving-selector'" :model-value="modelValue[name] || ''" :disabled="disabled" @update:model-value="patch(name,$event)" />
       <PromptRevisionSelector v-else-if="widget(spec)==='prompt-template-selector'" :model-value="modelValue[name] || ''" :knowledge-type="modelValue.knowledge_type || ''" :disabled="disabled" @update:model-value="patch(name,$event)" />

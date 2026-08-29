@@ -48,6 +48,43 @@ async function loadPage() {
 function changePage(delta) { pages.value = { ...pages.value, [selectedId.value]: Math.max(0, (page.value?.offset || 0) + delta * RESULT_PAGE_SIZE) } }
 function selectOutput(id) { outputChosen = true; selectedId.value = id }
 function sourceLabel(item) { return item.source_anchor || item.anchor_json?.label || item.source_chunk_id || '来源未记录' }
+function recorded(value) {
+  if (Array.isArray(value)) return value.length ? value.join('、') : '未记录'
+  return value === undefined || value === null || value === '' ? '未记录' : String(value)
+}
+function sourceFile(item) {
+  const anchor = item.anchor_json || {}
+  const sourceAnchor = typeof item.source_anchor === 'string' ? item.source_anchor.split('#')[0] : ''
+  return recorded(item.data_json?.filename || anchor.file || sourceAnchor)
+}
+function chunkPosition(item) {
+  const anchor = item.anchor_json || {}
+  const parts = []
+  const rawIndex = item.data_json?.chunk_index ?? anchor.chunk_index
+  if (rawIndex !== undefined && rawIndex !== null && rawIndex !== '' && Number.isInteger(Number(rawIndex))) {
+    parts.push(`第 ${Number(rawIndex) + 1} 个切片`)
+  }
+  const pages = [anchor.page, ...(anchor.positions || []).map(position => position?.page)]
+    .filter(value => value !== undefined && value !== null && value !== '')
+  const distinctPages = [...new Set(pages.map(String))]
+  if (distinctPages.length) parts.push(`第 ${distinctPages.join('、')} 页`)
+  if (anchor.section) parts.push(`章节：${anchor.section}`)
+  return parts.length ? parts.join(' · ') : '未记录'
+}
+function isBuiltinSample() { return props.run?.input_context?.input_source === 'builtin_sample' }
+function auditSummary(item) {
+  const context = props.run?.input_context || {}
+  if (context.input_source === 'builtin_sample') {
+    const version = context.sample_version ? ` · v${context.sample_version}` : ''
+    return `内置审核示例${version} · 已审核`
+  }
+  return item.source_review_snapshot_id ? '业务审核快照' : '未记录'
+}
+function lineageValue(item, key) {
+  if (item[key]) return recorded(item[key])
+  return isBuiltinSample() && ['source_chunk_revision_id', 'source_review_snapshot_id'].includes(key)
+    ? '不适用（内置审核示例）' : '未记录'
+}
 function pretty(value) { return JSON.stringify(value ?? {}, null, 2) }
 function semanticDetails(data) {
   return [
@@ -113,6 +150,17 @@ function semanticDetails(data) {
                 </dl>
                 <dl v-else-if="selected.key === 'graph:semantic'"><template v-for="[label, value] in semanticDetails(item.data_json || {})" :key="label"><dt>{{ label }}</dt><dd>{{ value ?? '—' }}</dd></template></dl>
                 <div v-else-if="!['text', 'qa'].includes(selected.key)"><h4>结构化字段</h4><pre>{{ pretty(item.data_json) }}</pre></div>
+                <h4>来源与审核</h4>
+                <dl class="provenance-details">
+                  <dt>知识标识</dt><dd>{{ recorded(item.source_knowledge_id) }}</dd>
+                  <dt>来源文件</dt><dd>{{ sourceFile(item) }}</dd>
+                  <dt>切片位置</dt><dd>{{ chunkPosition(item) }}</dd>
+                  <dt>来源版本</dt><dd>{{ recorded(item.source_version_ids) }}</dd>
+                  <dt>切片标识</dt><dd>{{ recorded(item.source_chunk_id) }}</dd>
+                  <dt>切片修订</dt><dd>{{ lineageValue(item, 'source_chunk_revision_id') }}</dd>
+                  <dt>审核信息</dt><dd>{{ auditSummary(item) }}</dd>
+                  <dt>审核快照</dt><dd>{{ lineageValue(item, 'source_review_snapshot_id') }}</dd>
+                </dl>
                 <h4>原文证据</h4><p>{{ item.evidence_text || '原文证据未记录' }}</p>
                 <h4>来源锚点</h4><pre>{{ pretty(item.anchor_json) }}</pre>
                 <details><summary>技术标识与原始 JSON</summary><pre>{{ pretty(item) }}</pre></details>
@@ -120,7 +168,7 @@ function semanticDetails(data) {
             </template></tbody>
           </table>
         </div>
-        <footer class="pagination"><button :disabled="page.offset === 0" @click="changePage(-1)">上一页</button><span>第 {{ Math.floor(page.offset / RESULT_PAGE_SIZE) + 1 }} 页 · 共 {{ page.total }} 条</span><button :disabled="!page.has_more" @click="changePage(1)">下一页</button></footer>
+        <footer class="pagination"><button :disabled="page.offset === 0" @click="changePage(-1)">上一页</button><span>第 {{ Math.floor(page.offset / RESULT_PAGE_SIZE) + 1 }} 页 · 共 {{ Math.max(1, Math.ceil(page.total / RESULT_PAGE_SIZE)) }} 页 · 共 {{ page.total }} 条</span><button :disabled="!page.has_more" @click="changePage(1)">下一页</button></footer>
       </template>
       <p v-else-if="!selected.preview" class="empty-result">该输出尚无已暂存的最终结果。节点中间输出仍可在执行 DAG 中查看。</p>
     </template>

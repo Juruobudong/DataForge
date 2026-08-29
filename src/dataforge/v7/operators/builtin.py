@@ -31,6 +31,9 @@ class BuiltinOperatorExecutor:
     @capture_generation_metrics
     def execute(self, *, inputs: list[dict[str, Any]], params: dict[str, Any],
                 context: OperatorExecutionContext) -> OperatorResult:
+        if self.code == "qa-extractor" and self.version == 1:
+            from .qa import NativeQAExecutor
+            return NativeQAExecutor().execute(inputs=inputs, params=params, context=context)
         runtime = {**dict(context.runtime or {}), "operator_version": self.version}
         if uses_triple_chunks(self.code, self.version, params):
             stage = GraphChunkStage(context.node_id, params, context.runtime.setdefault("generation", {}))

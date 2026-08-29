@@ -31,6 +31,24 @@ export function anchorLabel(anchor = {}) {
     const last = Number(blocks.at(-1).block_index) + 1
     return first === last ? `DOCX 第${first}块` : `DOCX 第${first}–${last}块`
   }
+  const positions = normalizedPositions(anchor)
+  const first = positions[0], last = positions.at(-1)
+  if (first?.kind === 'csv_record' || first?.kind === 'jsonl_record') {
+    const start = first.line_start || first.line_number
+    const end = last.line_end || last.line_number || start
+    return start === end ? `第${start}行` : `第${start}–${end}行`
+  }
+  if (first?.kind === 'xlsx_row') {
+    const sameSheet = positions.every(item => item.sheet === first.sheet)
+    if (sameSheet) return `${first.sheet} · 第${first.row}${first.row === last.row ? '' : `–${last.row}`}行`
+    return `${first.sheet} / ${last.sheet} · 多表记录`
+  }
+  if (first?.kind === 'json_record') {
+    return first.json_pointer === last.json_pointer ? `JSON ${first.json_pointer}` : `JSON ${first.json_pointer}–${last.json_pointer}`
+  }
+  if (first?.kind === 'text_range') {
+    return `字符 ${first.character_start}–${last.character_end}`
+  }
   return '来源定位不可用'
 }
 

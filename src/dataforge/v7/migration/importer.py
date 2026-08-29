@@ -19,7 +19,7 @@ from ..models import (
     FlowExecutionSnapshot, FlowSubgraph, FlowSubgraphRevision, KnowledgeFlowTemplate,
     KnowledgeFlowTemplateRevision, KnowledgeIndexProfile, KnowledgeType,
     KnowledgeTypeIndexBinding, KnowledgeTypeModeRevision, KnowledgeTypeRevision,
-    KnowledgeAssetVersion, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeItemSource, KnowledgeLibrary,
+    KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeItemSource, KnowledgeLibrary,
     OperatorDefinition, OperatorVersion, PromptTemplate, PromptTemplateRevision,
     QualityProfile, QualityProfileRevision,
     Deployment, MilvusTarget, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
@@ -44,6 +44,7 @@ METADATA_MODELS = {
     "source_review_snapshot_chunks": SourceReviewSnapshotChunk,
     "knowledge_libraries": KnowledgeLibrary, "knowledge_items": KnowledgeItem,
     "knowledge_item_sources": KnowledgeItemSource,
+    "knowledge_asset_items": KnowledgeAssetItem,
     "knowledge_types": KnowledgeType, "knowledge_type_revisions": KnowledgeTypeRevision,
     "knowledge_type_mode_revisions": KnowledgeTypeModeRevision,
     "knowledge_type_index_bindings": KnowledgeTypeIndexBinding,
@@ -167,6 +168,7 @@ class MigrationImporter:
                 if schema_version == 2:
                     self._register_package_preset(manifest)
                     self._prepare_asset_versions(manifest, selected, id_maps, job_id)
+                    self._asset_items(manifest, metadata, selected, id_maps)
                     waiting = self._resolve_import_target(job_id, checkpoint)
                     if waiting:
                         return waiting
@@ -236,7 +238,7 @@ class MigrationImporter:
             raise ValueError("本地 DataForge 版本低于 migration package 最低版本")
         if current > self._version_tuple(manifest["maximum_dataforge_version"]):
             raise ValueError("本地 DataForge 版本高于 migration package 最高版本")
-        supported = {"immutable_asset_versions", "multi_project_release", "resumable_import"}
+        supported = {"immutable_asset_versions", "multi_project_release", "resumable_import", "asset_item_snapshots"}
         missing = set(manifest.get("required_features") or []) - supported
         if missing:
             raise ValueError("本地缺少 migration package 所需功能：" + ", ".join(sorted(missing)))
@@ -273,6 +275,20 @@ class MigrationImporter:
                               for item in manifest.get("operator_versions") or []}
         if not required_operators.issubset(available_operators):
             raise ValueError("migration package 缺少所需 OperatorVersion")
+        from ..store import content_hash
+        assets = {item["id"]: item for item in manifest.get("asset_versions", [])}
+        seen = set()
+        counts = {key: 0 for key in assets}
+        for row in metadata.get("knowledge_asset_items", []):
+            key = (row["asset_version_id"], row["source_knowledge_id"])
+            if key[0] not in assets or key in seen:
+                raise ValueError("迁移包资产条目越界或重复")
+            if row["content_hash"] != content_hash(row["canonical_content"], row["data_json"]) or not row["evidence_json"]:
+                raise ValueError("迁移包资产条目摘要或 Evidence 无效")
+            seen.add(key)
+            counts[key[0]] += 1
+        if any(counts[key] != int(asset["item_count"]) for key, asset in assets.items()):
+            raise ValueError("迁移包缺少完整资产条目快照")
 
     def _register_package_preset(self, manifest: dict[str, Any]) -> None:
         if not self.local_config:
@@ -506,7 +522,6 @@ class MigrationImporter:
                     if name == "document_library_members" and payload["source_id"] not in selected_source_ids: continue
                     if name == "source_chunks":
                         payload["origin_flow_run_id"], payload["flow_run_id"] = payload.get("flow_run_id"), None
-                    if name == "source_versions": payload["object_key"] = f"migration/{source_instance_id}/{payload['id']}"
                     current = session.get(METADATA_MODELS[name], payload["id"])
                     if name == "sources" and current:
                         document = session.get(DocumentLibrary, payload["document_library_id"])
@@ -514,7 +529,10 @@ class MigrationImporter:
                             for key, value in _model_values(Source, payload).items():
                                 if key not in {"id", "created_at"}: setattr(current, key, value)
                     elif name == "source_versions":
-                        _upsert(session, SourceVersion, payload, immutable=("source_id", "sha256", "mime_type", "size_bytes"))
+                        _upsert(session, SourceVersion, payload, immutable=(
+                            "source_id", "version_no", "blob_uri", "sha256", "media_type",
+                            "size_bytes", "original_filename",
+                        ))
                     else:
                         _upsert(session, METADATA_MODELS[name], payload)
                     mapping_name = {"sources": "sources", "source_versions": "versions",
@@ -524,7 +542,6 @@ class MigrationImporter:
                         if name == "sources": cloned["document_library_id"] = id_maps["document_libraries"][payload["document_library_id"]]
                         elif name == "source_versions":
                             cloned["source_id"] = id_maps["sources"][payload["source_id"]]
-                            cloned["object_key"] = f"migration/{source_instance_id}/{cloned['id']}"
                             if cloned.get("current_review_snapshot_id"):
                                 cloned["current_review_snapshot_id"] = id_maps["review_snapshots"].get(
                                     cloned["current_review_snapshot_id"], cloned["current_review_snapshot_id"],
@@ -673,6 +690,8 @@ class MigrationImporter:
                     "index_profile_id": profile.get("index_profile_id"),
                     "qa_embedding_mode": task.get("qa_embedding_mode"),
                     "top_k": int(task.get("top_k", 10)), "enabled": True,
+                    "final_top_k": int(task.get("final_top_k", min(5, int(task.get("top_k", 10))))),
+                    "reranker_serving_code": task.get("reranker_serving_code"),
                 }
                 _upsert(session, ProjectDeploymentTask, deployment_task_payload,
                         immutable=("project_deployment_id", "project_task_id", "index_profile_id"))
@@ -1007,11 +1026,35 @@ class MigrationImporter:
                     continue
                 session.add(KnowledgeAssetVersion(
                     id=local_asset_id, **expected, status="building",
+                    review_gate_status=asset.get("review_gate_status", "pending"),
+                    review_snapshot_digest=asset.get("review_snapshot_digest"),
                     item_count=int(asset.get("item_count") or 0),
                     content_digest=asset.get("content_digest"),
                     source_release_id=manifest.get("release_id") or manifest.get("base_release_id"),
                     source_migration_job_id=job_id,
                 ))
+
+    def _asset_items(self, manifest, metadata, selected, id_maps):
+        assets = {item["id"]: item for item in manifest.get("asset_versions", [])}
+        with self.store.sessions.begin() as session:
+            for raw in metadata.get("knowledge_asset_items", []):
+                source_asset = assets[raw["asset_version_id"]]
+                if source_asset["knowledge_library_id"] not in selected:
+                    continue
+                payload = dict(raw)
+                payload["asset_version_id"] = id_maps["asset_versions"].get(raw["asset_version_id"], raw["asset_version_id"])
+                payload["knowledge_item_id"] = id_maps["items"].get(raw["knowledge_item_id"], raw["knowledge_item_id"])
+                payload["evidence_json"] = json.loads(json.dumps(raw["evidence_json"]))
+                if payload["asset_version_id"] != raw["asset_version_id"]:
+                    payload["id"] = "kai_" + hashlib.sha256(f'{payload["asset_version_id"]}:{raw["source_knowledge_id"]}'.encode()).hexdigest()[:48]
+                    for evidence in payload["evidence_json"]:
+                        for field, mapping in (("source_id", "sources"), ("source_version_id", "versions"),
+                                               ("source_chunk_revision_id", "chunk_revisions"),
+                                               ("source_review_snapshot_id", "review_snapshots")):
+                            original = evidence.get(field)
+                            evidence[field] = id_maps.get(mapping, {}).get(original, original)
+                _upsert(session, KnowledgeAssetItem, payload, immutable=(
+                    "asset_version_id", "source_knowledge_id", "canonical_content", "data_json", "content_hash", "evidence_json"))
 
     def _finish_asset_versions(self, manifest: dict[str, Any], selected: set[str],
                                id_maps: dict[str, dict[str, str]], job_id: str) -> None:
@@ -1087,17 +1130,13 @@ class MigrationImporter:
         version_by_source = {version["source_id"]: version for version in metadata["source_versions"]
                              if version["id"] in selected_version_ids}
         for version in version_by_source.values():
-            entry = f"objects/{version['id']}"
+            entry = f"blobs/{version['sha256']}"
             with archive.open(entry) as source:
-                stored = self.objects.put_stream(f"migration/{source_instance_id}/{version['id']}", source,
-                    int(version["size_bytes"]), version["mime_type"])
+                from ..storage import blob_object_key
+                stored = self.objects.put_stream(blob_object_key(version["blob_uri"]), source,
+                    int(version["size_bytes"]), version["media_type"])
                 if stored.sha256 != version["sha256"]:
                     raise ValueError(f"恢复对象 SHA-256 不匹配：{version['id']}")
-            if version["id"] in id_maps["versions"]:
-                with archive.open(entry) as source:
-                    stored = self.objects.put_stream(f"migration/{source_instance_id}/{id_maps['versions'][version['id']]}",
-                        source, int(version["size_bytes"]), version["mime_type"])
-                    if stored.sha256 != version["sha256"]: raise ValueError("副本对象 SHA-256 不匹配")
 
     def _apply_tombstones(self, manifest: dict[str, Any], selected: set[str]) -> None:
         source_instance_id = manifest["source_instance_id"]

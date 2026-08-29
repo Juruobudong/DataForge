@@ -358,7 +358,8 @@ export function cloneGraph(nodes, edges) {
 
 // Capability-first 算子呈现：常用能力快捷入口 + 按业务能力分组的算子实现。
 export const COMMON_OPERATOR_CAPABILITIES = [
-  { code: 'Text2QAGenerator', label: '问答生成' },
+  { code: 'qa-extractor', label: '问答提取' },
+  { code: 'Text2QAGenerator', label: '上游两阶段问答生成' },
   { code: 'prompt-generator', label: '文本生成' },
   { code: 'graph-extractor', label: '实体关系抽取' },
   { code: 'graph-quality-validator', label: '图谱校验' },

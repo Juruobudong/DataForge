@@ -20,6 +20,13 @@ const catalog = [
   operator('new-filter', 'candidate:*', 'candidate:*', { threshold: { type: 'number', maximum: 1, default: 0.4 } }),
   operator('generator', 'source_chunk_set', 'candidate:text'),
 ]
+
+it('drops native QA instructions when switching to DataFlow v8', () => {
+  const params = keepCompatibleParams({ llm_serving: 'model', questions_per_chunk: 2, extraction_instructions: '患者口吻' }, {
+    properties: { llm_serving: { type: 'string' }, questions_per_chunk: { type: 'integer', default: 1 } }, additionalProperties: false,
+  })
+  expect(params).toEqual({ llm_serving: 'model', questions_per_chunk: 2 })
+})
 const definition = () => ({ schema_version: 3, nodes: [
   { id: 'input', kind: 'operator', ref: 'reviewed-source-chunk-input', operator_version: 1 },
   { id: 'map', kind: 'operator', ref: 'mapper', operator_version: 1 },

@@ -26,6 +26,19 @@ test('DOCX blocks deduplicate and location fallbacks remain explicit', () => {
   assert.match(anchorNotice({ precision: 'unavailable' }), /不可用/)
 })
 
+test('structured record anchors expose stable business-readable labels', () => {
+  assert.equal(anchorLabel({ positions: [
+    { kind: 'csv_record', block_id: 'csv:1', line_start: 2, line_end: 2, block_index: 1 },
+    { kind: 'csv_record', block_id: 'csv:2', line_start: 3, line_end: 4, block_index: 2 },
+  ] }), '第2–4行')
+  assert.equal(anchorLabel({ positions: [
+    { kind: 'xlsx_row', block_id: 'xlsx:0:2', sheet: '门诊', row: 2, block_index: 1 },
+    { kind: 'xlsx_row', block_id: 'xlsx:0:3', sheet: '门诊', row: 3, block_index: 2 },
+  ] }), '门诊 · 第2–3行')
+  assert.equal(anchorLabel({ positions: [{ kind: 'json_record', block_id: 'json:0', json_pointer: '/0', block_index: 0 }] }), 'JSON /0')
+  assert.equal(anchorLabel({ positions: [{ kind: 'text_range', block_id: 'txt:0', character_start: 10, character_end: 20, block_index: 0 }] }), '字符 10–20')
+})
+
 test('source preview scrolls only its own container and centers an exact highlight', () => {
   const calls = []
   const container = {

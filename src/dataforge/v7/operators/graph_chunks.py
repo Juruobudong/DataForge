@@ -2,7 +2,7 @@
 from collections import defaultdict
 
 from ..graph_literal import detect_literal
-from ..graph_prompt import GRAPH_GUIDANCE_VERSIONS
+from ..graph_prompt import GRAPH_GUIDANCE_VERSIONS, RELATION_REPAIR_VERSION
 from .diagnostics import OperatorDiagnostics
 
 
@@ -13,11 +13,18 @@ def uses_triple_chunks(code, version, params):
     versions = {TRIPLE_CHUNK_VERSIONS.get(code)}
     if code == "relation-extractor":
         versions.add(GRAPH_GUIDANCE_VERSIONS[code])  # Retain the v6 chunk/endpoint contract.
+        versions.add(RELATION_REPAIR_VERSION)
     return params.get("graph_mode") == "triple" and version is not None and version in versions
 
 
 class GraphChunkError(ValueError):
     """An attributable data-contract error, not an infrastructure exception."""
+
+
+class GraphEndpointUnresolved(GraphChunkError):
+    def __init__(self, role, name):
+        self.role, self.name = role, name
+        super().__init__(f"GRAPH_ENDPOINT_UNRESOLVED: {role} 端点不在已抽取实体中：{name[:200]!r}")
 
 
 class TripleEndpoints:
@@ -56,7 +63,7 @@ class TripleEndpoints:
         if role == "object" and is_literal:
             return entity or {"name": name.strip(), "object_kind": "literal"}
         if entity is None:
-            raise GraphChunkError(f"GRAPH_ENDPOINT_UNRESOLVED: {role} 端点不在已抽取实体中：{name[:200]!r}")
+            raise GraphEndpointUnresolved(role, name)
         code = entity.get("type")
         if not isinstance(code, str) or not code.strip() or (self.config.entity_types and code not in self.config.entity_codes()):
             raise GraphChunkError(f"GRAPH_ENTITY_TYPE_INVALID: {role} 实体 {name[:200]!r} 缺少合法类型")
@@ -96,11 +103,39 @@ class GraphChunkStage:
         self.diagnostics = OperatorDiagnostics()
         self.diagnostics.add_secrets(params)
         self.attempted, self.successful, self.failed = set(), set(), set()
+        self.relation_repair_enabled = False
+        self.repair_attempted = set()
+        self.relation_counts = {}
+
+    def claim_relation_repair(self, chunk, error):
+        """Share one additional model call across every record of this chunk."""
+        key = chunk_identity(chunk)
+        if not self.relation_repair_enabled or key in self.repair_attempted:
+            return False
+        self.repair_attempted.add(key)
+        self.diagnostics.append("stdout", self.diagnostics.error(
+            f"GRAPH_RELATION_REPAIR_ATTEMPT: {error} [node={self.node_id}, source_version_id={key[0]}, source_chunk_id={key[1]}, attempt=1]") + "\n")
+        return True
+
+    def record_relation_result(self, key, records, outputs):
+        count = sum(len(value.get("relations") or []) for value in outputs)
+        self.relation_counts[key] = count
+        entity_count = sum(len([entity for entity in value.get("entities", []) if entity.get("object_kind") != "literal"]) for value in records)
+        zero_reason = "no_entities" if not entity_count else "no_legal_relations"
+        self.diagnostics.append("stdout", self.diagnostics.error(
+            f"GRAPH_RELATION_RESULT: source_version_id={key[0]} source_chunk_id={key[1]} entities={entity_count} relations={count} "
+            f"repair_attempts={int(key in self.repair_attempted)} zero_reason={zero_reason if not count else 'none'}") + "\n")
 
     @property
     def metrics(self):
-        return {"chunk_processing": [{"output_key": self.output_key, "attempted_chunks": len(self.attempted),
-                                      "successful_chunks": len(self.successful), "failed_chunks": len(self.failed)}]}
+        result = {"chunk_processing": [{"output_key": self.output_key, "attempted_chunks": len(self.attempted),
+                                        "successful_chunks": len(self.successful), "failed_chunks": len(self.failed)}]}
+        if self.relation_repair_enabled:
+            result["relation_repair"] = {"attempted_chunks": len(self.repair_attempted),
+                                         "successful_chunks": len(self.repair_attempted & self.successful),
+                                         "failed_chunks": len(self.repair_attempted - self.successful),
+                                         "relation_count": sum(self.relation_counts.values())}
+        return result
 
     def run(self, values, process, *, store=None, job_id=None):
         groups = defaultdict(list)
@@ -138,6 +173,8 @@ class GraphChunkStage:
             else:
                 successful[key] = chunk
                 self.successful.add(key)
+                if self.relation_repair_enabled:
+                    self.record_relation_result(key, records, outputs)
                 result.extend(outputs)
                 if store and job_id:
                     store.record_chunk_generation(job_id, self.output_key, chunk, status="completed", candidate_count=len(outputs))

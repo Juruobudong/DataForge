@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
-import hashlib
 import json
 import re
 from openai import APITimeoutError
@@ -12,6 +11,7 @@ from .base import OperatorResult
 from .runtime import OperatorRuntime, OperatorEarlyResult
 from .diagnostics import capture_operator_diagnostics
 from .outcomes import capture_generation_metrics
+from .qa import QAChunkSession, generate_qa_chunks, serving_snapshot
 from ..llm_serving import get_llm_serving_registry
 from ..catalog import DEFAULT_QA_EXTRACTION_INSTRUCTIONS
 
@@ -62,12 +62,6 @@ def qa_guided_serving(callback, instructions):
         return replies
 
     return call
-
-
-def serving_snapshot(registry, serving_id):
-    value = registry.require(serving_id)
-    keys = ("id", "type", "model_name", "base_url", "timeout_seconds", "max_retries", "max_tokens", "disable_thinking")
-    return {key: getattr(value, key) for key in keys}
 
 
 def serving_call(params, runtime):
@@ -123,7 +117,7 @@ class DataFlowOperatorExecutor:
         values = deepcopy(inputs)
         if not values:
             return OperatorResult()
-        callback = serving_call(params, context.runtime) if self.spec.get("uses_llm") else None
+        callback = serving_call(params, context.runtime) if self.spec.get("uses_llm") and self.adapter != "source-chunk-to-qa-v4" else None
         if self.adapter in {"governance-evaluate-v1", "governance-multihop-v1"}:
             from .governance import guarded_serving
             callback = guarded_serving(self.adapter, callback)
@@ -138,6 +132,11 @@ class DataFlowOperatorExecutor:
             callback = scored_callback
         def invoke(records, **kwargs):
             serving = callback
+            session = None
+            if self.adapter == "source-chunk-to-qa-v4":
+                session = QAChunkSession(params, context, records[0]["_df_row"], "dataflow")
+                serving = session.dataflow_callback(params.get("questions_per_chunk", 1))
+                kwargs["timeout"] = session.remaining()
             if self.adapter in {"source-chunk-to-qa-v2", "source-chunk-to-qa-v3"}:
                 instructions = params.get("extraction_instructions", "")
                 if not isinstance(instructions, str):
@@ -146,11 +145,14 @@ class DataFlowOperatorExecutor:
             result = self.runtime.call(self.spec, records=records, serving=serving,
                                      cancelled=context.runtime.get("cancelled"),
                                      diagnostics=context.runtime["_operator_diagnostics"], **kwargs)
+            if session:
+                session.remaining()
+                session.succeeded()
             return result.get("early_result", result["outputs"])
         if self.adapter.startswith("governance-"):
             from .governance import execute_governance
             return execute_governance(self, values, params, context, invoke)
-        if self.adapter == "source-chunk-to-qa-v3":
+        if self.adapter in {"source-chunk-to-qa-v3", "source-chunk-to-qa-v4"}:
             from .derived_text import prepare_generation, restore_evidence
             inputs, originals = prepare_generation(values, "qa", context)
             outputs = self._qa(inputs, params, context, invoke, allow_no_match=True) if inputs else []
@@ -171,7 +173,10 @@ class DataFlowOperatorExecutor:
             outputs = self._filter_candidates(values, params, invoke)
         else:
             raise ValueError(f"未批准的 DataFlow 字段适配器：{self.adapter}")
-        return OperatorResult(outputs=outputs, metrics={"input_records": len(values), "output_records": len(outputs)})
+        metrics = {"input_records": len(values), "output_records": len(outputs)}
+        if self.adapter == "source-chunk-to-qa-v4":
+            metrics["qa_recovery"] = dict(context.runtime.get("_qa_recovery", {}))
+        return OperatorResult(outputs=outputs, metrics=metrics)
 
     def _filter_candidates(self, values, params, invoke):
         from jsonschema import Draft202012Validator
@@ -219,67 +224,7 @@ class DataFlowOperatorExecutor:
                     retained.add(row_id)
         return [deepcopy(value) for index, value in enumerate(values) if index in retained]
 
-    @staticmethod
-    def _qa(values, params, context, invoke, *, allow_no_match=False):
-        outputs = []
-        runtime = context.runtime
-        outcome = runtime.setdefault("generation", {}).setdefault("qa", {"successful": [], "failed": [], "targeted": []})
-        store, job = runtime.get("store"), runtime.get("job_id")
-        count = params.get("questions_per_chunk", 1)
-        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10:
-            raise ValueError("questions_per_chunk 必须为 1–10")
-        for chunk in values:
-            scope = ("qa", str(chunk.get("source_version_id", "")), str(chunk.get("source_chunk_id", "")))
-            if runtime.get("retry_scope") is not None and scope not in runtime["retry_scope"]:
-                continue
-            outcome["targeted"].append(chunk)
-            try:
-                if not all(chunk.get(key) for key in ("source_id", "source_version_id", "source_chunk_id")):
-                    raise ValueError("SOURCE_LINEAGE_MISSING: 来源 Chunk 身份缺失")
-                if not isinstance(chunk.get("content"), str):
-                    raise ValueError("来源正文必须是字符串")
-                generated = []
-                if chunk["content"].strip():
-                    generated = invoke([{"text": chunk["content"], "_df_row": chunk["source_chunk_id"]}],
-                                       run_arguments={"input_key": "text", "input_question_num": count,
-                                                      "output_question_key": "question", "output_answer_key": "answer"})
-                    if allow_no_match and isinstance(generated, OperatorEarlyResult):
-                        generated = generated.outputs
-                    elif not generated:
-                        raise ValueError("QA_EMPTY_OUTPUT: 未生成合法问答")
-                candidates = []
-                for row in generated:
-                    if row.get("_df_row") != chunk["source_chunk_id"]:
-                        raise ValueError("SOURCE_LINEAGE_MISMATCH: 上游来源关联错误")
-                    if any(not isinstance(row.get(key), str) or not row[key].strip() for key in ("question", "answer")):
-                        raise ValueError("QA_OUTPUT_INVALID: 问题和答案必须为非空文本")
-                    data = {key: row[key].strip() for key in ("question", "answer")}
-                    identity = f"{chunk['source_id']}|qa|{chunk.get('chunk_index', 0)}|{data['question']}"
-                    candidates.append({
-                        "source_knowledge_id": hashlib.sha256(identity.encode()).hexdigest(),
-                        "canonical_content": f"{data['question']} {data['answer']}", "data_json": data,
-                        "source_version_ids": [chunk["source_version_id"]], "source_chunk_id": chunk["source_chunk_id"],
-                        "source_chunk_revision_id": chunk.get("source_chunk_revision_id"),
-                        "source_review_snapshot_id": chunk.get("source_review_snapshot_id"),
-                        "source_anchor": f"{chunk.get('filename', '')}#chunk-{chunk.get('chunk_index', 0)}",
-                        "anchor_json": deepcopy(chunk.get("anchor_json") or chunk.get("anchor") or {}),
-                        "evidence_text": chunk["content"], "is_primary": True,
-                    })
-                outcome["successful"].append(chunk); outputs.extend(candidates)
-                if store and job:
-                    store.record_chunk_generation(job, "qa", chunk, status="completed", candidate_count=len(candidates))
-            except Exception as exc:
-                diagnostics = runtime["_operator_diagnostics"]
-                error = diagnostics.error(exc)
-                diagnostics.append("stderr", error + "\n")
-                if "OPERATOR_CANCELLED" in str(exc):
-                    raise
-                outcome["failed"].append({**chunk, "error": error})
-                if store and job:
-                    store.record_chunk_generation(job, "qa", chunk, status="failed", error=error)
-        if outcome["failed"] and not outcome["successful"]:
-            raise ValueError(outcome["failed"][0]["error"])
-        return outputs
+    _qa = staticmethod(generate_qa_chunks)
 
     def _deduplicate(self, values, params, invoke, *, method=None):
         method = method or params.get("method", "identity")

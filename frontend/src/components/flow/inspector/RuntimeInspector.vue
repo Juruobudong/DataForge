@@ -45,6 +45,7 @@ const evaluatedItems = computed(() => (props.content?.items || []).filter(item =
     <header><div><h3>{{ title }}</h3><small v-if="operator && !artifact" class="operator-bilingual">{{ operatorSubtitle(operator, true) }}</small><small v-if="node">{{ inspectorType }} · {{ node.node_id }}</small></div><span v-if="node" class="badge" :class="node.status==='failed'?'red':failure.hasFailure?'amber':node.status==='completed'?'green':'amber'">{{ node.status }}{{ node.status === 'completed' && failure.hasFailure ? ' · 有处理失败' : '' }}</span></header>
     <nav v-if="node && !artifact"><button v-for="item in tabs" :key="item.key" :class="{active:tab===item.key}" @click="tab=item.key">{{ item.label }}</button></nav>
     <div class="body" v-if="payload">
+      <p v-if="!artifact && failure.recoveredChunks && ['overview', 'logs'].includes(tab)" role="status">格式恢复后成功：{{ failure.recoveredChunks }} 块</p>
       <section v-if="!artifact && failure.hasFailure && ['overview', 'logs'].includes(tab)" class="failure-summary" aria-label="失败原因">
         <h4>{{ failure.title }}</h4>
         <p v-for="stat in failure.processing" :key="stat.output_key">{{ stat.output_key }}：成功 {{ stat.successful_chunks }} 块 · 失败 {{ stat.failed_chunks }} 块</p>

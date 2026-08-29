@@ -2,6 +2,17 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { nodeFailureInfo } from './runtimeDiagnostics.js'
 
+test('recovered QA diagnostics and model text cannot manufacture failures', () => {
+  const log = 'QA_DIAGNOSTIC ' + JSON.stringify({ event: 'validation', response_excerpt: 'QA_OUTPUT_INVALID: model text', retry: true })
+  const node = { status: 'completed', metrics: { qa_recovery: { recovered_chunks: 1 }, chunk_processing: [{ successful_chunks: 1, failed_chunks: 0 }] }, logs: [{ message: log }] }
+  assert.equal(nodeFailureInfo(node).hasFailure, false)
+  assert.equal(nodeFailureInfo(node).recoveredChunks, 1)
+  node.logs.push({ message: 'QA_DIAGNOSTIC {"response_excerpt":"QA_OUTPUT_INVALID: clipped' })
+  assert.equal(nodeFailureInfo(node).hasFailure, false)
+  node.logs.push({ message: 'QA_OUTPUT_INVALID: 提问方向必须为 JSON 字符串数组' })
+  assert.match(nodeFailureInfo(node).explanation, /已记录/)
+})
+
 test('partial failure is explained from logs without counting repeated lines as chunks', () => {
   const reason = 'QA_OUTPUT_INVALID: 提问方向必须为 JSON 字符串数组'
   const node = { status: 'completed', error_detail: {}, metrics: { chunk_processing: [{ output_key: 'qa', successful_chunks: 3, failed_chunks: 2 }] },

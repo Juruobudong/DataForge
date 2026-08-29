@@ -24,7 +24,7 @@ from dataforge.v7.migration.manifest import validate_manifest
 from dataforge.v7.migration.planner import InstitutionReleasePlanner, MigrationPlanner
 from dataforge.v7.migration.verifier import ActivationPreflightVerifier
 from dataforge.v7.migrations import upgrade
-from dataforge.v7.models import ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
+from dataforge.v7.models import ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import V7Store
 from dataforge.v7.vector import V7Milvus
@@ -302,8 +302,8 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
     store = V7Store(url); store.seed()
     docs = store.create_document_library("冻结资料")
     source = store.create_source(
-        library_id=docs["id"], name="FAQ", filename="faq.txt", object_key="sources/freeze.txt",
-        sha256="f" * 64, size_bytes=10, mime_type="text/plain",
+        library_id=docs["id"], name="FAQ", filename="faq.txt", blob_uri=f"blob://{'f' * 64}",
+        sha256="f" * 64, size_bytes=10, media_type="text/plain",
     )
     record_and_approve_source(store, source, "冻结 FAQ 来源")
     library = store.create_knowledge_library("冻结 FAQ", "qa")
@@ -525,10 +525,10 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
     central = V7Store(central_url); central.seed()
     central_objects = LocalObjectStore(tmp_path / "central-v2-objects")
     document = central.create_document_library("完整模板资料")
-    stored = central_objects.put_bytes("sources/closure.txt", b"template closure", "text/plain")
+    stored = central_objects.put_blob(b"template closure", "text/plain")
     source = central.create_source(
-        library_id=document["id"], name="闭包", filename="closure.txt", object_key=stored.key,
-        sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="text/plain",
+        library_id=document["id"], name="闭包", filename="closure.txt", blob_uri=stored.blob_uri,
+        sha256=stored.sha256, size_bytes=stored.size_bytes, media_type="text/plain",
     )
     record_and_approve_source(central, source, "完整模板来源")
     binding = central.bind_document_library_template(document["id"], "flow_standard-qa")
@@ -554,7 +554,8 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         institution_name="医院 V2", institution_code="V2001",
     )
     profile = next(value for value in central.list_index_profiles() if value["code"] == "qa-question")
-    deployment_task = central.create_deployment_task(deployment["id"], task["id"], profile["id"])
+    deployment_task = central.create_deployment_task(deployment["id"], task["id"], profile["id"],
+        final_top_k=3, reranker_serving_code="bge_reranker_large")
     central.put_deployment_route(deployment_task["id"], "V2001", "医院 V2", [library_id])
     frozen = central.freeze_route_version(deployment["id"], "test")
     draft = central.create_institution_release_draft(
@@ -590,6 +591,9 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         assert archive.read("metadata/flow_execution_snapshots.jsonl").strip()
         assert archive.read("metadata/operator_versions.jsonl").strip()
         assert archive.read("metadata/document_library_processing_baselines.jsonl").strip()
+        exported_asset_items = [json.loads(line) for line in archive.read("metadata/knowledge_asset_items.jsonl").splitlines()]
+        assert exported_asset_items and exported_asset_items[0]["evidence_json"]
+        assert "asset_item_snapshots" in manifest_v2["required_features"]
 
     monkeypatch.setenv("DATAFORGE_INSTANCE_MODE", "local")
     monkeypatch.setenv("DATAFORGE_INSTANCE_CODE", "hospital-v2")
@@ -618,6 +622,12 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
     ).run(import_job["id"])
     assert waiting["status"] == "waiting"
     assert waiting["stage"] == "waiting_for_milvus_configuration"
+    with local.sessions() as session:
+        restored_item = session.scalar(select(KnowledgeAssetItem))
+        assert restored_item and restored_item.canonical_content == exported_asset_items[0]["canonical_content"]
+        assert restored_item.evidence_json == exported_asset_items[0]["evidence_json"]
+    restored_task = local.list_deployment_tasks(deployment["id"])[0]
+    assert restored_task["final_top_k"] == 3 and restored_task["reranker_serving_code"] == "bge_reranker_large"
     assert local.list_document_library_template_bindings(document["id"])[0]["pending_file_count"] == 0
 
     local_config.put(local_instance.id, "candidate_target", uri="http://milvus.local:19531")
@@ -874,9 +884,9 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     central_url = f"sqlite:///{tmp_path / 'central-roundtrip.sqlite3'}"; upgrade(central_url)
     central = V7Store(central_url); central.seed(); central_objects = LocalObjectStore(tmp_path / "central-objects")
     docs = central.create_document_library("资料")
-    stored = central_objects.put_bytes("sources/faq.txt", b"hospital faq", "text/plain")
-    source = central.create_source(library_id=docs["id"], name="FAQ", filename="faq.txt", object_key=stored.key,
-        sha256=stored.sha256, size_bytes=stored.size_bytes, mime_type="text/plain")
+    stored = central_objects.put_blob(b"hospital faq", "text/plain")
+    source = central.create_source(library_id=docs["id"], name="FAQ", filename="faq.txt", blob_uri=stored.blob_uri,
+        sha256=stored.sha256, size_bytes=stored.size_bytes, media_type="text/plain")
     record_and_approve_source(central, source, "医院 FAQ 来源")
     library = central.create_knowledge_library("医院 FAQ", "qa")
     knowledge_job = central.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")

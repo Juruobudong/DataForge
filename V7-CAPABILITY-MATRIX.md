@@ -2,6 +2,8 @@
 
 更新日期：2026-08-28
 
+问答 Provider 分离（2026-08-28）：默认原生 `qa-extractor v1`，Advanced 另选上游 `Text2QAGenerator v8`；提示词、业务参数与 Provider 分离，共用结构约束、有限恢复和诊断。本地完整 Debug 调用 `.34` 真实 Qwen3-32B：原生三轮共15块、DataFlow一轮5块均成功；未部署新版容器。见[实施记录](wiki/sources/qa-provider-separation-2026-08-28.md)。
+
 图谱业务抽取要求与规则编辑（2026-08-28）：实体/关系抽取器 v7 接入真实模型请求通道，版本化指令、统一只读提示词预览、实体名称/描述编辑和配置区定位已实现；本地验证统计见[实施记录](wiki/sources/graph-guidance-2026-08-28.md)。真实模型效果及远程验收仍为 CONNECT。
 
 四个内置流程原始高级 DAG（2026-08-28）：`DONE`。文本、问答、三元组、语义图谱转换后经过真实 Vue 编辑器保存、调试、发布及正式写入，本地受控模型回归通过；不修改默认拓扑或运行契约。真实模型效果和远程验收仍为 `CONNECT`。证据及测试隔离修正见[验收记录](wiki/sources/four-builtin-advanced-dags-2026-08-28.md)。
@@ -14,6 +16,8 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 
 知识流程执行契约与精选扩充（2026-08-28）：本地实现 CAS发布、Revision/Snapshot写保护、Debug/Published身份分域、Published冻结内容调试、原子替换及十个真实DataFlow精选算子；新旧环境并存。全量验证状态以[021记录](specs/021-flow-execution-curated-expansion/validation.md)为准，不代表`.34`或真实模型验收。来源：[本轮基线](wiki/sources/flow-execution-curated-expansion-2026-08-28.md)。
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
+
+产品定位为通用文档处理与知识生产。医疗实体预设、医院 Deployment、qa_agent 接入和医疗测试数据只代表可选领域能力；通用 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 与 Routing 契约不得依赖医疗语义。
 
 本文件只记录能力完成度与外部验收状态；当前系统结构见 [`docs/architecture/`](docs/architecture/overview.md)，设计原因见 [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md)，历史方案见 [`docs/archive/`](docs/archive/old-plan.md)。
 
@@ -47,10 +51,11 @@ DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、D
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
 | 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 由每次 Routing 操作显式选择并独立显示历史；Central live publish，中心侧 institution deferred freeze；机构 code 自动生成，知识范围顺序即 priority，技术对象进入帮助/高级信息。 |
+| 业务工作区 | 项目发布：检索调试 | `LOCAL` | Draft/Published/Historical 七阶段只读检索、临时实验、冻结正文/Evidence、重排失败停止；不做聊天、不改消费端。真实推理及浏览器视觉验收未完成。见[实施记录](wiki/sources/reranker-retrieval-debug-2026-08-28.md)。 |
 | 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | `.dfm` v2、项目资产锁定与额外 AssetVersion、结构化冲突门禁、模板闭包、正常 waiting、Prepare target fingerprint、Partition count/digest Activation Preflight 和逐项目/非原子批量激活已本地验证；`.34` 真实服务验收仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
-| 流程开发区 | 模型服务 | `DONE` | LLM/Embedding 独立持久化、Secret 脱敏、真实测试、默认/启停/引用管理；真实 `.34` 调用仍为 `CONNECT`。 |
+| 流程开发区 | 模型服务 | `DONE` | LLM/Embedding/Reranker 独立持久化、Secret 脱敏、真实测试接口、默认/启停/引用管理；Reranker 使用 bge-reranker-large，真实 `.34` 推理仍为 `CONNECT`。 |
 | 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
 | 流程开发区 | 知识流程 / 开发者资源 | `DONE` | 五固定模板只保留真实执行节点；Text/QA 直接接 Sink，Graph 保留独立校验。QA v6 支持冻结的多行提取要求，合法无匹配为成功零产出；失败保留旧知识。Standard/Advanced/Multi 共用参数与执行链；旧版本不改写。真实 `.34` 模型验收为 `CONNECT`。 |
 | 流程开发区 | 五类 Standard 透明算子与精选 DataFlow / Custom | `LOCAL` | Standard 输出由目录强制推导，Multi 规范 graph:triple/默认实体；技术视图区分真实算子与 Sink 平台治理。DataFlow/Custom 的有界脱敏双流日志贯通正式/Debug/派生节点与事件。保留版本目录、候选、真实精选算子及可信插件；实际包 + stub 模型本地验证，`.34` 容器与真实模型效果待验收。 |
@@ -67,8 +72,9 @@ DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、D
 | 知识库 `delete-check`、删除任务、重试 | `DONE` | 删除状态为 `active → deleting → deleted`；失败保持 `deleting`。 |
 | 知识库/项目自动编码与请求拒绝 | `DONE` | 知识库由服务端生成 `KL-YYYYMMDD-UUID4`，项目生成 `PRJ-YYYYMMDD-UUID4`；客户端提交 `code` 被拒绝。 |
 | 文档库模板绑定与自动结果库 | `DONE` | 一个文档库可绑定多个已发布模板；每个输出类型固定一个结果库，首次全量、后续增量、模板新修订全量。 |
+| Source 内容身份 / CAS Blob / 历史重新启用 | `LOCAL` | `(source_id, sha256)` 唯一、全局 `blob://<sha256>` 共享、当前内容幂等、历史内容二次确认、activation-scoped Dispatch/Job/Sink Gate 与引用安全删除已完成本地实现；真实 MySQL/MinIO 验收待 `.34`。 |
 | Source Preparation / Review Snapshot / Knowledge Dispatch | `DONE` | Preparation 与 Knowledge Flow 分离；只有全部活动 Chunk approved 才冻结不可变 Snapshot 并幂等 Dispatch，未审核的整库、选中文件、直接 Job 均服务端拒绝。 |
-| SourceChunkSet / Rechunk / SourceAnchor 精确审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote、SourceAnchorV2、PDF.js 多页 bbox、DOCX 结构块与独立 Workbench 已完成本地实现；真实 `.34` E2E 待验收。 |
+| SourceChunkSet / Rechunk / SourceAnchor 精确审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote，以及九类格式的页/bbox、行、sheet/row、结构块、字符范围和 JSON Pointer 定位已完成本地实现；真实 `.34` E2E 待验收。 |
 | Reviewed Flow 与下游多层 Gate | `DONE` | 知识模板唯一根为 Reviewed SourceChunk Input；Job/Runner/Sink/Evidence/AssetVersion/Vector/Ready/Routing 逐层复验 Snapshot 或 digest，Milvus 写入位于 LLM/Operator、Knowledge Sink 与 Embedding 之后。 |
 | `knowledge_item_sources`、Evidence、结构化锚点 | `DONE` | 返回文档、SourceVersion、锚点、Evidence 与 primary 标识。 |
 | Knowledge Diff 和向量状态 | `DONE` | 新变更有可读 before/after；旧记录兼容 hash。 |
@@ -136,6 +142,12 @@ DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、D
 - 已实现新建图谱五类默认、医疗 8 类预设、中文自定义类型、来源追踪、按来源撤销、部分补全，以及 Standard/Advanced 共用编辑组件。
 - Draft、编译、Snapshot 与 Runner 共用规范化 Schema；来源不影响语义 hash。节点全量/子集明确区分，清空显式子集不会扩大抽取范围。历史 Published Revision/Snapshot 不回写，不新增行业流程或数据库迁移。
 - 本地验证记录见 `wiki/pages/operations-and-testing.md`；真实 LLM 与 `.34` 端到端验收仍需用户部署后执行。
+
+## Triple 关系未知端点修复（2026-08-29）
+
+- Relation Extractor v8 已实现每块一次 `GRAPH_ENDPOINT_UNRESOLVED` 受控重抽取、确定性关系生成、原子端点复验及终态修复指标；不补实体、不改变 Semantic，无数据库迁移。
+- 自动化关系专项、提示词/Catalog 和 Debug 分块回归通过。真实 `qwen3_32b` 已证明未知端点可在一次重抽取后恢复，且所有轮次无正式知识或向量写入。
+- 固定三轮验收尚未签字：最近批次第 2 轮因四块上游实体同时为空导致最终零三元组。按批准范围未修改实体抽取；需完成范围确认并从第 1 轮重新连续通过三轮。服务器部署验收仍未执行。
 
 ## 依据
 

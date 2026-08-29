@@ -113,6 +113,12 @@ class OperatorDiagnostics:
             safe = redact(utf8_prefix(message, STREAM_LIMIT), self._secrets, truncated=True)
         return safe_prefix(safe, ERROR_LIMIT)
 
+    def response_excerpt(self, value, limit=4096):
+        """Redact before clipping a model excerpt, including a clipped secret."""
+        with self._lock:
+            safe = redact(str(value), self._secrets, truncated=True)
+        return safe_prefix(safe, limit)
+
 
 class OperatorExecutionError(ValueError):
     def __init__(self, error, diagnostics):

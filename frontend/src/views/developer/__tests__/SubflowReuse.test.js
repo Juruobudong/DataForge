@@ -45,12 +45,12 @@ describe('reusable subflow production and consumption', () => {
     expect(wrapper.findAll('.palette-entry')).toHaveLength(2)
   })
   it('edits QA extraction instructions as a normal Advanced business parameter', async () => {
-    const qa = { ...catalog[0], code: 'Text2QAGenerator', version: 6, provider: 'dataflow',
+    const qa = { ...catalog[0], code: 'qa-extractor', version: 1, provider: 'dataforge',
       input_ports: { input: { artifact_type: 'source_chunk_set', binding: 'edge' } },
       output_ports: { output: { artifact_type: 'candidate:qa' } },
       parameter_schema: { properties: { extraction_instructions: { type: 'string', title: 'QA 提取要求', 'x-dataforge-ui': { widget: 'textarea' } } } } }
     wrapper = mount(AdvancedFlowEditor, { props: { catalog: [qa], subflows: [], outputTypes: ['qa'] } })
-    wrapper.vm.loadDefinition({ nodes: [{ id: 'qa', kind: 'operator', ref: 'Text2QAGenerator', operator_version: 6, params: { extraction_instructions: '原要求' } }], edges: [] })
+    wrapper.vm.loadDefinition({ nodes: [{ id: 'qa', kind: 'operator', ref: 'qa-extractor', operator_version: 1, params: { extraction_instructions: '原要求' } }], edges: [] })
     wrapper.findComponent({ name: 'CanvasStub' }).vm.$emit('select-node', wrapper.vm.nodes[0])
     await flushPromises()
     await wrapper.get('textarea[aria-label="QA 提取要求"]').setValue('只提取随访事项\n使用患者口吻')

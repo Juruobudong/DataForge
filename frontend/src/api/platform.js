@@ -50,6 +50,16 @@ function graphNeighborQuery(depth, filters = {}, confirmLarge = false) {
 function json(method, payload) { return { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) } }
 
 export const api = {
+  rerankerServings: () => request('/api/reranker-servings'),
+  createRerankerServing: body => request('/api/reranker-servings', json('POST', body)),
+  patchRerankerServing: (id, body) => request(`/api/reranker-servings/${id}`, json('PATCH', body)),
+  testRerankerServing: id => request(`/api/reranker-servings/${id}/test`, { method: 'POST' }),
+  defaultRerankerServing: id => request(`/api/reranker-servings/${id}/set-default`, { method: 'POST' }),
+  rerankerServingReferences: id => request(`/api/reranker-servings/${id}/references`),
+  deleteRerankerServing: id => request(`/api/reranker-servings/${id}`, { method: 'DELETE' }),
+  patchDeploymentTask: (id, taskId, body) => request(`/api/project-deployments/${id}/tasks/${taskId}`, json('PATCH', body)),
+  retrievalDebugOptions: (id, params) => request(`/api/project-deployments/${id}/retrieval-debug/options?${new URLSearchParams(params)}`),
+  retrievalDebug: (id, body) => request(`/api/project-deployments/${id}/retrieval-debug`, json('POST', body)),
   servingCategories: () => request('/api/serving-categories'),
   modelServings: () => request('/api/model-servings'),
   createModelServing: body => request('/api/model-servings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
@@ -82,6 +92,10 @@ export const api = {
   uploadSources: (libraryId, form) => request(`/api/document-libraries/${libraryId}/sources/upload`, { method: 'POST', body: form }),
   sourceVersions: sourceId => request(`/api/sources/${sourceId}/versions`),
   replaceSource: (sourceId, form) => request(`/api/sources/${sourceId}/replace`, { method: 'POST', body: form }),
+  reactivateSourceVersion: (sourceId, versionId, expected_current_version_id) => request(
+    `/api/sources/${sourceId}/versions/${versionId}/reactivate`,
+    json('POST', { expected_current_version_id }),
+  ),
   deleteSource: sourceId => request(`/api/sources/${sourceId}`, { method: 'DELETE' }),
   retrySource: sourceId => request(`/api/sources/${sourceId}/retry`, { method: 'POST' }),
   sourceDetail: (sourceId, versionId = '', flowRunId = '') => request(`/api/sources/${sourceId}/detail?${new URLSearchParams(Object.entries({ version_id: versionId, flow_run_id: flowRunId }).filter(([, value]) => value)).toString()}`),
