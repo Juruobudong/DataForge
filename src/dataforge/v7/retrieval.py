@@ -10,7 +10,7 @@ import re
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from .models import KnowledgeAssetVersion, KnowledgeAssetItem, StorageContractRevision
@@ -47,6 +47,26 @@ class RetrievalDebugRequest(BaseModel):
     query: str = Field(min_length=1, max_length=8192)
     filters: list[RetrievalFilter] = Field(default_factory=list, max_length=32)
     overrides: RetrievalOverrides | None = None
+
+
+class PublicRetrievalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    org_code: str = Field(min_length=1, max_length=120)
+    query: str = Field(min_length=1, max_length=8192)
+
+    @field_validator("org_code", "query")
+    @classmethod
+    def non_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("value must not be blank")
+        return cleaned
+
+
+class PublicRetrievalError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int):
+        super().__init__(message)
+        self.code, self.message, self.status_code = code, message, status_code
 
 
 NUMERIC_TYPES = {"INT8", "INT16", "INT32", "INT64", "FLOAT", "DOUBLE"}
@@ -135,6 +155,17 @@ class RetrievalDebugService:
         if not request.query.strip():
             raise RetrievalError("query 不能为空")
         snapshot, identity = self.snapshot(deployment_id, request.release_stage, request.route_mode, request.version_no)
+        return self.run_resolved(snapshot, identity, request, instance_mode=instance_mode)
+
+    def run_resolved(self, snapshot: dict[str, Any], identity: dict[str, Any],
+                     request: RetrievalDebugRequest, *, instance_mode: str):
+        """Execute one already-resolved immutable routing snapshot.
+
+        Public retrieval resolves the Published snapshot by logical codes once and
+        calls this method so a concurrent publish cannot mix route versions.
+        """
+        if not request.query.strip():
+            raise RetrievalError("query 不能为空")
         task = next((item for item in snapshot.get("tasks", []) if item["task_code"] == request.task_code), None)
         org = next((item for item in (task or {}).get("org_routes", []) if item["org_code"] == request.org_code), None)
         if not task or not org:
@@ -305,3 +336,171 @@ class RetrievalDebugService:
                 citations.append({"citation_id": result["citation_id"], "asset_version_id": result["asset_version_id"],
                                   "source_knowledge_id": result["source_knowledge_id"], "sources": deepcopy(row.evidence_json)})
         return citations
+
+
+class PublicRetrievalService:
+    """Published-only business retrieval boundary.
+
+    Internal routing and diagnostic payloads may contain physical storage data.
+    This service never passes them through; every public field is constructed
+    explicitly below.
+    """
+
+    CONTRACT_VERSION = 1
+
+    def __init__(self, store, debug_service: RetrievalDebugService):
+        self.store, self.debug_service = store, debug_service
+
+    @staticmethod
+    def _not_found() -> PublicRetrievalError:
+        return PublicRetrievalError("route_not_found", "公共检索路由不存在", 404)
+
+    def _published(self, project_code: str, deployment_code: str, release_stage: str,
+                   task_code: str, org_code: str, *, allowed_deployment_id: str | None = None):
+        try:
+            snapshot = deepcopy(self.store.runtime_routing_snapshot(
+                project_code, deployment_code, release_stage,
+            ))
+        except ValueError as exc:
+            raise self._not_found() from exc
+        if (snapshot.get("project", {}).get("code") != project_code
+                or snapshot.get("deployment", {}).get("code") != deployment_code
+                or snapshot.get("release_stage") != release_stage):
+            raise self._not_found()
+        if (allowed_deployment_id is not None
+                and snapshot.get("project_deployment", {}).get("deployment_id") != allowed_deployment_id):
+            raise self._not_found()
+        task = next((item for item in snapshot.get("tasks", [])
+                     if item.get("task_code") == task_code), None)
+        org = next((item for item in (task or {}).get("org_routes", [])
+                    if item.get("org_code") == org_code), None)
+        if not task or not org or not org.get("libraries"):
+            raise self._not_found()
+        version = snapshot.get("version")
+        checksum = str(snapshot.get("checksum") or "")
+        if type(version) is not int or version < 1 or not checksum:
+            raise PublicRetrievalError(
+                "published_contract_invalid", "已发布检索契约不可用", 503,
+            )
+        identity = {"route_mode": "published", "version_no": version, "checksum": checksum}
+        return snapshot, task, org, identity
+
+    @staticmethod
+    def _route(snapshot, task_code, org_code):
+        return {
+            "project_code": snapshot["project"]["code"],
+            "deployment_code": snapshot["deployment"]["code"],
+            "release_stage": snapshot["release_stage"],
+            "task_code": task_code,
+            "org_code": org_code,
+            "route_version": snapshot["version"],
+            "route_checksum": snapshot["checksum"],
+        }
+
+    @staticmethod
+    def _policy(task):
+        return {
+            "top_k": task["top_k"],
+            "final_top_k": task.get("final_top_k", min(5, task["top_k"])),
+            "reranker_enabled": bool(task.get("reranker_serving_code")),
+        }
+
+    def contract(self, project_code: str, deployment_code: str, release_stage: str,
+                 task_code: str, org_code: str, *, request_id: str,
+                 allowed_deployment_id: str | None = None):
+        snapshot, task, _org, _identity = self._published(
+            project_code, deployment_code, release_stage, task_code, org_code,
+            allowed_deployment_id=allowed_deployment_id,
+        )
+        return {
+            "schema": "dataforge.retrieval-contract.v1",
+            "contract_version": self.CONTRACT_VERSION,
+            "request_id": request_id,
+            "route": self._route(snapshot, task_code, org_code),
+            "policy": self._policy(task),
+            "capabilities": {
+                "context": True, "evidence": True,
+                "filters": False, "request_overrides": False,
+            },
+        }
+
+    @staticmethod
+    def _public_evidence(source):
+        return {
+            "source_id": source.get("source_id"),
+            "source_name": source.get("source_name"),
+            "original_filename": source.get("original_filename"),
+            "relative_path": source.get("relative_path"),
+            "source_version_id": source.get("source_version_id"),
+            "source_version_no": source.get("source_version_no"),
+            "source_chunk_id": source.get("source_chunk_id"),
+            "source_chunk_revision_id": source.get("source_chunk_revision_id"),
+            "source_review_snapshot_id": source.get("source_review_snapshot_id"),
+            "source_anchor": source.get("source_anchor"),
+            "anchor": deepcopy(source.get("anchor")),
+            "evidence_text": source.get("evidence_text"),
+            "is_primary": bool(source.get("is_primary")),
+        }
+
+    def query(self, project_code: str, deployment_code: str, release_stage: str,
+              task_code: str, request: PublicRetrievalRequest, *, request_id: str,
+              instance_mode: str, allowed_deployment_id: str | None = None):
+        snapshot, task, _org, identity = self._published(
+            project_code, deployment_code, release_stage, task_code, request.org_code,
+            allowed_deployment_id=allowed_deployment_id,
+        )
+        debug_request = RetrievalDebugRequest(
+            release_stage=release_stage, route_mode="published",
+            task_code=task_code, org_code=request.org_code, query=request.query,
+        )
+        result = self.debug_service.run_resolved(
+            snapshot, identity, debug_request, instance_mode=instance_mode,
+        )
+        if result["status"] == "blocked":
+            raise PublicRetrievalError(
+                "wrong_execution_site", "机构检索必须在对应机构本地 DataForge 执行", 409,
+            )
+        if result["status"] != "completed":
+            raise PublicRetrievalError(
+                "retrieval_unavailable", "公共检索依赖或冻结契约不可用", 503,
+            )
+        stages = {item["key"]: item for item in result["stages"]}
+        final = stages["final"]["data"].get("results", [])
+        citations = {item["citation_id"]: item for item in
+                     stages["evidence"]["data"].get("citations", [])}
+        direction = stages["recall"]["data"].get("score_direction", "descending")
+        public_results = []
+        for rank, item in enumerate(final, 1):
+            reranked = item.get("rerank_score") is not None
+            citation = citations.get(item["citation_id"], {})
+            public_results.append({
+                "rank": rank,
+                "citation_id": item["citation_id"],
+                "content": item["content"],
+                "data": deepcopy(item.get("data") or {}),
+                "score": {
+                    "kind": "reranker" if reranked else "vector",
+                    "value": item["rerank_score"] if reranked else item["vector_score"],
+                    "direction": "descending" if reranked else direction,
+                },
+                "knowledge_library_id": item["knowledge_library_id"],
+                "asset_version_no": item["asset_version_no"],
+                "source_knowledge_id": item["source_knowledge_id"],
+                "evidence": [self._public_evidence(source)
+                             for source in citation.get("sources", [])],
+            })
+        context = stages["context"]["data"]
+        return {
+            "schema": "dataforge.retrieval-result.v1",
+            "contract_version": self.CONTRACT_VERSION,
+            "request_id": request_id,
+            "route": self._route(snapshot, task_code, request.org_code),
+            "policy": self._policy(task),
+            "results": public_results,
+            "context": {
+                "text": context.get("text", ""),
+                "truncated": bool(context.get("truncated")),
+                "total_characters": int(context.get("total_characters") or 0),
+            },
+            "latency_ms": result["latency_ms"],
+        }

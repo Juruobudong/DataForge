@@ -15,7 +15,7 @@ vi.mock('../../../components/flow/DataForgeFlowCanvas.vue', () => ({ default: {
   methods: { fit() {}, screenToFlowCoordinate(value) { return value } },
 } }))
 
-const catalog = [{ code: 'quality', name: 'Quality', display_name_zh: '质量评估', category: '质量治理', version: 1,
+const catalog = [{ code: 'quality', name: 'Quality', display_name_zh: '质量评估', category: 'quality-processing', source: 'dataforge', catalog_group: 'dataforge', version: 1,
   input_ports: { input: { artifact_type: 'candidate:text', cardinality: 'one', binding: 'edge' } },
   output_ports: { output: { artifact_type: 'candidate:text' } }, parameter_schema: {} }]
 const inner = { entry_node: 'q', exit_node: 'q', nodes: [{ id: 'q', kind: 'operator', ref: 'quality' }], edges: [] }
@@ -45,7 +45,7 @@ describe('reusable subflow production and consumption', () => {
     expect(wrapper.findAll('.palette-entry')).toHaveLength(2)
   })
   it('edits QA extraction instructions as a normal Advanced business parameter', async () => {
-    const qa = { ...catalog[0], code: 'qa-extractor', version: 1, provider: 'dataforge',
+    const qa = { ...catalog[0], code: 'qa-extractor', version: 1, source: 'dataforge', catalog_group: 'dataforge',
       input_ports: { input: { artifact_type: 'source_chunk_set', binding: 'edge' } },
       output_ports: { output: { artifact_type: 'candidate:qa' } },
       parameter_schema: { properties: { extraction_instructions: { type: 'string', title: 'QA 提取要求', 'x-dataforge-ui': { widget: 'textarea' } } } } }

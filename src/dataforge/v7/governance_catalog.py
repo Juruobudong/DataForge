@@ -94,7 +94,7 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
                 schema["required"] = [key for key in schema.get("required", []) if key != "llm_serving"]
             if code == "Text2QAGenerator":
                 item["adapter_code"] = item["runtime_requirements"]["adapter_version"] = "source-chunk-to-qa-v3"
-        if item.get("provider") == "dataflow":
+        if item.get("source") == "dataflow":
             item["subcategory"] = ("知识生成" if code == "Text2QAGenerator" else "文本优化" if code == "PromptedRefiner"
                                    else "去重" if "Deduplicate" in code else "质量治理" if code == "PromptedFilter" else "文本处理")
     for code, (name, category, namespace, adapter, description, properties) in GOVERNANCE_SPECS.items():
@@ -107,7 +107,8 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
                     parameter_docs={key: value.get("description", value["title"]) for key, value in properties.items()})
         if adapter == "conditions":
             item["parameter_schema"]["required"] = ["rules"]
-        item["runtime_requirements"] = {"provider": "dataflow", "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
+        item["source"], item["catalog_group"] = "dataflow", "dataflow_featured"
+        item["runtime_requirements"] = {"executor": "dataflow-llm" if uses_llm else "dataflow-storage",
             "package": package, "package_version": package_version, "package_digest": package_digest,
             "dependency_lock_digest": lock_digest, "implementation": f"dataflow.operators.{namespace}:{code}",
             "adapter_version": item["adapter_code"], "uses_llm": uses_llm, "resources": "CPU",

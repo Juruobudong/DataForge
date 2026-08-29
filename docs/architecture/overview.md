@@ -7,7 +7,7 @@
 
 DataForge V7 是面向跨领域资料的通用文档处理、受控知识生产与发布平台。它从 V7 新上传的 PDF、CSV、XLSX、Markdown、DOC、DOCX、TXT 等资料生成文本、问答、图谱及已发布扩展类型知识；逻辑知识库保存单一当前态，来源版本、执行快照、知识变更和不可变资产版本承担溯源、发布与回滚。
 
-通用主链不依赖具体行业词表、文档内容或部署主体。医疗实体预设、医院 Deployment、qa_agent 接入及医疗样例是可选领域配置与集成，用来复用同一套 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 和 Routing 契约，不定义平台范围。新增能力默认先验证跨领域文档语义，再按需增加领域预设。
+通用主链不依赖具体行业词表、文档内容或部署主体。医疗实体预设、医疗场景的机构 Deployment、qa_agent 接入及医疗样例是可选领域配置与集成，用来复用同一套 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 和 Routing 契约，不定义平台范围。新增能力默认先验证跨领域文档语义，再按需增加领域预设。
 
 平台不是通用脚本编排器。生产流程只能使用已登记的 Operator、强类型端口、已发布修订和不可变 `FlowExecutionSnapshot`；任意 Python、Shell、循环与运行时改图不属于 V7 能力。
 

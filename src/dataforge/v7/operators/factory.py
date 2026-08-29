@@ -2,16 +2,13 @@
 from .builtin import BuiltinOperatorExecutor
 from .dataflow import DataFlowOperatorExecutor
 from .registry import OperatorExecutorRegistry
-from ..catalog import LEGACY_CATALOG_SEEDS, CATALOG_SEEDS
+from ..catalog import CATALOG_SEEDS
 
 
 def build_runtime_registry(runner_callable, catalog, definition):
     registry = OperatorExecutorRegistry()
-    native = {(item["code"], item["version"]): item for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)
+    native = {(item["code"], item["version"]): item for item in CATALOG_SEEDS
               if item["runtime_requirements"].get("executor") in {"dataforge-native", "dataforge-adapter"}}
-    for code in ("prompt-generator", "structured-knowledge-generator", "entity-extractor"):
-        for version in (4, 5):
-            native.setdefault((code, version), {})
     seen = {}
     for node in definition.get("nodes", []):
         if node.get("kind") != "operator":
@@ -32,10 +29,10 @@ def build_runtime_registry(runner_callable, catalog, definition):
                 raise ValueError(f"算子 {code} v{version} 缺少冻结实现，禁止解析最新版本")
             registry.register(BuiltinOperatorExecutor(code, version, runner_callable)); continue
         spec = {**frozen, "code": code, "version": version}
-        provider = (spec.get("runtime_requirements") or {}).get("provider", "dataforge")
-        if provider == "dataflow":
+        source = spec.get("source", "dataforge")
+        if source == "dataflow":
             registry.register(DataFlowOperatorExecutor(spec))
-        elif provider == "custom":
+        elif source == "custom":
             from .custom import CustomOperatorExecutor
             registry.register(CustomOperatorExecutor(spec))
         elif (code, version) in native:

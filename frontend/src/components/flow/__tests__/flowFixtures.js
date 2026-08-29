@@ -4,9 +4,9 @@ export const dataflowOperators = [
   ['PromptedRefiner', '提示词修订器', 4],
   ['HashDeduplicateFilter', '哈希去重过滤器', 4],
   ['MinHashDeduplicateFilter', 'MinHash 相似去重过滤器', 4],
-].map(([code, display_name_zh, version]) => ({ code, name: code, display_name_zh, version, provider: 'dataflow',
-  id: code, node_id: code, kind: 'operator', surfaces: ['advanced-canvas'], category: '知识生成', exposure: 'public', dependency_status: { status: 'ready' } }))
-export const nativeQaOperator = { code: 'qa-extractor', name: 'QA Extractor', display_name_zh: '问答提取器', version: 1, provider: 'dataforge', kind: 'operator', surfaces: ['standard-template', 'advanced-canvas'], dependency_status: { status: 'ready' } }
+].map(([code, display_name_zh, version]) => ({ code, name: code, display_name_zh, version, source: 'dataflow', catalog_group: 'dataflow_featured',
+  id: code, node_id: code, kind: 'operator', surfaces: ['advanced-canvas'], category: code.includes('Deduplicate') ? 'deduplication' : code === 'PromptedRefiner' ? 'text-cleaning' : 'text-generation', exposure: 'public', dependency_status: { status: 'ready' } }))
+export const nativeQaOperator = { code: 'qa-extractor', name: 'QA Extractor', display_name_zh: '问答提取器', version: 1, source: 'dataforge', catalog_group: 'dataforge', category: 'content-processing', kind: 'operator', surfaces: ['standard-template', 'advanced-canvas'], dependency_status: { status: 'ready' } }
 export const entityTypeCatalog = {
   base: [['person', '人物'], ['organization', '组织'], ['location', '地点'], ['event', '事件'], ['concept', '概念']].map(([code, label]) => ({ code, label, description: '', source: 'base' })),
   presets: [{ code: 'medical', label: '医疗', entity_types: [['disease', '疾病'], ['symptom', '症状'], ['drug', '药品'], ['examination', '检查'], ['treatment', '治疗'], ['body_part', '人体部位'], ['department', '科室'], ['medical_indicator', '医学指标']].map(([code, label]) => ({ code, label, description: '', source: 'preset', preset: 'medical' })) }],

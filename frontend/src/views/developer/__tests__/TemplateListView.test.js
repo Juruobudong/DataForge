@@ -8,7 +8,7 @@ const router = vi.hoisted(() => ({ push: vi.fn(), replace: vi.fn() }))
 vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => ({ query: {} }) }))
 vi.mock('../../../api/platform', () => ({ api: Object.fromEntries([
   'flowTemplates', 'operatorCatalog', 'flowSubgraphs', 'knowledgeTypes', 'managedFlowTemplates',
-  'modelServings', 'qualityProfiles', 'detachFlowToAdvanced', 'previewFlowToAdvanced', 'createFlowTemplate', 'updateFlowTemplate', 'publishFlowTemplate',
+  'modelServings', 'qualityProfiles', 'detachFlowToAdvanced', 'previewFlowToAdvanced', 'materializeManagedFlow', 'createFlowTemplate', 'updateFlowTemplate', 'publishFlowTemplate',
 ].map(name => [name, vi.fn()])) }))
 vi.mock('../../../components/flow/advanced/AdvancedFlowEditor.vue', () => ({ default: {
   template: '<div class="advanced-editor-test"></div>',
@@ -29,6 +29,7 @@ beforeEach(() => {
   api.qualityProfiles.mockResolvedValue(qualityProfiles)
   api.detachFlowToAdvanced.mockResolvedValue(advanced)
   api.previewFlowToAdvanced.mockResolvedValue(conversionPreview)
+  api.materializeManagedFlow.mockResolvedValue({ output_types: ['text'], definition: advanced.definition })
   api.createFlowTemplate.mockResolvedValue({ id: 'converted', revision: 1, status: 'draft' })
   api.updateFlowTemplate.mockResolvedValue({ revision: 2, revision_id: 'r2', source_definition_checksum: 'checksum2', status: 'draft' })
 })
@@ -111,6 +112,89 @@ describe('knowledge flow draft and published versions', () => {
     vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
     await button('‹ 退出编辑').trigger('click')
     expect(wrapper.get('.template-list .template-revisions').text()).toBe(state.expected)
+  })
+})
+
+describe('new knowledge flow identity', () => {
+  async function startNew(index) {
+    await button('＋ 新建知识流程').trigger('click')
+    if (index === 'advanced') await wrapper.get('.advanced-choice button').trigger('click')
+    else await wrapper.findAll('.goal-grid button')[index].trigger('click')
+    await flushPromises()
+  }
+
+  it.each(managedTemplates.map((item, index) => ({ item, index })))(
+    'prefills the $item.name Standard identity',
+    async ({ item, index }) => {
+      await render(); await startNew(index)
+      const flowName = item.name.endsWith('流程') ? item.name : `${item.name}流程`
+      expect(wrapper.get('#template-code').element.value).toBe(`custom-${item.code}`)
+      expect(wrapper.get('#template-name').element.value).toBe(`${flowName}（自定义）`)
+      expect(wrapper.get('#template-code').attributes('disabled')).toBeUndefined()
+    },
+  )
+
+  it('prefills an editable identity for a blank Advanced flow', async () => {
+    await render(); await startNew('advanced')
+    expect(wrapper.get('#template-code').element.value).toBe('custom-advanced-flow')
+    expect(wrapper.get('#template-name').element.value).toBe('自定义高级知识流程')
+    expect(wrapper.get('#template-code').attributes('disabled')).toBeUndefined()
+  })
+
+  it('uses one shared suffix when either preferred value already exists', async () => {
+    api.flowTemplates.mockResolvedValue([
+      standardTemplate(), advanced,
+      { ...advanced, id: 'custom-qa', code: 'custom-standard-qa', name: '问答知识流程（自定义）' },
+    ])
+    await render(); await startNew(1)
+    expect(wrapper.get('#template-code').element.value).toBe('custom-standard-qa-2')
+    expect(wrapper.get('#template-name').element.value).toBe('问答知识流程（自定义）（2）')
+  })
+
+  it('shows and clears field-level required errors immediately', async () => {
+    await render(); await startNew('advanced')
+    await wrapper.get('#template-code').setValue('')
+    await wrapper.get('#template-name').setValue('')
+    expect(wrapper.get('#template-code').attributes()).toMatchObject({ 'aria-invalid': 'true', 'aria-describedby': 'template-code-error' })
+    expect(wrapper.get('#template-name').attributes()).toMatchObject({ 'aria-invalid': 'true', 'aria-describedby': 'template-name-error' })
+    expect(wrapper.get('#template-code-error').text()).toBe('模板编码不能为空')
+    expect(wrapper.get('#template-name-error').text()).toBe('模板名称不能为空')
+
+    await wrapper.get('#template-code').setValue('my-flow')
+    await wrapper.get('#template-name').setValue('我的流程')
+    expect(wrapper.find('#template-code-error').exists()).toBe(false)
+    expect(wrapper.find('#template-name-error').exists()).toBe(false)
+  })
+
+  it.each(['保存草稿', '运行当前流程'])('reveals and focuses the first empty field before %s without creating a flow', async action => {
+    await render(); await startNew('advanced')
+    await wrapper.get('#template-code').setValue('')
+    await button('流程设置').trigger('click')
+    await button(action).trigger('click'); await flushPromises()
+    expect(wrapper.find('.template-settings').exists()).toBe(true)
+    expect(document.activeElement).toBe(wrapper.get('#template-code').element)
+    expect(api.createFlowTemplate).not.toHaveBeenCalled()
+    expect(router.push).not.toHaveBeenCalled()
+    expect(wrapper.text()).not.toContain('模板编码和名称不能为空')
+  })
+
+  it('locks the code after first save while keeping the name editable', async () => {
+    await render(); await startNew(0)
+    await button('保存草稿').trigger('click'); await flushPromises()
+    expect(api.createFlowTemplate).toHaveBeenCalledWith(expect.objectContaining({ code: 'custom-standard-text', name: '文本知识流程（自定义）' }))
+    expect(wrapper.get('#template-code').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('#template-name').attributes('disabled')).toBeUndefined()
+  })
+
+  it('prefills the unsaved identity when saving a builtin as custom', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
+    await render(); await wrapper.findAll('.template-list button')[0].trigger('click')
+    await button('保存草稿').trigger('click'); await flushPromises()
+    expect(api.materializeManagedFlow).toHaveBeenCalledWith('standard-text')
+    expect(api.createFlowTemplate).not.toHaveBeenCalled()
+    expect(wrapper.get('#template-code').element.value).toBe('custom-standard-text')
+    expect(wrapper.get('#template-name').element.value).toBe('文本知识流程（自定义）')
+    expect(wrapper.get('#template-code').attributes('disabled')).toBeUndefined()
   })
 })
 

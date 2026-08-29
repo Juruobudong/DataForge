@@ -18,6 +18,7 @@ tests/
 wiki/
 # 本地环境变量与密钥（含真实凭据，禁止提交）
 # 注意：.gitignore 本身必须纳入版本控制，否则内网资产保护规则无法随仓库共享
+compose.yaml
 .env
 .env.*
 secrets/

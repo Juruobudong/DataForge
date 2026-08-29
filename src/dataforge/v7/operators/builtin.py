@@ -47,7 +47,8 @@ class BuiltinOperatorExecutor:
                 raise error from None
             return OperatorResult(outputs=outputs, logs=stage.diagnostics.snapshot(), metrics=stage.metrics)
         from .derived_text import NATIVE_DERIVED_VERSIONS, prepare_generation, restore_evidence
-        if NATIVE_DERIVED_VERSIONS.get(self.code) == self.version:
+        if NATIVE_DERIVED_VERSIONS.get(self.code) == self.version and not (
+                self.code == "text-knowledge-mapper" and all("source_chunk" not in value for value in inputs)):
             kind = "text" if self.code == "text-knowledge-mapper" else params.get("knowledge_type")
             values, originals = prepare_generation(inputs, kind, context)
             runtime["generation"] = context.runtime.setdefault("generation", {})
@@ -61,17 +62,11 @@ class BuiltinOperatorExecutor:
 
 
 def build_builtin_registry(runner_callable: RunnerCallable, catalog: dict[str, dict[str, Any]]) -> OperatorExecutorRegistry:
-    from ..catalog import LEGACY_CATALOG_SEEDS
     registry = OperatorExecutorRegistry()
-    entries = {(item["code"], item["version"]): item for item in LEGACY_CATALOG_SEEDS if item["code"] in catalog}
-    entries.update({(code, item.get("version", 1)): item for code, item in catalog.items()})
+    entries = {(code, item.get("version", 1)): item for code, item in catalog.items()}
     for (code, _), item in entries.items():
-        if (item.get("runtime_requirements") or {}).get("provider", "dataforge") != "dataforge":
+        if item.get("source", "dataforge") != "dataforge":
             continue
         version = int(item.get("version", 1))
         registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
-        if code in {"prompt-generator", "structured-knowledge-generator", "entity-extractor"}:
-            for legacy_version in (4, 5):
-                if legacy_version < version and (code, legacy_version) not in entries:
-                    registry.register(BuiltinOperatorExecutor(code, legacy_version, runner_callable))
     return registry

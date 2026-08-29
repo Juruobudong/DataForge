@@ -9,9 +9,13 @@ const emit = defineEmits(['drag-start', 'add-item', 'add-sink', 'retry', 'clear-
 
 const query = ref('')
 const help = ref(null)
-const expanded = ref(new Set(['DataForge 平台算子', 'DataFlow 精选', '自定义算子']))
+const expanded = ref(new Set(['DataForge 算子', 'DataFlow 精选', '扩展算子']))
 
-const providers = { dataforge: 'DataForge 平台算子', dataflow: 'DataFlow 精选', custom: '自定义算子' }
+const catalogGroups = { dataforge: 'DataForge 算子', dataflow_featured: 'DataFlow 精选', extension: '扩展算子' }
+const categoryLabels = {
+  'content-processing': '内容处理', 'knowledge-generation': '知识生成', 'quality-processing': '质量处理', 'index-processing': '索引处理',
+  'text-cleaning': '文本清洗', 'content-filtering': '内容过滤', deduplication: '去重', 'text-generation': '文本生成',
+}
 function connects(raw) {
   if (!props.source?.nodeId) return true
   const sourceNode = props.nodes.find(node => node.id === props.source.nodeId)
@@ -30,12 +34,14 @@ const available = computed(() => props.catalog.filter(item => {
   if (query.value && ![item.code, item.name, item.display_name_zh].join(' ').toLowerCase().includes(query.value.toLowerCase())) return false
   return connects({ kind: 'operator', ref: item.code, operator_version: item.version })
 }))
-const capabilityGroups = computed(() => Object.entries(providers).map(([provider, label]) => [label, available.value.filter(item => (item.provider || 'dataforge') === provider)]).filter(([, items]) => items.length))
+const capabilityGroups = computed(() => Object.entries(catalogGroups).map(([group, label]) => [group, label, available.value.filter(item => (item.catalog_group || 'dataforge') === group)]).filter(([, , items]) => items.length))
 function businessGroups(category, items) {
-  if (category !== providers.dataflow) return [['', items]]
-  const fallback = { Text2QAGenerator: '知识生成', PromptedRefiner: '文本优化', HashDeduplicateFilter: '去重', MinHashDeduplicateFilter: '去重' }
-  const legacy = { 内容生成: '知识生成', 内容处理: '文本优化', 内容清洗: '文本处理', 内容去重: '去重', 智能过滤: '质量治理' }
-  return ['文本处理', '隐私与安全', '去重', '文本优化', '知识生成', '质量治理'].map(label => [label, items.filter(item => (fallback[item.code] || legacy[item.subcategory] || item.subcategory) === label)]).filter(([, values]) => values.length)
+  const order = category === 'dataflow_featured'
+    ? ['text-cleaning', 'content-filtering', 'deduplication', 'text-generation']
+    : category === 'dataforge' ? ['content-processing', 'knowledge-generation', 'quality-processing', 'index-processing'] : []
+  return order.length
+    ? order.map(code => [categoryLabels[code], items.filter(item => item.category === code)]).filter(([, values]) => values.length)
+    : [['', items]]
 }
 const searching = computed(() => query.value.trim() !== '')
 const versions = ref({})
@@ -61,13 +67,13 @@ function toggle(key) {
     <p v-if="error" class="hint" role="alert">{{ error }} <button @click="emit('retry')">重试</button></p>
     <button v-if="source" class="hint" @click="emit('clear-source')">清除端口筛选</button>
     <div class="palette-scroll">
-      <section v-for="([category, items]) in capabilityGroups" :key="category">
+      <section v-for="([group, category, items]) in capabilityGroups" :key="group" :class="{ 'extension-group': group === 'extension' }">
         <button class="capability-head" @click="toggle(category)"><span class="capability-name">{{ category }}</span><span class="capability-count">{{ items.length }}</span><span class="chev">{{ searching || expanded.has(category) ? '▾' : '▸' }}</span></button>
         <template v-if="searching || expanded.has(category)">
-          <template v-for="([business, values]) in businessGroups(category, items)" :key="business">
+          <template v-for="([business, values]) in businessGroups(group, items)" :key="business">
           <h4 v-if="business">{{ business }}</h4>
           <div v-for="item in values" :key="item.code" class="palette-entry" draggable="true" role="group" :aria-label="operatorPrimaryName(item)" @mouseenter="help?.show($event,item,'summary')" @mouseleave="help?.leave()" @dragstart="help?.close(); emit('drag-start', $event, item, 'operator')" @dblclick="emit('add-item', item, 'operator')">
-            <div class="entry-body" role="button" tabindex="0" :aria-label="`添加${operatorPrimaryName(item)}`" @focus="help?.show($event,item,'summary')" @blur="help?.leave()" @keydown.enter.self.prevent="emit('add-item', item, 'operator')" @keydown.space.self.prevent="emit('add-item', item, 'operator')"><b>{{ operatorPrimaryName(item) }}</b><small>{{ item.name || item.code }}</small></div>
+            <div class="entry-body" role="button" tabindex="0" :aria-label="`添加${operatorPrimaryName(item)}`" @focus="help?.show($event,item,'summary')" @blur="help?.leave()" @keydown.enter.self.prevent="emit('add-item', item, 'operator')" @keydown.space.self.prevent="emit('add-item', item, 'operator')"><b>{{ operatorPrimaryName(item) }}</b><small>{{ item.code }} · v{{ item.version }}</small></div>
             <button type="button" class="operator-info" data-operator-info draggable="false" :aria-label="`查看${operatorPrimaryName(item)}说明`" aria-haspopup="dialog" :aria-expanded="Boolean(help?.isOpen(item.code))" @mouseenter="help?.show($event,item,'detail')" @mouseleave="help?.leave()" @focus="help?.show($event,item,'detail')" @blur="help?.leave()" @pointerdown.stop @mousedown.stop @click.stop="help?.toggle($event,item)" @dblclick.stop @keydown.stop @dragstart.stop.prevent>i</button>
           </div>
           </template>
@@ -102,6 +108,7 @@ function toggle(key) {
 .search span{color:#8190a5}
 .palette-scroll{flex:1;overflow-y:auto;padding:2px 9px 10px}
 .palette-scroll section+section{margin-top:11px}
+.palette-scroll .extension-group{margin-top:18px;padding-top:12px;border-top:1px solid #dfe5ee}
 .palette-scroll h4{margin:14px 0 8px;padding:6px 9px;border-left:3px solid #2f6fed;border-radius:0 5px 5px 0;background:#f2f6fc;color:#294b7a;font-size:14px;font-weight:800;line-height:1.5;letter-spacing:.02em}
 .palette-scroll button{display:grid;width:100%;min-height:48px;grid-template-columns:28px minmax(0,1fr) 16px;gap:8px;align-items:center;margin:4px 0;padding:7px 8px;text-align:left}
 .palette-scroll button:hover{border-color:#c9d8f3;background:#f8fbff}

@@ -8,8 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from .catalog import (catalog_by_code, normalize_chunker_params,
-                      RETIRED_KNOWLEDGE_OPERATORS, DEFAULT_QA_EXTRACTION_INSTRUCTIONS, RENAMED_DATAFLOW_OPERATORS)
+from .catalog import catalog_by_code, normalize_chunker_params, DEFAULT_QA_EXTRACTION_INSTRUCTIONS
 from .operator_catalog import resolve_operator
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
@@ -18,11 +17,12 @@ class FlowValidationError(ValueError):
     pass
 
 
-def _reject_renamed_operators(definition):
+def _reject_unknown_operators(definition, catalog):
     for node in definition.get("nodes", []):
-        if node.get("kind") == "operator" and node.get("ref") in RENAMED_DATAFLOW_OPERATORS:
-            replacements = " / ".join(RENAMED_DATAFLOW_OPERATORS[node["ref"]])
-            raise FlowValidationError(f"算子 {node['ref']} 已改名，新编排请使用 {replacements}；历史快照保持原版本")
+        if node.get("kind") == "operator":
+            code = str(node.get("ref") or "")
+            if not code or code not in catalog:
+                raise FlowValidationError(f"算子不存在：{code or '未声明'}")
 
 
 class FlowEdgeValidationError(FlowValidationError):
@@ -437,7 +437,7 @@ class FlowCompiler:
             if identity in stack:
                 raise FlowValidationError("禁止递归子图")
             child = resolve_subflow(node, self.subflows)
-            _reject_renamed_operators(child)
+            _reject_unknown_operators(child, self.catalog)
             validate_flow_edges(child, catalog=self.catalog, subflows=self.subflows)
             child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (identity,))
             if code == "knowledge-chunk" and node.get("params"):
@@ -466,7 +466,7 @@ class FlowCompiler:
         return result_nodes, result_edges
 
     def compile(self, definition: dict[str, Any]) -> dict[str, Any]:
-        _reject_renamed_operators(definition)
+        _reject_unknown_operators(definition, self.catalog)
         if _contains_knowledge_library_binding(definition):
             raise FlowValidationError("Flow Definition 不允许绑定 KnowledgeLibrary")
         validate_flow_edges(definition, catalog=self.catalog, subflows=self.subflows)
@@ -549,8 +549,6 @@ class FlowCompiler:
             if kind != "operator":
                 raise FlowValidationError(f"不支持的节点类型：{kind}")
             code = str(node.get("ref", "")); item = resolve_operator(self.catalog, node)
-            if code in RETIRED_KNOWLEDGE_OPERATORS:
-                raise FlowValidationError(f"算子已退出新编排：{code}；最终治理由 Knowledge Sink 执行")
             if not item or item.get("exposure") in {"disabled", "internal"} or not item.get("enabled", True):
                 raise FlowValidationError(f"算子不在 Flow allowlist：{code}")
             if purpose == "knowledge" and item.get("surfaces") and "advanced-canvas" not in item["surfaces"] and "standard-template" not in item["surfaces"]:
@@ -628,7 +626,8 @@ class FlowCompiler:
             node["operator_version"] = item.get("version", 1)
             node["adapter_code"] = item["adapter_code"]
             node["operator_spec"] = deepcopy({key: item.get(key) for key in (
-                "code", "version", "name", "display_name_zh", "description", "adapter_code", "runtime_requirements",
+                "code", "version", "name", "display_name_zh", "description", "source", "catalog_group", "category",
+                "adapter_code", "runtime_requirements",
                 "input_ports", "output_ports", "parameter_schema")})
             output_spec = (item.get("output_ports") or {}).get("output") or {"artifact_type": item["output"]}
             output = str(output_spec.get("artifact_type", item["output"]))

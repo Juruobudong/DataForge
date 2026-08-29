@@ -11,14 +11,10 @@ from copy import deepcopy
 
 from .llm_serving import DEFAULT_LLM_SERVING_ID
 
-RETIRED_KNOWLEDGE_OPERATORS = frozenset({
-    "quality-evaluator", "quality-filter", "source-binding", "knowledge-diff",
-})
-RENAMED_DATAFLOW_OPERATORS = {
-    "qa-generator": ("Text2QAGenerator",),
-    "prompted-refiner": ("PromptedRefiner",),
-    "deduplicate": ("HashDeduplicateFilter", "MinHashDeduplicateFilter"),
+DATAFORGE_CATEGORIES = {
+    "content-processing", "knowledge-generation", "quality-processing", "index-processing",
 }
+DATAFLOW_CATEGORIES = {"text-cleaning", "content-filtering", "deduplication", "text-generation"}
 DEFAULT_QA_EXTRACTION_INSTRUCTIONS = (
     "仅基于审核通过的原文生成问答。"
     "问题应清晰、具体且可独立理解，避免依赖上下文的模糊指代。"
@@ -77,9 +73,10 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "faq-table-row-builder": "将单机构 FAQ 表格逐行规范为来源切片",
     "faq-record-mapper": "将规范 FAQ 行确定性映射为专用知识",
     "text-knowledge-mapper": "将已审核来源切片确定性映射为文本候选知识",
-    "deduplicate": "移除重复的候选知识",
+    "HashDeduplicateFilter": "按知识身份精确移除重复候选",
+    "MinHashDeduplicateFilter": "在同一来源块内按文本相似度移除重复候选",
     "prompt-generator": "按受控提示生成结构化知识",
-    "qa-generator": "从来源文本块生成问答知识",
+    "Text2QAGenerator": "使用 DataFlow 两阶段流程从来源文本块生成问答知识",
     "qa-extractor": "基于业务要求从审核原文直接提取完整问答；DataForge 原生单阶段生成",
     "graph-extractor": "从来源文本块提取图谱知识",
     "entity-extractor": "识别文本中的实体候选",
@@ -92,24 +89,18 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "graph-quality-validator": "在正式发布前校验图谱实体、关系与字面值质量",
     "artifact-merge": "合并多个上游候选结果",
     "structured-knowledge-generator": "按知识类型契约生成结构化知识",
-    "quality-evaluator": "评估候选知识的质量分数",
-    "quality-filter": "按质量门槛筛选候选知识",
-    "source-binding": "为候选知识绑定来源与锚点",
     "schema-validator": "校验候选知识是否符合 Schema",
-    "knowledge-diff": "计算候选知识与当前版本的差异",
     "mineru-pipeline-gpu-adapter": "通过 MinerU GPU 服务解析 PDF",
     "kbc-cleaner-batch": "批量执行文本清理",
     "kbc-chunker-batch": "批量执行语义切片",
-    "prompted-refiner": "使用受控提示修订候选知识",
+    "PromptedRefiner": "使用受控提示修订候选知识",
     "multihop-qa": "生成需要多步推理的问答知识",
     "pii-compliance": "识别并处理个人敏感信息",
-    "kcenter-greedy": "按覆盖度选择代表性样本",
-    "reference-remover": "移除文档中的参考文献部分",
 }
 
 OPERATOR_CATEGORIES: tuple[str, ...] = (
-    "文档输入", "内容处理", "知识切分", "知识生成", "LLM 处理",
-    "质量治理", "向量处理", "知识发布", "流程控制",
+    "content-processing", "knowledge-generation", "quality-processing", "index-processing",
+    "text-cleaning", "content-filtering", "deduplication", "text-generation", "extension",
 )
 
 OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
@@ -119,15 +110,14 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "reviewed-source-chunk-input": "已审核来源切片",
     "text-knowledge-mapper": "文本知识映射器",
     "qa-extractor": "问答提取器",
-    "deduplicate": "候选去重器", "prompt-generator": "提示词生成器", "qa-generator": "问答生成器",
+    "HashDeduplicateFilter": "哈希去重过滤器", "MinHashDeduplicateFilter": "MinHash 相似去重过滤器",
+    "prompt-generator": "提示词生成器", "Text2QAGenerator": "QA 生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
     "triple-builder": "三元组构建器", "entity-normalizer": "实体规范器", "semantic-relation-builder": "语义关系构建器",
     "evidence-binder": "证据绑定器", "literal-detector": "字面值识别器", "graph-quality-validator": "图谱质量校验器", "artifact-merge": "产物合并器", "structured-knowledge-generator": "结构化知识生成器",
-    "quality-evaluator": "知识质量评估器", "quality-filter": "知识质量过滤器", "source-binding": "来源绑定器",
-    "schema-validator": "结构校验器", "knowledge-diff": "知识差异计算器", "mineru-pipeline-gpu-adapter": "MinerU GPU 解析适配器",
-    "kbc-cleaner-batch": "批量文本清洗器", "kbc-chunker-batch": "批量语义切片器", "prompted-refiner": "知识修订器",
-    "multihop-qa": "多跳问答生成器", "pii-compliance": "敏感信息合规器", "kcenter-greedy": "代表样本选择器",
-    "reference-remover": "参考文献移除器", "faq-table-row-builder": "FAQ 表格行构建器",
+    "schema-validator": "结构校验器", "mineru-pipeline-gpu-adapter": "MinerU GPU 解析适配器",
+    "kbc-cleaner-batch": "批量文本清洗器", "kbc-chunker-batch": "批量语义切片器", "PromptedRefiner": "提示词修订器",
+    "multihop-qa": "多跳问答生成器", "pii-compliance": "敏感信息合规器", "faq-table-row-builder": "FAQ 表格行构建器",
     "faq-record-mapper": "FAQ 知识映射器",
 }
 
@@ -141,9 +131,9 @@ SUBFLOW_DISPLAY_NAMES_ZH: dict[str, str] = {
 def _catalog_category(code: str, previous: str) -> tuple[str, str]:
     if code == "document-parser": return "文档输入", "文档解析"
     if code in {"semantic-chunker", "source-chunk-builder", "kbc-chunker-batch"}: return "知识切分", previous
-    if code in {"qa-generator", "graph-extractor", "entity-extractor", "relation-extractor", "triple-builder", "entity-normalizer", "semantic-relation-builder", "evidence-binder", "structured-knowledge-generator", "multihop-qa", "literal-detector"}: return "知识生成", previous
-    if code in {"prompt-generator", "prompted-refiner"}: return "LLM 处理", previous
-    if code in {"deduplicate", "quality-evaluator", "quality-filter", "source-binding", "schema-validator", "knowledge-diff", "graph-quality-validator", "kcenter-greedy"}: return "质量治理", previous
+    if code in {"Text2QAGenerator", "graph-extractor", "entity-extractor", "relation-extractor", "triple-builder", "entity-normalizer", "semantic-relation-builder", "evidence-binder", "structured-knowledge-generator", "multihop-qa", "literal-detector"}: return "知识生成", previous
+    if code in {"prompt-generator", "PromptedRefiner"}: return "LLM 处理", previous
+    if code in {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "schema-validator", "graph-quality-validator"}: return "质量治理", previous
     if code == "artifact-merge": return "流程控制", previous
     return "内容处理", previous
 
@@ -184,7 +174,7 @@ def _artifact_example(artifact_type: str) -> dict[str, Any]:
     return {"value": "示例数据"}
 
 
-def _entry(code: str, name: str, category: str, source: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", input_binding: str = "edge", node_role: str = "operator", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None, version: int | None = None) -> dict[str, Any]:
+def _entry(code: str, name: str, category: str, input_type: str, target: str, adapter: str, *, exposure: str = "canvas", risk: str = "standard", upstream: list[str] | None = None, input_cardinality: str = "one", input_binding: str = "edge", node_role: str = "operator", uses_llm: bool = False, extra_params: dict[str, dict[str, Any]] | None = None, version: int | None = None) -> dict[str, Any]:
     primary_category, subcategory = _catalog_category(code, category)
     parameter_schema: dict[str, Any] = {"type": "object", "additionalProperties": False}
     parameter_docs: dict[str, str] = {"_overview": "此版本没有面向画布的业务可配置参数；运行时内部配置不会返回前端。"}
@@ -214,23 +204,24 @@ def _entry(code: str, name: str, category: str, source: str, target: str, adapte
     return {
         "code": code, "name": name, "display_name_zh": OPERATOR_DISPLAY_NAMES_ZH[code],
         "summary": OPERATOR_DESCRIPTIONS[code], "description": OPERATOR_DESCRIPTIONS[code],
-        "category": primary_category, "subcategory": subcategory, "input": source,
+        "category": primary_category, "subcategory": subcategory, "input": input_type,
+        "source": "dataforge", "catalog_group": "dataforge",
         "output": target, "adapter_code": adapter, "exposure": exposure,
         "risk_level": risk, "upstream": upstream or [], "version": version or (4 if uses_llm else 3),
         "node_role": node_role,
         "scenarios": [f"适用于{OPERATOR_DESCRIPTIONS[code]}的受控知识流程"],
-        "knowledge_types": _knowledge_types(source, target),
+        "knowledge_types": _knowledge_types(input_type, target),
         "recommended_predecessors": [], "recommended_successors": [],
         "lifecycle_status": "deprecated" if exposure == "disabled" else "published",
-        "input_ports": {"input": {"artifact_type": source, "cardinality": input_cardinality,
+        "input_ports": {"input": {"artifact_type": input_type, "cardinality": input_cardinality,
                                     "required": True, "binding": input_binding}},
         "output_ports": {"output": {"artifact_type": target, "cardinality": "many",
                                       "required": False, "binding": "edge"}},
-        "input_example": {"input": [_artifact_example(source)]},
+        "input_example": {"input": [_artifact_example(input_type)]},
         "output_example": {"output": [_artifact_example(target)]},
         "parameter_schema": parameter_schema,
         "parameter_docs": parameter_docs,
-        "runtime_requirements": {"executor": "dataforge-native", "provider": "dataforge", "implementation": adapter, "adapter_version": 1, "upstream": upstream or [], "uses_llm": uses_llm},
+        "runtime_requirements": {"executor": "dataforge-native", "implementation": adapter, "adapter_version": 1, "upstream": upstream or [], "uses_llm": uses_llm},
     }
 
 
@@ -256,10 +247,10 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("faq-table-row-builder", "FAQ Table Row Builder", "清洗", "document_ir", "chunk_set", "faq_table_row_builder"),
     _entry("faq-record-mapper", "FAQ Record Mapper", "知识生成", "source_chunk_set", "candidate:qa-agent-faq", "faq_record_mapper"),
     _entry("text-knowledge-mapper", "Text Knowledge Mapper", "内容处理", "source_chunk_set", "candidate:text", "text_knowledge_mapper", uses_llm=False),
-    _entry("deduplicate", "Candidate Deduplicate", "清洗", "candidate:*", "candidate:*", "candidate_deduplicate", upstream=["MinHashDeduplicateFilter", "SemDeduplicateFilter"]),
+    _entry("HashDeduplicateFilter", "HashDeduplicateFilter", "清洗", "candidate:*", "candidate:*", "candidate_deduplicate", upstream=["HashDeduplicateFilter"]),
     _entry("prompt-generator", "Prompt Generator", "知识生成", "source_chunk_set", "candidate:*", "prompt_generator", risk="advanced", upstream=["PromptedGenerator", "ChunkedPromptedGenerator"], uses_llm=True, version=6,
            extra_params={"prompt_template_revision_id": {"schema": {"type": "string", "title": "Prompt 模板", "default": "promptrev_default", "x-dataforge-ui": {"widget": "prompt-template-selector"}}, "doc": "已发布且与当前知识类型匹配的 Prompt Template Revision ID。", "required": True}}),
-    _entry("qa-generator", "QA Generator", "知识生成", "source_chunk_set", "candidate:qa", "qa_generator", upstream=["Text2QAGenerator"], uses_llm=True),
+    _entry("Text2QAGenerator", "Text2QAGenerator", "知识生成", "source_chunk_set", "candidate:qa", "qa_generator", upstream=["Text2QAGenerator"], uses_llm=True),
     _entry("graph-extractor", "Graph Extractor", "知识生成", "source_chunk_set", "candidate:graph", "graph_extractor", uses_llm=True),
     _entry("entity-extractor", "Entity Extractor", "图谱", "source_chunk_set", "entity_candidate_set", "entity_extractor", uses_llm=True, version=6,
            extra_params={
@@ -285,22 +276,14 @@ CATALOG_SEEDS: tuple[dict[str, Any], ...] = (
     _entry("artifact-merge", "Artifact Merge", "治理", "candidate:*", "candidate:*", "artifact_merge", input_cardinality="many"),
     _entry("structured-knowledge-generator", "Structured Knowledge Generator", "知识生成", "source_chunk_set", "candidate:*", "structured_knowledge_generator", upstream=["ChunkedPromptedGenerator"], uses_llm=True, version=6,
            extra_params={"prompt_template_revision_id": {"schema": {"type": "string", "title": "Prompt 模板", "default": "promptrev_default", "x-dataforge-ui": {"widget": "prompt-template-selector"}}, "doc": "已发布且与当前知识类型匹配的 Prompt Template Revision ID。", "required": True}}),
-    _entry("quality-evaluator", "Knowledge Evaluator", "质量", "candidate:*", "candidate:*", "quality_evaluator", upstream=["PromptedEvaluator"], version=4,
-           extra_params={"quality_profile_revision_id": {"schema": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}, "doc": "已发布且与当前知识类型匹配的 Quality Profile Revision ID。", "required": True}}),
-    _entry("quality-filter", "Knowledge Filter", "质量", "candidate:*", "candidate:*", "quality_filter", upstream=["PromptedFilter"], version=4,
-           extra_params={"quality_profile_revision_id": {"schema": {"type": "string", "title": "质量规则", "default": "qualityrev_default", "x-dataforge-ui": {"widget": "quality-profile-selector"}}, "doc": "已发布且与当前知识类型匹配的 Quality Profile Revision ID。", "required": True}}),
-    _entry("source-binding", "Source Binding", "治理", "candidate:*", "candidate:*", "source_binding"),
     _entry("schema-validator", "Schema Validator", "治理", "candidate:*", "candidate:*", "schema_validator"),
     _entry("graph-quality-validator", "Graph Quality Validator", "质量", "candidate:*", "candidate:*", "graph_quality_validator"),
-    _entry("knowledge-diff", "Knowledge Diff", "治理", "candidate:*", "candidate:*", "knowledge_diff"),
     _entry("mineru-pipeline-gpu-adapter", "MinerU Pipeline GPU Adapter", "Runtime", "source_file", "document_ir", "mineru_pipeline_gpu", exposure="internal", upstream=["MinerUPipelineHTTPAdapter"]),
     _entry("kbc-cleaner-batch", "KBC Cleaner Batch", "Runtime", "document_ir", "document_ir", "kbc_cleaner_batch", exposure="internal", upstream=["KBCTextCleanerBatch"]),
     _entry("kbc-chunker-batch", "KBC Chunker Batch", "Runtime", "document_ir", "chunk_set", "kbc_chunker_batch", exposure="internal", upstream=["KBCChunkGeneratorBatch"]),
-    _entry("prompted-refiner", "Knowledge Refiner", "质量", "candidate:*", "candidate:*", "prompted_refiner", exposure="controlled", risk="advanced", upstream=["PromptedRefiner"]),
+    _entry("PromptedRefiner", "PromptedRefiner", "质量", "candidate:*", "candidate:*", "prompted_refiner", exposure="controlled", risk="advanced", upstream=["PromptedRefiner"]),
     _entry("multihop-qa", "Multi-hop QA", "知识生成", "chunk_set", "candidate:qa", "multihop_qa", exposure="controlled", risk="advanced", upstream=["Text2MultiHopQAGenerator"], uses_llm=True),
     _entry("pii-compliance", "PII Compliance", "合规", "document_ir", "document_ir", "pii_compliance", exposure="controlled", risk="compliance", upstream=["PIIAnonymizeRefiner"]),
-    _entry("kcenter-greedy", "KCenter Greedy", "禁用", "candidate:*", "candidate:*", "disabled", exposure="disabled", risk="disabled", upstream=["KCenterGreedyFilter"]),
-    _entry("reference-remover", "Reference Remover", "禁用", "document_ir", "document_ir", "disabled", exposure="disabled", risk="disabled", upstream=["ReferenceRemoverRefiner"]),
 )
 
 
@@ -311,8 +294,8 @@ DATAFLOW_LOCK_DIGEST = "d575faf7e20b1bf75725fa15a4d29de17168c957d09f99f5b2cd5053
 DATAFLOW_CURATED_LOCK_DIGEST = "dcd3a3c0858ee2af3790255b435885fd50f5ef649fc18a6b26a250d84a0890e8"
 
 
-def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[str]:
-    if code in RETIRED_KNOWLEDGE_OPERATORS or code in RENAMED_DATAFLOW_OPERATORS or exposure == "internal" or source in {"source_file", "document_ir", "chunk_set"}:
+def operator_surfaces(code: str, input_type: str, exposure: str = "canvas") -> list[str]:
+    if exposure == "internal" or input_type in {"source_file", "document_ir", "chunk_set"}:
         return ["system-internal"]
     standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "Text2QAGenerator", "qa-extractor",
                 "entity-extractor", "literal-detector", "relation-extractor", "triple-builder",
@@ -321,17 +304,9 @@ def operator_surfaces(code: str, source: str, exposure: str = "canvas") -> list[
     return (["standard-template"] if code in standard else []) + ["advanced-canvas"]
 
 
-LEGACY_CATALOG_SEEDS = tuple(deepcopy(item) for item in CATALOG_SEEDS)
-
-
 def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     item = deepcopy(item)
-    if item["code"] in RETIRED_KNOWLEDGE_OPERATORS:
-        item["exposure"] = "internal"
-        item["lifecycle_status"] = "deprecated"
-        item["description"] = item["summary"] = "已退出新编排，仅保留历史执行版本；最终治理由 Knowledge Sink 完成。"
     item["surfaces"] = operator_surfaces(item["code"], item["input"], item["exposure"])
-    item["provider"] = "dataforge"
     graph_modes = {"triple-builder": ["triple"], "semantic-relation-builder": ["semantic"], "evidence-binder": ["semantic"]}
     if item["code"] in graph_modes:
         item["graph_modes"] = graph_modes[item["code"]]
@@ -339,25 +314,24 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     if item["code"] == "graph-quality-validator":
         item["knowledge_types"] = ["graph"]
     if item["code"] in {"reviewed-source-chunk-input", "prompt-generator", "structured-knowledge-generator",
-                        "quality-evaluator", "quality-filter", "source-binding", "schema-validator",
-                        "knowledge-diff", "artifact-merge"}:
+                        "schema-validator", "artifact-merge"}:
         item["knowledge_types"] = ["*"]
     if item["code"] == "schema-validator":
         item["knowledge_types"] = ["graph"]
         item["display_name_zh"] = "图谱结构校验器"
         item["description"] = item["summary"] = "独立校验图谱实体、关系与方向约束，非法结构阻止该分支提交"
     implementations = {
-        "qa-generator": (5, "dataflow.operators.core_text:Text2QAGenerator", "source-chunk-to-qa-v1"),
-        "deduplicate": (4, "dataflow.operators.general_text:HashDeduplicateFilter", "candidate-deduplicate-v1"),
-        "prompted-refiner": (4, "dataflow.operators.core_text:PromptedRefiner", "candidate-refiner-v1"),
+        "Text2QAGenerator": (6, "dataflow.operators.core_text:Text2QAGenerator", "source-chunk-to-qa-v2"),
+        "HashDeduplicateFilter": (4, "dataflow.operators.general_text:HashDeduplicateFilter", "candidate-hash-deduplicate-v1"),
+        "PromptedRefiner": (4, "dataflow.operators.core_text:PromptedRefiner", "candidate-refiner-v1"),
     }
     if item["code"] not in implementations:
         return item
     version, implementation, adapter = implementations[item["code"]]
-    uses_llm = item["code"] != "deduplicate"
-    item.update(version=version, provider="dataflow", adapter_code=adapter)
+    uses_llm = item["code"] != "HashDeduplicateFilter"
+    item.update(version=version, source="dataflow", catalog_group="dataflow_featured", adapter_code=adapter)
     item["runtime_requirements"] = {
-        "executor": "dataflow-llm" if uses_llm else "dataflow-storage", "provider": "dataflow",
+        "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
         "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
         "dependency_lock_digest": DATAFLOW_LOCK_DIGEST,
         "implementation": implementation, "adapter_version": adapter, "uses_llm": uses_llm,
@@ -368,14 +342,12 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     if uses_llm:
         props["llm_serving"] = {"type": "string", "title": "模型服务", "x-dataforge-ui": {"widget": "llm-serving-selector"}}
         docs["llm_serving"] = "已配置的模型服务，发布时冻结配置指纹。"
-    if item["code"] == "qa-generator":
+    if item["code"] == "Text2QAGenerator":
         props["questions_per_chunk"] = {"type": "integer", "title": "每块最多问题数", "default": 1, "minimum": 1, "maximum": 10}
         docs["questions_per_chunk"] = "上游先生成提问方向，再生成问答；每块最多生成的问题数。"
-    elif item["code"] == "deduplicate":
-        props.update(method={"type": "string", "enum": ["identity", "minhash"], "default": "identity", "title": "去重方式"},
-                     threshold={"type": "number", "minimum": 0.01, "maximum": 1, "default": 0.9, "title": "相似度阈值"})
-        docs.update(method="identity 按知识 ID 精确去重；minhash 仅在同一来源 Chunk 内对文本或问答去重。", threshold="MinHash 相似度阈值。")
-        item["runtime_requirements"]["implementations"] = {"identity": implementation, "minhash": "dataflow.operators.general_text:MinHashDeduplicateFilter"}
+    elif item["code"] == "HashDeduplicateFilter":
+        item["runtime_requirements"]["implementations"] = {"identity": implementation}
+        item["description"] = item["summary"] = "使用 DataFlow HashDeduplicateFilter 按知识身份精确去重，保留来源与 Evidence"
     else:
         item["knowledge_types"] = ["text", "qa"]
         props["prompt_template_revision_id"] = {"type": "string", "title": "修订 Prompt", "default": "promptrev_refiner", "x-dataforge-ui": {"widget": "prompt-template-selector"}}
@@ -385,61 +357,25 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
 
 
 CATALOG_SEEDS = tuple(_curated_entry(item) for item in CATALOG_SEEDS)
-# Keep the published DataFlow v5 specification addressable; v6 adds guidance.
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "qa-generator")
 for _item in CATALOG_SEEDS:
-    if _item["code"] == "qa-generator":
-        _item["version"] = 6
-        _item["adapter_code"] = "source-chunk-to-qa-v2"
-        _item["runtime_requirements"]["adapter_version"] = "source-chunk-to-qa-v2"
+    if _item["code"] == "Text2QAGenerator":
         _item["parameter_schema"]["properties"]["extraction_instructions"] = deepcopy(QA_EXTRACTION_SCHEMA)
         _item["parameter_docs"]["extraction_instructions"] = QA_EXTRACTION_SCHEMA["description"]
 
-
-# New identities reuse the existing versioned execution contracts. Old codes
-# remain exact historical registrations, never aliases to a new implementation.
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in RENAMED_DATAFLOW_OPERATORS)
-
-
-def _upstream_named_entries(item):
-    names = RENAMED_DATAFLOW_OPERATORS.get(item["code"])
-    if not names:
-        return [item]
-    chinese = {"Text2QAGenerator": "文本转问答生成器", "PromptedRefiner": "提示词修订器",
-               "HashDeduplicateFilter": "哈希去重过滤器", "MinHashDeduplicateFilter": "MinHash 相似去重过滤器"}
-    result = []
-    for name in names:
-        value = deepcopy(item)
-        value.update(code=name, name=name, display_name_zh=chinese[name])
-        value["surfaces"] = operator_surfaces(name, value["input"], value["exposure"])
-        if item["code"] == "deduplicate":
-            method = "identity" if name == "HashDeduplicateFilter" else "minhash"
-            runtime = value["runtime_requirements"]
-            runtime["implementation"] = runtime["implementations"][method]
-            adapter = "candidate-hash-deduplicate-v1" if method == "identity" else "candidate-minhash-deduplicate-v1"
-            value["adapter_code"] = runtime["adapter_version"] = adapter
-            value["parameter_schema"]["properties"].pop("method", None)
-            value["parameter_docs"].pop("method", None)
-            if method == "identity":
-                value["parameter_schema"]["properties"].pop("threshold", None)
-                value["parameter_docs"].pop("threshold", None)
-                runtime["implementations"] = {"identity": runtime["implementation"]}
-                description = "使用 DataFlow HashDeduplicateFilter 按知识身份精确去重，保留来源与 Evidence"
-            else:
-                value["knowledge_types"] = ["text", "qa"]
-                description = "使用 DataFlow MinHashDeduplicateFilter 在同一来源 Chunk 内做相似去重；少于 5 字符的正文使用 HashDeduplicateFilter 精确去重保护"
-            value["description"] = value["summary"] = description
-        result.append(value)
-    return result
-
-
-CATALOG_SEEDS = tuple(value for item in CATALOG_SEEDS for value in _upstream_named_entries(item))
-for _item in LEGACY_CATALOG_SEEDS:
-    if _item["code"] in RENAMED_DATAFLOW_OPERATORS:
-        _item.update(exposure="internal", surfaces=["system-internal"], lifecycle_status="deprecated")
-for _item in CATALOG_SEEDS:
-    for _key in ("recommended_predecessors", "recommended_successors"):
-        _item[_key] = [new for code in _item.get(_key, []) for new in RENAMED_DATAFLOW_OPERATORS.get(code, (code,))]
+_hash = next(item for item in CATALOG_SEEDS if item["code"] == "HashDeduplicateFilter")
+_minhash = deepcopy(_hash)
+_minhash.update(code="MinHashDeduplicateFilter", name="MinHashDeduplicateFilter",
+                display_name_zh="MinHash 相似去重过滤器", knowledge_types=["text", "qa"])
+_minhash["adapter_code"] = _minhash["runtime_requirements"]["adapter_version"] = "candidate-minhash-deduplicate-v1"
+_minhash["runtime_requirements"]["implementation"] = "dataflow.operators.general_text:MinHashDeduplicateFilter"
+_minhash["runtime_requirements"]["implementations"] = {
+    "identity": "dataflow.operators.general_text:HashDeduplicateFilter",
+    "minhash": "dataflow.operators.general_text:MinHashDeduplicateFilter",
+}
+_minhash["parameter_schema"]["properties"]["threshold"] = {"type": "number", "minimum": 0.01, "maximum": 1, "default": 0.9, "title": "相似度阈值"}
+_minhash["parameter_docs"]["threshold"] = "仅在同一来源 Chunk 内对文本或问答做 MinHash 相似去重。"
+_minhash["description"] = _minhash["summary"] = "使用 DataFlow MinHashDeduplicateFilter 在同一来源 Chunk 内做相似去重；少于 5 字符的正文使用 HashDeduplicateFilter 精确去重保护"
+CATALOG_SEEDS += (_minhash,)
 
 DATAFLOW_CURATED_SPECS = {
     "ContentNullFilter": {"name": "空内容过滤器", "category": "内容清洗", "adapter": "candidate-row-filter-v1", "properties": {}},
@@ -485,7 +421,7 @@ def _new_curated_entries():
                    "anchor_json": {"page": 1}, "evidence_text": "审核后的来源正文", "data_json": {}}
         item["input_example"], item["output_example"] = {"input": [example]}, {"output": [deepcopy(example)]}
         item["runtime_requirements"] = {
-            "provider": "dataflow", "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
+            "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
             "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
             "dependency_lock_digest": DATAFLOW_CURATED_LOCK_DIGEST, "uses_llm": uses_llm,
             "implementation": f"dataflow.operators.{namespace}:{code}", "adapter_version": spec["adapter"],
@@ -503,15 +439,13 @@ for _item in CATALOG_SEEDS:
 
 from .governance_catalog import extend_catalog
 
-CATALOG_SEEDS, _governance_legacy = extend_catalog(
+CATALOG_SEEDS, _ = extend_catalog(
     CATALOG_SEEDS, DATAFLOW_PACKAGE, DATAFLOW_VERSION, DATAFLOW_DIGEST, DATAFLOW_CURATED_LOCK_DIGEST,
 )
-LEGACY_CATALOG_SEEDS += _governance_legacy
 
-# Triple chunk isolation is a new execution contract; published versions stay intact.
+# Apply the current execution contracts to the clean-environment catalog.
 from .operators.graph_chunks import TRIPLE_CHUNK_VERSIONS
 
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in TRIPLE_CHUNK_VERSIONS)
 for _item in CATALOG_SEEDS:
     if _item["code"] in TRIPLE_CHUNK_VERSIONS:
         _item["version"] = TRIPLE_CHUNK_VERSIONS[_item["code"]]
@@ -520,7 +454,6 @@ for _item in CATALOG_SEEDS:
 
 from .graph_prompt import GRAPH_GUIDANCE_VERSIONS
 
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] in GRAPH_GUIDANCE_VERSIONS)
 for _item in CATALOG_SEEDS:
     if _item["code"] in GRAPH_GUIDANCE_VERSIONS:
         _item["version"] = GRAPH_GUIDANCE_VERSIONS[_item["code"]]
@@ -534,18 +467,15 @@ for _item in CATALOG_SEEDS:
         }
         _item["parameter_docs"]["extraction_instructions"] = _item["parameter_schema"]["properties"]["extraction_instructions"]["description"]
 
-# A bounded endpoint repair belongs to a new relation execution version.
+# The current relation version includes bounded endpoint repair.
 from .graph_prompt import RELATION_REPAIR_VERSION
 
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "relation-extractor")
 for _item in CATALOG_SEEDS:
     if _item["code"] == "relation-extractor":
         _item["version"] = RELATION_REPAIR_VERSION
         _item["runtime_requirements"] = {**_item["runtime_requirements"], "triple_endpoint_repair_attempts": 1}
         _item["description"] = _item["summary"] = _item["description"] + "；Triple 未知实体端点最多重抽取一次，仍不合法则隔离整块；Semantic 不变。"
 
-# Separate provider identities; frozen v7 specifications remain unchanged.
-LEGACY_CATALOG_SEEDS += tuple(deepcopy(item) for item in CATALOG_SEEDS if item["code"] == "Text2QAGenerator")
 for _item in CATALOG_SEEDS:
     if _item["code"] == "Text2QAGenerator":
         _item["version"] = 8
@@ -560,14 +490,36 @@ _native_qa = _entry("qa-extractor", "QA Extractor", "知识生成", "source_chun
                         "questions_per_chunk": {"schema": {"type": "integer", "title": "每块最多问题数", "minimum": 1, "maximum": 10, "default": 1}},
                         "extraction_instructions": {"schema": deepcopy(QA_EXTRACTION_SCHEMA)},
                     })
-_native_qa.update(provider="dataforge", subcategory="知识生成", surfaces=["standard-template", "advanced-canvas"])
+_native_qa.update(subcategory="知识生成", surfaces=["standard-template", "advanced-canvas"])
 _native_qa["input_ports"]["input"]["accepted_types"] = ["source_chunk_set", "derived_text_set"]
 _native_qa["parameter_schema"]["properties"]["llm_serving"].pop("default", None)
 _native_qa["parameter_schema"]["required"] = []
 CATALOG_SEEDS += (_native_qa,)
 
+DATAFLOW_TEXT_GENERATION = {"Text2QAGenerator", "Text2MultiHopQAGenerator"}
+DATAFLOW_DEDUPLICATION = {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "NgramHashDeduplicateFilter", "SimHashDeduplicateFilter"}
+DATAFLOW_TEXT_CLEANING = {"PromptedRefiner", "PIIAnonymizeRefiner"}
+DATAFORGE_CONTENT_PROCESSING = {"reviewed-source-chunk-input", "faq-record-mapper", "text-knowledge-mapper", "qa-extractor"}
+DATAFORGE_QUALITY_PROCESSING = {"schema-validator", "graph-quality-validator"}
+
+for _item in CATALOG_SEEDS:
+    if _item["source"] == "dataflow":
+        _item["category"] = ("text-generation" if _item["code"] in DATAFLOW_TEXT_GENERATION else
+                             "deduplication" if _item["code"] in DATAFLOW_DEDUPLICATION else
+                             "text-cleaning" if _item["code"] in DATAFLOW_TEXT_CLEANING else "content-filtering")
+        _item["catalog_group"] = "dataflow_featured"
+    else:
+        _item["category"] = ("content-processing" if _item["code"] in DATAFORGE_CONTENT_PROCESSING else
+                             "quality-processing" if _item["code"] in DATAFORGE_QUALITY_PROCESSING else
+                             "knowledge-generation" if "advanced-canvas" in _item.get("surfaces", []) else "content-processing")
+        _item["catalog_group"] = "dataforge"
+
+UNAVAILABLE_OPERATOR_CODES = {
+    "qa-generator", "prompted-refiner", "deduplicate", "quality-evaluator", "quality-filter",
+    "source-binding", "knowledge-diff", "kcenter-greedy", "reference-remover",
+}
 PLATFORM_RESERVED_OPERATOR_CODES = frozenset(
-    {item["code"].casefold() for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)} | {"knowledge-sink"}
+    {item["code"].casefold() for item in CATALOG_SEEDS} | UNAVAILABLE_OPERATOR_CODES | {"knowledge-sink"}
 )
 
 

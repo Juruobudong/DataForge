@@ -35,7 +35,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
 </script>
 <template>
   <section class="plugin-manager panel">
-    <header><h3>自定义算子</h3><button @click="open = !open">注册 Manifest</button></header>
+    <header><h3>扩展算子</h3><button @click="open = !open">注册 Manifest</button></header>
     <p>仅注册维护人员已安装、已审核的包。验证调用真实插件代码，模型使用 Manifest 中的样例响应；不会写入正式知识。不接收 Python 源码。</p>
     <form v-if="open" @submit.prevent="register"><label>JSON Manifest<textarea v-model="manifest" aria-label="JSON Manifest" rows="12" required spellcheck="false" /></label><button :disabled="busy">{{ busy ? '正在注册…' : '注册草稿版本' }}</button></form>
     <article v-for="item in plugins" :key="key(item)">
@@ -44,7 +44,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer) })
       <button v-if="item.version_status !== 'published'" :disabled="reports[key(item)]?.status !== 'passed'" @click="publish(item)">审核并发布</button>
       <details v-if="reports[key(item)]"><summary>验证：{{ reports[key(item)].status }}</summary><pre>{{ JSON.stringify(reports[key(item)].report || {}, null, 2) }}</pre></details>
     </article>
-    <p v-if="!plugins.length">尚无自定义算子。</p><p v-if="error" role="alert" class="error">{{ error }}</p>
+    <p v-if="!plugins.length">尚无扩展算子。</p><p v-if="error" role="alert" class="error">{{ error }}</p>
   </section>
 </template>
 <style scoped>

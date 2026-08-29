@@ -20,13 +20,15 @@ ARTIFACT_TYPES = {"source_chunk_set", "entity_candidate_set", "relation_candidat
 
 def validate_manifest(raw):
     value = deepcopy(raw)
-    required = {"code", "name", "display_name_zh", "provider", "executor", "package", "package_version", "package_digest", "implementation",
+    required = {"code", "name", "display_name_zh", "executor", "package", "package_version", "package_digest", "implementation",
                 "input_ports", "output_ports", "parameter_schema", "input_example", "output_example"}
     if not isinstance(value, dict) or required - value.keys():
         raise ValueError("Manifest 缺少必需字段")
     if not re.fullmatch(r"[a-z][a-z0-9-]{2,100}", value["code"]) or value["code"].casefold() in PLATFORM_RESERVED_OPERATOR_CODES:
         raise ValueError("自定义 code 不合法或覆盖平台保留算子")
-    if value["provider"] != "custom" or value["executor"] not in {"dataflow-storage", "dataflow-llm", "custom-native"}:
+    if {"source", "catalog_group", "provider"} & value.keys():
+        raise ValueError("算子来源与目录分组由 DataForge 管理，Manifest 不能声明")
+    if value["executor"] not in {"dataflow-storage", "dataflow-llm", "custom-native"}:
         raise ValueError("不支持的自定义执行器")
     if value.get("surfaces", ["advanced-canvas"]) != ["advanced-canvas"]:
         raise ValueError("自定义算子只允许 advanced-canvas")
@@ -92,7 +94,7 @@ class OperatorPluginService:
 
     def register(self, manifest):
         value = validate_manifest(manifest)
-        runtime = {key: deepcopy(value[key]) for key in ("provider", "executor", "package", "package_version", "package_digest", "implementation",
+        runtime = {key: deepcopy(value[key]) for key in ("executor", "package", "package_version", "package_digest", "implementation",
                    "uses_llm", "input_mapping", "output_mapping", "init_parameters", "run_arguments", "capabilities", "timeout_seconds", "knowledge_types", "graph_modes") if key in value}
         runtime.update(adapter_version="custom-records-v1", approved=False, manifest=value, manifest_digest=digest(value))
         self.store.require_operator_runtime(runtime)
@@ -101,12 +103,13 @@ class OperatorPluginService:
             if definition is None:
                 definition = OperatorDefinition(id=f"op_{uuid4().hex}", code=value["code"], name=value["name"],
                     display_name_zh=value["display_name_zh"], summary=value.get("description", value["name"]),
-                    description=value.get("description", value["name"]), category="自定义算子", subcategory="",
+                    description=value.get("description", value["name"]), source="custom", catalog_group="extension",
+                    category="extension", subcategory="",
                     scenarios=["已审核来源知识处理"], knowledge_types=value.get("knowledge_types", ["text", "qa", "graph"]),
                     surfaces=["advanced-canvas"], exposure="controlled", risk_level="advanced", enabled=True, lifecycle_status="draft")
                 session.add(definition); session.flush()
             previous = session.scalars(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id)).all()
-            if any((row.runtime_requirements or {}).get("provider") != "custom" for row in previous):
+            if definition.source != "custom" or definition.catalog_group != "extension":
                 raise ValueError("不能覆盖平台版本")
             number = max((row.version_no for row in previous), default=0) + 1
             version = OperatorVersion(id=f"oprev_{uuid4().hex}", operator_definition_id=definition.id, version_no=number,
@@ -120,7 +123,7 @@ class OperatorPluginService:
     def versions(self):
         with self.store.sessions() as session:
             rows = session.execute(select(OperatorDefinition, OperatorVersion).join(OperatorVersion).order_by(OperatorVersion.created_at.desc())).all()
-            return [version_payload(definition, version) for definition, version in rows if version.runtime_requirements.get("provider") == "custom"]
+            return [version_payload(definition, version) for definition, version in rows if definition.source == "custom"]
 
     def start_validation(self, code, number):
         with self.store.sessions.begin() as session:
@@ -132,8 +135,9 @@ class OperatorPluginService:
 
     @staticmethod
     def _version(session, code, number):
-        version = session.scalar(select(OperatorVersion).join(OperatorDefinition).where(OperatorDefinition.code == code, OperatorVersion.version_no == number))
-        if not version or version.runtime_requirements.get("provider") != "custom":
+        version = session.scalar(select(OperatorVersion).join(OperatorDefinition).where(
+            OperatorDefinition.code == code, OperatorDefinition.source == "custom", OperatorVersion.version_no == number))
+        if not version:
             raise ValueError("自定义算子版本不存在")
         return version
 

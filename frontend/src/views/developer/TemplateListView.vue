@@ -13,6 +13,7 @@ const authoringMode = ref('advanced'), stageDefinition = ref(null)
 const selected = ref(null), sampleResult = ref(null)
 const result = ref(null), error = ref('')
 const code = ref(''), name = ref(''), outputTypes = ref(['text'])
+const codeInput = ref(null), nameInput = ref(null)
 const sampleId = ref('guideline-md'), settingsOpen = ref(false), dirty = ref(false), loading = ref(false)
 const editing = ref(false)
 const wizardOpen = ref(false)
@@ -48,6 +49,36 @@ onBeforeUnmount(resetSaveState)
 function outputFamily(value) { return value.startsWith('graph:') ? 'graph' : value }
 function outputSummary(item) { return templateOutputSummary(item, types.value) }
 
+function defaultDraftIdentity(managedCode = '') {
+  const managed = managedTemplates.value.find(item => item.code === managedCode)
+  const baseCode = managedCode ? `custom-${managedCode}` : 'custom-advanced-flow'
+  const managedName = managed?.name?.trim() || '知识'
+  const flowName = managedName.endsWith('流程') ? managedName : `${managedName}流程`
+  const baseName = managedCode ? `${flowName}（自定义）` : '自定义高级知识流程'
+  const existingCodes = new Set(templates.value.map(item => item.code?.trim()).filter(Boolean))
+  const existingNames = new Set(templates.value.map(item => item.name?.trim()).filter(Boolean))
+  let suffix = 1
+  while (true) {
+    const candidateCode = suffix === 1 ? baseCode : `${baseCode}-${suffix}`
+    const candidateName = suffix === 1 ? baseName : `${baseName}（${suffix}）`
+    if (!existingCodes.has(candidateCode) && !existingNames.has(candidateName)) return { code: candidateCode, name: candidateName }
+    suffix += 1
+  }
+}
+
+function applyDefaultDraftIdentity(managedCode = '') {
+  const identity = defaultDraftIdentity(managedCode)
+  code.value = identity.code
+  name.value = identity.name
+}
+
+async function revealIdentityErrors() {
+  settingsOpen.value = true
+  await nextTick()
+  if (!code.value.trim()) codeInput.value?.focus()
+  else if (!name.value.trim()) nameInput.value?.focus()
+}
+
 async function edit(item) {
   if (dirty.value && selected.value?.id !== item.id && !window.confirm('当前画布有未保存修改，确定放弃并切换模板吗？')) return
   resetSaveState()
@@ -76,6 +107,7 @@ function reset() {
 }
 function startNew(managedCode = '') {
   clearDraft(); editing.value = true; wizardOpen.value = false; settingsOpen.value = true
+  applyDefaultDraftIdentity(managedCode)
   if (!managedCode) { authoringMode.value = 'advanced'; outputTypes.value = ['text']; return }
   const managed = managedTemplates.value.find(item => item.code === managedCode)
   authoringMode.value = 'standard'
@@ -92,10 +124,11 @@ async function importBuiltin(item) {
   try {
     const derived = await api.materializeManagedFlow(item.managed_template_code || item.code)
     resetSaveState(); selected.value = null
-    code.value = ''; name.value = ''; outputTypes.value = derived.output_types.map(value => value === 'graph' ? 'graph:triple' : value)
+    applyDefaultDraftIdentity(item.managed_template_code || item.code)
+    outputTypes.value = derived.output_types.map(value => value === 'graph' ? 'graph:triple' : value)
     authoringMode.value = 'advanced'; stageDefinition.value = null
     result.value = null; sampleResult.value = null; error.value = ''
-    dirty.value = false; settingsOpen.value = false
+    dirty.value = false; settingsOpen.value = true
     editing.value = true
     await nextTick()
     advancedEditor.value?.loadDefinition(derived.definition)
@@ -196,20 +229,25 @@ async function save() {
 }
 async function saveOnce() {
   const session = editorSession, generation = editGeneration
-  if (!code.value.trim() || !name.value.trim()) { error.value = '模板编码和名称不能为空'; return }
+  if (!code.value.trim() || !name.value.trim()) {
+    error.value = ''; saveFailed.value = true
+    await revealIdentityErrors()
+    return false
+  }
   if (selected.value?.is_builtin) {
     const saveAsCustom = window.confirm('当前编辑的是内置流程。\n\n点击「确定」另存为新的自定义流程（需填写新编码和名称）；\n点击「取消」覆盖内置流程。')
     if (saveAsCustom) {
       try {
         const derived = await api.materializeManagedFlow(selected.value.managed_template_code || selected.value.code)
+        const managedCode = selected.value.managed_template_code || selected.value.code
         selected.value = null
-        code.value = ''; name.value = ''
+        applyDefaultDraftIdentity(managedCode)
         outputTypes.value = derived.output_types.map(value => value === 'graph' ? 'graph:triple' : value)
         authoringMode.value = 'advanced'; stageDefinition.value = null
-        dirty.value = false; settingsOpen.value = false
+        dirty.value = false; settingsOpen.value = true
         await nextTick()
         advancedEditor.value?.loadDefinition(derived.definition)
-        error.value = '已切换为「另存为自定义」，请填写新编码和名称后再次保存'
+        error.value = '已切换为「另存为自定义」，请确认模板编码和名称后再次保存'
       } catch (e) { error.value = e.message }
       return
     }
@@ -334,7 +372,19 @@ onMounted(async () => {
         </section>
     </template>
     <template v-else>
-        <form v-if="settingsOpen" class="template-settings" @submit.prevent="save"><label>模板编码<input v-model="code" :disabled="!!selected" required placeholder="template-code" @input="markDirty"></label><label>模板名称<input v-model="name" required placeholder="模板名称" @input="markDirty"></label><fieldset><legend>正式输出</legend><p v-if="authoringMode === 'standard'" data-testid="managed-outputs">固定模板维护：{{ outputSummary({ output_types: managedTemplates.find(item => item.code === (stageDefinition?.template_code || selected?.managed_template_code))?.output_types || [] }) }}</p><template v-else><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="markDirty">{{ item.name }}</label></template></fieldset><label>样例<select v-model="sampleId"><option value="guideline-md">指南 Markdown</option><option value="faq-csv">FAQ CSV</option><option value="case-txt">病例摘要</option></select></label><div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary">保存草稿</button></div></form>
+        <form v-if="settingsOpen" class="template-settings" novalidate @submit.prevent="save">
+          <label>模板编码
+            <input id="template-code" ref="codeInput" v-model="code" :disabled="!!selected" required placeholder="template-code" :aria-invalid="!code.trim() ? 'true' : undefined" :aria-describedby="!code.trim() ? 'template-code-error' : undefined" @input="markDirty">
+            <small v-if="!code.trim()" id="template-code-error" class="field-error">模板编码不能为空</small>
+          </label>
+          <label>模板名称
+            <input id="template-name" ref="nameInput" v-model="name" required placeholder="模板名称" :aria-invalid="!name.trim() ? 'true' : undefined" :aria-describedby="!name.trim() ? 'template-name-error' : undefined" @input="markDirty">
+            <small v-if="!name.trim()" id="template-name-error" class="field-error">模板名称不能为空</small>
+          </label>
+          <fieldset><legend>正式输出</legend><p v-if="authoringMode === 'standard'" data-testid="managed-outputs">固定模板维护：{{ outputSummary({ output_types: managedTemplates.find(item => item.code === (stageDefinition?.template_code || selected?.managed_template_code))?.output_types || [] }) }}</p><template v-else><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="markDirty">{{ item.name }}</label></template></fieldset>
+          <label>样例<select v-model="sampleId"><option value="guideline-md">指南 Markdown</option><option value="faq-csv">FAQ CSV</option><option value="case-txt">病例摘要</option></select></label>
+          <div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary">保存草稿</button></div>
+        </form>
         <div class="flow-toolbar">
           <div class="authoring-mode-actions"><span class="selection-state">{{ authoringMode === 'standard' ? '标准配置 · 业务阶段' : '高级编排 · Authoring DAG' }}</span><template v-if="authoringMode==='standard' && selected"><button @click="convertToAdvanced">转换为高级编排</button><FieldHelp label="高级编排转换说明" :text="advancedConversionHelp" /></template><button class="exit toolbar-exit" @click="exitEditing">‹ 退出编辑</button></div>
           <div><button class="primary" @click="save">保存草稿</button></div>
@@ -354,7 +404,7 @@ onMounted(async () => {
 .toast-enter-from,.toast-leave-to{opacity:0;transform:translateY(-7px)}
 .conversion-notice{padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--blue-soft);color:var(--text-secondary,#536177);font-size:var(--font-assist,13px)}
 .template-page-head .template-revisions,.template-list .template-revisions{color:var(--text-secondary,#536177);font-size:var(--font-assist,13px);line-height:1.5;overflow-wrap:anywhere}
-.template-page{min-width:1164px}.template-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:12px}.title-row{display:flex;align-items:center;gap:9px}.title-row h2{margin:0;font-size:21px}.dsl-badge{padding:5px 8px;border:1px solid #d8e4ff;border-radius:999px;color:#2f6fed;background:#eaf1ff;font-size:8px;font-weight:850}.template-page-head p{margin:5px 0 0;color:#778499;font-size:10px}.header-actions{display:flex;align-items:center;gap:7px}.save-state{display:inline-flex;align-items:center;gap:6px;margin-right:4px;color:#627087;font-size:8px;font-weight:800}.save-state i{width:7px;height:7px;border-radius:50%;background:#1d8c65}.save-state.dirty i{background:#b97917}.page-tabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #dfe5ed}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:#2f6fed;color:#2f6fed}.template-strip{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:10px;margin-bottom:9px}.new-template{white-space:nowrap}.template-groups{display:grid;gap:9px;min-width:0}.template-group{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:start;gap:8px}.template-group>header{display:grid;gap:2px;padding-top:8px;color:#34445a}.template-group>header small{color:#8a97a8}.template-list{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.template-list button{display:grid;min-width:190px;max-width:250px;text-align:left}.template-list button.active{border-color:#b9cff7;color:#2f6fed;background:#eff5ff}.template-card-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.template-list b,.template-list small{display:block}.template-list small{margin-top:3px;color:#8290a3;font-size:7px}.builtin-tag{padding:2px 6px;border:1px solid #c9dafb;border-radius:999px;color:#2f6fed;background:#edf4ff;font-size:7px;font-weight:800}.template-list .output-summary{color:#6b7a8f;font-size:7px}.upgrade-tag{padding:2px 6px;border:1px solid #efcf91;border-radius:999px;color:#986316;background:#fff7e7;font-size:7px;font-weight:800}.template-settings{display:grid;grid-template-columns:minmax(180px,1fr) minmax(200px,1.4fr);gap:10px;padding:14px;border:1px solid var(--border);border-radius:11px;background:#fff;margin-bottom:9px}.template-settings>label{display:grid;gap:4px;color:#536177;font-weight:700}.template-settings input,.template-settings select{border:1px solid #dfe5ed}.template-settings fieldset{border:1px solid #dfe5ed;border-radius:8px}.template-settings fieldset legend{color:#536177;font-weight:700}.template-settings fieldset label{display:inline-flex;align-items:center;gap:5px;margin-right:12px;color:#536177;font-weight:400}.settings-actions{display:flex;gap:6px;align-items:center}.settings-actions .danger{color:#c0392b;border-color:#f0c4bc}.flow-toolbar{display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:9px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:12px;background:#fff}.flow-toolbar .mode-bar{display:flex;align-items:center}.selection-state{color:#66758a;font-size:12px;margin-right:8px}.action-result{margin-top:12px;padding:12px;background:#182231;color:#d9e2ee;border-radius:10px;font:11px monospace;max-height:300px;overflow:auto}
+.template-page{min-width:1164px}.template-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:12px}.title-row{display:flex;align-items:center;gap:9px}.title-row h2{margin:0;font-size:21px}.dsl-badge{padding:5px 8px;border:1px solid #d8e4ff;border-radius:999px;color:#2f6fed;background:#eaf1ff;font-size:8px;font-weight:850}.template-page-head p{margin:5px 0 0;color:#778499;font-size:10px}.header-actions{display:flex;align-items:center;gap:7px}.save-state{display:inline-flex;align-items:center;gap:6px;margin-right:4px;color:#627087;font-size:8px;font-weight:800}.save-state i{width:7px;height:7px;border-radius:50%;background:#1d8c65}.save-state.dirty i{background:#b97917}.page-tabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #dfe5ed}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:#2f6fed;color:#2f6fed}.template-strip{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:10px;margin-bottom:9px}.new-template{white-space:nowrap}.template-groups{display:grid;gap:9px;min-width:0}.template-group{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:start;gap:8px}.template-group>header{display:grid;gap:2px;padding-top:8px;color:#34445a}.template-group>header small{color:#8a97a8}.template-list{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.template-list button{display:grid;min-width:190px;max-width:250px;text-align:left}.template-list button.active{border-color:#b9cff7;color:#2f6fed;background:#eff5ff}.template-card-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.template-list b,.template-list small{display:block}.template-list small{margin-top:3px;color:#8290a3;font-size:7px}.builtin-tag{padding:2px 6px;border:1px solid #c9dafb;border-radius:999px;color:#2f6fed;background:#edf4ff;font-size:7px;font-weight:800}.template-list .output-summary{color:#6b7a8f;font-size:7px}.upgrade-tag{padding:2px 6px;border:1px solid #efcf91;border-radius:999px;color:#986316;background:#fff7e7;font-size:7px;font-weight:800}.template-settings{display:grid;grid-template-columns:minmax(180px,1fr) minmax(200px,1.4fr);gap:10px;padding:14px;border:1px solid var(--border);border-radius:11px;background:#fff;margin-bottom:9px}.template-settings>label{display:grid;align-content:start;gap:4px;color:#536177;font-weight:700}.template-settings input,.template-settings select{border:1px solid #dfe5ed}.template-settings input[aria-invalid="true"]{border-color:#d66b6b}.template-settings .field-error{color:#b5473c;font-size:11px;font-weight:500}.template-settings fieldset{border:1px solid #dfe5ed;border-radius:8px}.template-settings fieldset legend{color:#536177;font-weight:700}.template-settings fieldset label{display:inline-flex;align-items:center;gap:5px;margin-right:12px;color:#536177;font-weight:400}.settings-actions{display:flex;gap:6px;align-items:center}.settings-actions .danger{color:#c0392b;border-color:#f0c4bc}.flow-toolbar{display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:9px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:12px;background:#fff}.flow-toolbar .mode-bar{display:flex;align-items:center}.selection-state{color:#66758a;font-size:12px;margin-right:8px}.action-result{margin-top:12px;padding:12px;background:#182231;color:#d9e2ee;border-radius:10px;font:11px monospace;max-height:300px;overflow:auto}
 .wizard-backdrop{position:fixed;z-index:40;inset:0;display:grid;place-items:center;background:rgba(16,24,40,.42)}.wizard{width:min(760px,90vw);padding:22px;border-radius:15px;background:#fff;box-shadow:0 24px 70px rgba(15,23,42,.24)}.wizard>header{display:flex;justify-content:space-between;gap:20px}.wizard h3{margin:0}.wizard p{color:#6d7b8e}.goal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px}.goal-grid button,.advanced-choice button{display:grid;gap:5px;padding:16px;text-align:left}.goal-grid small,.advanced-choice small{color:#748197}.advanced-choice{display:grid;grid-template-columns:80px 1fr;gap:10px;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid #e2e7ee}.advanced-choice>span{font-weight:800;color:#7a8799}
 .authoring-mode-actions{display:flex;align-items:center;gap:8px}.toolbar-exit{white-space:nowrap}
 </style>

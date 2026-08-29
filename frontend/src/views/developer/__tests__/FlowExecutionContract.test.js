@@ -12,7 +12,7 @@ import { keepCompatibleParams } from '../../../components/flow/flowModel.js'
 const router = vi.hoisted(() => ({ push: vi.fn(), replace: vi.fn() }))
 vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => ({ query: {} }) }))
 vi.mock('../../../api/platform', () => ({ api: Object.fromEntries(['operatorCandidates', 'flowTemplates', 'operatorCatalog', 'flowSubgraphs', 'knowledgeTypes', 'managedFlowTemplates', 'updateFlowTemplate', 'createFlowTemplate', 'modelServings', 'promptTemplates', 'qualityProfiles', 'publishFlowTemplate', 'previewFlowToAdvanced', 'resolveStandardFlow', 'graphEntityTypes'].map(name => [name, vi.fn()])) }))
-const operator = (code, input = 'candidate:*', output = 'candidate:*', properties = {}) => ({ code, name: code, display_name_zh: code, version: 1, version_status: 'published', provider: 'dataforge', exposure: 'public', enabled: true, approved: true, node_role: 'operator', surfaces: ['advanced-canvas'], knowledge_types: ['text'], input_ports: { input: { artifact_type: input, binding: 'edge', required: true } }, output_ports: { output: { artifact_type: output } }, parameter_schema: { type: 'object', properties, additionalProperties: false } })
+const operator = (code, input = 'candidate:*', output = 'candidate:*', properties = {}) => ({ code, name: code, display_name_zh: code, version: 1, version_status: 'published', source: 'dataforge', catalog_group: 'dataforge', category: 'content-processing', exposure: 'public', enabled: true, approved: true, node_role: 'operator', surfaces: ['advanced-canvas'], knowledge_types: ['text'], input_ports: { input: { artifact_type: input, binding: 'edge', required: true } }, output_ports: { output: { artifact_type: output } }, parameter_schema: { type: 'object', properties, additionalProperties: false } })
 const catalog = [
   { ...operator('reviewed-source-chunk-input', 'approved_source_chunks', 'source_chunk_set'), node_role: 'flow_input', input_ports: { input: { artifact_type: 'approved_source_chunks', binding: 'runtime_input' } } },
   operator('mapper', 'source_chunk_set', 'candidate:text'),
@@ -170,13 +170,26 @@ it('keeps only schema-compatible business values and applies target defaults', (
 })
 
 it('shows ten curated cards, business groups and actual readiness counts', async () => {
-  const groups = { Text2QAGenerator: '内容生成', PromptedRefiner: '内容处理', ContentNullFilter: '内容清洗', CharNumberFilter: '内容清洗', SpecialCharacterFilter: '内容清洗', HashDeduplicateFilter: '内容去重', MinHashDeduplicateFilter: '内容去重', NgramHashDeduplicateFilter: '内容去重', SimHashDeduplicateFilter: '内容去重', PromptedFilter: '智能过滤' }
-  const items = Object.entries(groups).map(([code, subcategory]) => ({ ...operator(code), provider: 'dataflow', subcategory, dependency_status: { status: 'ready' } }))
+  const groups = { Text2QAGenerator: 'text-generation', PromptedRefiner: 'text-cleaning', ContentNullFilter: 'content-filtering', CharNumberFilter: 'content-filtering', SpecialCharacterFilter: 'content-filtering', HashDeduplicateFilter: 'deduplication', MinHashDeduplicateFilter: 'deduplication', NgramHashDeduplicateFilter: 'deduplication', SimHashDeduplicateFilter: 'deduplication', PromptedFilter: 'content-filtering' }
+  const items = Object.entries(groups).map(([code, category]) => ({ ...operator(code), source: 'dataflow', catalog_group: 'dataflow_featured', category, dependency_status: { status: 'ready' } }))
   wrapper = mount(OperatorPalette, { props: { catalog: items } })
   expect(wrapper.findAll('.palette-entry')).toHaveLength(10)
   expect(wrapper.get('.capability-count').text()).toBe('10')
-  expect(wrapper.findAll('h4').map(item => item.text())).toEqual(['文本处理', '去重', '文本优化', '知识生成', '质量治理'])
+  expect(wrapper.findAll('h4').map(item => item.text())).toEqual(['文本清洗', '内容过滤', '去重', '文本生成'])
   expect(wrapper.text()).not.toContain('DataFlow ·')
   await wrapper.setProps({ catalog: items.map((item, index) => index === 0 ? { ...item, dependency_status: { status: 'missing' } } : item) })
   expect(wrapper.findAll('.palette-entry')).toHaveLength(9)
+})
+
+it('keeps two official systems parallel and extension operators in a separate section', () => {
+  const items = [
+    { ...operator('mapper'), source: 'dataforge', catalog_group: 'dataforge', category: 'content-processing' },
+    { ...operator('Text2QAGenerator'), source: 'dataflow', catalog_group: 'dataflow_featured', category: 'text-generation', dependency_status: { status: 'ready' } },
+    { ...operator('reviewed-addon'), source: 'custom', catalog_group: 'extension', category: 'extension', dependency_status: { status: 'ready' } },
+  ]
+  wrapper = mount(OperatorPalette, { props: { catalog: items } })
+  expect(wrapper.findAll('.capability-name').map(item => item.text())).toEqual(['DataForge 算子', 'DataFlow 精选', '扩展算子'])
+  expect(wrapper.find('.extension-group').exists()).toBe(true)
+  expect(wrapper.text()).not.toContain('索引处理')
+  expect(wrapper.findAll('.palette-entry small').map(item => item.text())).toContain('Text2QAGenerator · v1')
 })

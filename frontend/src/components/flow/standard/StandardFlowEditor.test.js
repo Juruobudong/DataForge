@@ -11,9 +11,9 @@ beforeEach(() => {
   api.qualityProfiles.mockResolvedValue(qualityProfiles)
   api.graphEntityTypes.mockResolvedValue(entityTypeCatalog)
   api.resolveStandardFlow.mockResolvedValue({ resolved_operators: [
-    { node_id: 'input', kind: 'operator', code: 'reviewed-source-chunk-input', display_name_zh: '已审核来源切片', name: 'Reviewed SourceChunk Input', version: 3, provider: 'dataforge', input_ports: {}, output_ports: { output: { artifact_type: 'source_chunk_set' } }, parameters: {}, locked: true },
-    { node_id: 'qa', kind: 'operator', code: 'qa-extractor', display_name_zh: '问答生成器', name: 'QA Extractor', version: 1, provider: 'dataforge', stage_label: '问答生成', uses_llm: true, input_ports: { input: { artifact_type: 'source_chunk_set' } }, output_ports: { output: { artifact_type: 'candidate:qa' } }, parameters: { questions_per_chunk: 1 }, output_key: 'qa', locked: true },
-    { node_id: 'sink', kind: 'knowledge_sink', code: 'knowledge-sink', display_name_zh: '知识输出', name: 'Knowledge Sink', version: 1, provider: 'dataforge', input_ports: {}, output_ports: {}, parameters: {}, output_key: 'qa', locked: true },
+    { node_id: 'input', kind: 'operator', code: 'reviewed-source-chunk-input', display_name_zh: '已审核来源切片', name: 'Reviewed SourceChunk Input', version: 3, source: 'dataforge', catalog_group: 'dataforge', executor: 'dataforge-native', input_ports: {}, output_ports: { output: { artifact_type: 'source_chunk_set' } }, parameters: {}, locked: true },
+    { node_id: 'qa', kind: 'operator', code: 'qa-extractor', display_name_zh: '问答生成器', name: 'QA Extractor', version: 1, source: 'dataforge', catalog_group: 'dataforge', executor: 'dataforge-native', stage_label: '问答生成', uses_llm: true, input_ports: { input: { artifact_type: 'source_chunk_set' } }, output_ports: { output: { artifact_type: 'candidate:qa' } }, parameters: { questions_per_chunk: 1 }, output_key: 'qa', locked: true },
+    { node_id: 'sink', kind: 'knowledge_sink', code: 'knowledge-sink', display_name_zh: '知识输出', name: 'Knowledge Sink', version: 1, source: 'dataforge', catalog_group: 'dataforge', executor: 'dataforge-native', input_ports: {}, output_ports: {}, parameters: {}, output_key: 'qa', locked: true },
   ], edges: [{ source: 'input', target: 'qa' }, { source: 'qa', target: 'sink' }], issues: [] })
 })
 afterEach(() => wrapper?.unmount())

@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { runtimeArtifactLabel, operatorPrimaryName, operatorSubtitle } from '../flowModel'
 const props = defineProps({ value: { type: Object, required: true } })
 const selected = ref(null)
-const providers = { dataforge: 'DataForge', dataflow: 'DataFlow', custom: 'Custom' }
+const sources = { dataforge: 'DataForge', dataflow: 'DataFlow', custom: '扩展' }
 const nodes = computed(() => props.value.resolved_operators || [])
 const links = computed(() => (props.value.edges || []).map(edge => Array.isArray(edge) ? { source: edge[0], target: edge[1] } : edge))
 const roots = computed(() => nodes.value.filter(node => !links.value.some(edge => edge.target === node.node_id)))
@@ -42,7 +42,7 @@ const branches = computed(() => nodes.value.filter(node => node.kind === 'knowle
     <aside v-if="selected" class="operator-detail" aria-label="算子详情" @keydown.esc="selected = null">
       <button class="close" aria-label="关闭算子详情" @click="selected = null">关闭</button>
       <h3>{{ operatorPrimaryName(selected) }}</h3><p>{{ operatorSubtitle(selected, true) }} · v{{ selected.version }}</p>
-      <p>{{ selected.description }}</p><p>{{ providers[selected.provider] }} · {{ selected.uses_llm ? '使用 LLM' : '不使用 LLM' }}</p>
+      <p>{{ selected.description }}</p><p>{{ sources[selected.source] }} · {{ selected.catalog_group }} · {{ selected.executor }} · {{ selected.uses_llm ? '使用 LLM' : '不使用 LLM' }}</p>
       <h4>输入类型</h4><p v-for="(port, name) in selected.input_ports" :key="name">{{ name }}：{{ port.artifact_type }}</p>
       <h4>输出类型</h4><p v-for="(port, name) in selected.output_ports" :key="name">{{ name }}：{{ port.artifact_type }}</p>
       <h4>当前业务参数（只读）</h4><dl><template v-for="(value, key) in selected.parameters" :key="key"><dt>{{ key }}</dt><dd>{{ value ?? '系统默认' }}</dd></template></dl>

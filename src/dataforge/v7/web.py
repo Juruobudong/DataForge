@@ -14,6 +14,8 @@ from pathlib import Path, PurePath
 from typing import Annotated, Literal
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,7 +33,13 @@ from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
 from .llm_serving import configure_llm_serving_registry
 from .servings import ServingManager
-from .retrieval import RetrievalDebugRequest, RetrievalDebugService
+from .retrieval import (
+    PublicRetrievalError,
+    PublicRetrievalRequest,
+    PublicRetrievalService,
+    RetrievalDebugRequest,
+    RetrievalDebugService,
+)
 from .entity_types import entity_type_catalog, resolve_entity_types
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
@@ -399,6 +407,14 @@ class RoutingActionRequest(BaseModel):
     confirm_production: bool = False
 
 
+class PublicRetrievalAdminRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    release_stage: Literal["test", "production"]
+    task_code: str = Field(min_length=1, max_length=120)
+    org_code: str = Field(min_length=1, max_length=120)
+    query: str = Field(min_length=1, max_length=8192)
+
+
 class DeploymentTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_task_id: str
@@ -637,7 +653,33 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     app.state.serving_startup_check_future = None
     app.state.routing_publications = set()
     app.state.retrieval_debug = RetrievalDebugService(store, serving_manager)
+    app.state.public_retrieval = PublicRetrievalService(store, app.state.retrieval_debug)
     app.state.routing_publications_lock = threading.RLock()
+
+    @app.exception_handler(RequestValidationError)
+    async def public_retrieval_validation_error(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/api/runtime/retrieval/v1/"):
+            return JSONResponse(status_code=422, content={
+                "error": {"code": "invalid_request", "message": "公共检索请求格式无效"},
+                "request_id": getattr(request.state, "request_id", ""),
+            }, headers={"Cache-Control": "no-store"})
+        return await request_validation_exception_handler(request, exc)
+
+    def public_retrieval_error(exc: PublicRetrievalError, request: Request) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={
+            "error": {"code": exc.code, "message": exc.message},
+            "request_id": getattr(request.state, "request_id", ""),
+        }, headers={"Cache-Control": "no-store"})
+
+    def require_retrieval_token(request: Request) -> None:
+        configured = os.getenv("DATAFORGE_RETRIEVAL_TOKEN", "").strip()
+        if not configured:
+            raise PublicRetrievalError(
+                "retrieval_token_not_configured", "DataForge Retrieval token 未配置", 503,
+            )
+        supplied = request.headers.get("Authorization", "")
+        if not secrets.compare_digest(supplied, f"Bearer {configured}"):
+            raise PublicRetrievalError("retrieval_token_invalid", "Retrieval token 无效", 401)
 
     @app.on_event("startup")
     def reconcile_component_checks() -> None:
@@ -655,7 +697,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.middleware("http")
     async def require_admin(request: Request, call_next):
         open_paths = {"/api/health", "/api/health/live", "/api/health/ready", "/api/auth/status", "/api/auth/login"}
-        runtime_path = request.url.path.startswith("/api/runtime/routing/")
+        runtime_path = request.url.path.startswith((
+            "/api/runtime/routing/", "/api/runtime/retrieval/v1/",
+        ))
         if resolved.authentication_enabled and request.url.path.startswith("/api/") and request.url.path not in open_paths and not runtime_path:
             token = request.cookies.get(SESSION_COOKIE)
             with store.sessions() as session:
@@ -1432,9 +1476,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/developer/operator-catalog")
     def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",
-                         include_internal: bool = True, surface: str = "", provider: str = ""):
+                         include_internal: bool = True, surface: str = "", source: str = "", catalog_group: str = ""):
         return store.list_operator_catalog(include_internal=include_internal, query=q, category=category, knowledge_type=knowledge_type,
-                                           exposure=exposure, status=status, surface=surface, provider=provider)
+                                           exposure=exposure, status=status, surface=surface, source=source, catalog_group=catalog_group)
 
     @app.post("/api/developer/operator-catalog/candidates")
     def operator_candidates(payload: OperatorCandidatesRequest):
@@ -2157,6 +2201,32 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
+    @app.post("/api/project-deployments/{deployment_id}/retrieval-public-test")
+    def retrieval_public_test(deployment_id: str, payload: PublicRetrievalAdminRequest,
+                              request: Request):
+        try:
+            app.state.instance.require_deployment(store, deployment_id)
+            snapshot, _identity = app.state.retrieval_debug.snapshot(
+                deployment_id, payload.release_stage, "published",
+            )
+            public_request = PublicRetrievalRequest(org_code=payload.org_code, query=payload.query)
+            content = app.state.public_retrieval.query(
+                snapshot["project"]["code"], snapshot["deployment"]["code"],
+                payload.release_stage, payload.task_code, public_request,
+                request_id=request.state.request_id, instance_mode=app.state.instance.mode,
+            )
+            return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
+        except LookupError:
+            return public_retrieval_error(
+                PublicRetrievalError("route_not_found", "公共检索路由不存在", 404), request,
+            )
+        except ValueError:
+            return public_retrieval_error(
+                PublicRetrievalError("route_not_found", "公共检索路由不存在", 404), request,
+            )
+        except PublicRetrievalError as exc:
+            return public_retrieval_error(exc, request)
+
     @app.get("/api/project-deployments/{deployment_id}/authorizations")
     def deployment_authorizations(deployment_id: str):
         try: app.state.instance.require_deployment(store, deployment_id); return store.list_authorizations(deployment_id)
@@ -2477,7 +2547,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         configured_token = os.getenv("DATAFORGE_RUNTIME_TOKEN", "").strip()
         if not configured_token:
             raise HTTPException(status_code=503, detail="DataForge runtime token 未配置")
-        if request.headers.get("Authorization", "") != f"Bearer {configured_token}":
+        if not secrets.compare_digest(
+                request.headers.get("Authorization", ""), f"Bearer {configured_token}"):
             raise HTTPException(status_code=401, detail="Runtime token 无效")
         try:
             snapshot = store.runtime_routing_snapshot(project_code, deployment_code, release_stage)
@@ -2488,6 +2559,44 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if checksum and request.headers.get("If-None-Match") == etag:
             return Response(status_code=304, headers={"ETag": etag})
         return JSONResponse(content=snapshot, headers={"ETag": etag, "Cache-Control": "no-store"})
+
+    @app.get("/api/runtime/retrieval/v1/{project_code}/{deployment_code}/{release_stage}/{task_code}/contract")
+    def public_retrieval_contract(project_code: str, deployment_code: str,
+                                  release_stage: Literal["test", "production"], task_code: str,
+                                  request: Request,
+                                  org_code: Annotated[str, Query(min_length=1, max_length=120)]):
+        try:
+            require_retrieval_token(request)
+            content = app.state.public_retrieval.contract(
+                project_code, deployment_code, release_stage, task_code, org_code,
+                request_id=request.state.request_id,
+                allowed_deployment_id=(app.state.instance.bound_deployment_id
+                                       if app.state.instance.mode == "local" else None),
+            )
+            return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
+        except PublicRetrievalError as exc:
+            return public_retrieval_error(exc, request)
+
+    @app.post("/api/runtime/retrieval/v1/{project_code}/{deployment_code}/{release_stage}/{task_code}/query")
+    def public_retrieval_query(project_code: str, deployment_code: str,
+                               release_stage: Literal["test", "production"], task_code: str,
+                               payload: PublicRetrievalRequest, request: Request):
+        try:
+            require_retrieval_token(request)
+            content = app.state.public_retrieval.query(
+                project_code, deployment_code, release_stage, task_code, payload,
+                request_id=request.state.request_id, instance_mode=app.state.instance.mode,
+                allowed_deployment_id=(app.state.instance.bound_deployment_id
+                                       if app.state.instance.mode == "local" else None),
+            )
+            return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
+        except PublicRetrievalError as exc:
+            logger.warning(
+                "Public retrieval failed. request_id=%s project=%s deployment=%s stage=%s task=%s code=%s",
+                request.state.request_id, project_code, deployment_code,
+                release_stage, task_code, exc.code,
+            )
+            return public_retrieval_error(exc, request)
 
     @app.post("/api/institution-deployments/drafts", status_code=201)
     def create_institution_release_draft(payload: InstitutionReleaseDraftRequest):

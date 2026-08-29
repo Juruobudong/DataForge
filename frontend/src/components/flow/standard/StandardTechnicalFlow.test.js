@@ -9,7 +9,7 @@ function projection(outputs) {
     let previous = 'input'
     for (const code of ['generator', ...(output.startsWith('graph:') ? ['schema-validator', 'graph-quality-validator'] : []), 'knowledge-sink']) {
       const id = `${output}-${code}`
-      nodes.push({ node_id: id, code, kind: code === 'knowledge-sink' ? 'knowledge_sink' : 'operator', display_name_zh: code, output_key: output, name: code, version: 1, provider: 'dataforge' })
+      nodes.push({ node_id: id, code, kind: code === 'knowledge-sink' ? 'knowledge_sink' : 'operator', display_name_zh: code, output_key: output, name: code, version: 1, source: 'dataforge', catalog_group: 'dataforge', executor: 'dataforge-native' })
       edges.push({ source: previous, target: id }); previous = id
     }
   }

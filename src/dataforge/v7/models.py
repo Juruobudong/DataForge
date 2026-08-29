@@ -592,6 +592,8 @@ class OperatorDefinition(Timestamped, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name_zh: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    catalog_group: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     category: Mapped[str] = mapped_column(String(64), nullable=False)
     subcategory: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)

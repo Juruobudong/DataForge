@@ -17,7 +17,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 知识流程执行契约与精选扩充（2026-08-28）：本地实现 CAS发布、Revision/Snapshot写保护、Debug/Published身份分域、Published冻结内容调试、原子替换及十个真实DataFlow精选算子；新旧环境并存。全量验证状态以[021记录](specs/021-flow-execution-curated-expansion/validation.md)为准，不代表`.34`或真实模型验收。来源：[本轮基线](wiki/sources/flow-execution-curated-expansion-2026-08-28.md)。
 范围：`dataforge.v7`、V7 前后端/Alembic/运行文档，以及 `qa_agent` 的 DataForge Runtime Routing 客户端；常规流程不读取、迁移或清理旧资源，唯一例外是显式执行的 `.34/faq` 只读导入，旧 Collection 始终不变。
 
-产品定位为通用文档处理与知识生产。医疗实体预设、医院 Deployment、qa_agent 接入和医疗测试数据只代表可选领域能力；通用 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 与 Routing 契约不得依赖医疗语义。
+产品定位为通用文档处理与知识生产。医疗实体预设、医疗场景的机构 Deployment、qa_agent 接入和医疗测试数据只代表可选领域能力；通用 Source、Preparation、Review、Flow、Knowledge Sink、AssetVersion 与 Routing 契约不得依赖医疗语义。
 
 本文件只记录能力完成度与外部验收状态；当前系统结构见 [`docs/architecture/`](docs/architecture/overview.md)，设计原因见 [`docs/adr/`](docs/adr/ADR-001-single-current-knowledge.md)，历史方案见 [`docs/archive/`](docs/archive/old-plan.md)。
 
@@ -36,7 +36,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 
 ## 页面与操作
 
-DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、DAG ref 与英文名称使用 `Text2QAGenerator` v6、`PromptedRefiner` v4、`HashDeduplicateFilter` v4、`MinHashDeduplicateFilter` v4。两个去重节点固定策略，旧编码仅保留历史内部执行；目录、画布与调试统一中英文对照。QA、来源与 Sink 行为保持不变。来源：[批准基线](wiki/sources/dataflow-upstream-names-2026-08-28.md)。
+算子库双体系与身份解耦（2026-08-29）：官方目录并列为 DataForge 算子和21个 DataFlow 精选，可信插件位于独立扩展区。Catalog 一等保存 `source/catalog_group/category`，Runner 按冻结 `executor` 分派；旧 code、alias、历史注册和退出身份不再 Seed 或执行。当前为本地实现，`.34`/Docker/真实模型仍待验收。来源：[实施基线](wiki/sources/operator-catalog-dual-system-2026-08-29.md)。
 
 自定义流程当前草稿执行（2026-08-28）：`DONE`。Advanced 完整 DSL 直接编译；500ms 自动保存、运行前排空保存队列、草稿 checksum 冲突保护、不可变 Run DAG/来源/校验和展示已实现。删除必要转换节点返回端口错误，不补节点；正式 Job 仍使用发布快照。真实 `.34` 服务验收为 `CONNECT`。来源：[批准基线](wiki/sources/current-draft-execution-2026-08-28.md)。
 
@@ -52,6 +52,7 @@ DataFlow 原名身份与中英文展示（2026-08-28）：当前精选目录、D
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
 | 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 由每次 Routing 操作显式选择并独立显示历史；Central live publish，中心侧 institution deferred freeze；机构 code 自动生成，知识范围顺序即 priority，技术对象进入帮助/高级信息。 |
 | 业务工作区 | 项目发布：检索调试 | `LOCAL` | Draft/Published/Historical 七阶段只读检索、临时实验、冻结正文/Evidence、重排失败停止；不做聊天、不改消费端。真实推理及浏览器视觉验收未完成。见[实施记录](wiki/sources/reranker-retrieval-debug-2026-08-28.md)。 |
+| 业务工作区 | Public Retrieval v1 与统一检索测试台 | `LOCAL` | Published-only contract/query、独立 Retrieval Token、白名单业务 DTO、管理员公共测试与技术双模式已实现；qa_agent/kg 尚未迁移，`.34` 真实 Bearer/Milvus/浏览器验收为 `CONNECT`。见[实施记录](wiki/sources/public-retrieval-gateway-2026-08-29.md)。 |
 | 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | `.dfm` v2、项目资产锁定与额外 AssetVersion、结构化冲突门禁、模板闭包、正常 waiting、Prepare target fingerprint、Partition count/digest Activation Preflight 和逐项目/非原子批量激活已本地验证；`.34` 真实服务验收仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |

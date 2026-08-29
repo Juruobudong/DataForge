@@ -7,7 +7,7 @@ import { checkEdgeCompatibility } from '../edge/edgeCompatibility.js'
 
 let wrapper
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.useRealTimers() })
-const item = (code = 'HtmlEntityFilter', provider = 'dataflow') => ({ code, name: code, display_name_zh: 'HTML 实体过滤器', summary: '删除含HTML实体的整条文本，不是局部清理。', description: '删除含HTML实体的整条文本，不是局部清理。', provider, version: 1, exposure: 'canvas', status: 'published', enabled: true, approved: true, surfaces: ['advanced-canvas'], knowledge_types: ['text'], subcategory: '文本处理', dependency_status: { status: 'ready' }, runtime_requirements: { provider, uses_llm: false, resources: 'CPU', data_behavior: '过滤整条文本', limitations: '不进行HTML实体替换' }, input_ports: { input: { artifact_type: 'candidate:text' } }, output_ports: { output: { artifact_type: 'candidate:text' } } })
+const item = (code = 'HtmlEntityFilter', source = 'dataflow') => ({ code, name: code, display_name_zh: 'HTML 实体过滤器', summary: '删除含HTML实体的整条文本，不是局部清理。', description: '删除含HTML实体的整条文本，不是局部清理。', source, catalog_group: source === 'custom' ? 'extension' : source === 'dataflow' ? 'dataflow_featured' : 'dataforge', category: source === 'custom' ? 'extension' : source === 'dataflow' ? 'content-filtering' : 'content-processing', version: 1, exposure: 'canvas', status: 'published', enabled: true, approved: true, surfaces: ['advanced-canvas'], knowledge_types: ['text'], dependency_status: { status: 'ready' }, runtime_requirements: { executor: source === 'dataforge' ? 'dataforge-native' : 'dataflow-storage', uses_llm: false, resources: 'CPU', data_behavior: '过滤整条文本', limitations: '不进行HTML实体替换' }, input_ports: { input: { artifact_type: 'candidate:text' } }, output_ports: { output: { artifact_type: 'candidate:text' } } })
 function palette(catalog = [item()]) { wrapper = mount(OperatorPalette, { props: { catalog, outputTypes: ['text'] }, attachTo: document.body }); return wrapper }
 const info = () => wrapper.get('.operator-info')
 const dialog = () => document.querySelector('[role="dialog"]')
@@ -17,7 +17,7 @@ describe('operator help has no graph mutations', () => {
     palette()
     expect(wrapper.get('.palette-entry').text()).toContain('HtmlEntityFilter')
     expect(wrapper.get('.palette-entry').text()).not.toContain('整条文本')
-    expect(wrapper.get('.palette-entry').text()).not.toContain('v1')
+    expect(wrapper.get('.palette-entry').text()).toContain('v1')
     expect(wrapper.findAll('.palette-entry [title]')).toHaveLength(0)
     await wrapper.get('.palette-entry').trigger('mouseenter'); await flushPromises()
     const tooltip = document.querySelector('[role="tooltip"]')

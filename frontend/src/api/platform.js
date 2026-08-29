@@ -30,7 +30,7 @@ async function request(path, options = {}) {
     const raw = await response.text().catch(() => '')
     let detail = raw, problem = null
     try {
-      const parsed = JSON.parse(raw), value = parsed.detail ?? parsed
+      const parsed = JSON.parse(raw), value = parsed.detail ?? parsed.error ?? parsed
       if (value && typeof value === 'object') { problem = value; detail = value.message || JSON.stringify(value) }
       else detail = String(value || raw)
     } catch (_) {}
@@ -60,6 +60,7 @@ export const api = {
   patchDeploymentTask: (id, taskId, body) => request(`/api/project-deployments/${id}/tasks/${taskId}`, json('PATCH', body)),
   retrievalDebugOptions: (id, params) => request(`/api/project-deployments/${id}/retrieval-debug/options?${new URLSearchParams(params)}`),
   retrievalDebug: (id, body) => request(`/api/project-deployments/${id}/retrieval-debug`, json('POST', body)),
+  retrievalPublicTest: (id, body) => request(`/api/project-deployments/${id}/retrieval-public-test`, json('POST', body)),
   servingCategories: () => request('/api/serving-categories'),
   modelServings: () => request('/api/model-servings'),
   createModelServing: body => request('/api/model-servings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),

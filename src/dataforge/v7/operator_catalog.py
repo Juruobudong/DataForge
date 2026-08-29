@@ -6,7 +6,7 @@ from typing import Any
 from uuid import uuid4
 from sqlalchemy import select
 
-from .catalog import CATALOG_SEEDS, LEGACY_CATALOG_SEEDS, operator_surfaces
+from .catalog import CATALOG_SEEDS, operator_surfaces
 from .models import OperatorDefinition, OperatorVersion, utc_now
 
 
@@ -42,18 +42,20 @@ def resolve_operator(catalog, node):
 
 
 def seed_catalog(session):
-    # Never overwrite a published version. Legacy implementations remain addressable.
-    entries = {(item["code"], item["version"]): item for item in (*LEGACY_CATALOG_SEEDS, *CATALOG_SEEDS)}
+    # A clean environment seeds only the current published identity/version pairs.
+    entries = {(item["code"], item["version"]): item for item in CATALOG_SEEDS}
     for item in entries.values():
         definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == item["code"]))
         if definition is None:
             definition = OperatorDefinition(id=f"op_{item['code'].replace('-', '_')}", code=item["code"],
+                                            source=item["source"], catalog_group=item["catalog_group"],
                                             enabled=item["exposure"] != "disabled")
             session.add(definition)
         for key in ("name", "display_name_zh", "description", "category", "subcategory", "summary", "scenarios",
                     "knowledge_types", "recommended_predecessors", "recommended_successors", "lifecycle_status", "risk_level"):
             setattr(definition, key, deepcopy(item[key]))
         definition.exposure = "public" if item["exposure"] == "canvas" else item["exposure"]
+        definition.source, definition.catalog_group = item["source"], item["catalog_group"]
         definition.surfaces = item.get("surfaces") or operator_surfaces(item["code"], item["input"], item["exposure"])
         session.flush()
         version = session.scalar(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id,
@@ -74,17 +76,17 @@ def seed_catalog(session):
 
 def version_payload(definition, version):
     runtime = deepcopy(version.runtime_requirements or {})
-    provider = runtime.get("provider", "dataforge")
     return {
         **{key: deepcopy(getattr(definition, key)) for key in (
-            "id", "code", "name", "display_name_zh", "summary", "description", "category", "subcategory",
+            "id", "code", "name", "display_name_zh", "summary", "description", "source", "catalog_group", "category", "subcategory",
             "exposure", "risk_level", "enabled", "scenarios", "recommended_predecessors", "recommended_successors")},
         "knowledge_types": runtime.get("knowledge_types", definition.knowledge_types),
         "graph_modes": runtime.get("graph_modes", []),
         "surfaces": list(definition.surfaces or runtime.get("surfaces") or []),
-        "provider": provider, "status": definition.lifecycle_status, "version_status": version.status,
+        "status": definition.lifecycle_status, "version_status": version.status,
         "version": version.version_no, "version_id": version.id,
         "adapter_code": version.adapter_code, "runtime_requirements": runtime,
+        "executor": runtime.get("executor", "dataforge-native"),
         "uses_llm": bool(runtime.get("uses_llm")), "approved": runtime.get("approved", definition.exposure != "controlled"),
         "node_role": "flow_input" if definition.code == "reviewed-source-chunk-input" else "operator",
         "input": (version.input_ports.get("input") or {}).get("artifact_type", ""),
@@ -108,7 +110,8 @@ def technical_projection(definition, catalog):
         params = node.get("params") or {}
         if node.get("kind") == "knowledge_sink":
             item = {"code": "knowledge-sink", "name": "Knowledge Sink", "display_name_zh": "知识输出",
-                    "version": 1, "provider": "dataforge", "description": "正式知识提交入口", "uses_llm": False,
+                    "version": 1, "source": "dataforge", "catalog_group": "dataforge", "category": "quality-processing",
+                    "description": "正式知识提交入口", "uses_llm": False,
                     "input_ports": {"input": {"artifact_type": f"candidate:{node.get('output_key')}"}}, "output_ports": {}, "parameter_schema": {}}
         else:
             try:
@@ -125,7 +128,10 @@ def technical_projection(definition, catalog):
             "name": frozen.get("name", item.get("name", node.get("ref", ""))),
             "display_name_zh": frozen.get("display_name_zh", item.get("display_name_zh", node.get("ref", ""))),
             "description": frozen.get("description", item.get("description", "")),
-            "provider": runtime.get("provider", item.get("provider", "dataforge")),
+            "source": frozen.get("source", item.get("source", "dataforge")),
+            "catalog_group": frozen.get("catalog_group", item.get("catalog_group", "dataforge")),
+            "category": frozen.get("category", item.get("category", "content-processing")),
+            "executor": runtime.get("executor", "dataforge-native"),
             "uses_llm": runtime.get("uses_llm", item.get("uses_llm", False)),
             "input_ports": frozen.get("input_ports", item.get("input_ports", {})),
             "output_ports": frozen.get("output_ports", item.get("output_ports", {})),

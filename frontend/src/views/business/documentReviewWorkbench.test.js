@@ -34,6 +34,11 @@ test('workbench uses SourceAnchor preview, polling and independent focus/batch s
   assert.match(workbench, /:focused="focusedChunkId === chunk\.id"/)
   assert.match(workbench, /:checked="selectedIds\.includes\(chunk\.id\)"/)
   assert.match(chunkCard, /keydown\.enter\.space/)
+  assert.match(chunkCard, /class="chunk-content"/)
+  assert.match(chunkCard, /expanded:\s*focused/)
+  assert.match(chunkCard, /-webkit-line-clamp:6/)
+  assert.match(chunkCard, /\.chunk-content\.expanded\{[^}]*-webkit-line-clamp:unset/)
+  assert.match(chunkCard, /<textarea v-if="editing"/)
 })
 
 test('PDF.js and DOCX evidence viewers expose multi-position highlights and explicit fallback states', () => {

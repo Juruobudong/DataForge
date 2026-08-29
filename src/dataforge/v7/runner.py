@@ -464,7 +464,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
         "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
         "evidence_text": content, "is_primary": True,
     }
-    kind = "qa" if ref in {"qa-extractor", "Text2QAGenerator", "qa-generator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
+    kind = "qa" if ref in {"qa-extractor", "Text2QAGenerator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
     mode = str(params.get("graph_mode") or "")
     if ref == "triple-builder" or kind == "graph" and mode != "semantic":
         data = {"subject": "高血压", "predicate": "需要", "object": "规范随访"}
@@ -534,30 +534,18 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
                                        for index, item in enumerate((value.get("entities") or [])) if item.get("object_kind") != "literal"]} for value in values]
     if ref in {"triple-builder", "semantic-relation-builder", "evidence-binder"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
-    if ref in {"prompt-generator", "qa-extractor", "Text2QAGenerator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+    if ref in {"prompt-generator", "qa-extractor", "Text2QAGenerator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         return [_preview_candidate(ref, params, value, index) for index, value in enumerate(values)]
     if ref == "graph-quality-validator":
         return [{**value, "graph_quality": {"hard_fail": False, "warnings": []}} for value in values]
     if ref == "artifact-merge":
         return [dict(value) for value in values]
-    if ref == "quality-evaluator":
-        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
-        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
-        return [{**value, "quality_score": float(value.get("quality_score", 1.0)),
-                 "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score
-                 else "review" if float(value.get("quality_score", 1.0)) >= review_score else "reject"}
-                for value in values]
-    if ref == "quality-filter":
-        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
-        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
-        return [{**value, "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score else "review"}
-                for value in values if float(value.get("quality_score", 1.0)) >= review_score]
-    if ref in {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "deduplicate"}:
+    if ref in {"HashDeduplicateFilter", "MinHashDeduplicateFilter"}:
         unique: dict[str, dict[str, Any]] = {}
         for value in values:
             unique.setdefault(str(value.get("source_knowledge_id") or json.dumps(value, sort_keys=True, default=str)), dict(value))
         return list(unique.values())
-    if ref in {"source-binding", "schema-validator", "knowledge-diff", "PromptedRefiner", "prompted-refiner"}:
+    if ref in {"schema-validator", "PromptedRefiner"}:
         return [dict(value) for value in values]
     raise ValueError(f"算子不支持受控内存预览：{ref}")
 
@@ -1516,9 +1504,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 if store and job_id:
                     store.record_chunk_generation(job_id, kind, chunk, status="failed", error=str(exc))
         return result
-    if ref in {"prompt-generator", "qa-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
+    if ref in {"prompt-generator", "graph-extractor", "structured-knowledge-generator", "multihop-qa"}:
         kind = str(params.get("knowledge_type", ""))
-        if ref == "qa-generator": kind = "qa"
         if ref == "graph-extractor": kind = "graph"
         mode = str(params.get("graph_mode") or "")
         output_key = f"graph:{mode}" if kind == "graph" and mode else kind
@@ -1619,23 +1606,6 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         return _bind_evidence(values)
     if ref == "artifact-merge":
         return [dict(value) for value in values]
-    if ref == "quality-evaluator":
-        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
-        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
-        return [{**value, "quality_score": float(value.get("quality_score", 1.0)),
-                 "quality_status": "pass" if float(value.get("quality_score", 1.0)) >= pass_score
-                 else "review" if float(value.get("quality_score", 1.0)) >= review_score else "reject"}
-                for value in values]
-    if ref == "quality-filter":
-        rules = dict((params.get("_resolved_quality_profile") or {}).get("rules") or {})
-        pass_score, review_score = float(rules.get("pass_score", 0.8)), float(rules.get("review_score", 0.6))
-        result = []
-        for value in values:
-            score = float(value.get("quality_score", 1.0))
-            if score < review_score:
-                continue
-            result.append({**value, "quality_status": "pass" if score >= pass_score else "review"})
-        return result
     if ref == "schema-validator":
         if str(params.get("knowledge_type") or "") == "graph":
             graph_mode = str(params.get("graph_mode") or "")
@@ -1653,14 +1623,6 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
             if report.get("missing_evidence_count"): problems.append("缺少 Evidence")
             raise ValueError("图谱质量门禁未通过：" + "；".join(problems or ["质量不达标"]))
         return [{**value, "graph_quality": report} for value in values]
-    if ref in {"source-binding", "knowledge-diff", "deduplicate", "prompted-refiner"}:
-        # Candidate-only operators deliberately never mutate published items.
-        if ref == "deduplicate":
-            unique: dict[str, dict[str, Any]] = {}
-            for value in values:
-                unique.setdefault(str(value.get("source_knowledge_id")), value)
-            return list(unique.values())
-        return [dict(value) for value in values]
     raise ValueError(f"Runner 没有批准的算子 Adapter：{ref}")
 
 

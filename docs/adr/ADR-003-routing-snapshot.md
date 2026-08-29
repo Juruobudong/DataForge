@@ -18,7 +18,7 @@ Snapshot 按 Project、Deployment 和 `test|production` 隔离。发布时先写
 ## 结果
 
 - 消费端不扫描 Collection、不猜测 Partition，也不直接解释中心授权表。
-- 同一医院 Deployment 可承载多个 Project，同时保持任务、授权、版本与回滚隔离。
+- 同一机构 Deployment 可承载多个 Project，同时保持任务、授权、版本与回滚隔离。
 - 阶段切换不会隐式发布或借用另一阶段 Snapshot；缺失目标阶段版本时 fail closed。
 - 单项目发布和 local 激活可以在失败时保留旧 Snapshot；批量 local 激活明确为非原子顺序操作。
 - 每次冻结前必须验证 Profile、Contract、Ready AssetVersion 和目标 Partition，发布流程比直接改配置更严格。

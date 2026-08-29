@@ -1,6 +1,6 @@
 # Routing 架构
 
-> 当前状态：已实现架构，更新于 2026-08-24。真实部署接入状态见 [`V7-CAPABILITY-MATRIX.md`](../../V7-CAPABILITY-MATRIX.md)。
+> 当前状态：已实现架构，更新于 2026-08-29。真实部署接入状态见 [`V7-CAPABILITY-MATRIX.md`](../../V7-CAPABILITY-MATRIX.md)。
 
 ## 授权边界
 
@@ -54,3 +54,7 @@ RouteVersion 按 `(project_deployment_id, release_stage)` 独立编号。冻结�
 ## 检索调试扩展（2026-08-28）
 
 任务的 final_top_k、reranker_serving_code 及重排模型身份增量冻结到 Snapshot v3；现有消费端字段不变。管理员检索调试复用授权边界，Draft 只生成内存快照，Published/Historical 只读取指定快照；检索执行不写 Routing/Asset/Milvus。正文与 Evidence 使用 knowledge_asset_items，Query Embedding 使用资产冻结的模型/维度；临时覆盖不保存。中心到机构仍仅解析 Routing。详见 [实施基线](../../wiki/sources/reranker-retrieval-debug-2026-08-28.md)。
+
+## Public Retrieval v1（2026-08-29）
+
+RoutingSnapshot 继续作为内部基础设施契约，保留 Milvus Target、Collection、Partition、Embedding 与 Storage Contract。业务边界改用 Published-only Public Retrieval v1：逻辑身份为 `project_code/deployment_code/release_stage/task_code + org_code`，Public DTO 仅输出 route、policy、正文、业务 data、评分、Context 与冻结 Evidence。独立 Retrieval Token 不能读取 Runtime Snapshot；管理员测试端点复用相同执行器和 presenter，但不向浏览器下发 token。当前 qa_agent 与 kg_for_consultation 尚未迁移。详见 [实施基线](../../wiki/sources/public-retrieval-gateway-2026-08-29.md)。

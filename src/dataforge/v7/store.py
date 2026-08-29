@@ -28,7 +28,7 @@ import yaml
 
 from .catalog import (
     CATALOG_SEEDS, OPERATOR_CATEGORIES, SUBFLOW_DISPLAY_NAMES_ZH, catalog_by_code,
-    normalize_chunker_params, preparation_flow_definition, subflow_seeds, RENAMED_DATAFLOW_OPERATORS,
+    normalize_chunker_params, preparation_flow_definition, subflow_seeds,
 )
 from .flow import FlowCompiler, FlowValidationError
 from .operator_catalog import load_catalog, seed_catalog, resolve_operator, technical_projection
@@ -1675,7 +1675,8 @@ class V7Store:
             return {"id": item.id, "revision_id": revision.id, "revision": revision.revision_no, "status": "published"}
 
     def list_operator_catalog(self, *, include_internal: bool = False, query: str = "", category: str = "",
-                              knowledge_type: str = "", exposure: str = "", status: str = "", surface: str = "", provider: str = "") -> list[dict[str, Any]]:
+                              knowledge_type: str = "", exposure: str = "", status: str = "", surface: str = "",
+                              source: str = "", catalog_group: str = "") -> list[dict[str, Any]]:
         with self.sessions() as session:
             catalog = load_catalog(session)
             values = []
@@ -1687,10 +1688,6 @@ class V7Store:
                 return runtime_states[identity]
             for value in sorted(catalog.values(), key=lambda item: (item["category"], item["code"])):
                 value = dict(value)
-                # Historical identities remain resolvable from frozen versions,
-                # but are not advertised as duplicate operators in the catalog UI.
-                if value["code"] in RENAMED_DATAFLOW_OPERATORS:
-                    continue
                 if not include_internal and value["exposure"] == "internal":
                     continue
                 searchable = json.dumps(value, ensure_ascii=False).lower()
@@ -1700,7 +1697,8 @@ class V7Store:
                 if exposure and value["exposure"] != {"canvas": "public"}.get(exposure, exposure): continue
                 if status and value["status"] != status: continue
                 if surface and surface not in value["surfaces"]: continue
-                if provider and value["provider"] != provider: continue
+                if source and value["source"] != source: continue
+                if catalog_group and value["catalog_group"] != catalog_group: continue
                 value["dependency_status"] = runtime_state(value["runtime_requirements"])
                 value["versions"] = [{**{key: item_value for key, item_value in item.items() if key != "runtime_requirements"},
                                       "dependency_status": runtime_state(item["runtime_requirements"])}
@@ -1711,7 +1709,7 @@ class V7Store:
 
     def operator_runtime_status(self, requirements, *, check=False):
         from .operators.runtime import OperatorRuntime
-        if requirements.get("provider", "dataforge") == "dataforge":
+        if requirements.get("executor", "dataforge-native") in {"dataforge-native", "dataforge-adapter"}:
             return {"status": "ready"}
         runner_url = os.getenv("DATAFORGE_RUNNER_URL")
         if runner_url:
@@ -1779,6 +1777,8 @@ class V7Store:
             "total": len(values),
             "categories": [{"name": name, "count": sum(item["category"] == name for item in values)} for name in OPERATOR_CATEGORIES],
             "knowledge_types": sorted({kind for item in values for kind in item.get("knowledge_types", [])}),
+            "sources": sorted({item["source"] for item in values}),
+            "catalog_groups": sorted({item["catalog_group"] for item in values}),
             "exposures": [{"value": value, "label": label, "count": sum(item["exposure"] == value for item in values)} for value, label in (
                 ("canvas", "可直接使用"), ("controlled", "受控使用"), ("internal", "系统内部"), ("disabled", "已禁用"))],
             "statuses": sorted({item["status"] for item in values}),
@@ -1809,7 +1809,8 @@ class V7Store:
     def publish_operator_version(self, code: str, version_no: int) -> dict[str, Any]:
         with self.sessions() as lookup:
             version = lookup.scalar(select(OperatorVersion).join(OperatorDefinition).where(OperatorDefinition.code == code, OperatorVersion.version_no == version_no))
-            custom = version and (version.runtime_requirements or {}).get("provider") == "custom"
+            definition = lookup.scalar(select(OperatorDefinition).where(OperatorDefinition.id == version.operator_definition_id)) if version else None
+            custom = definition and definition.source == "custom"
         if custom:
             from .operator_plugins import OperatorPluginService
             return OperatorPluginService(self).publish(code, version_no)
@@ -4141,7 +4142,6 @@ class V7Store:
         previous_nodes = {str(item.get("id")): item for item in (previous_definition or {}).get("nodes", [])
                           if isinstance(item, dict)}
         catalog = load_catalog(session)
-        quality_groups: dict[str, list[dict[str, Any]]] = {}
         for node_id, node in by_id.items():
             if node.get("kind") != "operator":
                 continue
@@ -4218,40 +4218,7 @@ class V7Store:
                     raise FlowParameterError("PROMPT_KNOWLEDGE_TYPE_MISMATCH", "Prompt Revision 与 Flow 知识类型不匹配",
                                              node_id=node_id, field="prompt_template_revision_id")
 
-            quality_id = final.get("quality_profile_revision_id")
-            if quality_id:
-                revision = session.get(QualityProfileRevision, str(quality_id))
-                if not revision or revision.status != "published":
-                    raise FlowParameterError("QUALITY_PROFILE_INVALID", "Quality Profile Revision 不存在或未发布",
-                                             node_id=node_id, field="quality_profile_revision_id")
-                knowledge_type = str(final.get("knowledge_type") or "")
-                if knowledge_type and not self._asset_matches_knowledge_type(revision.knowledge_types, knowledge_type):
-                    raise FlowParameterError("QUALITY_PROFILE_KNOWLEDGE_TYPE_MISMATCH", "Quality Profile 与 Flow 知识类型不匹配",
-                                             node_id=node_id, field="quality_profile_revision_id")
-                for sink_id, _, _ in contexts:
-                    quality_groups.setdefault(sink_id, []).append(node)
             node["params"] = final
-
-        for sink_id, group in quality_groups.items():
-            relevant = [node for node in group if node.get("ref") in {"quality-evaluator", "quality-filter"}]
-            values = {str((node.get("params") or {}).get("quality_profile_revision_id") or "") for node in relevant}
-            values.discard("")
-            if len(values) <= 1:
-                continue
-            changed = []
-            for node in relevant:
-                node_id = str(node["id"])
-                current = (node.get("params") or {}).get("quality_profile_revision_id")
-                old = ((previous_nodes.get(node_id) or {}).get("params") or {}).get("quality_profile_revision_id")
-                if current != old:
-                    changed.append(str(current))
-            if len(set(changed)) != 1:
-                raise FlowParameterError("QUALITY_PROFILE_CONFLICT",
-                    f"Sink {sink_id} 链路的质量评估与过滤规则不一致", node_id=sink_id,
-                    field="quality_profile_revision_id")
-            selected = changed[0]
-            for node in relevant:
-                node.setdefault("params", {})["quality_profile_revision_id"] = selected
         return value
 
     def _compile_template_definition(self, session: Session, definition: dict[str, Any], output_types: list[str] | None,
@@ -4318,10 +4285,10 @@ class V7Store:
             if requirements.get("uses_llm"):
                 from .operators.dataflow import serving_snapshot
                 params["_resolved_serving"] = serving_snapshot(registry, params["llm_serving"])
-            if require_serving_health and requirements.get("provider") in {"dataflow", "custom"}:
+            if require_serving_health and requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
                 state = self.require_operator_runtime(requirements)
                 requirements["environment_digest"] = state["runtime_digest"]
-            elif requirements.get("provider") in {"dataflow", "custom"}:
+            elif requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
                 state = self.operator_runtime_status(requirements)
                 if state["status"] == "ready":
                     requirements["environment_digest"] = state["runtime_digest"]
@@ -4335,13 +4302,6 @@ class V7Store:
                     "input_schema": prompt.input_schema, "output_schema": prompt.output_schema,
                 }
                 compiled["dependencies"].append({"kind": "prompt_template_revision", "id": prompt.id})
-            if ref in {"quality-evaluator", "quality-filter"} or params.get("quality_profile_revision_id"):
-                quality_id = params.get("quality_profile_revision_id")
-                quality = session.get(QualityProfileRevision, quality_id) if quality_id else None
-                if not quality or quality.status != "published":
-                    raise ValueError("质量节点只能引用已发布 Quality Profile Revision")
-                params["_resolved_quality_profile"] = {"id": quality.id, "rules": dict(quality.rules_json or {})}
-                compiled["dependencies"].append({"kind": "quality_profile_revision", "id": quality.id})
         frozen_operators = {(node["ref"], node["operator_version"]): node["operator_spec"] for node in compiled["compiled_definition"]["nodes"] if node.get("kind") == "operator"}
         for dependency in compiled["dependencies"]:
             if dependency.get("kind") == "operator":
@@ -4856,7 +4816,7 @@ class V7Store:
             if require_serving_health:
                 for node in compiled["compiled_definition"].get("nodes", []):
                     requirements = (node.get("operator_spec") or {}).get("runtime_requirements") or {}
-                    if requirements.get("provider") in {"dataflow", "custom"}:
+                    if requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
                         self.require_operator_runtime(requirements)
                 if self.enforce_serving_health:
                     for dependency in compiled["dependencies"]:
@@ -5389,6 +5349,12 @@ class V7Store:
         if errors:
             raise FlowParameterError("PARAMETER_SCHEMA_INVALID", errors[0].message, node_id=node_id,
                                      field=str(next(iter(errors[0].path), "")))
+        if code == "relation-extractor" and not params.get("graph_mode"):
+            graph_modes = {str(item.get("graph_mode") or "") for item in nodes
+                           if item.get("kind") == "knowledge_sink" and item.get("knowledge_type") == "graph"}
+            graph_modes.discard("")
+            if len(graph_modes) == 1:
+                params["graph_mode"] = graph_modes.pop()
         version = operator["version"]
         config = normalize_graph_config(definition.get("graph_config"))
         if code == "entity-extractor" and params.get("entity_type_scope") == "subset":

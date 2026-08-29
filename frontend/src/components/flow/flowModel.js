@@ -89,7 +89,7 @@ export function operatorNodeSubtitle(meta = {}, showTechnicalCode = false) {
 
 export function operatorLabel(item = {}) {
   const title = operatorPrimaryName(item)
-  return (item.runtime_requirements?.provider || item.provider) === 'dataflow' ? `${title} / ${operatorSubtitle(item)}` : title
+  return item.source === 'dataflow' ? `${title} / ${operatorSubtitle(item)}` : title
 }
 
 export function operatorAvailable(item, purpose = 'knowledge', outputTypes = []) {
@@ -97,7 +97,6 @@ export function operatorAvailable(item, purpose = 'knowledge', outputTypes = [])
   if (['deprecated', 'disabled', 'draft'].includes(item.status) || (item.version_status && item.version_status !== 'published')) return false
   if (item.surfaces && !item.surfaces.includes(purpose === 'knowledge' ? 'advanced-canvas' : 'system-internal')) return false
   if (item.dependency_status && item.dependency_status.status !== 'ready') return false
-  if (['dataflow', 'custom'].includes(item.provider || item.runtime_requirements?.provider) && item.dependency_status?.status !== 'ready') return false
   if (outputTypes.length && item.knowledge_types?.length && !item.knowledge_types.includes('*') && !outputTypes.some(kind => item.knowledge_types.includes(kind.split(':')[0]))) return false
   if (outputTypes.length && item.graph_modes?.length && !outputTypes.some(kind => kind.startsWith('graph') && item.graph_modes.includes(kind.split(':')[1] || 'triple'))) return false
   return true
@@ -214,7 +213,9 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
   return {
     kind: 'operator', nodeRole: role, name: item?.display_name_zh || item?.name || definition.ref, englishName: item?.name || definition.ref,
     code: definition.ref, category: item?.category || (definition.operator_spec ? '已冻结算子' : '未知算子'), status,
-    provider: item?.runtime_requirements?.provider || item?.provider || 'dataforge', dependencyStatus: catalogVersion?.dependency_status || { status: 'unknown', reason: '该版本不在当前可用目录中' },
+    source: item?.source || 'dataforge', catalogGroup: item?.catalog_group || 'dataforge',
+    executor: item?.runtime_requirements?.executor || 'dataforge-native',
+    dependencyStatus: catalogVersion?.dependency_status || { status: 'unknown', reason: '该版本不在当前可用目录中' },
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),
     parameterSchema: item?.parameter_schema || {}, inputExample: item?.input_example || {}, outputExample: item?.output_example || {}, version: item?.version,

@@ -178,14 +178,9 @@ def faq_template_definition() -> dict[str, Any]:
     nodes = [
         {"id": "reviewed-input", "kind": "operator", "ref": "reviewed-source-chunk-input"},
         {"id": "generate", "kind": "operator", "ref": "faq-record-mapper", "params": {"knowledge_type": FAQ_TYPE_CODE}},
-        {"id": "evaluate", "kind": "operator", "ref": "quality-evaluator", "params": {"knowledge_type": FAQ_TYPE_CODE, "quality_profile_revision_id": "qualityrev_default"}},
-        {"id": "filter", "kind": "operator", "ref": "quality-filter", "params": {"knowledge_type": FAQ_TYPE_CODE, "quality_profile_revision_id": "qualityrev_default"}},
-        {"id": "bind", "kind": "operator", "ref": "source-binding", "params": {"knowledge_type": FAQ_TYPE_CODE}},
-        {"id": "validate", "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": FAQ_TYPE_CODE}},
-        {"id": "diff", "kind": "operator", "ref": "knowledge-diff", "params": {"knowledge_type": FAQ_TYPE_CODE}},
         {"id": "sink", "kind": "knowledge_sink", "knowledge_type": FAQ_TYPE_CODE, "output_key": FAQ_TYPE_CODE},
     ]
-    order = ["reviewed-input", "generate", "evaluate", "filter", "bind", "validate", "diff", "sink"]
+    order = ["reviewed-input", "generate", "sink"]
     return {
         "schema_version": 3,
         "purpose": "knowledge",

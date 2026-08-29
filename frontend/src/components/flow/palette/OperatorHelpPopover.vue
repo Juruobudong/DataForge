@@ -7,7 +7,7 @@ const state = ref(null), element = ref(null), position = ref({})
 let anchor = null, closeTimer
 const title = computed(() => operatorPrimaryName(state.value?.item || {}))
 const runtime = computed(() => state.value?.item?.runtime_requirements || {})
-const provider = computed(() => ({ dataforge: 'DataForge 平台', dataflow: 'DataFlow', custom: '自定义算子' }[state.value?.item?.provider || runtime.value.provider] || '未声明'))
+const source = computed(() => ({ dataforge: 'DataForge', dataflow: 'DataFlow', custom: '扩展' }[state.value?.item?.source] || '未声明'))
 const summary = computed(() => state.value?.item?.summary || state.value?.item?.description || '用途未声明')
 const scenarios = computed(() => [...new Set(state.value?.item?.scenarios || [])].filter(value => value !== summary.value && value !== state.value?.item?.description && value !== runtime.value.limitations))
 function ports(direction) {
@@ -66,7 +66,7 @@ defineExpose({ show, leave, toggle, close, isOpen: code => state.value?.mode ===
     <section v-if="state" ref="element" class="operator-help-popover" :class="state.mode" :style="position" :role="state.mode === 'detail' ? 'dialog' : 'tooltip'" :aria-label="`${title}说明`" :aria-modal="state.mode === 'detail' ? 'false' : undefined" @mouseenter="cancelClose" @mouseleave="leave" @focusin="cancelClose" @focusout="leave" @pointerdown.stop @click.stop @dblclick.stop @keydown.stop @dragstart.stop.prevent>
       <p v-if="state.mode === 'summary'" class="summary-text">{{ summary }}</p>
       <template v-else>
-        <header><div><strong>{{ title }}</strong><small>{{ state.item.name || state.item.code }} · v{{ state.item.version ?? '未声明' }} · {{ provider }}</small></div><button type="button" aria-label="关闭算子说明" @click="close">×</button></header>
+        <header><div><strong>{{ title }}</strong><small>{{ state.item.code }} · v{{ state.item.version ?? '未声明' }} · {{ source }}</small></div><button type="button" aria-label="关闭算子说明" @click="close">×</button></header>
         <h4>用途</h4><p>{{ summary }}</p>
         <p v-if="state.item.description && state.item.description !== summary && state.item.description !== runtime.limitations">{{ state.item.description }}</p>
         <template v-if="scenarios.length"><h4>适用场景</h4><ul><li v-for="item in scenarios" :key="item">{{ item }}</li></ul></template>
