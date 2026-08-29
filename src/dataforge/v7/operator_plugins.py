@@ -6,9 +6,10 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
-from .catalog import PLATFORM_RESERVED_OPERATOR_CODES
+from .catalog import OPERATOR_CATEGORIES, PLATFORM_RESERVED_OPERATOR_CODES
 from .models import OperatorDefinition, OperatorVersion, OperatorValidationRun, utc_now
 from .operator_catalog import version_payload
+from .operator_runtime_contract import validate_runtime_requirements
 from .operators.base import OperatorExecutionContext
 from .operators.custom import CustomOperatorExecutor, PROTECTED, validate_records
 from .operators.runtime import OperatorRuntime, digest
@@ -20,14 +21,16 @@ ARTIFACT_TYPES = {"source_chunk_set", "entity_candidate_set", "relation_candidat
 
 def validate_manifest(raw):
     value = deepcopy(raw)
-    required = {"code", "name", "display_name_zh", "executor", "package", "package_version", "package_digest", "implementation",
+    required = {"code", "name", "display_name_zh", "category", "executor", "package", "package_version", "package_digest", "implementation",
                 "input_ports", "output_ports", "parameter_schema", "input_example", "output_example"}
     if not isinstance(value, dict) or required - value.keys():
         raise ValueError("Manifest 缺少必需字段")
     if not re.fullmatch(r"[a-z][a-z0-9-]{2,100}", value["code"]) or value["code"].casefold() in PLATFORM_RESERVED_OPERATOR_CODES:
         raise ValueError("自定义 code 不合法或覆盖平台保留算子")
-    if {"source", "catalog_group", "provider"} & value.keys():
-        raise ValueError("算子来源与目录分组由 DataForge 管理，Manifest 不能声明")
+    if {"source", "catalog_group", "provider", "driver"} & value.keys():
+        raise ValueError("算子来源、目录分组与 Runtime Driver 由 DataForge 管理，Manifest 不能声明")
+    if value["category"] not in OPERATOR_CATEGORIES:
+        raise ValueError("自定义算子 category 必须使用受控业务分类")
     if value["executor"] not in {"dataflow-storage", "dataflow-llm", "custom-native"}:
         raise ValueError("不支持的自定义执行器")
     if value.get("surfaces", ["advanced-canvas"]) != ["advanced-canvas"]:
@@ -96,21 +99,25 @@ class OperatorPluginService:
         value = validate_manifest(manifest)
         runtime = {key: deepcopy(value[key]) for key in ("executor", "package", "package_version", "package_digest", "implementation",
                    "uses_llm", "input_mapping", "output_mapping", "init_parameters", "run_arguments", "capabilities", "timeout_seconds", "knowledge_types", "graph_modes") if key in value}
-        runtime.update(adapter_version="custom-records-v1", approved=False, manifest=value, manifest_digest=digest(value))
+        runtime.update(driver="custom", adapter_version="custom-records-v1", approved=False,
+                       manifest=value, manifest_digest=digest(value))
+        validate_runtime_requirements(runtime)
         self.store.require_operator_runtime(runtime)
         with self.store.sessions.begin() as session:
             definition = session.scalar(select(OperatorDefinition).where(OperatorDefinition.code == value["code"]))
             if definition is None:
                 definition = OperatorDefinition(id=f"op_{uuid4().hex}", code=value["code"], name=value["name"],
                     display_name_zh=value["display_name_zh"], summary=value.get("description", value["name"]),
-                    description=value.get("description", value["name"]), source="custom", catalog_group="extension",
-                    category="extension", subcategory="",
+                    description=value.get("description", value["name"]), source="custom", catalog_group="custom",
+                    category=value["category"], subcategory="",
                     scenarios=["已审核来源知识处理"], knowledge_types=value.get("knowledge_types", ["text", "qa", "graph"]),
                     surfaces=["advanced-canvas"], exposure="controlled", risk_level="advanced", enabled=True, lifecycle_status="draft")
                 session.add(definition); session.flush()
             previous = session.scalars(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id)).all()
-            if definition.source != "custom" or definition.catalog_group != "extension":
+            if definition.source != "custom" or definition.catalog_group != "custom":
                 raise ValueError("不能覆盖平台版本")
+            if definition.category != value["category"]:
+                raise ValueError("同一自定义算子 code 的业务分类不能跨版本变更")
             number = max((row.version_no for row in previous), default=0) + 1
             version = OperatorVersion(id=f"oprev_{uuid4().hex}", operator_definition_id=definition.id, version_no=number,
                 status="draft", adapter_code="custom-records-v1", input_ports=value["input_ports"], output_ports=value["output_ports"],

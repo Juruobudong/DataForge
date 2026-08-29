@@ -31,6 +31,7 @@ from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
 from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
+from .milvus_targets import MilvusTargetService
 from .llm_serving import configure_llm_serving_registry
 from .servings import ServingManager
 from .retrieval import (
@@ -382,7 +383,7 @@ class DeploymentPatch(BaseModel):
 
 class DeploymentTargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    milvus_uri: str
+    milvus_target_id: str
     confirm_production: bool = False
     expected_target_uri: str | None = None
 
@@ -644,6 +645,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
     serving_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="serving-startup-check")
     local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
+    milvus_targets_service = MilvusTargetService(store, lambda uri, token: V7Milvus(uri, token))
     serving_manager = ServingManager(store.sessions, resolved.config_encryption_key)
     configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
@@ -2040,17 +2042,21 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/milvus-targets")
     def milvus_targets():
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以管理 Milvus 服务注册表")
         return store.list_milvus_targets()
 
     @app.post("/api/milvus-targets", status_code=201)
     def create_milvus_target(payload: MilvusTargetRequest):
         if app.state.instance.mode != "central": raise HTTPException(status_code=403, detail="Local 实例不能创建 Milvus Target")
-        try: return store.create_milvus_target(payload.name, payload.milvus_url)
+        try: return milvus_targets_service.create(payload.name, payload.milvus_url)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.patch("/api/milvus-targets/{target_id}")
     def patch_milvus_target(target_id: str, payload: MilvusTargetPatch):
-        try: return store.patch_milvus_target(target_id, **payload.model_dump())
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以管理 Milvus 服务注册表")
+        try: return milvus_targets_service.patch(target_id, **payload.model_dump())
         except ValueError as exc: raise _error(exc) from exc
 
     def _require_central_deployment_admin() -> None:
@@ -2075,14 +2081,14 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         _require_central_deployment_admin()
         if payload.release_stage != "test":
             raise _error(ValueError("新 Deployment 必须先以 test 阶段创建"))
+        if payload.milvus_target_id is not None or payload.test_milvus_uri is not None:
+            raise _error(ValueError("机构 Milvus 由私有化实例自行配置，中心创建机构时不能提交 Target"))
         try:
             arguments = {
                 "code": payload.code, "name": payload.name, "scope": payload.scope,
                 "institution_name": payload.institution_name,
                 "institution_code": payload.institution_code,
             }
-            if payload.test_milvus_uri is not None:
-                arguments["test_milvus_uri"] = payload.test_milvus_uri
             return store.create_shared_deployment(**arguments)
         except ValueError as exc: raise _error(exc) from exc
 
@@ -2102,7 +2108,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try:
             _assert_deployment_idle(deployment_id)
             return store.put_deployment_target(
-                deployment_id, release_stage, payload.milvus_uri,
+                deployment_id, release_stage, payload.milvus_target_id,
                 confirm_production=payload.confirm_production,
                 expected_target_uri=payload.expected_target_uri,
             )
@@ -2302,9 +2308,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if not payload:
             raise ValueError("ProjectDeployment 不存在")
         should_connect = app.state.instance.mode == "local" or payload.get("scope") == "central"
-        target = store.deployment_stage_target(deployment_id, release_stage)
-        target_uri = target["milvus_target"]["milvus_url"]
-        uri = target_uri if should_connect else None
+        uri = None
+        if should_connect:
+            target = store.deployment_stage_target(deployment_id, release_stage)
+            uri = target["milvus_target"]["milvus_url"]
         stage_token_name = (
             "DATAFORGE_PRODUCTION_MILVUS_TOKEN"
             if release_stage == "production"
@@ -2715,7 +2722,14 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if app.state.instance.mode != "local":
             raise HTTPException(status_code=403, detail="只有机构本地可以管理 Milvus 配置")
         try:
-            return local_milvus_config.put(app.state.instance.id, slot, **payload.model_dump())
+            local_milvus_config.put(app.state.instance.id, slot, **payload.model_dump())
+            try:
+                return local_milvus_config.verify(
+                    app.state.instance.id, slot,
+                    factory=lambda uri, token: V7Milvus(uri, token),
+                )
+            except ValueError:
+                return local_milvus_config.get(app.state.instance.id, slot)
         except ValueError as exc:
             raise _error(exc) from exc
 

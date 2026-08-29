@@ -10,7 +10,7 @@ test('旧偏好自动插入新菜单并忽略删除和重复 key', () => {
     hidden: [],
   } })
   assert.deepEqual(merged.order, [
-    'dashboard', 'knowledge', 'vector-storage', 'authorization',
+    'dashboard', 'knowledge', 'vector-storage', 'milvus-targets', 'authorization',
     'documents', 'jobs', 'institution-deployments',
   ])
 })
@@ -26,6 +26,7 @@ test('required 菜单不能隐藏，普通菜单保留隐藏状态', () => {
 
 test('local-only 菜单只在 local registry 中出现', () => {
   assert.equal(mergeMenuPreference(businessMenuRegistry('central')).order.includes('local-initialization'), false)
+  assert.equal(mergeMenuPreference(businessMenuRegistry('local')).order.includes('milvus-targets'), false)
   assert.equal(mergeMenuPreference(businessMenuRegistry('local')).order.at(-1), 'local-initialization')
 })
 

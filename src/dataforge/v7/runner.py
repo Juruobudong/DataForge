@@ -27,11 +27,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from ..config import Settings
-from .catalog import catalog_by_code, normalize_chunker_params
+from .catalog import normalize_chunker_params
 from .operators import OperatorExecutionContext, build_builtin_registry
 from .operators.factory import build_runtime_registry
 from .operators.graph_chunks import GraphChunkError, GraphEndpointUnresolved, TripleEndpoints, chunk_identity
-from .operator_catalog import load_catalog
 from .graph_literal import classify_object, detect_literal
 from .graph_prompt import (RELATION_REPAIR_VERSION, uses_graph_guidance, relation_repair_prompt,
                            graph_node_prompt, graph_config_for_node as _graph_config_for_node)
@@ -1737,9 +1736,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         incoming = _incoming(definition)
         root_documents = store.reviewed_chunks_for_job(job_id)
         current_source_chunks = [dict(value) for value in root_documents]
-        with store.sessions() as session:
-            catalog = load_catalog(session)
-        registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
+        registry = build_runtime_registry(_builtin_dispatch, definition)
         runtime = {
             "root_documents": root_documents, "sources": sources, "versions": versions,
             "type_contracts": type_contracts, "job_id": job_id, "store": store,
@@ -1761,7 +1758,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 sink_nodes.append(node)
                 continue
             ref = str(node.get("ref"))
-            operator_version = int(node.get("operator_version") or catalog.get(ref, {}).get("version", 1))
+            operator_version = int(node["operator_version"])
             resolved_params = dict(node.get("params") or {})
             failed_upstream = [source_id for source_id in source_nodes if source_id in node_errors]
             if failed_upstream:
@@ -1946,9 +1943,7 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
     root_documents = context["root_documents"]
     type_contracts = context["type_contracts"]
     graph_config = _graph_config_from_contracts(type_contracts)
-    with store.sessions() as session:
-        catalog = load_catalog(session)
-    registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
+    registry = build_runtime_registry(_builtin_dispatch, definition)
     outputs: dict[str, list[dict[str, Any]]] = {}
     artifact_ids: dict[str, list[str]] = {}
     failed: dict[str, str] = {}
@@ -2020,15 +2015,14 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
             ref = str(node.get("ref"))
             params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}
             params.pop("force_ocr", None)
-            operator_version = int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1))
+            operator_version = int(node["operator_version"])
             try:
                 result = registry.resolve(ref, operator_version).execute(
                     inputs=input_values, params=params,
                     context=OperatorExecutionContext(flow_run_id=flow_run_id, node_id=node_id, runtime=runtime),
                 )
                 outputs[node_id] = result.outputs
-                item = catalog.get(ref) or {}
-                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or item.get("output", "execution")} for value in result.outputs]
+                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or "execution"} for value in result.outputs]
                 artifact_ids[node_id] = store.record_flow_node(
                     flow_run_id, node_id, input_ids, recorded, operator_code=ref,
                     operator_version=operator_version, resolved_parameters=params, logs=getattr(result, "logs", []),
@@ -2067,10 +2061,8 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
     by_id = {str(node["id"]): node for node in definition.get("nodes", [])}
     versions_list = context["versions"]; versions = {item.id: item for item in versions_list}; sources = context["sources"]
     type_contracts = store.type_contracts_for_job(context["job_id"]); parent_outputs = context["parent_outputs"]
-    with store.sessions() as session:
-        catalog = load_catalog(session)
     graph_config = _graph_config_from_contracts(type_contracts)
-    registry = build_runtime_registry(_builtin_dispatch, catalog, definition)
+    registry = build_runtime_registry(_builtin_dispatch, definition)
     outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
     try:
@@ -2105,8 +2097,8 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                 outputs[node_id] = [{"_artifact_type": f"knowledge_preview:{output_key}", **preview}]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, outputs[node_id], status="awaiting_commit"); continue
             ref = str(node.get("ref")); params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}; params.pop("force_ocr", None)
+            operator_version = int(node["operator_version"])
             try:
-                operator_version = int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1))
                 result = registry.resolve(ref, operator_version).execute(
                     inputs=input_values, params=params,
                     context=OperatorExecutionContext(flow_run_id=flow_run_id, node_id=node_id, runtime={
@@ -2118,15 +2110,15 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
                     }),
                 )
                 values = result.outputs
-                outputs[node_id] = values; item = catalog.get(ref) or {}
-                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or item.get("output", "execution")} for value in values]
+                outputs[node_id] = values
+                recorded = [{**value, "_artifact_type": node.get("resolved_output_type") or "execution"} for value in values]
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, recorded, operator_code=ref,
-                                                               operator_version=int(node.get("operator_version") or item.get("version", 1)), resolved_parameters=params, logs=getattr(result, "logs", []),
+                                                               operator_version=operator_version, resolved_parameters=params, logs=getattr(result, "logs", []),
                                                                metrics={**getattr(result, "metrics", {}), "input_records": len(input_values), "output_records": len(values)})
             except Exception as exc:
                 failed.add(node_id); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run_id, node_id, input_ids, [], error=str(exc), operator_code=ref,
-                                                               operator_version=int(node.get("operator_version") or (catalog.get(ref) or {}).get("version", 1)), resolved_parameters=params, logs=getattr(exc, "operator_logs", []), metrics=getattr(exc, "operator_metrics", {}))
+                                                               operator_version=operator_version, resolved_parameters=params, logs=getattr(exc, "operator_logs", []), metrics=getattr(exc, "operator_metrics", {}))
         chunk_errors = _graph_chunk_errors(generation)
         warning = "；".join(list(chunk_errors.values())[:20]) or None
         if previews:

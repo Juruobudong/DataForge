@@ -3,7 +3,7 @@
   "name": "Native Reviewed Suffix",
   "display_name_zh": "审核文本后缀",
   "description": "原生协议的可信样例。",
-  "provider": "custom",
+  "category": "content-processing",
   "executor": "custom-native",
   "package": "dataforge-medical-demo-operators",
   "package_version": "0.1.0",

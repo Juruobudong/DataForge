@@ -12,6 +12,7 @@ from .diagnostics import capture_operator_diagnostics
 from .outcomes import capture_generation_metrics
 from .qa import QAChunkSession, generate_qa_chunks, serving_snapshot
 from ..llm_serving import get_llm_serving_registry
+from ..operator_runtime_contract import validate_runtime_requirements
 
 
 def serving_call(params, runtime):
@@ -57,6 +58,9 @@ class DataFlowOperatorExecutor:
     def __init__(self, spec, runtime=None):
         self.code, self.version = spec["code"], spec["version"]
         self.spec = deepcopy(spec["runtime_requirements"])
+        runtime_identity = validate_runtime_requirements(self.spec)
+        if runtime_identity["driver"] != "dataflow":
+            raise ValueError("DataFlowOperatorExecutor 只接受 dataflow Runtime Driver")
         self.parameter_schema = deepcopy(spec.get("parameter_schema") or {})
         self.adapter = self.spec["adapter_version"]
         self.runtime = runtime or OperatorRuntime()

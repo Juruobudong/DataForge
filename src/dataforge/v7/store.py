@@ -32,6 +32,7 @@ from .catalog import (
 )
 from .flow import FlowCompiler, FlowValidationError
 from .operator_catalog import load_catalog, seed_catalog, resolve_operator, technical_projection
+from .operator_runtime_contract import requires_external_runtime, validate_runtime_requirements
 from .subflows import SubflowService, published_subflows, pin_subflows
 from .flow_authoring import (
     FLOW_AUTHORING_COMPILER, MANAGED_FLOW_CATALOG, ManagedTemplateError,
@@ -774,8 +775,6 @@ class V7Store:
             if not target:
                 target = MilvusTarget(id=target_id, name=target_name, milvus_url=target_url)
                 session.add(target); session.flush()
-            else:
-                target.name, target.milvus_url = target_name, target_url
             link = session.scalar(select(DeploymentTarget).where(
                 DeploymentTarget.deployment_id == deployment.id,
                 DeploymentTarget.release_stage == stage,
@@ -1709,7 +1708,8 @@ class V7Store:
 
     def operator_runtime_status(self, requirements, *, check=False):
         from .operators.runtime import OperatorRuntime
-        if requirements.get("executor", "dataforge-native") in {"dataforge-native", "dataforge-adapter"}:
+        validate_runtime_requirements(requirements)
+        if not requires_external_runtime(requirements):
             return {"status": "ready"}
         runner_url = os.getenv("DATAFORGE_RUNNER_URL")
         if runner_url:
@@ -4282,13 +4282,14 @@ class V7Store:
             params = node.get("params") or {}
             ref = node.get("ref")
             requirements = (node.get("operator_spec") or {}).get("runtime_requirements") or {}
+            validate_runtime_requirements(requirements)
             if requirements.get("uses_llm"):
                 from .operators.dataflow import serving_snapshot
                 params["_resolved_serving"] = serving_snapshot(registry, params["llm_serving"])
-            if require_serving_health and requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
+            if require_serving_health and requires_external_runtime(requirements):
                 state = self.require_operator_runtime(requirements)
                 requirements["environment_digest"] = state["runtime_digest"]
-            elif requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
+            elif requires_external_runtime(requirements):
                 state = self.operator_runtime_status(requirements)
                 if state["status"] == "ready":
                     requirements["environment_digest"] = state["runtime_digest"]
@@ -4815,8 +4816,11 @@ class V7Store:
                         "checksum": snapshot.dependency_json.get("source_checksum") or self._definition_checksum(snapshot.compiled_definition_json)}
             if require_serving_health:
                 for node in compiled["compiled_definition"].get("nodes", []):
+                    if node.get("kind") != "operator":
+                        continue
                     requirements = (node.get("operator_spec") or {}).get("runtime_requirements") or {}
-                    if requirements.get("executor") not in {None, "dataforge-native", "dataforge-adapter"}:
+                    validate_runtime_requirements(requirements)
+                    if requires_external_runtime(requirements):
                         self.require_operator_runtime(requirements)
                 if self.enforce_serving_health:
                     for dependency in compiled["dependencies"]:
@@ -8824,6 +8828,14 @@ class V7Store:
     @staticmethod
     def _target_payload(target: MilvusTarget) -> dict[str, Any]:
         return {"id": target.id, "name": target.name, "milvus_url": target.milvus_url,
+                "verification_status": target.verification_status,
+                "verified_at": target.verified_at.isoformat() if target.verified_at else None,
+                "verification_error": target.verification_error,
+                "candidate_milvus_url": target.candidate_milvus_url,
+                "candidate_verification_status": target.candidate_verification_status,
+                "candidate_verified_at": target.candidate_verified_at.isoformat()
+                    if target.candidate_verified_at else None,
+                "candidate_verification_error": target.candidate_verification_error,
                 "created_at": target.created_at.isoformat(), "updated_at": target.updated_at.isoformat()}
 
     @staticmethod
@@ -8875,11 +8887,23 @@ class V7Store:
         with self.sessions() as session:
             return [self._target_payload(item) for item in session.scalars(select(MilvusTarget).order_by(MilvusTarget.name))]
 
+    def get_milvus_target(self, target_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            value = session.get(MilvusTarget, target_id)
+            if not value:
+                raise ValueError("Milvus Target 不存在")
+            return self._target_payload(value)
+
     def create_milvus_target(self, name: str, milvus_url: str) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("Milvus Target 名称不能为空")
+        if not milvus_url.strip():
+            raise ValueError("Milvus Target URI 不能为空")
         with self.sessions.begin() as session:
-            value = MilvusTarget(id=new_id("mt"), name=name.strip(), milvus_url=milvus_url.strip())
+            value = MilvusTarget(
+                id=new_id("mt"), name=name.strip(), milvus_url=milvus_url.strip(),
+                verification_status="pending_verification",
+            )
             session.add(value); self.audit(session, "milvus_target.created", "milvus_target", value.id)
             session.flush(); return self._target_payload(value)
 
@@ -8892,8 +8916,61 @@ class V7Store:
             if name is not None:
                 if not name.strip(): raise ValueError("Milvus Target 名称不能为空")
                 value.name = name.strip()
-            if milvus_url is not None: value.milvus_url = milvus_url.strip()
+            if milvus_url is not None:
+                normalized_uri = milvus_url.strip()
+                if not normalized_uri:
+                    raise ValueError("Milvus Target URI 不能为空")
+                if value.verification_status == "verified" and normalized_uri != value.milvus_url:
+                    value.candidate_milvus_url = normalized_uri
+                    value.candidate_verification_status = "pending_verification"
+                    value.candidate_verified_at = None
+                    value.candidate_verification_error = None
+                else:
+                    value.milvus_url = normalized_uri
+                    value.verification_status = "pending_verification"
+                    value.verified_at = None
+                    value.verification_error = None
+                    value.candidate_milvus_url = None
+                    value.candidate_verification_status = None
+                    value.candidate_verified_at = None
+                    value.candidate_verification_error = None
+            self.audit(session, "milvus_target.updated", "milvus_target", value.id, {
+                "name_changed": name is not None, "uri_changed": milvus_url is not None,
+            })
             session.flush(); return self._target_payload(value)
+
+    def finish_milvus_target_verification(self, target_id: str, *, candidate: bool,
+                                          passed: bool, error: str | None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            value = session.get(MilvusTarget, target_id)
+            if not value:
+                raise ValueError("Milvus Target 不存在")
+            checked_at = utc_now()
+            if candidate:
+                if not value.candidate_milvus_url:
+                    raise ValueError("Milvus Target 候选地址不存在")
+                if passed:
+                    value.milvus_url = value.candidate_milvus_url
+                    value.verification_status = "verified"
+                    value.verified_at = checked_at
+                    value.verification_error = None
+                    value.candidate_milvus_url = None
+                    value.candidate_verification_status = None
+                    value.candidate_verified_at = None
+                    value.candidate_verification_error = None
+                else:
+                    value.candidate_verification_status = "verification_failed"
+                    value.candidate_verified_at = checked_at
+                    value.candidate_verification_error = error
+            else:
+                value.verification_status = "verified" if passed else "verification_failed"
+                value.verified_at = checked_at
+                value.verification_error = error
+            self.audit(session, "milvus_target.verified", "milvus_target", value.id, {
+                "candidate": candidate, "passed": passed,
+            })
+            session.flush()
+            return self._target_payload(value)
 
     def list_deployments(self, project_id: str, *, allowed_deployment_id: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -8975,6 +9052,26 @@ class V7Store:
         session.flush()
         return target
 
+    @staticmethod
+    def _bind_stage_target(session: Session, deployment: Deployment, release_stage: str,
+                           target: MilvusTarget) -> MilvusTarget:
+        if release_stage not in {"test", "production"}:
+            raise ValueError("release_stage 只允许 test 或 production")
+        link = session.scalar(select(DeploymentTarget).where(
+            DeploymentTarget.deployment_id == deployment.id,
+            DeploymentTarget.release_stage == release_stage,
+            DeploymentTarget.target_kind == "milvus",
+        ))
+        if link:
+            link.milvus_target_id = target.id
+        else:
+            session.add(DeploymentTarget(
+                id=new_id("dtarget"), deployment_id=deployment.id, release_stage=release_stage,
+                target_kind="milvus", milvus_target_id=target.id,
+            ))
+        session.flush()
+        return target
+
     def create_shared_deployment(self, code: str | None = None, name: str | None = None, *, scope: str = "institution",
                                  institution_name: str | None = None,
                                  institution_code: str | None = None,
@@ -9008,27 +9105,35 @@ class V7Store:
                 release_stage="test", status="active",
             )
             session.add(deployment); session.flush()
-            self._put_stage_target(session, deployment, "test", test_milvus_uri)
-            if normalized_code == CENTRAL_DEPLOYMENT_CODE:
+            if scope == "central":
+                self._put_stage_target(session, deployment, "test", test_milvus_uri)
                 self._put_stage_target(session, deployment, "production", QA_AGENT_PRODUCTION_MILVUS_URL)
             self.audit(session, "deployment.created", "deployment", deployment.id)
             session.flush()
             return self._shared_deployment_payload(deployment, self._deployment_targets(session, deployment.id))
 
-    def put_deployment_target(self, deployment_id: str, release_stage: str, milvus_uri: str, *,
+    def put_deployment_target(self, deployment_id: str, release_stage: str, milvus_target_id: str, *,
                               confirm_production: bool = False,
                               expected_target_uri: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, deployment_id)
             if not deployment:
                 raise ValueError("Deployment 不存在")
-            normalized_uri = str(milvus_uri or "").strip()
+            if deployment.scope != "central":
+                raise ValueError("机构 Milvus 由私有化实例自行配置，中心不保存机构 Target")
+            target = session.get(MilvusTarget, milvus_target_id)
+            if not target:
+                raise ValueError("Milvus Target 不存在")
+            if target.verification_status != "verified":
+                raise ValueError("只有连接验证通过的 Milvus Target 才能绑定")
+            normalized_uri = target.milvus_url
             if release_stage == "production" and (
                     confirm_production is not True or expected_target_uri != normalized_uri):
-                raise ValueError("配置生产 Target 必须确认完整的机构生产 URI")
-            target = self._put_stage_target(session, deployment, release_stage, normalized_uri)
+                raise ValueError("配置生产 Target 必须确认完整的中心生产 URI")
+            self._bind_stage_target(session, deployment, release_stage, target)
             self.audit(session, "deployment.target_updated", "deployment", deployment.id,
-                       {"release_stage": release_stage, "milvus_url": normalized_uri})
+                       {"release_stage": release_stage, "milvus_target_id": target.id,
+                        "milvus_url": normalized_uri})
             return {"deployment_id": deployment.id, "release_stage": release_stage,
                     "target_kind": "milvus", "milvus_target": self._target_payload(target)}
 
@@ -9078,6 +9183,13 @@ class V7Store:
             institution_name=institution_name, institution_code=institution_code,
             test_milvus_uri=test_uri,
         )
+        with self.sessions.begin() as session:
+            deployment = session.get(Deployment, shared["id"])
+            if deployment:
+                if requested_target:
+                    self._bind_stage_target(session, deployment, "test", session.get(MilvusTarget, requested_target.id))
+                else:
+                    self._put_stage_target(session, deployment, "test", test_uri)
         return self.bind_project_deployment(shared["id"], project_id)
 
     def patch_deployment(self, deployment_id: str, **changes: Any) -> dict[str, Any]:
@@ -9365,7 +9477,12 @@ class V7Store:
                 raise ValueError("ProjectDeployment 的 Project 或 Deployment 不存在")
             if release_stage not in {"test", "production"}:
                 raise ValueError("release_stage 只允许 test 或 production")
-            target = self._stage_target(session, deployment.id, release_stage)
+            target = None
+            try:
+                target = self._stage_target(session, deployment.id, release_stage)
+            except ValueError:
+                if deployment.scope != "institution":
+                    raise
             if is_qa_agent_project(project):
                 if deployment.scope == "institution" and (
                         not deployment.institution_name or not deployment.institution_code):
@@ -9450,7 +9567,9 @@ class V7Store:
                                            "project_id": project_deployment.project_id,
                                            "deployment_id": project_deployment.deployment_id,
                                            "status": project_deployment.status},
-                    "milvus_target": {"id": target.id, "name": target.name, "milvus_url": target.milvus_url},
+                    "milvus_target": None if not target else {
+                        "id": target.id, "name": target.name, "milvus_url": target.milvus_url,
+                    },
                     "tasks": tasks, "routes": flat_routes}
 
     def validate_routing(self, boundary_id: str, release_stage: str, milvus=None, *,

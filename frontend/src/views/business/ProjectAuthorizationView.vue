@@ -11,11 +11,11 @@ import RouteVersionTable from '../../components/project-publishing/RouteVersionT
 import { statusLabel } from '../../constants/statusLabels'
 import { compatibleProfilesForTask, movePriority, preferredDeployment, qaEmbeddingMode, routingPublishReadiness, routingValidationView } from './projectPublishingModel'
 
-const instance = ref(null), projects = ref([]), libraries = ref([]), sharedDeployments = ref([]), knowledgeTypes = ref([])
+const instance = ref(null), projects = ref([]), libraries = ref([]), sharedDeployments = ref([]), knowledgeTypes = ref([]), milvusTargets = ref([])
 const projectId = ref(''), deploymentId = ref(''), selectedStage = ref('test'), tab = ref('target')
 const deploymentTasks = ref([]), authorizations = ref([]), versions = ref([])
 const deploymentTaskId = ref(''), chosen = ref([])
-const institutionName = ref(''), institutionCode = ref(''), institutionTargetUri = ref('')
+const institutionName = ref(''), institutionCode = ref(''), selectedMilvusTargetId = ref('')
 const newInstitutionName = ref(''), newInstitutionCode = ref(''), bindDeploymentId = ref('')
 const showCreateProject = ref(false), newProjectName = ref('')
 const newTaskCode = ref(''), newTaskName = ref(''), newTaskKnowledgeType = ref(''), newTaskDescription = ref('')
@@ -29,6 +29,8 @@ const central = computed(() => instance.value?.instance_mode === 'central')
 const selectedDeployment = computed(() => deployments.value.find(item => item.id === deploymentId.value))
 const freezesForInstitution = computed(() => central.value && selectedDeployment.value?.scope === 'institution')
 const currentStageTarget = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.milvus_url || '')
+const currentStageTargetId = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.id || '')
+const verifiedMilvusTargets = computed(() => milvusTargets.value.filter(item => item.verification_status === 'verified'))
 const isKgConsultation = computed(() => selectedProject.value?.code === 'kg-for-consultation')
 const unboundDeployments = computed(() => {
   const bound = new Set(deployments.value.map(item => item.deployment_id))
@@ -47,7 +49,9 @@ const compatibleProfiles = computed(() => compatibleProfilesForTask(selectedProj
 const selectedIndexProfile = computed(() => compatibleProfiles.value.find(item => item.id === newIndexProfileId.value))
 const selectedQaEmbeddingMode = computed(() => qaEmbeddingMode(selectedIndexProfile.value))
 const selectedDeploymentTask = computed(() => deploymentTasks.value.find(item => item.id === deploymentTaskId.value))
-const publishState = computed(() => routingPublishReadiness(deploymentTasks.value, authorizations.value, currentStageTarget.value))
+const publishState = computed(() => routingPublishReadiness(
+  deploymentTasks.value, authorizations.value, freezesForInstitution.value ? 'deferred_to_local' : currentStageTarget.value,
+))
 const validationView = computed(() => routingValidationView(result.value))
 const releaseActionLabel = computed(() => `${freezesForInstitution.value ? '冻结' : '发布'}${statusLabel(selectedStage.value)}版本`)
 const availableLibraries = computed(() => {
@@ -74,6 +78,7 @@ async function load() {
     ;[instance.value, projects.value, libraries.value, sharedDeployments.value, knowledgeTypes.value] = await Promise.all([
       api.instance(), api.projects(), api.knowledgeLibraries(), api.sharedDeployments(), api.knowledgeTypes(),
     ])
+    milvusTargets.value = instance.value?.instance_mode === 'central' ? await api.milvusTargets() : []
     projectId.value ||= projects.value[0]?.id || ''
     newTaskKnowledgeType.value ||= activeKnowledgeTypes.value[0]?.code || ''
     chooseBoundDeployment()
@@ -85,7 +90,7 @@ async function loadDeployment() {
   try {
     institutionName.value = selectedDeployment.value?.institution_name || ''
     institutionCode.value = selectedDeployment.value?.institution_code || ''
-    institutionTargetUri.value = currentStageTarget.value
+    selectedMilvusTargetId.value = currentStageTargetId.value
     ;[deploymentTasks.value, authorizations.value, versions.value] = await Promise.all([
       api.deploymentTasks(deploymentId.value), api.authorizations(deploymentId.value), api.routeVersions(deploymentId.value, selectedStage.value),
     ])
@@ -137,14 +142,14 @@ async function saveInstitutionIdentity() {
   try { await api.patchSharedDeployment(selectedDeployment.value.deployment_id, { institution_name: institutionName.value, institution_code: institutionCode.value }); await load(); await loadDeployment(); notice.value = '机构身份已保存。' }
   catch (e) { error.value = e.message }
 }
-async function saveInstitutionTarget() {
-  const uri = institutionTargetUri.value.trim()
-  if (!uri) return
+async function saveCentralTarget() {
+  const target = verifiedMilvusTargets.value.find(item => item.id === selectedMilvusTargetId.value)
+  if (!target) return
   const production = selectedStage.value === 'production'
-  if (production && !window.confirm(`确认保存生产环境 Milvus 服务地址？\n发布目标：${selectedDeployment.value?.name}\nMilvus：${uri}`)) return
+  if (production && !window.confirm(`确认切换中心生产环境 Milvus 服务？\nMilvus：${target.milvus_url}`)) return
   try {
-    await api.putDeploymentTarget(selectedDeployment.value.deployment_id, selectedStage.value, { milvus_uri: uri, confirm_production: production, expected_target_uri: production ? uri : null })
-    await load(); await loadDeployment(); notice.value = `${statusLabel(selectedStage.value)} Milvus 服务地址已保存。`
+    await api.putDeploymentTarget(selectedDeployment.value.deployment_id, selectedStage.value, { milvus_target_id: target.id, confirm_production: production, expected_target_uri: production ? target.milvus_url : null })
+    await load(); await loadDeployment(); notice.value = `${statusLabel(selectedStage.value)} Milvus 服务已切换。`
   } catch (e) { error.value = e.message }
 }
 async function createInstitutionDeployment() {
@@ -185,7 +190,7 @@ async function rollback(version) {
 
 watch(projectId, () => { selectedStage.value = 'test'; deploymentId.value = ''; chooseBoundDeployment(); newProjectTaskId.value = ''; newIndexProfileId.value = '' })
 watch(deploymentId, () => { selectedStage.value = 'test'; loadDeployment() })
-watch(selectedStage, async () => { result.value = null; preview.value = null; institutionTargetUri.value = currentStageTarget.value; if (deploymentId.value) versions.value = await api.routeVersions(deploymentId.value, selectedStage.value) })
+watch(selectedStage, async () => { result.value = null; preview.value = null; selectedMilvusTargetId.value = currentStageTargetId.value; if (deploymentId.value) versions.value = await api.routeVersions(deploymentId.value, selectedStage.value) })
 watch(deploymentTaskId, syncChosen)
 watch(newProjectTaskId, () => { newIndexProfileId.value = compatibleProfiles.value[0]?.id || '' })
 onMounted(load)
@@ -199,8 +204,8 @@ onMounted(load)
     <nav class="tabs"><button :class="{active:tab==='target'}" @click="tab='target'">发布目标</button><button :class="{active:tab==='tasks'}" @click="tab='tasks'">任务配置</button><button :class="{active:tab==='scope'}" @click="tab='scope'">知识范围</button><button :class="{active:tab==='routing'}" @click="tab='routing'">发布配置</button><button :class="{active:tab==='retrieval'}" @click="tab='retrieval'">检索调试</button><button :class="{active:tab==='history'}" @click="tab='history'">发布记录</button></nav>
     <PublishTargetPanel v-if="tab==='target'" :deployment="selectedDeployment" :selected-stage="selectedStage" :target-uri="currentStageTarget" @update:selected-stage="selectedStage=$event">
       <form v-if="selectedDeployment?.scope==='institution'" class="stack" @submit.prevent="saveInstitutionIdentity"><label>机构名称<input v-model="institutionName" required></label><label>机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"></label><button>保存机构身份</button></form>
-      <form v-if="selectedDeployment?.scope==='institution'&&!local" class="stack" @submit.prevent="saveInstitutionTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务地址<input v-model="institutionTargetUri" required placeholder="http://hospital-milvus:19531"></label><button>保存 Milvus 服务地址</button></form>
-      <p v-if="selectedDeployment?.scope==='central'" class="notice">DataForge 中心的测试与生产 Milvus 服务由平台配置维护，此处只读。</p>
+      <p v-if="selectedDeployment?.scope==='institution'&&!local" class="notice">机构 Milvus 不在中心保存；私有化部署后由机构在“本地初始化”中注册并验证。</p>
+      <form v-if="selectedDeployment?.scope==='central'&&central" class="stack" @submit.prevent="saveCentralTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务<select v-model="selectedMilvusTargetId" required><option value="">选择已验证服务</option><option v-for="target in verifiedMilvusTargets" :key="target.id" :value="target.id">{{ target.name }} · {{ target.milvus_url }}</option></select></label><button>保存 Milvus 服务</button><RouterLink to="/business/milvus-targets">管理 Milvus 服务注册表</RouterLink></form>
       <form v-if="!local" class="stack" @submit.prevent="createInstitutionDeployment"><h4>新增机构发布目标</h4><label>机构名称<input v-model="newInstitutionName" required></label><label>机构代码<input v-model="newInstitutionCode" required></label><button>创建并绑定当前项目</button></form>
       <form v-if="!local&&unboundDeployments.length" class="stack" @submit.prevent="bindExistingDeployment"><h4>绑定已有发布目标</h4><select v-model="bindDeploymentId" required><option value="">选择发布目标</option><option v-for="item in unboundDeployments" :key="item.id" :value="item.id">{{ item.name }} · {{ item.institution_code }}</option></select><button>绑定当前项目</button></form>
     </PublishTargetPanel>

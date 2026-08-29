@@ -16,6 +16,7 @@ from .registry import OperatorExecutorRegistry
 from .outcomes import capture_generation_metrics
 from .graph_chunks import GraphChunkStage, uses_triple_chunks
 from .diagnostics import OperatorExecutionError
+from ..operator_runtime_contract import validate_runtime_requirements
 
 RunnerCallable = Callable[[str, dict[str, Any], list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]]
 
@@ -65,7 +66,8 @@ def build_builtin_registry(runner_callable: RunnerCallable, catalog: dict[str, d
     registry = OperatorExecutorRegistry()
     entries = {(code, item.get("version", 1)): item for code, item in catalog.items()}
     for (code, _), item in entries.items():
-        if item.get("source", "dataforge") != "dataforge":
+        runtime = validate_runtime_requirements(item.get("runtime_requirements"))
+        if runtime["driver"] != "builtin":
             continue
         version = int(item.get("version", 1))
         registry.register(BuiltinOperatorExecutor(code, version, runner_callable))

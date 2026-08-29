@@ -9,9 +9,9 @@ const emit = defineEmits(['drag-start', 'add-item', 'add-sink', 'retry', 'clear-
 
 const query = ref('')
 const help = ref(null)
-const expanded = ref(new Set(['DataForge 算子', 'DataFlow 精选', '扩展算子']))
+const expanded = ref(new Set(['DataForge 算子', 'DataFlow 精选', '自定义算子']))
 
-const catalogGroups = { dataforge: 'DataForge 算子', dataflow_featured: 'DataFlow 精选', extension: '扩展算子' }
+const catalogGroups = { dataforge: 'DataForge 算子', dataflow_featured: 'DataFlow 精选', custom: '自定义算子' }
 const categoryLabels = {
   'content-processing': '内容处理', 'knowledge-generation': '知识生成', 'quality-processing': '质量处理', 'index-processing': '索引处理',
   'text-cleaning': '文本清洗', 'content-filtering': '内容过滤', deduplication: '去重', 'text-generation': '文本生成',
@@ -38,7 +38,8 @@ const capabilityGroups = computed(() => Object.entries(catalogGroups).map(([grou
 function businessGroups(category, items) {
   const order = category === 'dataflow_featured'
     ? ['text-cleaning', 'content-filtering', 'deduplication', 'text-generation']
-    : category === 'dataforge' ? ['content-processing', 'knowledge-generation', 'quality-processing', 'index-processing'] : []
+    : category === 'dataforge' ? ['content-processing', 'knowledge-generation', 'quality-processing', 'index-processing']
+      : category === 'custom' ? ['content-processing', 'knowledge-generation', 'quality-processing', 'index-processing', 'text-cleaning', 'content-filtering', 'deduplication', 'text-generation'] : []
   return order.length
     ? order.map(code => [categoryLabels[code], items.filter(item => item.category === code)]).filter(([, values]) => values.length)
     : [['', items]]
@@ -67,7 +68,7 @@ function toggle(key) {
     <p v-if="error" class="hint" role="alert">{{ error }} <button @click="emit('retry')">重试</button></p>
     <button v-if="source" class="hint" @click="emit('clear-source')">清除端口筛选</button>
     <div class="palette-scroll">
-      <section v-for="([group, category, items]) in capabilityGroups" :key="group" :class="{ 'extension-group': group === 'extension' }">
+      <section v-for="([group, category, items]) in capabilityGroups" :key="group" :class="{ 'custom-group': group === 'custom' }">
         <button class="capability-head" @click="toggle(category)"><span class="capability-name">{{ category }}</span><span class="capability-count">{{ items.length }}</span><span class="chev">{{ searching || expanded.has(category) ? '▾' : '▸' }}</span></button>
         <template v-if="searching || expanded.has(category)">
           <template v-for="([business, values]) in businessGroups(group, items)" :key="business">
@@ -108,7 +109,7 @@ function toggle(key) {
 .search span{color:#8190a5}
 .palette-scroll{flex:1;overflow-y:auto;padding:2px 9px 10px}
 .palette-scroll section+section{margin-top:11px}
-.palette-scroll .extension-group{margin-top:18px;padding-top:12px;border-top:1px solid #dfe5ee}
+.palette-scroll .custom-group{margin-top:18px;padding-top:12px;border-top:1px solid #dfe5ee}
 .palette-scroll h4{margin:14px 0 8px;padding:6px 9px;border-left:3px solid #2f6fed;border-radius:0 5px 5px 0;background:#f2f6fc;color:#294b7a;font-size:14px;font-weight:800;line-height:1.5;letter-spacing:.02em}
 .palette-scroll button{display:grid;width:100%;min-height:48px;grid-template-columns:28px minmax(0,1fr) 16px;gap:8px;align-items:center;margin:4px 0;padding:7px 8px;text-align:left}
 .palette-scroll button:hover{border-color:#c9d8f3;background:#f8fbff}

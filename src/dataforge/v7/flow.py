@@ -10,6 +10,7 @@ from typing import Any
 
 from .catalog import catalog_by_code, normalize_chunker_params, DEFAULT_QA_EXTRACTION_INSTRUCTIONS
 from .operator_catalog import resolve_operator
+from .operator_runtime_contract import validate_runtime_requirements
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
@@ -610,7 +611,9 @@ class FlowCompiler:
                     params = normalize_chunker_params(params)
                 except ValueError as exc:
                     raise FlowValidationError(f"节点 {node_id} 参数非法：{exc}") from exc
-            uses_llm = bool((item.get("runtime_requirements") or {}).get("uses_llm"))
+            runtime_requirements = item.get("runtime_requirements")
+            validate_runtime_requirements(runtime_requirements)
+            uses_llm = bool(runtime_requirements.get("uses_llm"))
             if "llm_serving" in params and not uses_llm:
                 raise FlowValidationError(f"节点 {node_id} 不是 LLM 算子，不能配置 llm_serving")
             if uses_llm:

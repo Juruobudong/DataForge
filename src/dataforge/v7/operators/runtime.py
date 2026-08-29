@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass
 
 from .diagnostics import OperatorDiagnostics, OperatorExecutionError
+from ..operator_runtime_contract import validate_runtime_requirements
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,8 @@ class OperatorRuntime:
         return value, package
 
     def status(self, spec):
-        if spec.get("executor", "dataforge-native") in {"dataforge-native", "dataforge-adapter"}:
+        validate_runtime_requirements(spec)
+        if spec["executor"] == "dataforge-native":
             return {"status": "ready"}
         try:
             runtime, _ = self.resolve(spec)
@@ -88,6 +90,7 @@ class OperatorRuntime:
 
     def _call(self, spec, *, records, init, run_arguments, context, params,
               serving, cancelled, timeout, action, implementation, diagnostics):
+        validate_runtime_requirements(spec)
         runtime, package = self.resolve(spec)
         implementation = implementation or spec["implementation"]
         allowed = {spec["implementation"], *(spec.get("implementations") or {}).values()}

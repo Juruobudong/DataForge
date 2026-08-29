@@ -1257,6 +1257,16 @@ class MilvusTarget(Timestamped, Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     milvus_url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    verification_status: Mapped[str] = mapped_column(
+        String(32), default="pending_verification", server_default="pending_verification",
+        nullable=False, index=True,
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    candidate_milvus_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    candidate_verification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    candidate_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    candidate_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Deployment(Timestamped, Base):
@@ -1441,6 +1451,7 @@ class LocalMilvusConfiguration(Timestamped, Base):
     status: Mapped[str] = mapped_column(String(32), default="pending_verification", nullable=False, index=True)
     verified_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ImportedRouteCandidate(Timestamped, Base):

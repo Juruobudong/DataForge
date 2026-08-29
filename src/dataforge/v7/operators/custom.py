@@ -4,6 +4,7 @@ from .base import OperatorResult
 from .dataflow import serving_call
 from .runtime import OperatorRuntime
 from .diagnostics import capture_operator_diagnostics
+from ..operator_runtime_contract import validate_runtime_requirements
 
 PROTECTED = ("source_id", "source_version_id", "source_version_ids", "source_chunk_id", "source_chunk_revision_id",
              "source_review_snapshot_id", "source_anchor", "anchor", "anchor_json", "evidence_text", "source_knowledge_id")
@@ -38,6 +39,9 @@ class CustomOperatorExecutor:
         self.code, self.version = definition["code"], definition["version"]
         self.definition = definition
         self.spec = deepcopy(definition["runtime_requirements"])
+        runtime_identity = validate_runtime_requirements(self.spec)
+        if runtime_identity["driver"] != "custom":
+            raise ValueError("CustomOperatorExecutor 只接受 custom Runtime Driver")
         if self.spec.get("adapter_version") != "custom-records-v1":
             raise ValueError("未批准的自定义字段适配版本")
         self.runtime = runtime or OperatorRuntime()

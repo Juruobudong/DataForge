@@ -53,6 +53,7 @@ class LocalMilvusConfigurationService:
             "username": value.username, "secret_configured": bool(value.secret_ciphertext),
             "status": value.status, "verified_fingerprint": value.verified_fingerprint,
             "verified_at": value.verified_at.isoformat() if value.verified_at else None,
+            "verification_error": value.verification_error,
             "updated_at": value.updated_at.isoformat(),
         }
 
@@ -110,6 +111,7 @@ class LocalMilvusConfigurationService:
                 changed = True
             if changed:
                 value.status, value.verified_fingerprint, value.verified_at = "pending_verification", None, None
+                value.verification_error = None
             session.flush()
             return self._payload(value)
 
@@ -147,7 +149,12 @@ class LocalMilvusConfigurationService:
                     LocalMilvusConfiguration.slot == slot,
                 ).with_for_update())
                 if value:
-                    value.status, value.verified_fingerprint, value.verified_at = "verification_failed", None, None
+                    message = str(exc).replace(target.uri, "[redacted]")
+                    if target.token:
+                        message = message.replace(target.token, "[redacted]")
+                    message = message[:1000]
+                    value.status, value.verified_fingerprint, value.verified_at = "verification_failed", None, utc_now()
+                    value.verification_error = message
             raise ValueError(f"Milvus 验证失败：{exc}") from exc
         with self.store.sessions.begin() as session:
             value = session.scalar(select(LocalMilvusConfiguration).where(
@@ -160,6 +167,7 @@ class LocalMilvusConfigurationService:
                 value.uri, value.database_name, value.tls_enabled, value.username, value.secret_ciphertext,
             )
             value.status, value.verified_fingerprint, value.verified_at = "verified", fingerprint, utc_now()
+            value.verification_error = None
             return self._payload(value)
 
     def promote_candidate(self, instance_id: str) -> dict[str, Any]:
@@ -195,5 +203,6 @@ class LocalMilvusConfigurationService:
                 current.uri, current.database_name, current.tls_enabled,
                 current.username, current.secret_ciphertext,
             )
+            current.verification_error = None
             session.flush()
             return self._payload(current)

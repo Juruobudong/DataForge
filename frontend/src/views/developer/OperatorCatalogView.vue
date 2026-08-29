@@ -6,8 +6,8 @@ import OperatorPluginManager from '../../components/flow/OperatorPluginManager.v
 import { operatorPrimaryName, operatorSubtitle } from '../../components/flow/flowModel'
 
 const EXPOSURE_LABELS = { public: '可直接使用', controlled: '受控使用', internal: '系统内部', disabled: '已禁用' }
-const SOURCES = { dataforge: 'DataForge', dataflow: 'DataFlow', custom: '扩展' }
-const CATEGORY_LABELS = { 'content-processing': '内容处理', 'knowledge-generation': '知识生成', 'quality-processing': '质量处理', 'index-processing': '索引处理', 'text-cleaning': '文本清洗', 'content-filtering': '内容过滤', deduplication: '去重', 'text-generation': '文本生成', extension: '扩展' }
+const SOURCES = { dataforge: 'DataForge', dataflow: 'DataFlow', custom: '自定义' }
+const CATEGORY_LABELS = { 'content-processing': '内容处理', 'knowledge-generation': '知识生成', 'quality-processing': '质量处理', 'index-processing': '索引处理', 'text-cleaning': '文本清洗', 'content-filtering': '内容过滤', deduplication: '去重', 'text-generation': '文本生成' }
 const catalog = ref([]), facets = ref({ categories: [], knowledge_types: [], statuses: [] })
 const query = ref(''), category = ref(''), knowledge = ref(''), exposure = ref(''), status = ref('')
 const selected = ref(null), error = ref('')
@@ -32,7 +32,7 @@ onMounted(load)
 
 <template>
   <section class="catalog-page">
-    <div class="page-head"><div><h2>算子组件</h2><p>查看 DataForge 算子、DataFlow 精选及扩展算子的契约、版本与运行依赖；扩展算子仅注册并验证已安装的审核包，不接受在线 Python 源码。</p></div><span class="badge blue">{{ visible.length }} / {{ catalog.length }}</span></div>
+    <div class="page-head"><div><h2>算子组件</h2><p>查看 DataForge 算子、DataFlow 精选及自定义算子的契约、版本与运行依赖；自定义算子仅注册并验证已安装的审核包，不接受在线 Python 源码。</p></div><span class="badge blue">{{ visible.length }} / {{ catalog.length }}</span></div>
     <div class="catalog-filters">
       <input v-model="query" placeholder="搜索名称、编码或说明">
       <select v-model="category"><option value="">全部分类</option><option v-for="item in facets.categories" :key="item.name" :value="item.name">{{ item.name }} ({{ item.count }})</option></select>

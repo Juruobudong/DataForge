@@ -181,15 +181,17 @@ it('shows ten curated cards, business groups and actual readiness counts', async
   expect(wrapper.findAll('.palette-entry')).toHaveLength(9)
 })
 
-it('keeps two official systems parallel and extension operators in a separate section', () => {
+it('keeps two official systems parallel and groups custom operators by business category', () => {
   const items = [
     { ...operator('mapper'), source: 'dataforge', catalog_group: 'dataforge', category: 'content-processing' },
     { ...operator('Text2QAGenerator'), source: 'dataflow', catalog_group: 'dataflow_featured', category: 'text-generation', dependency_status: { status: 'ready' } },
-    { ...operator('reviewed-addon'), source: 'custom', catalog_group: 'extension', category: 'extension', dependency_status: { status: 'ready' } },
+    { ...operator('reviewed-addon'), source: 'custom', catalog_group: 'custom', category: 'quality-processing', dependency_status: { status: 'ready' } },
+    { ...operator('reviewed-cleaner'), source: 'custom', catalog_group: 'custom', category: 'text-cleaning', dependency_status: { status: 'ready' } },
   ]
   wrapper = mount(OperatorPalette, { props: { catalog: items } })
-  expect(wrapper.findAll('.capability-name').map(item => item.text())).toEqual(['DataForge 算子', 'DataFlow 精选', '扩展算子'])
-  expect(wrapper.find('.extension-group').exists()).toBe(true)
+  expect(wrapper.findAll('.capability-name').map(item => item.text())).toEqual(['DataForge 算子', 'DataFlow 精选', '自定义算子'])
+  expect(wrapper.find('.custom-group').exists()).toBe(true)
+  expect(wrapper.findAll('.custom-group h4').map(item => item.text())).toEqual(['质量处理', '文本清洗'])
   expect(wrapper.text()).not.toContain('索引处理')
   expect(wrapper.findAll('.palette-entry small').map(item => item.text())).toContain('Text2QAGenerator · v1')
 })

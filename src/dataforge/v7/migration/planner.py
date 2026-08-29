@@ -18,8 +18,6 @@ from ..models import (
     KnowledgeAssetVersion,
     Project,
     Deployment,
-    DeploymentTarget,
-    MilvusTarget,
     ProjectDeployment,
     ProjectDeploymentTask,
     ProjectOrgRoute,
@@ -112,22 +110,13 @@ class MigrationPlanner:
             ).order_by(ProjectRouteVersion.version_no.desc()))
             if package_kind == "deployment_seed" and not latest_route:
                 raise ValueError("deployment_seed 要求已发布的 Routing baseline")
-            target = session.scalar(select(MilvusTarget).join(
-                DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
-            ).where(
-                DeploymentTarget.deployment_id == deployment.id,
-                DeploymentTarget.release_stage == deployment.release_stage,
-                DeploymentTarget.target_kind == "milvus",
-            ))
-            if not target: raise ValueError("Deployment 当前阶段没有 Milvus Target")
             return {
                 "project": {"id": project.id, "code": project.code, "name": project.name},
                 "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
                                "institution_name": deployment.institution_name,
                                "institution_code": deployment.institution_code,
                                "scope": deployment.scope,
-                               "release_stage": deployment.release_stage,
-                               "milvus_target_id": target.id},
+                               "release_stage": deployment.release_stage},
                 "project_deployment": {"id": project_deployment.id,
                                        "project_id": project_deployment.project_id,
                                        "deployment_id": project_deployment.deployment_id,
@@ -439,14 +428,6 @@ class InstitutionReleasePlanner:
                                   "source_versions": "source_version"}[kind]
                 tombstones.extend({"kind": tombstone_kind, **previous[identifier]}
                                   for identifier in removed_ids)
-            target = session.scalar(select(MilvusTarget).join(
-                DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
-            ).where(DeploymentTarget.deployment_id == deployment.id,
-                    DeploymentTarget.release_stage == release_stage,
-                    DeploymentTarget.target_kind == "milvus"))
-            milvus_preset = dict(draft.milvus_override_json or {})
-            if not milvus_preset and target:
-                milvus_preset = {"uri": target.milvus_url}
             object_size = session.scalar(select(func.sum(SourceVersion.size_bytes)).where(
                 SourceVersion.id.in_(dependencies.source_version_ids)
             )) if dependencies.source_version_ids else 0
@@ -457,8 +438,7 @@ class InstitutionReleasePlanner:
                 "deployment": {"id": deployment.id, "code": deployment.code, "name": deployment.name,
                                "institution_name": deployment.institution_name,
                                "institution_code": deployment.institution_code, "scope": deployment.scope,
-                               "release_stage": release_stage,
-                               "milvus_preset": milvus_preset or None},
+                               "release_stage": release_stage},
                 "projects": projects,
                 "knowledge_library_ids": library_ids,
                 "asset_versions": [item for values in collections.values() for item in values],

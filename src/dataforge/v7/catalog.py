@@ -100,7 +100,7 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
 
 OPERATOR_CATEGORIES: tuple[str, ...] = (
     "content-processing", "knowledge-generation", "quality-processing", "index-processing",
-    "text-cleaning", "content-filtering", "deduplication", "text-generation", "extension",
+    "text-cleaning", "content-filtering", "deduplication", "text-generation",
 )
 
 OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
@@ -221,7 +221,7 @@ def _entry(code: str, name: str, category: str, input_type: str, target: str, ad
         "output_example": {"output": [_artifact_example(target)]},
         "parameter_schema": parameter_schema,
         "parameter_docs": parameter_docs,
-        "runtime_requirements": {"executor": "dataforge-native", "implementation": adapter, "adapter_version": 1, "upstream": upstream or [], "uses_llm": uses_llm},
+        "runtime_requirements": {"driver": "builtin", "executor": "dataforge-native", "implementation": adapter, "adapter_version": 1, "upstream": upstream or [], "uses_llm": uses_llm},
     }
 
 
@@ -331,6 +331,7 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     uses_llm = item["code"] != "HashDeduplicateFilter"
     item.update(version=version, source="dataflow", catalog_group="dataflow_featured", adapter_code=adapter)
     item["runtime_requirements"] = {
+        "driver": "dataflow",
         "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
         "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
         "dependency_lock_digest": DATAFLOW_LOCK_DIGEST,
@@ -421,6 +422,7 @@ def _new_curated_entries():
                    "anchor_json": {"page": 1}, "evidence_text": "审核后的来源正文", "data_json": {}}
         item["input_example"], item["output_example"] = {"input": [example]}, {"output": [deepcopy(example)]}
         item["runtime_requirements"] = {
+            "driver": "dataflow",
             "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
             "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION, "package_digest": DATAFLOW_DIGEST,
             "dependency_lock_digest": DATAFLOW_CURATED_LOCK_DIGEST, "uses_llm": uses_llm,
@@ -514,12 +516,8 @@ for _item in CATALOG_SEEDS:
                              "knowledge-generation" if "advanced-canvas" in _item.get("surfaces", []) else "content-processing")
         _item["catalog_group"] = "dataforge"
 
-UNAVAILABLE_OPERATOR_CODES = {
-    "qa-generator", "prompted-refiner", "deduplicate", "quality-evaluator", "quality-filter",
-    "source-binding", "knowledge-diff", "kcenter-greedy", "reference-remover",
-}
 PLATFORM_RESERVED_OPERATOR_CODES = frozenset(
-    {item["code"].casefold() for item in CATALOG_SEEDS} | UNAVAILABLE_OPERATOR_CODES | {"knowledge-sink"}
+    {item["code"].casefold() for item in CATALOG_SEEDS} | {"knowledge-sink"}
 )
 
 

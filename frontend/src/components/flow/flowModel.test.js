@@ -63,9 +63,22 @@ test('DataFlow class identity is bilingual and is not duplicated as a technical 
     // Runtime uses the frozen name even if the current catalog is changed.
     const meta = resolveNodeMetadata(definition, [{ ...operator, name: 'wrong latest name' }])
     assert.equal(meta.name, operator.display_name_zh)
+    assert.equal(meta.driver, 'dataflow')
+    assert.match(meta.executor, /^dataflow-/)
     assert.equal(operatorNodeSubtitle(meta, true), `${operator.code}`)
     assert.equal(operatorNodeSubtitle(meta), `${operator.code}`)
   }
+})
+
+test('frozen runtime driver and executor override unrelated catalog and source identity', () => {
+  const frozen = { code: 'custom-records', name: 'Custom Records', version: 1, source: 'dataflow', catalog_group: 'dataflow_featured',
+    runtime_requirements: { driver: 'custom', executor: 'dataflow-storage' } }
+  const meta = resolveNodeMetadata({ kind: 'operator', ref: frozen.code, operator_version: 1, operator_spec: frozen }, [
+    { ...frozen, driver: 'dataflow', executor: 'dataflow-storage', runtime_requirements: undefined },
+  ])
+  assert.equal(meta.source, 'dataflow')
+  assert.equal(meta.driver, 'custom')
+  assert.equal(meta.executor, 'dataflow-storage')
 })
 
 test('subflow presentation separates built-in Chinese, English, code, and revision', () => {

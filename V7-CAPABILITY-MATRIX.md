@@ -36,7 +36,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 
 ## 页面与操作
 
-算子库双体系与身份解耦（2026-08-29）：官方目录并列为 DataForge 算子和21个 DataFlow 精选，可信插件位于独立扩展区。Catalog 一等保存 `source/catalog_group/category`，Runner 按冻结 `executor` 分派；旧 code、alias、历史注册和退出身份不再 Seed 或执行。当前为本地实现，`.34`/Docker/真实模型仍待验收。来源：[实施基线](wiki/sources/operator-catalog-dual-system-2026-08-29.md)。
+算子库双体系与身份解耦（2026-08-29）：官方目录并列为 DataForge 算子和21个 DataFlow 精选，可信插件位于独立自定义算子区。Catalog 一等保存 `source/catalog_group/category`；执行只读取冻结 `runtime_requirements.driver/executor`：Driver 选择 Runner 顶层适配器，Executor 选择适配器内部协议。自定义 DataFlow 协议仍由 Custom Driver 包裹，来源与目录不参与分派。旧 code、alias、历史注册和退出身份不再 Seed 或执行。当前为本地实现，`.34`/Docker/真实模型仍待验收。来源：[实施基线](wiki/sources/operator-catalog-dual-system-2026-08-29.md)、[自定义算子收口](wiki/sources/custom-operator-identity-convergence-2026-08-29.md)。
 
 自定义流程当前草稿执行（2026-08-28）：`DONE`。Advanced 完整 DSL 直接编译；500ms 自动保存、运行前排空保存队列、草稿 checksum 冲突保护、不可变 Run DAG/来源/校验和展示已实现。删除必要转换节点返回端口错误，不补节点；正式 Job 仍使用发布快照。真实 `.34` 服务验收为 `CONNECT`。来源：[批准基线](wiki/sources/current-draft-execution-2026-08-28.md)。
 
@@ -48,6 +48,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
 | 业务工作区 | 向量存储：Collection/Partition 库存、资产映射与受控运维 | `DONE` | 实时聚合 Milvus 与 AssetVersion/Routing/Release/GC；普通刷新只读 stats，显式 verify 持久化最近 count/digest；load/release 仅限严格受管版本 Partition，无任意 drop。`.34` 真实对账仍为 `CONNECT`。 |
+| 业务工作区 | Milvus 服务注册表与自动连接验证 | `LOCAL` | 中心支持服务列表、新增、改名、候选改址与只读 `list_collections` 验证；只有 verified 服务可绑定中心环境。机构 Milvus 不进中心注册表，由 local 保存 Candidate 时自动验证。真实 `.34` 连通仍为 `CONNECT`。 |
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
 | 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 由每次 Routing 操作显式选择并独立显示历史；Central live publish，中心侧 institution deferred freeze；机构 code 自动生成，知识范围顺序即 priority，技术对象进入帮助/高级信息。 |
@@ -90,7 +91,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格默认独立、仅显式选择兼容 ready 登记时复用。旧 `graph` Profile 仅供已有库冻结兼容，不参与受管供应或容量探测；真实供应仍属部署验收。 |
 | RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/显式环境隔离；Snapshot v3 指向 Ready `kl_*__vN`，legacy Deployment stage 不阻止另一环境 Runtime，local 单项目激活原子，批量明确非原子。 |
-| Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；唯一 Central 固定双 Target，新机构发布目标由名称/机构代码生成 `inst-*`，Deployment 可关联多个 Project且机构码可锁定；local current/candidate/preset 凭据 AES-GCM 入库且响应脱敏。 |
+| Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；唯一 Central 从 verified 注册表选择双环境 Target；机构由名称/机构代码生成 `inst-*`，中心不保存其 Milvus。local current/candidate 凭据 AES-GCM 入库、响应脱敏并自动验证。 |
 | `.dfm` v2 Seed / Institution Release / Knowledge Update | `DONE` | 多 frozen 项目、完整当前资产、差异/Tombstone、模板运行闭包、Ed25519、v1 导入兼容与检查点恢复。 |
 | Knowledge Type / Profile 发布契约 | `DONE` | 草稿只登记 planned 资源；发布自动 Provision 扩展/Manual create，实时校验 Manual attach，再冻结 Profile 与 Type Revision；同一 Type Revision 拒绝重复 Collection。 |
 | qa_agent FAQ 专用文件生产与固定迁移 | `DONE` | `qa-agent-faq`、自动 Profile、受管 Collection、无 LLM CSV/XLSX 模板、固定 12 Partition CLI/Bash 和 qa_agent `legacy/shadow/primary` 已实现并完成本地定向测试；真实导入归 C-10。 |

@@ -108,7 +108,8 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
         if adapter == "conditions":
             item["parameter_schema"]["required"] = ["rules"]
         item["source"], item["catalog_group"] = "dataflow", "dataflow_featured"
-        item["runtime_requirements"] = {"executor": "dataflow-llm" if uses_llm else "dataflow-storage",
+        item["runtime_requirements"] = {"driver": "dataflow",
+            "executor": "dataflow-llm" if uses_llm else "dataflow-storage",
             "package": package, "package_version": package_version, "package_digest": package_digest,
             "dependency_lock_digest": lock_digest, "implementation": f"dataflow.operators.{namespace}:{code}",
             "adapter_version": item["adapter_code"], "uses_llm": uses_llm, "resources": "CPU",

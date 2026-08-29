@@ -26,15 +26,15 @@ it('shows upstream class names and Chinese names for all renamed DataFlow operat
 it('distinguishes operator sources without changing exposure badges', async () => {
   api.operatorCatalog.mockResolvedValue(['dataforge', 'dataflow', 'custom'].map(source => ({
     id: source, code: `${source}-operator`, name: `${source} operator`, source,
-    catalog_group: source === 'custom' ? 'extension' : source === 'dataflow' ? 'dataflow_featured' : 'dataforge',
-    version: 1, category: source === 'custom' ? 'extension' : 'knowledge-generation', exposure: 'public', dependency_status: { status: 'ready' },
+    catalog_group: source === 'custom' ? 'custom' : source === 'dataflow' ? 'dataflow_featured' : 'dataforge',
+    version: 1, category: source === 'custom' ? 'quality-processing' : 'knowledge-generation', exposure: 'public', dependency_status: { status: 'ready' },
   })))
   api.operatorCatalogFacets.mockResolvedValue({ categories: [], knowledge_types: [], statuses: [] })
   wrapper = mount(OperatorCatalogView, { global: { stubs: { OperatorInspector: true, OperatorPluginManager: true } } })
   await flushPromises()
 
   const badges = wrapper.findAll('.source-badge')
-  expect(badges.map(badge => badge.text())).toEqual(['DataForge', 'DataFlow', '扩展'])
+  expect(badges.map(badge => badge.text())).toEqual(['DataForge', 'DataFlow', '自定义'])
   expect(badges.map(badge => badge.classes().includes('source-dataflow'))).toEqual([false, true, false])
   expect(badges.map(badge => badge.classes().includes('blue'))).toEqual([true, false, false])
   expect(wrapper.findAll('.operator-row > .badge').map(badge => badge.text())).toEqual(Array(3).fill('可直接使用'))

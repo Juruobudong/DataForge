@@ -334,11 +334,6 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
     assert frozen["status"] == "frozen"
     assert store.route_version_detail(deployment["id"], frozen["version_no"])["assets"]
     assert store.list_migration_jobs() == []
-    production_uri = "http://institution-production:19531"
-    store.put_deployment_target(
-        deployment["deployment_id"], "production", production_uri,
-        confirm_production=True, expected_target_uri=production_uri,
-    )
     production_frozen = store.freeze_route_version(deployment["id"], "production")
     production_draft = store.create_institution_release_draft(
         deployment["deployment_id"], "institution_release", release_stage="production",
@@ -346,7 +341,7 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
     )
     production_plan = InstitutionReleasePlanner(store).plan(production_draft["id"])
     assert production_plan["deployment"]["release_stage"] == "production"
-    assert production_plan["deployment"]["milvus_preset"] == {"uri": production_uri}
+    assert "milvus_preset" not in production_plan["deployment"]
     with pytest.raises(ValueError, match="不能混合测试环境和生产环境"):
         store.create_institution_release_draft(
             deployment["deployment_id"], "institution_release",

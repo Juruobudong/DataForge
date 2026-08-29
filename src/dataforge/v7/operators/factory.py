@@ -2,13 +2,11 @@
 from .builtin import BuiltinOperatorExecutor
 from .dataflow import DataFlowOperatorExecutor
 from .registry import OperatorExecutorRegistry
-from ..catalog import CATALOG_SEEDS
+from ..operator_runtime_contract import validate_runtime_requirements
 
 
-def build_runtime_registry(runner_callable, catalog, definition):
+def build_runtime_registry(runner_callable, definition):
     registry = OperatorExecutorRegistry()
-    native = {(item["code"], item["version"]): item for item in CATALOG_SEEDS
-              if item["runtime_requirements"].get("executor") in {"dataforge-native", "dataforge-adapter"}}
     seen = {}
     for node in definition.get("nodes", []):
         if node.get("kind") != "operator":
@@ -25,18 +23,15 @@ def build_runtime_registry(runner_callable, catalog, definition):
             continue
         seen[(code, version)] = frozen
         if not frozen:
-            if (code, version) not in native:
-                raise ValueError(f"算子 {code} v{version} 缺少冻结实现，禁止解析最新版本")
-            registry.register(BuiltinOperatorExecutor(code, version, runner_callable)); continue
+            raise ValueError(f"算子 {code} v{version} 缺少冻结实现，禁止解析当前 Catalog")
         spec = {**frozen, "code": code, "version": version}
-        source = spec.get("source", "dataforge")
-        if source == "dataflow":
+        runtime = validate_runtime_requirements(spec.get("runtime_requirements"))
+        driver = runtime["driver"]
+        if driver == "builtin":
+            registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
+        elif driver == "dataflow":
             registry.register(DataFlowOperatorExecutor(spec))
-        elif source == "custom":
+        elif driver == "custom":
             from .custom import CustomOperatorExecutor
             registry.register(CustomOperatorExecutor(spec))
-        elif (code, version) in native:
-            registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
-        else:
-            raise ValueError(f"原生算子 {code} v{version} 未注册")
     return registry

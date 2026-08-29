@@ -42,7 +42,7 @@ const branches = computed(() => nodes.value.filter(node => node.kind === 'knowle
     <aside v-if="selected" class="operator-detail" aria-label="算子详情" @keydown.esc="selected = null">
       <button class="close" aria-label="关闭算子详情" @click="selected = null">关闭</button>
       <h3>{{ operatorPrimaryName(selected) }}</h3><p>{{ operatorSubtitle(selected, true) }} · v{{ selected.version }}</p>
-      <p>{{ selected.description }}</p><p>{{ sources[selected.source] }} · {{ selected.catalog_group }} · {{ selected.executor }} · {{ selected.uses_llm ? '使用 LLM' : '不使用 LLM' }}</p>
+      <p>{{ selected.description }}</p><p>{{ sources[selected.source] }} · {{ selected.catalog_group }}<template v-if="selected.kind === 'operator'"> · {{ selected.driver }} · {{ selected.executor }}</template> · {{ selected.uses_llm ? '使用 LLM' : '不使用 LLM' }}</p>
       <h4>输入类型</h4><p v-for="(port, name) in selected.input_ports" :key="name">{{ name }}：{{ port.artifact_type }}</p>
       <h4>输出类型</h4><p v-for="(port, name) in selected.output_ports" :key="name">{{ name }}：{{ port.artifact_type }}</p>
       <h4>当前业务参数（只读）</h4><dl><template v-for="(value, key) in selected.parameters" :key="key"><dt>{{ key }}</dt><dd>{{ value ?? '系统默认' }}</dd></template></dl>
