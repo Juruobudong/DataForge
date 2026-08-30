@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -38,3 +39,10 @@ class ConfigCipher:
         if len(payload) < 29:
             raise ValueError("服务凭据密文无效")
         return AESGCM(self._key).decrypt(payload[:12], payload[12:], aad.encode("utf-8")).decode("utf-8")
+
+    def secret_fingerprint(self, value: str | None) -> str:
+        if not value:
+            return hashlib.sha256(b"").hexdigest()
+        if not self._key:
+            raise ValueError("保存服务凭据前必须配置 DATAFORGE_CONFIG_ENCRYPTION_KEY")
+        return hmac.new(self._key, value.encode("utf-8"), hashlib.sha256).hexdigest()

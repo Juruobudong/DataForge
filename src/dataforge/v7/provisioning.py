@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import argparse
 from typing import Any
 
@@ -114,11 +113,6 @@ class ManagedCollectionDeletionService:
     def __init__(self, store: V7Store, milvus: V7Milvus | None):
         self.store, self.milvus = store, milvus
 
-    @classmethod
-    def from_environment(cls, store: V7Store) -> "ManagedCollectionDeletionService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
-
     @staticmethod
     def _description(item: ManagedCollection) -> str:
         return ManagedCollectionProvisioner._description(item)
@@ -131,7 +125,7 @@ class ManagedCollectionDeletionService:
             expected = self._description(item)
             collection_name = item.collection_name
         if not self.milvus:
-            observed = {"error": "未配置 DATAFORGE_MILVUS_URI，不能验证 Collection 所有权"}
+            observed = {"error": "未配置 verified Authoring Target，不能验证 Collection 所有权"}
         else:
             try:
                 observed = self.milvus.inspect_managed_collection(collection_name, expected)
@@ -147,7 +141,7 @@ class ManagedCollectionDeletionService:
             context = self.store.managed_collection_deletion_context(job_id)
             item = context["collection"]
             if not self.milvus:
-                return self.store.finish_managed_collection_deletion(job_id, "未配置 DATAFORGE_MILVUS_URI，不能删除受管 Collection")
+                return self.store.finish_managed_collection_deletion(job_id, "未配置 verified Authoring Target，不能删除受管 Collection")
             preflight = self.preflight(item.id)
             if preflight["blockers"]:
                 messages = "；".join(blocker["message"] for blocker in preflight["blockers"])
@@ -160,16 +154,22 @@ class ManagedCollectionDeletionService:
 
 def main() -> None:
     from dataforge.config import Settings
+    from .instance import InstanceContext
+    from .local_config import LocalMilvusConfigurationService
+    from .milvus_targets import MilvusConnectionResolver
 
     parser = argparse.ArgumentParser(description="协调 DataForge 受管 Milvus Collection")
     parser.add_argument("--reconcile", action="store_true", help="幂等创建或校验全部受管 Collection")
     parser.parse_args()
     settings = Settings.load()
-    uri = os.getenv("DATAFORGE_MILVUS_URI")
-    if not uri:
-        raise SystemExit("DATAFORGE_MILVUS_URI 未配置")
     store = V7Store(settings.database_url)
+    instance = InstanceContext.load(store, settings)
+    connection = (
+        LocalMilvusConfigurationService(store, settings.config_encryption_key).verified(instance.id, "current_target")
+        if instance.mode == "local"
+        else MilvusConnectionResolver(store, settings.config_encryption_key).authoring(instance.id)
+    )
     results = ManagedCollectionProvisioner(
-        store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")),
+        store, connection.client(),
     ).reconcile()
     print(json.dumps(results, ensure_ascii=False))

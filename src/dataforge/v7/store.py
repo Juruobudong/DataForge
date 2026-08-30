@@ -118,6 +118,7 @@ from .models import (
     Deployment,
     DeploymentTarget,
     MilvusTarget,
+    MilvusTargetRevision,
     ProjectDeployment,
     ProjectDeploymentTask,
     ProjectOrgRoute,
@@ -180,11 +181,13 @@ GRAPH_NEIGHBOR_CONFIRM_THRESHOLD = 500
 
 QA_AGENT_TEST_MILVUS_URL = os.environ.get("DATAFORGE_QA_AGENT_TEST_MILVUS_URL") or "http://milvus-central-test:19531"
 QA_AGENT_PRODUCTION_MILVUS_URL = os.environ.get("DATAFORGE_QA_AGENT_PRODUCTION_MILVUS_URL") or "http://milvus-central-production:19531"
+CENTRAL_TEST_MILVUS_URI = os.environ.get("DATAFORGE_CENTRAL_TEST_MILVUS_URI") or "http://milvus-central-test:19531"
+CENTRAL_PRODUCTION_MILVUS_URI = os.environ.get("DATAFORGE_CENTRAL_PRODUCTION_MILVUS_URI") or "http://milvus-central-production:19531"
 CENTRAL_DEPLOYMENT_CODE = "dataforge-central"
 CENTRAL_DEPLOYMENT_ID = "deployment_dataforge_central"
 CENTRAL_STAGE_TARGETS = {
-    "test": ("milvus_dataforge_central_test", "DataForge 中心测试 Milvus", QA_AGENT_TEST_MILVUS_URL),
-    "production": ("milvus_dataforge_central_production", "DataForge 中心生产 Milvus", QA_AGENT_PRODUCTION_MILVUS_URL),
+    "test": ("milvus_dataforge_central_test", "DataForge 中心测试 Milvus", CENTRAL_TEST_MILVUS_URI),
+    "production": ("milvus_dataforge_central_production", "DataForge 中心生产 Milvus", CENTRAL_PRODUCTION_MILVUS_URI),
 }
 LOGGER = logging.getLogger(__name__)
 
@@ -773,19 +776,27 @@ class V7Store:
         for stage, (target_id, target_name, target_url) in CENTRAL_STAGE_TARGETS.items():
             target = session.get(MilvusTarget, target_id)
             if not target:
-                target = MilvusTarget(id=target_id, name=target_name, milvus_url=target_url)
+                target = MilvusTarget(
+                    id=target_id, name=target_name, milvus_url=target_url,
+                    verification_status="pending_verification",
+                )
                 session.add(target); session.flush()
-            link = session.scalar(select(DeploymentTarget).where(
-                DeploymentTarget.deployment_id == deployment.id,
-                DeploymentTarget.release_stage == stage,
-                DeploymentTarget.target_kind == "milvus",
-            ))
-            if not link:
-                session.add(DeploymentTarget(
-                    id=f"deployment_target_dataforge_central_{stage}",
-                    deployment_id=deployment.id, release_stage=stage,
-                    target_kind="milvus", milvus_target_id=target.id,
-                ))
+            if not target.current_revision_id and not target.candidate_revision_id:
+                registered_url = target.milvus_url
+                revision = MilvusTargetRevision(
+                    id=f"mtrev_dataforge_central_{stage}", milvus_target_id=target.id,
+                    revision_no=1, milvus_url=registered_url,
+                    connection_fingerprint=hashlib.sha256(
+                        json.dumps({"uri": registered_url,
+                                    "credential_fingerprint": hashlib.sha256(b"").hexdigest()},
+                                   sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    verification_status="pending_verification",
+                )
+                session.add(revision); session.flush()
+                target.candidate_revision_id = revision.id
+                target.candidate_milvus_url = registered_url
+                target.candidate_verification_status = "pending_verification"
         session.flush()
         return deployment
 
@@ -7984,6 +7995,19 @@ class V7Store:
             asset.status, asset.error = "verifying", None
             return {"id": asset.id, "status": asset.status, "partition_name": asset.partition_name}
 
+    def freeze_asset_authoring_connection(self, job_id: str, revision_id: str | None,
+                                           fingerprint: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            job = session.get(VectorSyncJob, job_id)
+            asset = session.get(KnowledgeAssetVersion, job.asset_version_id) if job and job.asset_version_id else None
+            if not job or not asset:
+                raise ValueError("向量同步任务没有候选 AssetVersion")
+            if asset.authoring_connection_fingerprint and asset.authoring_connection_fingerprint != fingerprint:
+                raise ValueError("AssetVersion 已冻结到另一知识生产 Milvus 连接")
+            asset.authoring_target_revision_id = revision_id
+            asset.authoring_connection_fingerprint = fingerprint
+            return {"asset_version_id": asset.id, "revision_id": revision_id, "fingerprint": fingerprint}
+
     def finish_vector_sync(self, job_id: str, vector_rows: Iterable[dict[str, Any]], error: str | None = None,
                            *, asset_count: int | None = None, asset_digest: str | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
@@ -8371,6 +8395,8 @@ class V7Store:
                         "asset_version_id": item.id, "knowledge_library_id": item.knowledge_library_id,
                         "version_no": item.version_no, "collection_name": item.collection_name,
                         "partition_name": item.partition_name,
+                        "authoring_target_revision_id": item.authoring_target_revision_id,
+                        "authoring_connection_fingerprint": item.authoring_connection_fingerprint,
                     }
                     if reason:
                         protected.append({**payload, "reason": reason})
@@ -8826,8 +8852,9 @@ class V7Store:
                 "knowledge_type": task.knowledge_type, "description": task.description, "status": task.status}
 
     @staticmethod
-    def _target_payload(target: MilvusTarget) -> dict[str, Any]:
-        return {"id": target.id, "name": target.name, "milvus_url": target.milvus_url,
+    def _target_payload(target: MilvusTarget, current: MilvusTargetRevision | None = None,
+                        candidate: MilvusTargetRevision | None = None) -> dict[str, Any]:
+        payload = {"id": target.id, "name": target.name, "milvus_url": target.milvus_url,
                 "verification_status": target.verification_status,
                 "verified_at": target.verified_at.isoformat() if target.verified_at else None,
                 "verification_error": target.verification_error,
@@ -8836,7 +8863,35 @@ class V7Store:
                 "candidate_verified_at": target.candidate_verified_at.isoformat()
                     if target.candidate_verified_at else None,
                 "candidate_verification_error": target.candidate_verification_error,
+                "current_revision_id": target.current_revision_id,
+                "candidate_revision_id": target.candidate_revision_id,
                 "created_at": target.created_at.isoformat(), "updated_at": target.updated_at.isoformat()}
+        if current:
+            payload.update(connection_fingerprint=current.connection_fingerprint,
+                           token_configured=bool(current.token_ciphertext), revision_no=current.revision_no,
+                           health_status=current.health_status or "unknown",
+                           health_checked_at=current.health_checked_at.isoformat()
+                               if current.health_checked_at else None,
+                           health_latency_ms=current.health_latency_ms,
+                           health_error=current.health_error)
+        else:
+            payload.update(connection_fingerprint=None, token_configured=False, revision_no=None,
+                           health_status="unknown", health_checked_at=None,
+                           health_latency_ms=None, health_error=None)
+        if candidate:
+            payload.update(candidate_connection_fingerprint=candidate.connection_fingerprint,
+                           candidate_token_configured=bool(candidate.token_ciphertext),
+                           candidate_revision_no=candidate.revision_no)
+        else:
+            payload.update(candidate_connection_fingerprint=None, candidate_token_configured=False,
+                           candidate_revision_no=None)
+        return payload
+
+    @staticmethod
+    def _target_revisions(session: Session, target: MilvusTarget) -> tuple[MilvusTargetRevision | None, MilvusTargetRevision | None]:
+        current = session.get(MilvusTargetRevision, target.current_revision_id) if target.current_revision_id else None
+        candidate = session.get(MilvusTargetRevision, target.candidate_revision_id) if target.candidate_revision_id else None
+        return current, candidate
 
     @staticmethod
     def _shared_deployment_payload(deployment: Deployment, targets: dict[str, MilvusTarget] | None = None) -> dict[str, Any]:
@@ -8885,16 +8940,92 @@ class V7Store:
 
     def list_milvus_targets(self) -> list[dict[str, Any]]:
         with self.sessions() as session:
-            return [self._target_payload(item) for item in session.scalars(select(MilvusTarget).order_by(MilvusTarget.name))]
+            result = []
+            for item in session.scalars(select(MilvusTarget).order_by(MilvusTarget.name)):
+                result.append(self._target_payload(item, *self._target_revisions(session, item)))
+            return result
 
     def get_milvus_target(self, target_id: str) -> dict[str, Any]:
         with self.sessions() as session:
             value = session.get(MilvusTarget, target_id)
             if not value:
                 raise ValueError("Milvus Target 不存在")
-            return self._target_payload(value)
+            return self._target_payload(value, *self._target_revisions(session, value))
 
-    def create_milvus_target(self, name: str, milvus_url: str) -> dict[str, Any]:
+    def milvus_target_revision(self, revision_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            revision = session.get(MilvusTargetRevision, revision_id)
+            if not revision:
+                raise ValueError("Milvus Target Revision 不存在")
+            return {
+                "id": revision.id, "milvus_target_id": revision.milvus_target_id,
+                "revision_no": revision.revision_no, "milvus_url": revision.milvus_url,
+                "token_ciphertext": revision.token_ciphertext,
+                "token_key_version": revision.token_key_version,
+                "connection_fingerprint": revision.connection_fingerprint,
+                "verification_status": revision.verification_status,
+                "health_status": revision.health_status,
+                "health_checked_at": revision.health_checked_at.isoformat()
+                    if revision.health_checked_at else None,
+                "health_latency_ms": revision.health_latency_ms,
+                "health_error": revision.health_error,
+            }
+
+    def candidate_milvus_target_revision(self, target_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            target = session.get(MilvusTarget, target_id)
+            if not target or not target.candidate_revision_id:
+                raise ValueError("Milvus Target 候选配置不存在")
+            return self.milvus_target_revision(target.candidate_revision_id)
+
+    def bind_authoring_milvus_target(self, instance_id: str, target_id: str) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            instance = session.get(DataForgeInstance, instance_id)
+            target = session.get(MilvusTarget, target_id)
+            if not instance or not target:
+                raise ValueError("DataForge 实例或 Milvus Target 不存在")
+            current = session.get(MilvusTargetRevision, target.current_revision_id) if target.current_revision_id else None
+            if not current or current.verification_status != "verified":
+                raise ValueError("只有连接验证通过的 Milvus Target 才能设为默认知识写入目标")
+            instance.authoring_milvus_target_id = target.id
+            self.audit(session, "instance.authoring_milvus_target_updated", "dataforge_instance", instance.id, {
+                "milvus_target_id": target.id, "revision_id": current.id,
+            })
+            return self._target_payload(target, current, None)
+
+    def bind_authoring_milvus_target_if_unset(self, instance_id: str, target_id: str) -> dict[str, Any] | None:
+        """Bind the verified default once without replacing an administrator choice."""
+        with self.sessions.begin() as session:
+            instance = session.get(DataForgeInstance, instance_id, with_for_update=True)
+            if not instance:
+                raise ValueError("DataForge 实例不存在")
+            if instance.authoring_milvus_target_id:
+                return None
+            target = session.get(MilvusTarget, target_id)
+            current = session.get(MilvusTargetRevision, target.current_revision_id) \
+                if target and target.current_revision_id else None
+            if not target or not current or current.verification_status != "verified":
+                return None
+            instance.authoring_milvus_target_id = target.id
+            self.audit(session, "instance.authoring_milvus_target_defaulted", "dataforge_instance", instance.id, {
+                "milvus_target_id": target.id, "revision_id": current.id,
+            })
+            return self._target_payload(target, current, None)
+
+    def authoring_milvus_target(self, instance_id: str) -> dict[str, Any]:
+        with self.sessions() as session:
+            instance = session.get(DataForgeInstance, instance_id)
+            if not instance or not instance.authoring_milvus_target_id:
+                raise ValueError("当前实例尚未配置默认知识写入目标")
+            target = session.get(MilvusTarget, instance.authoring_milvus_target_id)
+            current = session.get(MilvusTargetRevision, target.current_revision_id) if target and target.current_revision_id else None
+            if not target or not current or current.verification_status != "verified":
+                raise ValueError("默认知识写入目标未通过连接验证")
+            return self._target_payload(target, current, None)
+
+    def create_milvus_target(self, name: str, milvus_url: str, *, token_ciphertext: str | None = None,
+                             token_key_version: str | None = None,
+                             connection_fingerprint: str | None = None) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("Milvus Target 名称不能为空")
         if not milvus_url.strip():
@@ -8904,11 +9035,27 @@ class V7Store:
                 id=new_id("mt"), name=name.strip(), milvus_url=milvus_url.strip(),
                 verification_status="pending_verification",
             )
-            session.add(value); self.audit(session, "milvus_target.created", "milvus_target", value.id)
-            session.flush(); return self._target_payload(value)
+            session.add(value); session.flush()
+            revision = MilvusTargetRevision(
+                id=new_id("mtrev"), milvus_target_id=value.id, revision_no=1,
+                milvus_url=milvus_url.strip(), token_ciphertext=token_ciphertext,
+                token_key_version=token_key_version,
+                connection_fingerprint=connection_fingerprint or hashlib.sha256(milvus_url.strip().encode()).hexdigest(),
+                verification_status="pending_verification",
+            )
+            session.add(revision); session.flush()
+            value.candidate_revision_id = revision.id
+            value.candidate_milvus_url = revision.milvus_url
+            value.candidate_verification_status = revision.verification_status
+            self.audit(session, "milvus_target.created", "milvus_target", value.id)
+            session.flush(); return self._target_payload(value, None, revision)
 
     def patch_milvus_target(self, target_id: str, *, name: str | None = None,
-                            milvus_url: str | None = None) -> dict[str, Any]:
+                            milvus_url: str | None = None,
+                            token_ciphertext: str | None = None,
+                            token_key_version: str | None = None,
+                            connection_fingerprint: str | None = None,
+                            connection_changed: bool = False) -> dict[str, Any]:
         with self.sessions.begin() as session:
             value = session.get(MilvusTarget, target_id)
             if not value:
@@ -8916,61 +9063,101 @@ class V7Store:
             if name is not None:
                 if not name.strip(): raise ValueError("Milvus Target 名称不能为空")
                 value.name = name.strip()
-            if milvus_url is not None:
-                normalized_uri = milvus_url.strip()
+            if connection_changed:
+                current, _old_candidate = self._target_revisions(session, value)
+                normalized_uri = str(milvus_url if milvus_url is not None else (current.milvus_url if current else value.milvus_url)).strip()
                 if not normalized_uri:
                     raise ValueError("Milvus Target URI 不能为空")
-                if value.verification_status == "verified" and normalized_uri != value.milvus_url:
-                    value.candidate_milvus_url = normalized_uri
-                    value.candidate_verification_status = "pending_verification"
-                    value.candidate_verified_at = None
-                    value.candidate_verification_error = None
-                else:
-                    value.milvus_url = normalized_uri
-                    value.verification_status = "pending_verification"
-                    value.verified_at = None
-                    value.verification_error = None
-                    value.candidate_milvus_url = None
-                    value.candidate_verification_status = None
-                    value.candidate_verified_at = None
-                    value.candidate_verification_error = None
+                latest = session.scalar(select(func.max(MilvusTargetRevision.revision_no)).where(
+                    MilvusTargetRevision.milvus_target_id == value.id,
+                )) or 0
+                revision = MilvusTargetRevision(
+                    id=new_id("mtrev"), milvus_target_id=value.id, revision_no=latest + 1,
+                    milvus_url=normalized_uri, token_ciphertext=token_ciphertext,
+                    token_key_version=token_key_version,
+                    connection_fingerprint=connection_fingerprint or hashlib.sha256(normalized_uri.encode()).hexdigest(),
+                    verification_status="pending_verification",
+                )
+                session.add(revision); session.flush()
+                value.candidate_revision_id = revision.id
+                value.candidate_milvus_url = revision.milvus_url
+                value.candidate_verification_status = revision.verification_status
+                value.candidate_verified_at = None
+                value.candidate_verification_error = None
             self.audit(session, "milvus_target.updated", "milvus_target", value.id, {
-                "name_changed": name is not None, "uri_changed": milvus_url is not None,
+                "name_changed": name is not None, "connection_changed": connection_changed,
             })
-            session.flush(); return self._target_payload(value)
+            session.flush(); return self._target_payload(value, *self._target_revisions(session, value))
 
-    def finish_milvus_target_verification(self, target_id: str, *, candidate: bool,
-                                          passed: bool, error: str | None) -> dict[str, Any]:
+    def finish_milvus_target_verification(self, target_id: str, *, expected_revision_id: str,
+                                          expected_fingerprint: str,
+                                          passed: bool, error: str | None,
+                                          latency_ms: int | None = None) -> dict[str, Any]:
         with self.sessions.begin() as session:
-            value = session.get(MilvusTarget, target_id)
+            value = session.get(MilvusTarget, target_id, with_for_update=True)
             if not value:
                 raise ValueError("Milvus Target 不存在")
+            if value.candidate_revision_id != expected_revision_id:
+                raise ValueError("Milvus Target 验证结果已过期")
+            revision = session.get(MilvusTargetRevision, expected_revision_id, with_for_update=True)
+            if not revision or revision.connection_fingerprint != expected_fingerprint:
+                raise ValueError("Milvus Target 验证结果已过期")
             checked_at = utc_now()
-            if candidate:
-                if not value.candidate_milvus_url:
-                    raise ValueError("Milvus Target 候选地址不存在")
-                if passed:
-                    value.milvus_url = value.candidate_milvus_url
-                    value.verification_status = "verified"
-                    value.verified_at = checked_at
-                    value.verification_error = None
-                    value.candidate_milvus_url = None
-                    value.candidate_verification_status = None
-                    value.candidate_verified_at = None
-                    value.candidate_verification_error = None
-                else:
-                    value.candidate_verification_status = "verification_failed"
-                    value.candidate_verified_at = checked_at
-                    value.candidate_verification_error = error
-            else:
-                value.verification_status = "verified" if passed else "verification_failed"
+            revision.verification_status = "verified" if passed else "verification_failed"
+            revision.verified_at = checked_at
+            revision.verification_error = error
+            revision.health_status = "healthy" if passed else "unavailable"
+            revision.health_checked_at = checked_at
+            revision.health_latency_ms = latency_ms
+            revision.health_error = error
+            if passed:
+                value.current_revision_id = revision.id
+                value.milvus_url = revision.milvus_url
+                value.verification_status = "verified"
                 value.verified_at = checked_at
-                value.verification_error = error
+                value.verification_error = None
+                value.candidate_revision_id = None
+                value.candidate_milvus_url = None
+                value.candidate_verification_status = None
+                value.candidate_verified_at = None
+                value.candidate_verification_error = None
+            else:
+                value.candidate_verification_status = "verification_failed"
+                value.candidate_verified_at = checked_at
+                value.candidate_verification_error = error
+                if not value.current_revision_id:
+                    value.verification_status = "verification_failed"
+                    value.verified_at = checked_at
+                    value.verification_error = error
             self.audit(session, "milvus_target.verified", "milvus_target", value.id, {
-                "candidate": candidate, "passed": passed,
+                "revision_id": revision.id, "passed": passed,
             })
             session.flush()
-            return self._target_payload(value)
+            return self._target_payload(value, *self._target_revisions(session, value))
+
+    def finish_milvus_target_health_check(self, target_id: str, *, expected_revision_id: str,
+                                          expected_fingerprint: str, healthy: bool,
+                                          latency_ms: int | None, error: str | None) -> dict[str, Any]:
+        with self.sessions.begin() as session:
+            value = session.get(MilvusTarget, target_id, with_for_update=True)
+            if not value:
+                raise ValueError("Milvus Target 不存在")
+            if value.current_revision_id != expected_revision_id:
+                raise ValueError("Milvus Target 健康检查结果已过期")
+            revision = session.get(MilvusTargetRevision, expected_revision_id, with_for_update=True)
+            if (not revision or revision.connection_fingerprint != expected_fingerprint
+                    or revision.verification_status != "verified"):
+                raise ValueError("Milvus Target 健康检查结果已过期")
+            revision.health_status = "healthy" if healthy else "unavailable"
+            revision.health_checked_at = utc_now()
+            revision.health_latency_ms = latency_ms
+            revision.health_error = error
+            self.audit(session, "milvus_target.health_checked", "milvus_target", value.id, {
+                "revision_id": revision.id, "healthy": healthy,
+                "latency_ms": latency_ms,
+            })
+            session.flush()
+            return self._target_payload(value, *self._target_revisions(session, value))
 
     def list_deployments(self, project_id: str, *, allowed_deployment_id: str | None = None) -> list[dict[str, Any]]:
         with self.sessions() as session:
@@ -9003,6 +9190,9 @@ class V7Store:
         ))
         if not target:
             raise ValueError(f"Deployment 尚未配置 {release_stage} Milvus Target")
+        revision = session.get(MilvusTargetRevision, target.current_revision_id) if target.current_revision_id else None
+        if not revision or revision.verification_status != "verified":
+            raise ValueError(f"Deployment 的 {release_stage} Milvus Target 未通过连接验证")
         return target
 
     def deployment_stage_target(self, boundary_id: str, release_stage: str) -> dict[str, Any]:
@@ -9022,41 +9212,13 @@ class V7Store:
             }
 
     @staticmethod
-    def _put_stage_target(session: Session, deployment: Deployment, release_stage: str,
-                          milvus_url: str, *, name: str | None = None) -> MilvusTarget:
-        if release_stage not in {"test", "production"}:
-            raise ValueError("release_stage 只允许 test 或 production")
-        normalized_uri = str(milvus_url or "").strip()
-        if not normalized_uri:
-            raise ValueError("Milvus Target URI 不能为空")
-        link = session.scalar(select(DeploymentTarget).where(
-            DeploymentTarget.deployment_id == deployment.id,
-            DeploymentTarget.release_stage == release_stage,
-            DeploymentTarget.target_kind == "milvus",
-        ))
-        target = session.get(MilvusTarget, link.milvus_target_id) if link else None
-        if not target:
-            target = MilvusTarget(
-                id=new_id("mt"), name=(name or f"{deployment.name} · {release_stage} Milvus").strip(),
-                milvus_url=normalized_uri,
-            )
-            session.add(target); session.flush()
-        else:
-            target.name = (name or target.name).strip()
-            target.milvus_url = normalized_uri
-        if not link:
-            session.add(DeploymentTarget(
-                id=new_id("dtarget"), deployment_id=deployment.id, release_stage=release_stage,
-                target_kind="milvus", milvus_target_id=target.id,
-            ))
-        session.flush()
-        return target
-
-    @staticmethod
     def _bind_stage_target(session: Session, deployment: Deployment, release_stage: str,
                            target: MilvusTarget) -> MilvusTarget:
         if release_stage not in {"test", "production"}:
             raise ValueError("release_stage 只允许 test 或 production")
+        revision = session.get(MilvusTargetRevision, target.current_revision_id) if target.current_revision_id else None
+        if not revision or revision.verification_status != "verified":
+            raise ValueError("只有连接验证通过的 Milvus Target 才能绑定")
         link = session.scalar(select(DeploymentTarget).where(
             DeploymentTarget.deployment_id == deployment.id,
             DeploymentTarget.release_stage == release_stage,
@@ -9105,9 +9267,6 @@ class V7Store:
                 release_stage="test", status="active",
             )
             session.add(deployment); session.flush()
-            if scope == "central":
-                self._put_stage_target(session, deployment, "test", test_milvus_uri)
-                self._put_stage_target(session, deployment, "production", QA_AGENT_PRODUCTION_MILVUS_URL)
             self.audit(session, "deployment.created", "deployment", deployment.id)
             session.flush()
             return self._shared_deployment_payload(deployment, self._deployment_targets(session, deployment.id))
@@ -9124,9 +9283,10 @@ class V7Store:
             target = session.get(MilvusTarget, milvus_target_id)
             if not target:
                 raise ValueError("Milvus Target 不存在")
-            if target.verification_status != "verified":
+            current = session.get(MilvusTargetRevision, target.current_revision_id) if target.current_revision_id else None
+            if not current or current.verification_status != "verified":
                 raise ValueError("只有连接验证通过的 Milvus Target 才能绑定")
-            normalized_uri = target.milvus_url
+            normalized_uri = current.milvus_url
             if release_stage == "production" and (
                     confirm_production is not True or expected_target_uri != normalized_uri):
                 raise ValueError("配置生产 Target 必须确认完整的中心生产 URI")
@@ -9169,28 +9329,9 @@ class V7Store:
                           milvus_target_id: str, *, institution_name: str | None = None,
                           institution_code: str | None = None,
                           release_stage: str = "test") -> dict[str, Any]:
-        if release_stage != "test":
-            raise ValueError("新 Deployment 必须先以 test 阶段创建，再由管理员手工切换生产")
-        test_uri = QA_AGENT_TEST_MILVUS_URL
-        with self.sessions() as session:
-            requested_target = session.get(MilvusTarget, milvus_target_id) if milvus_target_id else None
-            if requested_target and requested_target.milvus_url:
-                test_uri = requested_target.milvus_url
-        shared = self.create_shared_deployment(
-            None if institution_code or institution_name else code,
-            None if institution_code or institution_name else name,
-            scope="institution" if institution_code or institution_name else "central",
-            institution_name=institution_name, institution_code=institution_code,
-            test_milvus_uri=test_uri,
+        raise ValueError(
+            "旧 Project Deployment 创建入口已停用；请先创建共享 Deployment，再绑定 Project"
         )
-        with self.sessions.begin() as session:
-            deployment = session.get(Deployment, shared["id"])
-            if deployment:
-                if requested_target:
-                    self._bind_stage_target(session, deployment, "test", session.get(MilvusTarget, requested_target.id))
-                else:
-                    self._put_stage_target(session, deployment, "test", test_uri)
-        return self.bind_project_deployment(shared["id"], project_id)
 
     def patch_deployment(self, deployment_id: str, **changes: Any) -> dict[str, Any]:
         with self.sessions() as session:
@@ -9387,18 +9528,11 @@ class V7Store:
             deployment_task = session.get(ProjectDeploymentTask, deployment_task_id)
             if not deployment_task or not deployment_task.enabled: raise ValueError("DeploymentTask 不存在或未启用")
             deployment = session.get(ProjectDeployment, deployment_task.project_deployment_id)
-            shared_deployment = session.get(Deployment, deployment.deployment_id) if deployment else None
             project = session.get(Project, deployment.project_id) if deployment else None
             project_task = session.get(ProjectTask, deployment_task.project_task_id)
             profile = session.get(KnowledgeIndexProfile, deployment_task.index_profile_id) if deployment_task.index_profile_id else None
             if is_qa_agent_project(project) and not qa_agent_profile_contract(project_task, profile):
                 raise ValueError("qa-agent org route 的 Task 与 Index Profile 合同不匹配")
-            if shared_deployment and shared_deployment.scope == "institution":
-                if not shared_deployment.institution_code:
-                    raise ValueError("机构 Deployment 尚未配置 institution_code")
-                if org_code.strip() != shared_deployment.institution_code:
-                    raise ValueError("机构 Deployment 的 org_code 必须等于 institution_code")
-                org_name = shared_deployment.institution_name or org_name
             libraries = list(session.scalars(select(KnowledgeLibrary).where(
                 KnowledgeLibrary.id.in_(library_ids), KnowledgeLibrary.status == "active",
                 KnowledgeLibrary.migration_status == "ready")))
@@ -9423,6 +9557,7 @@ class V7Store:
             for item in session.scalars(select(ProjectOrgRouteLibrary).where(
                     ProjectOrgRouteLibrary.project_org_route_id == route.id)):
                 session.delete(item)
+            session.flush()
             for priority, library in enumerate(ordered_libraries):
                 session.add(ProjectOrgRouteLibrary(id=new_id("rl"), project_org_route_id=route.id,
                     knowledge_library_id=library.id, priority=priority, enabled=True))
@@ -9540,6 +9675,8 @@ class V7Store:
                             "priority": link.priority,
                             "asset_version_id": asset.id if asset else None,
                             "asset_version_no": asset.version_no if asset else None,
+                            "authoring_target_revision_id": asset.authoring_target_revision_id if asset else None,
+                            "authoring_connection_fingerprint": asset.authoring_connection_fingerprint if asset else None,
                             "partition_name": physical_partition, "indexes": [{**profile_payload,
                                 "asset_version_id": asset.id if asset else None,
                                 "asset_version_no": asset.version_no if asset else None,
@@ -9555,6 +9692,8 @@ class V7Store:
                               "task_name": task.name, "knowledge_type": task.knowledge_type,
                               "qa_embedding_mode": deployment_task.qa_embedding_mode, "top_k": deployment_task.top_k,
                               "index_profile": profile_payload, "org_routes": org_routes, **retrieval})
+            target_revision = session.get(MilvusTargetRevision, target.current_revision_id) \
+                if target and target.current_revision_id else None
             return {"schema": "dataforge.routing-snapshot.v7", "schema_version": 3,
                     "release_stage": release_stage,
                     "project": {"id": project.id, "code": project.code, "name": project.name},
@@ -9568,7 +9707,11 @@ class V7Store:
                                            "deployment_id": project_deployment.deployment_id,
                                            "status": project_deployment.status},
                     "milvus_target": None if not target else {
-                        "id": target.id, "name": target.name, "milvus_url": target.milvus_url,
+                        "id": target.id, "name": target.name, "milvus_url": target_revision.milvus_url,
+                        "revision_id": target_revision.id,
+                        "revision_no": target_revision.revision_no,
+                        "connection_fingerprint": target_revision.connection_fingerprint,
+                        "token_configured": bool(target_revision.token_ciphertext),
                     },
                     "tasks": tasks, "routes": flat_routes}
 
@@ -10099,7 +10242,8 @@ class V7Store:
             return self._route_candidate_payload(candidate)
 
     def create_institution_release_draft(self, target_deployment_id: str, package_kind: str,
-                                         *, release_stage: str | None = None,
+                                         *, target_institution_code: str,
+                                         release_stage: str | None = None,
                                          route_version_ids: list[str] | None = None,
                                          knowledge_library_ids: list[str] | None = None,
                                          extra_asset_version_ids: list[str] | None = None,
@@ -10107,10 +10251,15 @@ class V7Store:
                                          include_full_document_library: bool = False) -> dict[str, Any]:
         if package_kind not in {"deployment_seed", "institution_release", "knowledge_update"}:
             raise ValueError("机构发布包类型无效")
+        normalized_target_code = str(target_institution_code or "").strip()
+        if not normalized_target_code:
+            raise ValueError("机构发布目标 institution_code 不能为空")
         with self.sessions.begin() as session:
             deployment = session.get(Deployment, target_deployment_id)
             if not deployment or deployment.scope != "institution":
                 raise ValueError("机构发布目标必须是 institution Deployment")
+            if deployment.institution_code != normalized_target_code:
+                raise ValueError("机构发布目标 institution_code 与 Deployment 不匹配")
             route_ids = list(dict.fromkeys(route_version_ids or []))
             library_ids = list(dict.fromkeys(knowledge_library_ids or []))
             extra_asset_ids = list(dict.fromkeys(extra_asset_version_ids or []))
@@ -10142,7 +10291,8 @@ class V7Store:
             draft = InstitutionReleaseDraft(
                 id=new_id("reldraft"), target_deployment_id=deployment.id,
                 package_kind=package_kind, base_release_id=base_release_id,
-                selection_json={"release_stage": resolved_stage,
+                selection_json={"target_institution_code": normalized_target_code,
+                                "release_stage": resolved_stage,
                                 "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
                                 "extra_asset_version_ids": extra_asset_ids,
                                 "include_full_document_library": bool(include_full_document_library)},
@@ -10169,6 +10319,7 @@ class V7Store:
             InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
         ).order_by(InstitutionReleaseDraftProject.created_at))]
         return {"id": draft.id, "target_deployment_id": draft.target_deployment_id,
+                "target_institution_code": (draft.selection_json or {}).get("target_institution_code"),
                 "package_kind": draft.package_kind, "status": draft.status,
                 "revision_no": draft.revision_no, "base_release_id": draft.base_release_id,
                 "release_stage": (draft.selection_json or {}).get("release_stage"),
@@ -10196,6 +10347,11 @@ class V7Store:
             if not draft or draft.status not in {"draft", "planned", "failed"}:
                 raise ValueError("机构发布草稿当前不可编辑")
             current = dict(draft.selection_json or {})
+            deployment = session.get(Deployment, draft.target_deployment_id)
+            if (not deployment or deployment.scope != "institution"
+                    or not current.get("target_institution_code")
+                    or current["target_institution_code"] != deployment.institution_code):
+                raise ValueError("机构发布草稿的 institution_code 与目标 Deployment 不匹配")
             route_ids = list(dict.fromkeys(route_version_ids if route_version_ids is not None
                                            else current.get("route_version_ids") or []))
             library_ids = list(dict.fromkeys(knowledge_library_ids if knowledge_library_ids is not None
@@ -10218,7 +10374,6 @@ class V7Store:
             resolved_stage = (release_stage or current.get("release_stage")
                               or (next(iter(route_stages)) if route_stages else None))
             if resolved_stage not in {"test", "production"}:
-                deployment = session.get(Deployment, draft.target_deployment_id)
                 resolved_stage = deployment.release_stage if deployment else None
             if resolved_stage not in {"test", "production"}:
                 raise ValueError("release_stage 只允许 test 或 production")
@@ -10249,6 +10404,7 @@ class V7Store:
                     project_route_version_id=route.id,
                 ))
             draft.selection_json = {
+                "target_institution_code": current["target_institution_code"],
                 "release_stage": resolved_stage,
                 "route_version_ids": route_ids, "knowledge_library_ids": library_ids,
                 "extra_asset_version_ids": extra_asset_ids,
@@ -10274,6 +10430,14 @@ class V7Store:
             draft = session.get(InstitutionReleaseDraft, draft_id, with_for_update=True)
             if not draft or draft.status not in {"draft", "planned", "failed"}:
                 raise ValueError("机构发布草稿当前不可冻结")
+            deployment = session.get(Deployment, draft.target_deployment_id)
+            target_code = (draft.selection_json or {}).get("target_institution_code")
+            snapshot_deployment = snapshot.get("deployment") or {}
+            if (not deployment or deployment.scope != "institution" or not target_code
+                    or deployment.institution_code != target_code
+                    or snapshot_deployment.get("id") != deployment.id
+                    or snapshot_deployment.get("institution_code") != target_code):
+                raise ValueError("机构发布 Snapshot 的 institution_code 与目标 Deployment 不匹配")
             existing = session.scalar(select(InstitutionReleaseSnapshot).where(
                 InstitutionReleaseSnapshot.manifest_digest == digest,
             ))

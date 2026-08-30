@@ -36,6 +36,36 @@ export function movePriority(ids, id, offset) {
   return next
 }
 
+export function orgRoutesForTask(authorizations, deploymentTaskId) {
+  return (authorizations || []).filter(route => route.project_deployment_task_id === deploymentTaskId)
+}
+
+export function newOrgScopeDefaults(deployment, existingRoutes = []) {
+  const preferredCode = deployment?.scope === 'institution'
+    ? String(deployment?.institution_code || '').trim()
+    : 'general'
+  const used = new Set((existingRoutes || []).map(route => route.org_code))
+  return {
+    orgCode: used.has(preferredCode) ? '' : preferredCode,
+    orgName: deployment?.scope === 'institution' ? String(deployment?.institution_name || '').trim() : '',
+  }
+}
+
+export function availableOrgCodePresets(value) {
+  if (!Array.isArray(value)) return []
+  return value.filter(item => String(item?.name || '').trim() && String(item?.org_code || '').trim())
+    .map(item => ({ name: String(item.name).trim(), org_code: String(item.org_code).trim() }))
+}
+
+export function resolveOrgCodePreset(presets, presetCode, existingRoutes = []) {
+  const preset = availableOrgCodePresets(presets).find(item => item.org_code === presetCode)
+  if (!preset) return null
+  return {
+    preset,
+    existingRoute: existingRoutes.find(route => route.org_code === preset.org_code) || null,
+  }
+}
+
 export function routingValidationView(result) {
   const checks = Array.isArray(result?.checks) ? result.checks : []
   const target = result?.target_validation || {}

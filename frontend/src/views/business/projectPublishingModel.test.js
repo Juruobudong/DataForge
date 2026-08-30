@@ -1,11 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 
 import {
+  availableOrgCodePresets,
   compatibleProfilesForTask,
   movePriority,
+  newOrgScopeDefaults,
+  orgRoutesForTask,
   preferredDeployment,
   qaEmbeddingMode,
+  resolveOrgCodePreset,
   routingPublishReadiness,
   routingValidationView,
 } from './projectPublishingModel.js'
@@ -59,6 +64,49 @@ test('新项目优先选择 DataForge 中心，本地实例选择绑定目标', 
 test('知识范围优先级按上下移动后的显式顺序提交', () => {
   assert.deepEqual(movePriority(['c', 'a', 'b'], 'a', -1), ['a', 'c', 'b'])
   assert.deepEqual(movePriority(['c', 'a', 'b'], 'c', -1), ['c', 'a', 'b'])
+})
+
+test('知识范围按 Task 与 org_code 组合隔离', () => {
+  const routes = [
+    { id: 'a-1', project_deployment_task_id: 'task-a', org_code: 'ORG-1' },
+    { id: 'a-2', project_deployment_task_id: 'task-a', org_code: 'ORG-2' },
+    { id: 'b-1', project_deployment_task_id: 'task-b', org_code: 'ORG-1' },
+  ]
+  assert.deepEqual(orgRoutesForTask(routes, 'task-a').map(item => item.id), ['a-1', 'a-2'])
+  assert.deepEqual(orgRoutesForTask(routes, 'task-b').map(item => item.id), ['b-1'])
+})
+
+test('新增知识范围只预填未占用的机构码且保持可独立修改', () => {
+  const deployment = { scope: 'institution', institution_code: 'INST-A', institution_name: '机构 A' }
+  assert.deepEqual(newOrgScopeDefaults(deployment), { orgCode: 'INST-A', orgName: '机构 A' })
+  assert.deepEqual(newOrgScopeDefaults(deployment, [{ org_code: 'INST-A' }]), {
+    orgCode: '', orgName: '机构 A',
+  })
+  assert.deepEqual(newOrgScopeDefaults({ scope: 'central' }), { orgCode: 'general', orgName: '' })
+})
+
+test('org_code 预配置保持顺序并只切换当前 Task 已有范围', () => {
+  const presets = availableOrgCodePresets([
+    { name: ' 厦门第一医院 ', org_code: ' KMDSRMYY ' },
+    { name: '厦门市中医院', org_code: 'XMSZ' },
+  ])
+  assert.deepEqual(presets, [
+    { name: '厦门第一医院', org_code: 'KMDSRMYY' },
+    { name: '厦门市中医院', org_code: 'XMSZ' },
+  ])
+  assert.deepEqual(availableOrgCodePresets(null), [])
+  assert.equal(resolveOrgCodePreset(presets, 'KMDSRMYY', [{ id: 'route-a', org_code: 'KMDSRMYY' }]).existingRoute.id, 'route-a')
+  assert.equal(resolveOrgCodePreset(presets, 'KMDSRMYY', []).existingRoute, null)
+  assert.equal(resolveOrgCodePreset(presets, 'UNKNOWN', []), null)
+})
+
+test('项目发布预设选择自动填充且手工改码回到自定义', () => {
+  const publishing = fs.readFileSync(new URL('./ProjectAuthorizationView.vue', import.meta.url), 'utf8')
+  assert.match(publishing, /预配置机构/)
+  assert.match(publishing, /@change="applyOrgPreset"/)
+  assert.match(publishing, /@input="markCustomOrgCode"/)
+  assert.match(publishing, /resolvedPreset\.existingRoute/)
+  assert.match(publishing, /orgName\.value = resolvedPreset\.preset\.name/)
 })
 
 test('Routing 校验分项保留 blocked、Expected/Observed 与 deferred 语义', () => {

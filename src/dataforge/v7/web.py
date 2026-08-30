@@ -31,7 +31,10 @@ from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
 from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
-from .milvus_targets import MilvusTargetService
+from .milvus_targets import (
+    InstanceMilvusConnectionResolver, MilvusConnectionResolver, MilvusTargetService,
+    StaleMilvusVerification,
+)
 from .llm_serving import configure_llm_serving_registry
 from .servings import ServingManager
 from .retrieval import (
@@ -42,10 +45,12 @@ from .retrieval import (
     RetrievalDebugService,
 )
 from .entity_types import entity_type_catalog, resolve_entity_types
+from .migration.importer import validate_local_package_target
 from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
 from .migration.verifier import ActivationPreflightVerifier
 from .store import (
+    CENTRAL_STAGE_TARGETS,
     ReviewGateError,
     V7Store,
     new_id,
@@ -55,6 +60,7 @@ from .vector_inventory import INVENTORY_STATUSES, MilvusInventoryService
 
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MILVUS_STARTUP_CHECK_DELAY_SECONDS = 30
 MEDIA_TYPES = {
     ".pdf": "application/pdf", ".csv": "text/csv",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -348,12 +354,20 @@ class MilvusTargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
     milvus_url: str
+    token: str | None = None
 
 
 class MilvusTargetPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str | None = None
     milvus_url: str | None = None
+    token: str | None = None
+    preserve_token: bool = True
+
+
+class AuthoringMilvusTargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    milvus_target_id: str
 
 
 class DeploymentRequest(BaseModel):
@@ -457,6 +471,7 @@ class RouteCandidateBatchRequest(BaseModel):
 class InstitutionReleaseDraftRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     target_deployment_id: str
+    target_institution_code: str = Field(min_length=1, max_length=120)
     package_kind: Literal["deployment_seed", "institution_release", "knowledge_update"]
     release_stage: Literal["test", "production"] | None = None
     route_version_ids: list[str] = Field(default_factory=list)
@@ -481,11 +496,8 @@ class InstitutionReleaseDraftPatch(BaseModel):
 class LocalMilvusConfigurationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     uri: str
-    database_name: str = "default"
-    tls_enabled: bool = False
-    username: str | None = None
-    secret: str | None = None
-    preserve_secret: bool = True
+    token: str | None = None
+    preserve_token: bool = True
 
 
 class MigrationResumeRequest(BaseModel):
@@ -644,19 +656,43 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     component_checks = ComponentCheckService(store, resolved, objects)
     component_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="observability-run")
     serving_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="serving-startup-check")
+    milvus_startup_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="milvus-startup-check")
     local_milvus_config = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
-    milvus_targets_service = MilvusTargetService(store, lambda uri, token: V7Milvus(uri, token))
+    milvus_targets_service = MilvusTargetService(
+        store, resolved.config_encryption_key, lambda uri, token: V7Milvus(uri, token),
+    )
+    central_milvus_resolver = MilvusConnectionResolver(store, resolved.config_encryption_key)
     serving_manager = ServingManager(store.sessions, resolved.config_encryption_key)
     configure_llm_serving_registry(store.sessions, resolved.config_encryption_key)
     app = FastAPI(title="DataForge V7", version="7.0.0")
     app.state.store, app.state.objects, app.state.instance, app.state.samples = store, objects, instance, samples
     app.state.local_milvus_config = local_milvus_config
+    milvus_resolver = InstanceMilvusConnectionResolver(
+        central_milvus_resolver, local_milvus_config, lambda: app.state.instance,
+    )
+    component_checks.milvus_resolver = milvus_resolver
+    app.state.milvus_resolver = milvus_resolver
     app.state.serving_manager = serving_manager
     app.state.serving_startup_check_future = None
+    app.state.milvus_targets_service = milvus_targets_service
+    app.state.milvus_startup_check_stop = threading.Event()
+    app.state.milvus_startup_check_future = None
     app.state.routing_publications = set()
-    app.state.retrieval_debug = RetrievalDebugService(store, serving_manager)
+    app.state.retrieval_debug = RetrievalDebugService(store, serving_manager, milvus_resolver=milvus_resolver)
     app.state.public_retrieval = PublicRetrievalService(store, app.state.retrieval_debug)
     app.state.routing_publications_lock = threading.RLock()
+
+    def _authoring_connection():
+        try:
+            return milvus_resolver.authoring(app.state.instance.id)
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _vector_sync_service() -> VectorSyncService:
+        return VectorSyncService.from_connection(store, _authoring_connection())
+
+    def _milvus_inventory_service() -> MilvusInventoryService:
+        return MilvusInventoryService.from_connection(store, _authoring_connection())
 
     @app.exception_handler(RequestValidationError)
     async def public_retrieval_validation_error(request: Request, exc: RequestValidationError):
@@ -683,6 +719,25 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if not secrets.compare_digest(supplied, f"Bearer {configured}"):
             raise PublicRetrievalError("retrieval_token_invalid", "Retrieval token 无效", 401)
 
+    def _check_central_milvus_after_delay() -> list[dict]:
+        if app.state.milvus_startup_check_stop.wait(MILVUS_STARTUP_CHECK_DELAY_SECONDS):
+            return []
+        target_ids = tuple(spec[0] for spec in CENTRAL_STAGE_TARGETS.values())
+        results = milvus_targets_service.check_startup_targets(target_ids)
+        test_target_id = CENTRAL_STAGE_TARGETS["test"][0]
+        test_result = next((item for item in results if item.get("target_id") == test_target_id), None)
+        if test_result and test_result.get("status") == "healthy":
+            try:
+                store.bind_authoring_milvus_target_if_unset(app.state.instance.id, test_target_id)
+            except Exception as exc:
+                logger.warning(
+                    "Default authoring Milvus binding failed: target_id=%s error_type=%s",
+                    test_target_id, type(exc).__name__,
+                )
+        return results
+
+    app.state.run_milvus_startup_check_after_delay = _check_central_milvus_after_delay
+
     @app.on_event("startup")
     def reconcile_component_checks() -> None:
         store.interrupt_component_checks()
@@ -690,11 +745,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             app.state.serving_startup_check_future = serving_check_executor.submit(
                 serving_manager.check_configured_on_startup,
             )
+            if app.state.instance.mode == "central":
+                app.state.milvus_startup_check_future = milvus_startup_check_executor.submit(
+                    _check_central_milvus_after_delay,
+                )
 
     @app.on_event("shutdown")
     def shutdown_component_checks() -> None:
+        app.state.milvus_startup_check_stop.set()
         component_check_executor.shutdown(wait=False, cancel_futures=True)
         serving_check_executor.shutdown(wait=False, cancel_futures=True)
+        milvus_startup_check_executor.shutdown(wait=False, cancel_futures=True)
 
     @app.middleware("http")
     async def require_admin(request: Request, call_next):
@@ -774,6 +835,14 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/instance")
     def instance_info():
         payload = app.state.instance.payload()
+        payload["org_code_presets"] = [
+            {"name": item.name, "org_code": item.org_code}
+            for item in resolved.org_code_presets
+        ]
+        try:
+            payload["authoring_milvus_target"] = store.authoring_milvus_target(app.state.instance.id)
+        except ValueError:
+            payload["authoring_milvus_target"] = None
         payload["deployment_flavor"] = (
             "central_control_plane" if app.state.instance.mode == "central" else "institution_private"
         )
@@ -1420,11 +1489,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try:
             from .provisioning import ManagedCollectionProvisioner
             requirements = store.knowledge_type_publication_requirements(type_id)
-            service = VectorSyncService.from_environment(store)
+            service = _vector_sync_service()
             for requirement in requirements:
                 if requirement["collection_policy"] == "managed":
                     if not service.milvus:
-                        raise ValueError("未配置 DATAFORGE_MILVUS_URI，不能 Provision 受管 Collection")
+                        raise ValueError("未配置 verified Authoring Target，不能 Provision 受管 Collection")
                     result = ManagedCollectionProvisioner(store, service.milvus).reconcile_one(requirement["managed_collection_id"])
                     if result["status"] != "ready":
                         raise ValueError(result.get("error") or "受管 Collection Provision 失败")
@@ -1816,11 +1885,36 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/vector-indexes")
     def vector_indexes():
         profiles = store.list_index_profiles()
-        observed = {}
+        observed, capacity = {}, []
+        authoring_milvus = {"status": "ready", "message": "知识生产 Milvus 当前可用"}
         try:
-            observed = {item["collection_name"]: item for item in MilvusInventoryService.from_environment(store).collections()}
-        except Exception:
-            observed = {}
+            connection = milvus_resolver.authoring(app.state.instance.id)
+        except ValueError:
+            connection = None
+            authoring_milvus = {
+                "status": "not_configured",
+                "message": "当前实例尚未配置默认知识写入目标",
+            }
+        if connection:
+            try:
+                observed = {
+                    item["collection_name"]: item
+                    for item in MilvusInventoryService.from_connection(store, connection).collections()
+                }
+                capacity = VectorSyncService.from_connection(store, connection).capacity_report()
+            except Exception:
+                observed = {}
+                authoring_milvus = {
+                    "status": "unavailable",
+                    "message": "知识生产 Milvus 当前不可用；环境摘要已降级",
+                }
+        if not capacity:
+            capacity = VectorSyncService(store).capacity_report()
+            reason = authoring_milvus["message"]
+            capacity = [
+                {**item, "reason": reason} if item.get("reason") == "Milvus 未配置" else item
+                for item in capacity
+            ]
         for profile in profiles:
             collection = observed.get(profile["collection_name"]) or {}
             serving_dimension = (profile.get("embedding_serving") or {}).get("dimension")
@@ -1835,11 +1929,15 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 ),
             }
         return {"profiles": profiles, "managed_collections": store.list_managed_collections(),
-                "capacity": VectorSyncService.from_environment(store).capacity_report()}
+                "capacity": capacity, "authoring_milvus": authoring_milvus}
 
     @app.get("/api/vector-storage/overview")
     def vector_storage_overview():
-        return MilvusInventoryService.from_environment(store).overview()
+        try:
+            return _milvus_inventory_service().overview()
+        except (ValueError, HTTPException) as exc:
+            return {"configured": False, "healthy": False, "error_code": "MILVUS_NOT_CONFIGURED",
+                    "error_message": str(getattr(exc, "detail", exc))}
 
     @app.get("/api/vector-storage/collections")
     def vector_storage_collections(
@@ -1852,9 +1950,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     ):
         if status and status not in INVENTORY_STATUSES:
             raise HTTPException(status_code=422, detail="向量库存状态筛选无效")
-        service = MilvusInventoryService.from_environment(store)
+        service = _milvus_inventory_service()
         if not service.milvus:
-            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+            raise HTTPException(status_code=503, detail="verified Authoring Target 未配置")
         try:
             return service.collections(
                 q=q, knowledge_type=knowledge_type, status=status,
@@ -1866,9 +1964,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/vector-storage/collections/{collection_name}")
     def vector_storage_collection(collection_name: str):
-        service = MilvusInventoryService.from_environment(store)
+        service = _milvus_inventory_service()
         if not service.milvus:
-            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+            raise HTTPException(status_code=503, detail="verified Authoring Target 未配置")
         try:
             return service.collection_detail(collection_name)
         except ValueError as exc:
@@ -1878,9 +1976,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}")
     def vector_storage_partition(collection_name: str, partition_name: str):
-        service = MilvusInventoryService.from_environment(store)
+        service = _milvus_inventory_service()
         if not service.milvus:
-            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+            raise HTTPException(status_code=503, detail="verified Authoring Target 未配置")
         try:
             return service.partition_detail(collection_name, partition_name)
         except ValueError as exc:
@@ -1891,7 +1989,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/verify")
     def verify_vector_storage_partition(collection_name: str, partition_name: str):
         try:
-            return MilvusInventoryService.from_environment(store).verify_partition(collection_name, partition_name)
+            return _milvus_inventory_service().verify_partition(collection_name, partition_name)
         except ValueError as exc:
             raise _error(exc) from exc
         except Exception as exc:
@@ -1900,7 +1998,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/load")
     def load_vector_storage_partition(collection_name: str, partition_name: str):
         try:
-            return MilvusInventoryService.from_environment(store).load_partition(collection_name, partition_name)
+            return _milvus_inventory_service().load_partition(collection_name, partition_name)
         except ValueError as exc:
             raise _error(exc) from exc
         except Exception as exc:
@@ -1909,7 +2007,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/vector-storage/collections/{collection_name}/partitions/{partition_name}/release")
     def release_vector_storage_partition(collection_name: str, partition_name: str):
         try:
-            return MilvusInventoryService.from_environment(store).release_partition(collection_name, partition_name)
+            return _milvus_inventory_service().release_partition(collection_name, partition_name)
         except ValueError as exc:
             raise _error(exc) from exc
         except Exception as exc:
@@ -1921,22 +2019,22 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/developer/managed-collections/{collection_id}/reconcile")
     def reconcile_managed_collection(collection_id: str):
         from .provisioning import ManagedCollectionProvisioner
-        service = VectorSyncService.from_environment(store)
+        service = _vector_sync_service()
         if not service.milvus:
-            raise HTTPException(status_code=503, detail="DATAFORGE_MILVUS_URI 未配置")
+            raise HTTPException(status_code=503, detail="verified Authoring Target 未配置")
         try: return ManagedCollectionProvisioner(store, service.milvus).reconcile_one(collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/managed-collections/{collection_id}/delete-check")
     def managed_collection_delete_check(collection_id: str):
         from .provisioning import ManagedCollectionDeletionService
-        try: return ManagedCollectionDeletionService.from_environment(store).preflight(collection_id)
+        try: return ManagedCollectionDeletionService(store, _authoring_connection().client()).preflight(collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.delete("/api/developer/managed-collections/{collection_id}", status_code=202)
     def delete_managed_collection(collection_id: str):
         from .provisioning import ManagedCollectionDeletionService
-        try: return ManagedCollectionDeletionService.from_environment(store).request_delete(collection_id)
+        try: return ManagedCollectionDeletionService(store, _authoring_connection().client()).request_delete(collection_id)
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/managed-collections/{collection_id}/deletion-jobs")
@@ -1981,10 +2079,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
 
     def index_validator(collection_name: str, fields: dict, dimension: int) -> None:
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        if not uri:
-            raise ValueError("未配置 DATAFORGE_MILVUS_URI，不能校验或发布 Index Profile")
-        V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")).validate_collection(collection_name, fields, dimension)
+        connection = _authoring_connection()
+        V7Milvus(connection.uri, connection.token).validate_collection(collection_name, fields, dimension)
 
     @app.post("/api/developer/index-profiles/{profile_id}/validate")
     def validate_index_profile(profile_id: str):
@@ -1997,9 +2093,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             from .provisioning import ManagedCollectionProvisioner
             requirement = store.index_profile_publication_requirement(profile_id)
             if requirement["collection_policy"] == "managed":
-                service = VectorSyncService.from_environment(store)
+                service = _vector_sync_service()
                 if not service.milvus:
-                    raise ValueError("未配置 DATAFORGE_MILVUS_URI，不能 Provision 受管 Collection")
+                    raise ValueError("未配置 verified Authoring Target，不能 Provision 受管 Collection")
                 result = ManagedCollectionProvisioner(store, service.milvus).reconcile_one(requirement["managed_collection_id"])
                 if result["status"] != "ready":
                     raise ValueError(result.get("error") or "受管 Collection Provision 失败")
@@ -2023,7 +2119,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def vector_sync_jobs(knowledge_library_id: str | None = None): return store.list_vector_sync_jobs(knowledge_library_id)
 
     @app.post("/api/vector-sync-jobs/{sync_job_id}/run")
-    def run_vector_sync(sync_job_id: str): return VectorSyncService.from_environment(store).run(sync_job_id)
+    def run_vector_sync(sync_job_id: str):
+        try: return _vector_sync_service().run(sync_job_id)
+        except ValueError as exc: raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/projects")
     def projects(): return store.list_projects(allowed_deployment_id=app.state.instance.bound_deployment_id if app.state.instance.mode == "local" else None)
@@ -2049,7 +2147,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/milvus-targets", status_code=201)
     def create_milvus_target(payload: MilvusTargetRequest):
         if app.state.instance.mode != "central": raise HTTPException(status_code=403, detail="Local 实例不能创建 Milvus Target")
-        try: return milvus_targets_service.create(payload.name, payload.milvus_url)
+        try: return milvus_targets_service.create(payload.name, payload.milvus_url, payload.token)
+        except StaleMilvusVerification as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.patch("/api/milvus-targets/{target_id}")
@@ -2057,6 +2156,37 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if app.state.instance.mode != "central":
             raise HTTPException(status_code=403, detail="只有智能中心可以管理 Milvus 服务注册表")
         try: return milvus_targets_service.patch(target_id, **payload.model_dump())
+        except StaleMilvusVerification as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/milvus-targets/{target_id}/verify")
+    def verify_milvus_target(target_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以验证 Milvus 服务")
+        try: return milvus_targets_service.verify(target_id)
+        except StaleMilvusVerification as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/milvus-targets/{target_id}/health-check")
+    def check_milvus_target_health(target_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以检查 Milvus 服务健康")
+        try: return milvus_targets_service.check_current(target_id)
+        except StaleMilvusVerification as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/milvus-targets/{target_id}/collections-check")
+    def check_milvus_target_collections(target_id: str):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以检查 Milvus Collection")
+        try: return milvus_targets_service.check_collections(target_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.put("/api/instance/milvus-authoring-target")
+    def put_authoring_milvus_target(payload: AuthoringMilvusTargetRequest):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有智能中心可以配置默认知识写入目标")
+        try: return store.bind_authoring_milvus_target(app.state.instance.id, payload.milvus_target_id)
         except ValueError as exc: raise _error(exc) from exc
 
     def _require_central_deployment_admin() -> None:
@@ -2145,14 +2275,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/projects/{project_id}/deployments", status_code=201)
     def create_deployment(project_id: str, payload: DeploymentRequest):
-        if app.state.instance.mode != "central": raise HTTPException(status_code=403, detail="Local 实例不能创建 Deployment")
-        try: return store.create_deployment(
-            project_id, payload.code, payload.name, payload.deployment_type or payload.scope,
-            payload.milvus_target_id or "",
-            institution_name=payload.institution_name, institution_code=payload.institution_code,
-            release_stage=payload.release_stage,
+        raise HTTPException(
+            status_code=410,
+            detail="旧创建入口已停用；请使用 /api/deployments 和 /api/deployments/{id}/projects",
         )
-        except ValueError as exc: raise _error(exc) from exc
 
     @app.patch("/api/projects/{project_id}/deployments/{deployment_id}")
     def patch_deployment(project_id: str, deployment_id: str, payload: DeploymentPatch):
@@ -2308,23 +2434,28 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if not payload:
             raise ValueError("ProjectDeployment 不存在")
         should_connect = app.state.instance.mode == "local" or payload.get("scope") == "central"
-        uri = None
+        connection = None
         if should_connect:
-            target = store.deployment_stage_target(deployment_id, release_stage)
-            uri = target["milvus_target"]["milvus_url"]
-        stage_token_name = (
-            "DATAFORGE_PRODUCTION_MILVUS_TOKEN"
-            if release_stage == "production"
-            else "DATAFORGE_TEST_MILVUS_TOKEN"
-        )
-        token = os.getenv(stage_token_name) or os.getenv("DATAFORGE_MILVUS_TOKEN")
+            try:
+                connection = milvus_resolver.stage(deployment_id, release_stage)
+            except ValueError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
         if should_connect:
-            return store.validate_routing(
-                deployment_id, release_stage, V7Milvus(uri, token) if uri else None,
+            result = store.validate_routing(
+                deployment_id, release_stage, V7Milvus(connection.uri, connection.token) if connection else None,
                 target_validation_mode="live",
-                target_reason=(None if uri else
+                target_reason=(None if connection else
                                "当前 Deployment 需要目标验证，但未配置有效的目标 Milvus URI"),
             )
+            if app.state.instance.mode == "local" and connection and result.get("snapshot"):
+                result["snapshot"]["milvus_target"] = {
+                    "id": connection.target_id, "name": "机构本地 Milvus",
+                    "milvus_url": connection.uri,
+                    "revision_id": f"local:{connection.revision_id}",
+                    "connection_fingerprint": connection.fingerprint,
+                    "token_configured": bool(connection.token),
+                }
+            return result
         return store.validate_routing(
             deployment_id, release_stage, target_validation_mode="deferred_to_local",
             target_reason=("中心不连接机构现场 Milvus，实体检查延后到机构本地 "
@@ -2392,8 +2523,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if not candidate_check["valid"]:
                 raise ValueError("路由校验失败：" + "；".join(candidate_check["problems"]))
             candidate = candidate_check["snapshot"]
-            if app.state.instance.mode == "local" or candidate.get("deployment", {}).get("scope") == "central":
-                RoutingDeliveryService(store, resolved.routing_dir / "production-backups").sync(candidate)
+            if app.state.instance.mode == "central" and candidate.get("deployment", {}).get("scope") == "central":
+                RoutingDeliveryService(
+                    store, resolved.routing_dir / "production-backups", resolver=milvus_resolver,
+                ).sync(candidate)
             check = _validate_target_routing(deployment_id, stage)
             if not check["valid"]: raise ValueError("路由校验失败：" + "；".join(check["problems"]))
             snapshot = check["snapshot"]
@@ -2612,6 +2745,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try:
             return store.create_institution_release_draft(
                 payload.target_deployment_id, payload.package_kind,
+                target_institution_code=payload.target_institution_code,
                 release_stage=payload.release_stage,
                 route_version_ids=payload.route_version_ids,
                 knowledge_library_ids=payload.knowledge_library_ids,
@@ -2728,6 +2862,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                     app.state.instance.id, slot,
                     factory=lambda uri, token: V7Milvus(uri, token),
                 )
+            except StaleMilvusVerification as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except ValueError:
                 return local_milvus_config.get(app.state.instance.id, slot)
         except ValueError as exc:
@@ -2739,6 +2875,8 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             raise HTTPException(status_code=403, detail="只有机构本地可以验证 Milvus 配置")
         try:
             return local_milvus_config.verify(app.state.instance.id, slot)
+        except StaleMilvusVerification as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise _error(exc) from exc
 
@@ -2812,10 +2950,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if not size: raise ValueError("迁移包不能为空")
             inspected = inspect_package(target, resolved.migration_trusted_public_keys)
             manifest = inspected["manifest"]
-            if manifest["package_kind"] == "deployment_seed" and app.state.instance.bound_deployment_id:
-                raise ValueError("本地实例已经初始化，禁止第二次导入 deployment_seed")
-            if manifest["package_kind"] == "knowledge_update" and not app.state.instance.bound_deployment_id:
-                raise ValueError("未初始化的 local 实例不能导入 knowledge_update")
+            validate_local_package_target(store, app.state.instance, manifest)
             manifest_assets = {str(item.get("id") or item.get("asset_version_id")): item
                                for item in manifest.get("asset_versions") or []}
             items = [{"knowledge_library_id": part["knowledge_library_id"], "collection_name": collection,

@@ -33,8 +33,10 @@ def process_instance_id(component: str) -> str:
 
 
 class ComponentCheckService:
-    def __init__(self, store: V7Store, settings: Settings, objects: MinioObjectStore | LocalObjectStore):
+    def __init__(self, store: V7Store, settings: Settings, objects: MinioObjectStore | LocalObjectStore,
+                 *, milvus_resolver=None):
         self.store, self.settings, self.objects = store, settings, objects
+        self.milvus_resolver = milvus_resolver
 
     @staticmethod
     def validate_components(values: list[str]) -> list[str]:
@@ -163,10 +165,10 @@ class ComponentCheckService:
 
     def _milvus(self, _: str) -> dict[str, Any]:
         def action():
-            uri = os.getenv("DATAFORGE_MILVUS_URI", "").strip()
-            if not uri:
-                return "not_configured", "Milvus 未配置", {}
-            milvus = V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"))
+            if not self.milvus_resolver:
+                return "not_configured", "知识生产 Milvus 未配置", {}
+            connection = self.milvus_resolver.authoring()
+            milvus = V7Milvus(connection.uri, connection.token)
             names = set(milvus.list_collections())
             with self.store.sessions() as session:
                 managed = session.scalar(select(ManagedCollection).where(ManagedCollection.status == "ready")
@@ -174,7 +176,10 @@ class ComponentCheckService:
                 asset = session.scalar(select(KnowledgeAssetVersion).where(KnowledgeAssetVersion.status == "ready")
                                        .order_by(KnowledgeAssetVersion.ready_at.desc()).limit(1))
             if not managed:
-                return "degraded", "Milvus 可连接，尚无 Ready 受管 Collection 可验证", {"collection_count": len(names), "write_verified": False}
+                return "degraded", "Milvus 可连接，尚无 Ready 受管 Collection 可验证", {
+                    "collection_count": len(names), "write_verified": False,
+                    "target_revision_id": connection.revision_id,
+                }
             if managed.collection_name not in names:
                 raise RuntimeError("managed_collection_missing")
             observed = milvus.inspect_collection(managed.collection_name)

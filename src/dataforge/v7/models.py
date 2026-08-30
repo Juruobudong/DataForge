@@ -1164,6 +1164,10 @@ class KnowledgeAssetVersion(Timestamped, Base):
     last_observed_count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     last_observed_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authoring_target_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("milvus_target_revisions.id"), nullable=True, index=True
+    )
+    authoring_connection_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -1267,6 +1271,35 @@ class MilvusTarget(Timestamped, Base):
     candidate_verification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     candidate_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     candidate_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stable registry identity. Connection data lives in immutable revisions;
+    # these two ids select the active and in-flight configurations.
+    current_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    candidate_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+
+class MilvusTargetRevision(Timestamped, Base):
+    __tablename__ = "milvus_target_revisions"
+    __table_args__ = (
+        UniqueConstraint("milvus_target_id", "revision_no", name="uq_milvus_target_revision_no"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    milvus_target_id: Mapped[str] = mapped_column(ForeignKey("milvus_targets.id"), nullable=False, index=True)
+    revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    milvus_url: Mapped[str] = mapped_column(String(1024), nullable=False)
+    token_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    connection_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    verification_status: Mapped[str] = mapped_column(
+        String(32), default="pending_verification", nullable=False, index=True
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    health_status: Mapped[str] = mapped_column(
+        String(32), default="unknown", server_default="unknown", nullable=False, index=True,
+    )
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    health_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    health_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Deployment(Timestamped, Base):
@@ -1317,6 +1350,9 @@ class DataForgeInstance(Base):
     instance_mode: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     bound_deployment_id: Mapped[str | None] = mapped_column(ForeignKey("deployments.id"), nullable=True, unique=True)
     source_instance_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authoring_milvus_target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("milvus_targets.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
@@ -1443,11 +1479,10 @@ class LocalMilvusConfiguration(Timestamped, Base):
     dataforge_instance_id: Mapped[str] = mapped_column(ForeignKey("dataforge_instances.id"), nullable=False, index=True)
     slot: Mapped[str] = mapped_column(String(32), nullable=False)
     uri: Mapped[str] = mapped_column(String(1024), nullable=False)
-    database_name: Mapped[str] = mapped_column(String(255), default="default", nullable=False)
-    tls_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    secret_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
-    secret_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    token_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_key_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    config_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    connection_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="pending_verification", nullable=False, index=True)
     verified_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

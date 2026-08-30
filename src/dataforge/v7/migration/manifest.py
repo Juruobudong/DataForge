@@ -89,6 +89,8 @@ def validate_manifest(value: dict[str, Any]) -> dict[str, Any]:
 
     if int(value.get("manifest_schema_version", 0)) != 2:
         raise ManifestError("v2 manifest_schema_version 必须为 2")
+    if deployment.get("scope") != "institution" or not str(deployment.get("institution_code") or "").strip():
+        raise ManifestError("v2 manifest 必须包含机构发布目标 institution_code")
     for key in ("minimum_dataforge_version", "maximum_dataforge_version", "source_instance_version",
                 "required_features", "operator_versions", "storage_contract_versions",
                 "asset_versions", "diff_summary", "tombstones"):

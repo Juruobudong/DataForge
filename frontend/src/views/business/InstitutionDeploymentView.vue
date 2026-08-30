@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
-import { frozenRoutesForStage, groupedAssetOptions, releaseCanFreeze, releaseSelectionSummary } from './institutionReleaseModel'
+import { frozenRoutesForStage, groupedAssetOptions, institutionReleaseTarget, releaseCanFreeze, releaseSelectionSummary } from './institutionReleaseModel'
 
 const route = useRoute(), router = useRouter()
 const instance = ref(null), deployments = ref([]), projects = ref([]), libraries = ref([])
@@ -17,6 +17,7 @@ const local = computed(() => instance.value?.instance_mode === 'local')
 let saveTimer = null
 const institutionDeployments = computed(() => deployments.value.filter(item => item.scope === 'institution'))
 const selectedDeployment = computed(() => institutionDeployments.value.find(item => item.id === deploymentId.value))
+const targetInstitutionCode = computed(() => selectedDeployment.value?.institution_code || '')
 const updateOnly = computed(() => packageKind.value === 'knowledge_update')
 const assetGroups = computed(() => groupedAssetOptions(assetOptions.value))
 const selectionSummary = computed(() => releaseSelectionSummary(plan.value))
@@ -82,7 +83,7 @@ async function createDraft() {
   try {
     busy.value = true; error.value = ''
     draft.value = await api.createInstitutionReleaseDraft({
-      target_deployment_id: deploymentId.value, package_kind: packageKind.value,
+      ...institutionReleaseTarget(selectedDeployment.value), package_kind: packageKind.value,
       release_stage: selectedStage.value,
       route_version_ids: updateOnly.value ? [] : selectedRoutes.value,
       knowledge_library_ids: updateOnly.value ? selectedLibraries.value : [], base_release_id: null,
@@ -173,7 +174,8 @@ onMounted(load)
       <nav class="tabs"><button v-for="value in [1,2,3,4,5]" :key="value" :class="{active:step===value}" :disabled="value>1&&!draft" @click="step=value">{{ value }}. {{ ['发布范围','知识资产','判重与就绪','资产差异','冻结与构建'][value-1] }}</button></nav>
       <section v-if="step===1" class="panel stack">
         <div class="panel-head"><div><h3>发布范围</h3><p>发布工作台不会修改任何项目授权；项目授权必须先在“项目发布”中冻结。</p></div><span class="badge amber">自动保存草稿</span></div>
-        <label>目标机构<select v-model="deploymentId"><option v-for="item in institutionDeployments" :key="item.id" :value="item.id">{{ item.institution_name || item.name }} · {{ item.institution_code }}</option></select></label>
+        <label>目标机构<select v-model="deploymentId" :disabled="Boolean(draft)"><option v-for="item in institutionDeployments" :key="item.id" :value="item.id">{{ item.institution_name || item.name }} · {{ item.institution_code }}</option></select></label>
+        <label>机构发布目标（institution_code）<input :value="targetInstitutionCode" readonly></label>
         <label>发布模式<select v-model="packageKind"><option value="deployment_seed">首次部署 Seed</option><option value="institution_release">机构多项目发布</option><option value="knowledge_update">知识资产更新</option></select></label>
         <div class="tabs" role="tablist" aria-label="机构发布环境"><button type="button" role="tab" :aria-selected="selectedStage==='test'" :class="{active:selectedStage==='test'}" @click="selectedStage='test'">测试环境</button><button type="button" role="tab" :aria-selected="selectedStage==='production'" :class="{active:selectedStage==='production'}" @click="selectedStage='production'">生产环境</button></div>
         <p class="notice" v-if="updateOnly">本操作只迁移知识资产，不会改变机构本地任何项目的当前路由。</p>
@@ -185,7 +187,7 @@ onMounted(load)
         <label v-if="updateOnly"><input v-model="includeFullDocuments" type="checkbox"> 同时携带完整关联文档库与模板运行闭包</label>
         <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedStage]?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
         <label v-if="overrideUri">临时覆盖原因<textarea v-model="overrideReason" required rows="2"></textarea></label>
-        <div class="actions"><button class="primary" :disabled="busy||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)||(overrideUri&&!overrideReason.trim())" @click="createDraft">创建并检查草稿</button></div>
+        <div class="actions"><button class="primary" :disabled="busy||!targetInstitutionCode||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)||(overrideUri&&!overrideReason.trim())" @click="createDraft">创建并检查草稿</button></div>
       </section>
 
       <section v-else-if="step===2" class="panel">

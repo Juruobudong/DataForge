@@ -14,9 +14,9 @@ Project
               → knowledge_library_id[]
 ```
 
-- Deployment 表达机构或中心发布目标，按 `DeploymentTarget.release_stage` 同时拥有 test/production Milvus Target；ProjectDeployment 表达 Project 关联。`Deployment.release_stage` 只保留 legacy 兼容。
+- Deployment 表达机构或中心发布目标；中心只有在 Target current revision 已 verified 后才可按 `DeploymentTarget.release_stage` 绑定 test/production，机构 Deployment 在中心没有 Milvus Target。ProjectDeployment 表达 Project 关联。`Deployment.release_stage` 只保留 legacy 兼容。
 - 同一 Deployment 可以承载多个 Project，但任务、授权、RouteVersion、Snapshot、版本号和回滚互不共享。
-- `org_code` 属于 ProjectDeploymentTask 授权，只在已绑定的 Project、Deployment 与 Task 内选择知识库；它不能选择环境、阶段或 Milvus Target。
+- `org_code` 属于 ProjectDeploymentTask 授权，只在已绑定的 Project、Deployment 与 Task 内选择知识库；唯一边界为 `(project_deployment_task_id, org_code)`，一个 Task 可有多个 org，同一 org 可跨 Task 复用。它不能选择机构 Deployment、环境、阶段或 Milvus Target，也不要求等于 `institution_code`。
 - 每个授权知识库在冻结前必须通过类型、Profile、Vector Ready 和目标 Partition 校验。
 
 ## RouteVersion 与 Snapshot
@@ -58,3 +58,7 @@ RouteVersion 按 `(project_deployment_id, release_stage)` 独立编号。冻结�
 ## Public Retrieval v1（2026-08-29）
 
 RoutingSnapshot 继续作为内部基础设施契约，保留 Milvus Target、Collection、Partition、Embedding 与 Storage Contract。业务边界改用 Published-only Public Retrieval v1：逻辑身份为 `project_code/deployment_code/release_stage/task_code + org_code`，Public DTO 仅输出 route、policy、正文、业务 data、评分、Context 与冻结 Evidence。独立 Retrieval Token 不能读取 Runtime Snapshot；管理员测试端点复用相同执行器和 presenter，但不向浏览器下发 token。当前 qa_agent 与 kg_for_consultation 尚未迁移。详见 [实施基线](../../wiki/sources/public-retrieval-gateway-2026-08-29.md)。
+
+## Milvus Connection Contract（2026-08-30）
+
+中心 Registry 以稳定 Target + 不可变 URI/加密 Token Revision 管理连接。实例单独绑定 verified Authoring Target；Index、Provision、Vector Sync 和 Inventory 使用该连接，AssetVersion 冻结实际来源 revision。RoutingSnapshot v3 增量冻结目标 revision/fingerprint，DataForge Retrieval 与 Delivery 按冻结 revision 解密 Token；秘密不进入 Snapshot、Public DTO 或 `.dfm`。Seed Target 为 pending 且无绑定，验证结果通过 CAS 防止配置在网络请求期间被替换。详见 [ADR-009](../adr/ADR-009-milvus-connection-contract.md) 与 [实施基线](../../wiki/sources/milvus-connection-contract-2026-08-30.md)。

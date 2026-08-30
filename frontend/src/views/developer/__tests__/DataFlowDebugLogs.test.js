@@ -4,7 +4,8 @@ import DataFlowDebugView from '../DataFlowDebugView.vue'
 import { api } from '../../../api/platform'
 
 const route = vi.hoisted(() => ({ query: {} }))
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }), useRoute: () => route }))
+const router = vi.hoisted(() => ({ push: vi.fn() }))
+vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => route }))
 vi.mock('../../../api/platform', () => ({ createClientRequestId: () => 'request', api: Object.fromEntries([
   'flowTemplates', 'flowRuns', 'operatorCatalog', 'vectorIndexes', 'flowRunCapabilities', 'flowRun', 'flowRunEvents', 'debugRunOptions',
   'debugRunMaterialization', 'sinkPreviewCandidates', 'debugRunPreflight', 'createDebugRun', 'createDerivedRun',
@@ -20,6 +21,7 @@ const initial = { id: 'r', status: 'running', debug_input_snapshot_id: 's', node
   runtime_dag: { nodes: [{ id: 'n', kind: 'operator', ref: 'text-knowledge-mapper', status: 'running' }], edges: [] } }
 beforeEach(() => {
   route.query = {}
+  router.push.mockReset()
   vi.spyOn(window, 'setInterval').mockImplementation(fn => { poll = fn; return 1 })
   vi.spyOn(window, 'clearInterval').mockImplementation(() => {})
   api.flowTemplates.mockResolvedValue([])
@@ -38,6 +40,19 @@ const clickButton = async name => {
   await wrapper.findAll('button').find(button => button.text() === name).trigger('click')
   await flushPromises()
 }
+
+it('keeps Debug available when the optional Milvus environment summary returns 503', async () => {
+  api.flowTemplates.mockResolvedValue([{ id: 'flow', name: '可调试流程', revision_status: 'published' }])
+  api.vectorIndexes.mockRejectedValue(new Error('HTTP 503 · 当前实例尚未配置默认知识写入目标'))
+  wrapper = mount(DataFlowDebugView)
+  await flushPromises()
+
+  expect(wrapper.get('.template-card').text()).toContain('可调试流程')
+  expect(wrapper.get('.environment').text()).toContain('知识生产 Milvus 当前不可用')
+  expect(wrapper.find('.error').exists()).toBe(false)
+  await wrapper.findAll('button').find(button => button.text() === '管理 Milvus 服务').trigger('click')
+  expect(router.push).toHaveBeenCalledWith('/business/milvus-targets')
+})
 async function prepareRun({ history = true, options = { revision: { id: 'rev', status: 'draft' } } } = {}) {
   api.flowTemplates.mockResolvedValue([{ id: 'flow', name: '测试流程', revision_status: 'draft' }])
   api.flowRuns.mockResolvedValue(history ? [{ id: 'r', template_id: 'flow', debug_input_snapshot_id: 's' }] : [])

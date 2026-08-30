@@ -17,14 +17,15 @@ from fastapi.testclient import TestClient
 from dataforge.config import Settings
 from dataforge.v7.instance import InstanceContext
 from dataforge.v7.local_config import LocalMilvusConfigurationService
+from dataforge.v7.milvus_targets import MilvusTargetService
 from dataforge.v7.migration.exporter import MigrationExporter
-from dataforge.v7.migration.importer import MigrationImporter
+from dataforge.v7.migration.importer import MigrationImporter, validate_local_package_target
 from dataforge.v7.migration.package import MigrationPackageBuilder, inspect_package
 from dataforge.v7.migration.manifest import validate_manifest
 from dataforge.v7.migration.planner import InstitutionReleasePlanner, MigrationPlanner
 from dataforge.v7.migration.verifier import ActivationPreflightVerifier
 from dataforge.v7.migrations import upgrade
-from dataforge.v7.models import ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
+from dataforge.v7.models import DataForgeInstance, Deployment, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import V7Store
 from dataforge.v7.vector import V7Milvus
@@ -33,7 +34,33 @@ from dataforge.v7.web import create_app
 
 
 def seeded_qa_project(store: V7Store) -> dict:
+    with store.sessions() as session:
+        instance = session.scalar(select(DataForgeInstance))
+        central = session.scalar(select(Deployment).where(Deployment.scope == "central"))
+    if instance and instance.instance_mode == "central":
+        service = MilvusTargetService(store, None, lambda _uri, _token: SimpleNamespace(check_connection=lambda: "2.5.18"))
+        for target_id in ("milvus_dataforge_central_test", "milvus_dataforge_central_production"):
+            target = store.get_milvus_target(target_id)
+            if target["candidate_revision_id"]:
+                service.verify(target_id)
+        test_target = store.get_milvus_target("milvus_dataforge_central_test")
+        production_target = store.get_milvus_target("milvus_dataforge_central_production")
+        store.bind_authoring_milvus_target(instance.id, test_target["id"])
+        if not central:
+            raise AssertionError("central deployment missing")
+        for stage, target in (("test", test_target), ("production", production_target)):
+            current = store.list_shared_deployments(allowed_deployment_id=central.id)[0]["stage_targets"]
+            if stage not in current:
+                store.put_deployment_target(
+                    central.id, stage, target["id"], confirm_production=stage == "production",
+                    expected_target_uri=target["milvus_url"] if stage == "production" else None,
+                )
     return next(item for item in store.list_projects() if item["code"] == "qa-agent")
+
+
+def bind_institution(store: V7Store, project_id: str, name: str, code: str) -> dict:
+    shared = store.create_shared_deployment(institution_name=name, institution_code=code)
+    return store.bind_project_deployment(shared["id"], project_id)
 
 
 def record_and_approve_source(store: V7Store, source: dict, content: str = "迁移测试来源") -> None:
@@ -194,19 +221,20 @@ def test_local_instance_hides_other_deployment_and_rejects_second_seed(tmp_path:
     url = f"sqlite:///{tmp_path / 'local.sqlite3'}"; upgrade(url)
     store = V7Store(url); store.seed()
     project = seeded_qa_project(store)
-    bound_target = store.create_milvus_target("institution-a", "http://institution-a:19530")
-    bound = store.create_deployment(
-        project["id"], "hospital-a", "医院 A", "local", bound_target["id"],
-        institution_name="医院 A", institution_code="KM001",
-    )
-    target = store.create_milvus_target("other", "http://unreachable:19530")
-    other = store.create_deployment(project["id"], "hospital-b", "医院 B", "local", target["id"],
-                                    institution_name="医院 B", institution_code="KM002")
+    bound = bind_institution(store, project["id"], "医院 A", "KM001")
+    other = bind_institution(store, project["id"], "医院 B", "KM002")
     settings = Settings(project_root=tmp_path, state_dir=tmp_path / "state", database_url=url,
                         instance_mode="local", instance_code="hospital-a")
     client = TestClient(create_app(settings, check_schema=True))
     assert client.post("/api/projects", json={"name": "不允许的本地项目"}).status_code == 403
     context = client.app.state.instance.bind_seed(store, bound["deployment_id"], "central-one")
+    local_config = LocalMilvusConfigurationService(store, None)
+    local_config.put(context.id, "candidate_target", uri="http://institution-a:19530")
+    local_config.verify(
+        context.id, "candidate_target",
+        factory=lambda _uri, _token: SimpleNamespace(list_collections=lambda: []),
+    )
+    local_config.promote_candidate(context.id)
     monkeypatch.setattr(
         v7_web, "V7Milvus",
         lambda uri, token=None: SimpleNamespace(
@@ -290,14 +318,54 @@ def test_routing_snapshot_is_generated_from_deployment_authorization(tmp_path: P
     assert snapshot["milvus_target"]["id"] == deployment["milvus_target_id"]
     assert snapshot["tasks"][0]["org_routes"][0]["knowledge_library_ids"] == [library["id"]]
     first = store.create_route_version(deployment["id"], snapshot)
-    target = store.create_milvus_target("hospital-b", "http://hospital-b:19530")
-    other = store.create_deployment(project["id"], "hospital-b", "医院 B", "local", target["id"],
-                                    institution_name="医院 B", institution_code="KM002")
+    other = bind_institution(store, project["id"], "医院 B", "KM002")
     other_version = store.create_route_version(other["id"], store.routing_snapshot(other["id"], "test"))
     assert first.version_no == other_version.version_no == 1
 
 
-def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path: Path, monkeypatch):
+def test_task_and_org_code_form_independent_knowledge_scopes(tmp_path: Path):
+    url = f"sqlite:///{tmp_path / 'org-scopes.sqlite3'}"; upgrade(url)
+    store = V7Store(url); store.seed()
+    first_library = store.create_knowledge_library("范围一", "qa")
+    second_library = store.create_knowledge_library("范围二", "qa")
+    project = store.create_project("知识范围项目")
+    first_task = store.create_project_task(project["id"], "knowledge_qa", "主问答", "qa")
+    deployment = bind_institution(store, project["id"], "机构 A", "INST-A")
+    profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
+    first_channel = store.create_deployment_task(deployment["id"], first_task["id"], profile["id"])
+    second_task = store.create_project_task(project["id"], "knowledge_qa_secondary", "辅助问答", "qa")
+    second_channel = store.create_deployment_task(deployment["id"], second_task["id"], profile["id"])
+
+    first_route = store.put_deployment_route(
+        first_channel["id"], "ORG-A", "范围 A", [first_library["id"]],
+    )
+    store.put_deployment_route(first_channel["id"], "INST-A", "机构默认范围", [second_library["id"]])
+    store.put_deployment_route(second_channel["id"], "ORG-A", "辅助范围 A", [second_library["id"]])
+    updated = store.put_deployment_route(
+        first_channel["id"], "ORG-A", "范围 A 更新", [second_library["id"], first_library["id"]],
+    )
+
+    assert updated["id"] == first_route["id"]
+    authorizations = store.list_authorizations(deployment["id"])
+    assert len(authorizations) == 3
+    assert {
+        (item["task_code"], item["org_code"]): item["knowledge_library_ids"]
+        for item in authorizations
+    } == {
+        ("knowledge_qa", "INST-A"): [second_library["id"]],
+        ("knowledge_qa", "ORG-A"): [second_library["id"], first_library["id"]],
+        ("knowledge_qa_secondary", "ORG-A"): [second_library["id"]],
+    }
+    snapshot = store.routing_snapshot(deployment["id"], "test")
+    assert snapshot["deployment"]["institution_code"] == "INST-A"
+    assert {(item["task_code"], item["org_code"]) for item in snapshot["routes"]} == {
+        ("knowledge_qa", "INST-A"),
+        ("knowledge_qa", "ORG-A"),
+        ("knowledge_qa_secondary", "ORG-A"),
+    }
+
+
+def test_institution_freeze_locks_institution_code_and_does_not_create_package(tmp_path: Path, monkeypatch):
     url = f"sqlite:///{tmp_path / 'freeze.sqlite3'}"; upgrade(url)
     store = V7Store(url); store.seed()
     docs = store.create_document_library("冻结资料")
@@ -323,13 +391,10 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
         }], asset_count=1, asset_digest="f" * 64)
     project = seeded_qa_project(store)
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
-    deployment = store.create_deployment(
-        project["id"], "hospital-freeze", "冻结医院", "local", "",
-        institution_name="冻结医院", institution_code="FREEZE001",
-    )
+    deployment = bind_institution(store, project["id"], "冻结医院", "FREEZE001")
     profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
     deployment_task = store.create_deployment_task(deployment["id"], task["id"], profile["id"])
-    store.put_deployment_route(deployment_task["id"], "FREEZE001", "冻结医院", [library["id"]])
+    store.put_deployment_route(deployment_task["id"], "FREEZE-SCOPE", "冻结知识范围", [library["id"]])
     frozen = store.freeze_route_version(deployment["id"], "test")
     assert frozen["status"] == "frozen"
     assert store.route_version_detail(deployment["id"], frozen["version_no"])["assets"]
@@ -337,6 +402,7 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
     production_frozen = store.freeze_route_version(deployment["id"], "production")
     production_draft = store.create_institution_release_draft(
         deployment["deployment_id"], "institution_release", release_stage="production",
+        target_institution_code=deployment["institution_code"],
         route_version_ids=[production_frozen["id"]],
     )
     production_plan = InstitutionReleasePlanner(store).plan(production_draft["id"])
@@ -345,6 +411,7 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
     with pytest.raises(ValueError, match="不能混合测试环境和生产环境"):
         store.create_institution_release_draft(
             deployment["deployment_id"], "institution_release",
+            target_institution_code=deployment["institution_code"],
             route_version_ids=[frozen["id"], production_frozen["id"]],
         )
     monkeypatch.setenv("DATAFORGE_INSTANCE_MODE", "central")
@@ -374,11 +441,12 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
         second_binding["id"], second_task["id"], profile["id"],
     )
     store.put_deployment_route(
-        second_deployment_task["id"], "FREEZE001", "冻结医院", [library["id"]],
+        second_deployment_task["id"], "FREEZE-SCOPE", "共享冻结知识范围", [library["id"]],
     )
     second_frozen = store.freeze_route_version(second_binding["id"], "test")
     draft = store.create_institution_release_draft(
         deployment["deployment_id"], "deployment_seed",
+        target_institution_code=deployment["institution_code"],
         route_version_ids=[frozen["id"], second_frozen["id"]],
     )
     required_asset_id = store.route_version_detail(
@@ -412,6 +480,7 @@ def test_institution_freeze_locks_org_code_and_does_not_create_package(tmp_path:
         session.get(KnowledgeAssetVersion, other_asset_id).collection_name = required_asset.collection_name
     conflict_draft = store.create_institution_release_draft(
         deployment["deployment_id"], "institution_release",
+        target_institution_code=deployment["institution_code"],
         route_version_ids=[frozen["id"], second_frozen["id"]],
         extra_asset_version_ids=[other_asset_id],
     )
@@ -456,7 +525,8 @@ def test_manifest_v2_requires_project_routes_and_rejects_secrets():
         "source_instance_version": "7.0.0", "required_features": ["immutable_asset_versions"],
         "operator_versions": [], "storage_contract_versions": [],
         "base_release_id": None, "base_manifest_digest": None,
-        "deployment": {"id": "dep-1", "code": "hospital-a"},
+        "deployment": {"id": "dep-1", "code": "hospital-a", "scope": "institution",
+                       "institution_code": "INST-A"},
         "projects": [{"project_deployment_id": "pd-1", "route_version": 1,
                       "route_snapshot": {"schema_version": 3}}],
         "scope": {"deployment_count": 1, "knowledge_library_ids": ["kl-1"]},
@@ -466,8 +536,58 @@ def test_manifest_v2_requires_project_routes_and_rejects_secrets():
         "diff_summary": {}, "tombstones": [],
     }
     assert validate_manifest(value)["schema_version"] == 2
+    with pytest.raises(ValueError, match="institution_code"):
+        validate_manifest({**value, "deployment": {"id": "dep-1", "code": "hospital-a",
+                                                     "scope": "institution"}})
     with pytest.raises(ValueError, match="敏感字段"):
         validate_manifest({**value, "milvus_preset": {"token": "leak"}})
+
+
+def test_institution_release_target_code_is_verified_for_draft_and_local_import(tmp_path: Path):
+    central_url = f"sqlite:///{tmp_path / 'target-central.sqlite3'}"; upgrade(central_url)
+    central = V7Store(central_url); central.seed()
+    deployment = central.create_shared_deployment(institution_name="机构 A", institution_code="INST-A")
+    library = central.create_knowledge_library("目标校验知识", "text")
+    with pytest.raises(ValueError, match="institution_code 与 Deployment 不匹配"):
+        central.create_institution_release_draft(
+            deployment["id"], "knowledge_update", target_institution_code="INST-B",
+            knowledge_library_ids=[library["id"]],
+        )
+    draft = central.create_institution_release_draft(
+        deployment["id"], "knowledge_update", target_institution_code="INST-A",
+        knowledge_library_ids=[library["id"]],
+    )
+    assert draft["target_institution_code"] == "INST-A"
+    central.patch_shared_deployment(deployment["id"], institution_code="INST-B")
+    with pytest.raises(ValueError, match="institution_code 与目标 Deployment 不匹配"):
+        InstitutionReleasePlanner(central).plan(draft["id"])
+
+    local_url = f"sqlite:///{tmp_path / 'target-local.sqlite3'}"; upgrade(local_url)
+    local = V7Store(local_url); local.seed()
+    local_settings = Settings(
+        project_root=tmp_path, state_dir=tmp_path / "target-local-state", database_url=local_url,
+        instance_mode="local", instance_code="institution-a",
+    )
+    local_instance = InstanceContext.load(local, local_settings)
+    local_deployment = local.create_shared_deployment(institution_name="机构 A", institution_code="INST-A")
+    matching_manifest = {
+        "schema_version": 2, "manifest_schema_version": 2, "package_kind": "institution_release",
+        "deployment": {"id": local_deployment["id"], "scope": "institution",
+                       "institution_code": "INST-A"},
+    }
+    with pytest.raises(ValueError, match="未初始化"):
+        validate_local_package_target(local, local_instance, matching_manifest)
+    local_instance = local_instance.bind_seed(local, local_deployment["id"], "central")
+    validate_local_package_target(local, local_instance, matching_manifest)
+    with pytest.raises(ValueError, match="institution_code.*不匹配"):
+        validate_local_package_target(local, local_instance, {
+            **matching_manifest,
+            "deployment": {**matching_manifest["deployment"], "institution_code": "INST-B"},
+        })
+    with pytest.raises(ValueError, match="第二次导入"):
+        validate_local_package_target(local, local_instance, {
+            **matching_manifest, "package_kind": "deployment_seed",
+        })
 
 
 def test_local_milvus_credentials_are_encrypted_and_changes_clear_verification(tmp_path: Path, monkeypatch):
@@ -485,30 +605,29 @@ def test_local_milvus_credentials_are_encrypted_and_changes_clear_verification(t
     )
     created = service.put(
         instance.id, "candidate_target", uri="http://milvus.local:19531",
-        username="operator", secret="private-token",
+        token="private-token",
     )
-    assert created["secret_configured"] is True and "secret" not in created
-    assert service.resolve(instance.id, "candidate_target").token == "operator:private-token"
+    assert created["token_configured"] is True and "token" not in created
+    assert service.resolve(instance.id, "candidate_target").token == "private-token"
 
     class Client:
         @staticmethod
         def list_collections(): return []
 
     class Milvus:
-        def client(self): return Client()
+        def list_collections(self): return Client.list_collections()
 
     verified = service.verify(instance.id, "candidate_target", factory=lambda _uri, _token: Milvus())
     assert verified["status"] == "verified" and verified["verified_fingerprint"]
     changed = service.put(
         instance.id, "candidate_target", uri="http://milvus-new.local:19531",
-        username="operator",
     )
     assert changed["status"] == "pending_verification"
-    assert changed["verified_fingerprint"] is None and changed["secret_configured"] is True
+    assert changed["verified_fingerprint"] is None and changed["token_configured"] is True
     service.verify(instance.id, "candidate_target", factory=lambda _uri, _token: Milvus())
     promoted = service.promote_candidate(instance.id)
-    assert promoted["status"] == "verified" and promoted["secret_configured"] is True
-    assert service.resolve(instance.id, "current_target").token == "operator:private-token"
+    assert promoted["status"] == "verified" and promoted["token_configured"] is True
+    assert service.resolve(instance.id, "current_target").token == "private-token"
 
 
 def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_route(
@@ -544,17 +663,15 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
 
     project = seeded_qa_project(central)
     task = next(value for value in project["tasks"] if value["code"] == "knowledge_qa")
-    deployment = central.create_deployment(
-        project["id"], "hospital-v2", "医院 V2", "local", "",
-        institution_name="医院 V2", institution_code="V2001",
-    )
+    deployment = bind_institution(central, project["id"], "医院 V2", "V2001")
     profile = next(value for value in central.list_index_profiles() if value["code"] == "qa-question")
     deployment_task = central.create_deployment_task(deployment["id"], task["id"], profile["id"],
         final_top_k=3, reranker_serving_code="bge_reranker_large")
     central.put_deployment_route(deployment_task["id"], "V2001", "医院 V2", [library_id])
     frozen = central.freeze_route_version(deployment["id"], "test")
     draft = central.create_institution_release_draft(
-        deployment["deployment_id"], "deployment_seed", route_version_ids=[frozen["id"]],
+        deployment["deployment_id"], "deployment_seed",
+        target_institution_code=deployment["institution_code"], route_version_ids=[frozen["id"]],
     )
     release_plan = InstitutionReleasePlanner(central).plan(draft["id"])
     release = central.freeze_institution_release_snapshot(draft["id"], release_plan)
@@ -633,7 +750,7 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         def list_collections(): return []
 
     class HealthMilvus:
-        def client(self): return HealthClient()
+        def list_collections(self): return HealthClient.list_collections()
 
     local_config.verify(
         local_instance.id, "candidate_target", factory=lambda _uri, _token: HealthMilvus(),
@@ -725,7 +842,8 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
             "content_hash": item["content_hash"],
         }], asset_count=1, asset_digest="d" * 64)
     update_draft = central.create_institution_release_draft(
-        deployment["deployment_id"], "knowledge_update", knowledge_library_ids=[library_id],
+        deployment["deployment_id"], "knowledge_update",
+        target_institution_code=deployment["institution_code"], knowledge_library_ids=[library_id],
     )
     update_plan = InstitutionReleasePlanner(central).plan(update_draft["id"])
     update_release = central.freeze_institution_release_snapshot(update_draft["id"], update_plan)
@@ -894,17 +1012,12 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
             "vector_id": f'vec-{sync["index_profile_id"]}', "content_hash": item["content_hash"]}])
     project = seeded_qa_project(central)
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
-    deployment = central.create_deployment(
-        project["id"], "hospital-a", "医院 A", "central", "",
-        institution_name="医院 A", institution_code="KM001",
-    )
+    deployment = bind_institution(central, project["id"], "医院 A", "KM001")
     qa_question_profile = next(item for item in central.list_index_profiles() if item["code"] == "qa-question")
     deployment_task = central.create_deployment_task(deployment["id"], task["id"], qa_question_profile["id"])
     central.put_deployment_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
     central.create_route_version(deployment["id"], central.routing_snapshot(deployment["id"], "test"), status="published")
-    other_target = central.create_milvus_target("hospital-b", "http://hospital-b-secret:19530")
-    other_deployment = central.create_deployment(project["id"], "hospital-b-secret", "医院 B 私有部署", "local", other_target["id"],
-                                                 institution_name="医院 B", institution_code="KM002")
+    other_deployment = bind_institution(central, project["id"], "医院 B", "KM002")
     other_task = central.create_deployment_task(other_deployment["id"], task["id"], qa_question_profile["id"])
     central.put_deployment_route(other_task["id"], "KM002", "医院 B", [library["id"]])
     plan = MigrationPlanner(central).plan(deployment["id"], [library["id"]])

@@ -1,7 +1,6 @@
 """Live Milvus inventory joined with immutable DataForge asset metadata."""
 from __future__ import annotations
 
-import os
 import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -53,13 +52,8 @@ class MilvusInventoryService:
         return message
 
     @classmethod
-    def from_environment(cls, store: V7Store) -> "MilvusInventoryService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        return cls(
-            store,
-            V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None,
-            target=uri,
-        )
+    def from_connection(cls, store: V7Store, connection) -> "MilvusInventoryService":
+        return cls(store, V7Milvus(connection.uri, connection.token), target=connection.uri)
 
     @staticmethod
     def _observed_contract(actual: dict[str, Any]) -> tuple[int | None, str | None, set[str]]:
@@ -127,7 +121,7 @@ class MilvusInventoryService:
 
     def _build(self, *, only_managed: bool = False) -> list[dict[str, Any]]:
         if not self.milvus:
-            raise RuntimeError("DATAFORGE_MILVUS_URI 未配置")
+            raise RuntimeError("当前实例未配置 verified Authoring Target")
         metadata = self.store.vector_inventory_metadata()
         managed_by_name = metadata["managed_collections"]
         assets = metadata["assets"]
@@ -248,7 +242,7 @@ class MilvusInventoryService:
                 "partition_count": 0, "entity_count": 0,
                 "inconsistent_count": 0, "unmanaged_count": 0,
                 "error_code": "MILVUS_NOT_CONFIGURED",
-                "error_message": "当前实例没有配置 DATAFORGE_MILVUS_URI",
+                "error_message": "当前实例没有配置 verified Authoring Target",
             }
         try:
             rows = self._build()
@@ -319,7 +313,7 @@ class MilvusInventoryService:
 
     def verify_partition(self, collection_name: str, partition_name: str) -> dict[str, Any]:
         if not self.milvus:
-            raise RuntimeError("DATAFORGE_MILVUS_URI 未配置")
+            raise RuntimeError("当前实例未配置 verified Authoring Target")
         asset = self.store.vector_partition_metadata(collection_name, partition_name)
         if not asset:
             raise ValueError("未托管 Partition 没有可校验的 AssetVersion")
@@ -361,7 +355,7 @@ class MilvusInventoryService:
 
     def load_partition(self, collection_name: str, partition_name: str) -> dict[str, Any]:
         if not self.milvus:
-            raise RuntimeError("DATAFORGE_MILVUS_URI 未配置")
+            raise RuntimeError("当前实例未配置 verified Authoring Target")
         self._assert_manageable(collection_name, partition_name)
         try:
             self.milvus.load_partition(collection_name, partition_name)
@@ -371,7 +365,7 @@ class MilvusInventoryService:
 
     def release_partition(self, collection_name: str, partition_name: str) -> dict[str, Any]:
         if not self.milvus:
-            raise RuntimeError("DATAFORGE_MILVUS_URI 未配置")
+            raise RuntimeError("当前实例未配置 verified Authoring Target")
         self._assert_manageable(collection_name, partition_name)
         try:
             self.milvus.release_partition(collection_name, partition_name)

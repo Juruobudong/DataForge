@@ -118,6 +118,10 @@ class V7Milvus:
         """List the current Milvus collections without inferring ownership."""
         return sorted(str(name) for name in self.client().list_collections())
 
+    def check_connection(self) -> str:
+        """Probe Milvus without reading Collection metadata."""
+        return str(self.client().get_server_version())
+
     def inspect_collection(self, collection_name: str) -> dict[str, Any]:
         """Return live collection metadata without scanning entity payloads."""
         client = self.client()
@@ -515,24 +519,26 @@ def vector_id(profile_code: str, knowledge_library_id: str, source_knowledge_id:
 class VectorSyncService:
     def __init__(self, store: V7Store, *, milvus: V7Milvus | None = None,
                  embeddings: EmbeddingProvider | None = None,
-                 embedding_registry: EmbeddingServingRegistry | None = None):
+                 embedding_registry: EmbeddingServingRegistry | None = None,
+                 connection=None):
         self.store = store
         self.milvus = milvus
         self.embeddings = embeddings
         self.embedding_registry = embedding_registry
+        self.connection = connection
 
     @classmethod
-    def from_environment(cls, store: V7Store) -> "VectorSyncService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        if not uri:
-            return cls(store)
+    def from_connection(cls, store: V7Store, connection) -> "VectorSyncService":
         capacity_limit = int(os.getenv("DATAFORGE_COLLECTION_CAPACITY_LIMIT", "0")) or None
         threshold = float(os.getenv("DATAFORGE_COLLECTION_CAPACITY_THRESHOLD", "0.8"))
         settings = Settings.load()
         registry = EmbeddingServingRegistry(ServingManager(store.sessions, settings.config_encryption_key))
-        return cls(store,
-                   milvus=V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"), capacity_limit=capacity_limit, capacity_threshold=threshold),
-                   embedding_registry=registry)
+        return cls(
+            store,
+            milvus=V7Milvus(connection.uri, connection.token, capacity_limit=capacity_limit,
+                            capacity_threshold=threshold),
+            embedding_registry=registry, connection=connection,
+        )
 
     @staticmethod
     def _input(embedding_input: str, item) -> str:
@@ -580,9 +586,15 @@ class VectorSyncService:
             except ValueError as exc:
                 return self.store.finish_vector_sync(sync_job_id, [], str(exc))
         if not self.milvus or not provider:
-            return self.store.finish_vector_sync(sync_job_id, [], "未配置 DATAFORGE_MILVUS_URI 或可用 Embedding Serving，不能标记 Vector Ready")
+            return self.store.finish_vector_sync(sync_job_id, [], "未配置 verified Authoring Target 或可用 Embedding Serving，不能标记 Vector Ready")
         partition_name = asset.partition_name if asset else library.partition_name
         try:
+            if asset and self.connection:
+                revision_id = self.connection.revision_id \
+                    if not str(self.connection.target_id or "").startswith("local:") else None
+                self.store.freeze_asset_authoring_connection(
+                    job.id, revision_id, self.connection.fingerprint,
+                )
             expected_dimension = asset.embedding_dimension if asset and asset.embedding_dimension else embedding.dimension
             model_name = asset.embedding_model if asset and asset.embedding_model else embedding.model
             if serving_config and serving_config.dimension != expected_dimension:
@@ -646,20 +658,20 @@ class VectorSyncService:
         names = sorted({item["collection_name"] for item in active if item["code"] != "graph"})
         if not self.milvus:
             return skipped + [{"collection_name": name, "available": False, "reason": "Milvus 未配置"} for name in names]
-        checked = [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names)]
-        return skipped + checked
+        existing = set(self.milvus.list_collections())
+        missing = [{
+            "collection_name": name, "available": False, "reason": "Collection 尚未创建",
+        } for name in names if name not in existing]
+        checked = [{"collection_name": item.collection_name, "entity_count": item.entity_count, "capacity_limit": item.capacity_limit, "threshold": item.threshold, "alert": item.alert, "available": True} for item in (self.milvus.capacity(name) for name in names if name in existing)]
+        return skipped + missing + checked
 
 
 class KnowledgeAssetGcService:
     """Explicit, allowlisted deletion of unreferenced versioned Partitions."""
 
-    def __init__(self, store: V7Store, milvus: V7Milvus | None = None):
+    def __init__(self, store: V7Store, milvus: V7Milvus | None = None, *, resolver=None):
         self.store, self.milvus = store, milvus
-
-    @classmethod
-    def from_environment(cls, store: V7Store) -> "KnowledgeAssetGcService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
+        self.resolver = resolver
 
     def run(self, job_id: str) -> dict[str, Any]:
         context = self.store.knowledge_asset_gc_context(job_id)
@@ -668,13 +680,19 @@ class KnowledgeAssetGcService:
         deleted: list[str] = []
         try:
             for item in context["plan"].get("eligible", []):
+                milvus = self.milvus
+                if item.get("authoring_target_revision_id") and self.resolver:
+                    connection = self.resolver.revision(item["authoring_target_revision_id"])
+                    milvus = connection.client()
+                if not milvus:
+                    raise ValueError("AssetVersion 缺少可解析的 Authoring Target")
                 partition = str(item["partition_name"])
                 if "__v" not in partition:
                     raise ValueError(f"拒绝删除非版本化 Partition：{partition}")
                 collection = str(item["collection_name"])
-                if self.milvus.partition_exists(collection, partition):
-                    self.milvus.drop_partition(collection, partition)
-                if self.milvus.partition_exists(collection, partition):
+                if milvus.partition_exists(collection, partition):
+                    milvus.drop_partition(collection, partition)
+                if milvus.partition_exists(collection, partition):
                     raise ValueError(f"Partition 删除后仍存在：{collection}/{partition}")
                 deleted.append(str(item["asset_version_id"]))
             return self.store.finish_knowledge_asset_gc_job(job_id, deleted)
@@ -686,16 +704,11 @@ class VectorDeletionService:
     def __init__(self, store: V7Store, milvus: V7Milvus | None = None):
         self.store, self.milvus = store, milvus
 
-    @classmethod
-    def from_environment(cls, store: V7Store) -> "VectorDeletionService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if uri else None)
-
     def run(self, deletion_job_id: str) -> dict[str, Any]:
         try:
             context = self.store.vector_deletion_context(deletion_job_id)
             if not self.milvus:
-                return self.store.finish_vector_deletion(deletion_job_id, "未配置 DATAFORGE_MILVUS_URI，不能清理向量记录")
+                return self.store.finish_vector_deletion(deletion_job_id, "未配置可解析的 Milvus 连接，不能清理向量记录")
             self.milvus.delete(context["profile"].collection_name, context["library"].partition_name,
                                context["profile"].fields_json["id"], context["job"].vector_ids)
             return self.store.finish_vector_deletion(deletion_job_id)
@@ -708,18 +721,11 @@ class LibraryDeletionService:
     def __init__(self, store: V7Store, milvus: V7Milvus | None = None):
         self.store, self.milvus = store, milvus
 
-    @classmethod
-    def from_environment(cls, store: V7Store) -> "LibraryDeletionService":
-        uri = os.getenv("DATAFORGE_MILVUS_URI")
-        if not uri:
-            return cls(store)
-        return cls(store, V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN")))
-
     def run(self, deletion_job_id: str) -> dict[str, Any]:
         try:
             context = self.store.library_deletion_context(deletion_job_id)
             if not self.milvus:
-                return self.store.finish_library_deletion(deletion_job_id, "未配置 DATAFORGE_MILVUS_URI，不能清理 V7 Partition")
+                return self.store.finish_library_deletion(deletion_job_id, "未配置可解析的 Milvus 连接，不能清理 V7 Partition")
             library = context["library"]
             for profile in context["profiles"]:
                 self.milvus.drop_partition(profile.collection_name, library.partition_name)

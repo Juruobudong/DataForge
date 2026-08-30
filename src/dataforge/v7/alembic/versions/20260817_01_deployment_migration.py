@@ -122,14 +122,8 @@ def _seed_control_plane(bind) -> dict[str, str]:
             "INSERT INTO deployments (id,code,name,scope,institution_name,institution_code,release_stage,status,created_at,updated_at) "
             "VALUES (:id,'dataforge-central','DataForge 中心环境','central',NULL,NULL,'test','active',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
         ), {"id": deployment_id})
-    for stage, target_id in (("test", target_specs[0][0]), ("production", target_specs[1][0])):
-        row_id = f"deployment_target_dataforge_central_{stage}"
-        if not bind.execute(sa.text("SELECT 1 FROM deployment_targets WHERE id=:id"), {"id": row_id}).first():
-            bind.execute(sa.text(
-                "INSERT INTO deployment_targets "
-                "(id,deployment_id,release_stage,target_kind,milvus_target_id,created_at,updated_at) "
-                "VALUES (:id,:deployment,:stage,'milvus',:target,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
-            ), {"id": row_id, "deployment": deployment_id, "stage": stage, "target": target_id})
+    # Targets are registered only. A verified connection revision must exist
+    # before application code creates any DeploymentTarget binding.
     if not bind.execute(sa.text("SELECT 1 FROM dataforge_instances LIMIT 1")).first():
         mode = os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower()
         if mode not in {"central", "local"}:

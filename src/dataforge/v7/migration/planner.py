@@ -160,6 +160,9 @@ class InstitutionReleasePlanner:
             deployment = session.get(Deployment, draft.target_deployment_id)
             if not deployment or deployment.scope != "institution" or not deployment.institution_code:
                 raise ValueError("机构发布目标身份不完整")
+            target_code = (draft.selection_json or {}).get("target_institution_code")
+            if not target_code or target_code != deployment.institution_code:
+                raise ValueError("机构发布草稿的 institution_code 与目标 Deployment 不匹配")
             project_links = list(session.scalars(select(InstitutionReleaseDraftProject).where(
                 InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
             ).order_by(InstitutionReleaseDraftProject.created_at)))

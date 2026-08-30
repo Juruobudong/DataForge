@@ -1,6 +1,6 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-28
+更新日期：2026-08-30
 
 问答 Provider 分离（2026-08-28）：默认原生 `qa-extractor v1`，Advanced 另选上游 `Text2QAGenerator v8`；提示词、业务参数与 Provider 分离，共用结构约束、有限恢复和诊断。本地完整 Debug 调用 `.34` 真实 Qwen3-32B：原生三轮共15块、DataFlow一轮5块均成功；未部署新版容器。见[实施记录](wiki/sources/qa-provider-separation-2026-08-28.md)。
 
@@ -48,13 +48,13 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
 | 业务工作区 | 向量存储：Collection/Partition 库存、资产映射与受控运维 | `DONE` | 实时聚合 Milvus 与 AssetVersion/Routing/Release/GC；普通刷新只读 stats，显式 verify 持久化最近 count/digest；load/release 仅限严格受管版本 Partition，无任意 drop。`.34` 真实对账仍为 `CONNECT`。 |
-| 业务工作区 | Milvus 服务注册表与自动连接验证 | `LOCAL` | 中心支持服务列表、新增、改名、候选改址与只读 `list_collections` 验证；只有 verified 服务可绑定中心环境。机构 Milvus 不进中心注册表，由 local 保存 Candidate 时自动验证。真实 `.34` 连通仍为 `CONNECT`。 |
+| 业务工作区 | Milvus Connection Contract 与启动健康复核 | `LOCAL` | 中心 Target 使用不可变 URI/加密 Token Revision、CAS `list_collections` 验证和实例级 Authoring 绑定；central 正式数据库 API 启动 30 秒后并行复核内置测试/生产 current，健康失败不撤销 verified Revision 或绑定，页面也可人工复核。Seed 不绑定，机构 Milvus 不进中心，由 local URI/Token Candidate 使用相同 CAS。真实 `.34` 启动检查与双绑定仍为 `CONNECT`。 |
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
-| 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 由每次 Routing 操作显式选择并独立显示历史；Central live publish，中心侧 institution deferred freeze；机构 code 自动生成，知识范围顺序即 priority，技术对象进入帮助/高级信息。 |
+| 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 显式隔离；知识范围按 `(Task, org_code)` 多范围保存。API 环境变量提供有序 org 建议项，默认 `KMDSRMYY/XMSZ`，选择只填充名称/编码，仍可自定义且不关联机构码。 |
 | 业务工作区 | 项目发布：检索调试 | `LOCAL` | Draft/Published/Historical 七阶段只读检索、临时实验、冻结正文/Evidence、重排失败停止；不做聊天、不改消费端。真实推理及浏览器视觉验收未完成。见[实施记录](wiki/sources/reranker-retrieval-debug-2026-08-28.md)。 |
 | 业务工作区 | Public Retrieval v1 与统一检索测试台 | `LOCAL` | Published-only contract/query、独立 Retrieval Token、白名单业务 DTO、管理员公共测试与技术双模式已实现；qa_agent/kg 尚未迁移，`.34` 真实 Bearer/Milvus/浏览器验收为 `CONNECT`。见[实施记录](wiki/sources/public-retrieval-gateway-2026-08-29.md)。 |
-| 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | `.dfm` v2、项目资产锁定与额外 AssetVersion、结构化冲突门禁、模板闭包、正常 waiting、Prepare target fingerprint、Partition count/digest Activation Preflight 和逐项目/非原子批量激活已本地验证；`.34` 真实服务验收仍为 `CONNECT`。 |
+| 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | 草稿显式校验 Deployment ID 与 `institution_code`，`.dfm` v2 和 local 导入复验机构目标；项目资产锁定、额外 AssetVersion、结构化冲突、模板闭包、waiting、Prepare fingerprint 与逐项目激活已实现，`.34` 仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding/Reranker 独立持久化、Secret 脱敏、真实测试接口、默认/启停/引用管理；Reranker 使用 bge-reranker-large，真实 `.34` 推理仍为 `CONNECT`。 |

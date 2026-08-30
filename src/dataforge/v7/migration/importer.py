@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import os
 import shutil
 import zipfile
 from datetime import datetime
@@ -20,9 +19,10 @@ from ..models import (
     KnowledgeFlowTemplateRevision, KnowledgeIndexProfile, KnowledgeType,
     KnowledgeTypeIndexBinding, KnowledgeTypeModeRevision, KnowledgeTypeRevision,
     KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeItemSource, KnowledgeLibrary,
+    KnowledgeMigrationJob,
     OperatorDefinition, OperatorVersion, PromptTemplate, PromptTemplateRevision,
     QualityProfile, QualityProfileRevision,
-    Deployment, MilvusTarget, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
+    Deployment, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
     ProjectOrgRouteLibrary, ProjectTask, Source, SourceChunk, SourceChunkRevision,
     SourceReviewSnapshot, SourceReviewSnapshotChunk, SourceVersion, StorageContract,
     StorageContractRevision,
@@ -97,6 +97,28 @@ def _upsert(session, model, payload: dict[str, Any], *, immutable: tuple[str, ..
             if getattr(current, key) != values.get(key): raise ValueError(f"{model.__tablename__} {values['id']} 定义不兼容")
         return current
     current = model(**values); session.add(current); return current
+
+
+def validate_local_package_target(store: V7Store, instance: InstanceContext,
+                                  manifest: dict[str, Any]) -> None:
+    schema_version = int(manifest.get("manifest_schema_version") or manifest.get("schema_version", 1))
+    if schema_version != 2:
+        return
+    deployment = manifest.get("deployment") or {}
+    target_id = str(deployment.get("id") or "").strip()
+    target_code = str(deployment.get("institution_code") or "").strip()
+    if deployment.get("scope") != "institution" or not target_id or not target_code:
+        raise ValueError("迁移包缺少有效的机构发布目标 institution_code")
+    if manifest.get("package_kind") == "deployment_seed":
+        if instance.bound_deployment_id:
+            raise ValueError("本地实例已经初始化，禁止第二次导入 deployment_seed")
+        return
+    if not instance.bound_deployment_id:
+        raise ValueError("未初始化的 local 实例不能导入 Institution Release 或 Knowledge Update")
+    with store.sessions() as session:
+        bound = session.get(Deployment, instance.bound_deployment_id)
+        if (not bound or bound.id != target_id or bound.institution_code != target_code):
+            raise ValueError("迁移包 institution_code 与本地绑定的机构发布目标不匹配")
 
 
 class MigrationImporter:
@@ -232,6 +254,7 @@ class MigrationImporter:
         schema_version = int(manifest.get("manifest_schema_version") or manifest.get("schema_version", 1))
         if schema_version != 2:
             return
+        validate_local_package_target(self.store, self.instance, manifest)
         from ... import __version__ as dataforge_version
         current = self._version_tuple(dataforge_version)
         if current < self._version_tuple(manifest["minimum_dataforge_version"]):
@@ -296,7 +319,7 @@ class MigrationImporter:
         preset = (manifest.get("deployment") or {}).get("milvus_preset") or {}
         uri = str(preset.get("uri") or "").strip()
         if uri:
-            self.local_config.put(self.instance.id, "package_preset", uri=uri, preserve_secret=False)
+            self.local_config.put(self.instance.id, "package_preset", uri=uri, preserve_token=False)
 
     def _resolve_import_target(self, job_id: str, checkpoint: dict[str, Any]) -> dict[str, Any] | None:
         if not self.local_config:
@@ -481,13 +504,9 @@ class MigrationImporter:
                 deployment_payload = dict(control["deployment"])
                 deployment_payload["release_stage"] = "test"
                 deployment = _upsert(session, Deployment, deployment_payload)
-                local_uri = str(getattr(self.milvus, "uri", "") or os.getenv("DATAFORGE_MILVUS_URI", "")).strip()
-                if not local_uri:
-                    existing_target = session.scalar(select(MilvusTarget).order_by(MilvusTarget.created_at))
-                    local_uri = str(existing_target.milvus_url if existing_target else "").strip()
-                if not local_uri:
-                    raise ValueError("local 实例没有 Milvus Target URI")
-                self.store._put_stage_target(session, deployment, "test", local_uri)
+                # Legacy v1 may carry a Deployment, but institution Milvus is
+                # still resolved from local current_target and never written as
+                # a central DeploymentTarget.
                 project_deployment = _upsert(session, ProjectDeployment, control["project_deployment"])
                 for payload in control["tasks"]: _upsert(session, ProjectTask, payload)
                 for payload in control["deployment_tasks"]: _upsert(session, ProjectDeploymentTask, payload)
@@ -989,6 +1008,9 @@ class MigrationImporter:
             for collection, partitions in manifest["collections"].items() for part in partitions
         }
         with self.store.sessions.begin() as session:
+            migration_job = session.get(KnowledgeMigrationJob, job_id)
+            local_target_fingerprint = str((migration_job.checkpoint_json or {}).get("active_target_fingerprint") or "") \
+                if migration_job else ""
             for source_asset_id, asset in assets.items():
                 source_library_id = asset["knowledge_library_id"]
                 if source_library_id not in selected:
@@ -1019,6 +1041,7 @@ class MigrationImporter:
                     "embedding_model": asset.get("embedding_model"),
                     "embedding_dimension": asset.get("embedding_dimension"),
                     "collection_name": collection, "partition_name": partition_name,
+                    "authoring_connection_fingerprint": local_target_fingerprint or None,
                 }
                 if current:
                     if any(getattr(current, key) != value for key, value in expected.items()):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,18 +17,10 @@ from .vector import V7Milvus
 class RoutingDeliveryService:
     """Copy only the partitions referenced by one immutable routing candidate."""
 
-    def __init__(self, store: V7Store, backup_dir: Path | None = None):
+    def __init__(self, store: V7Store, backup_dir: Path | None = None, *, resolver=None):
         self.store = store
         self.backup_dir = backup_dir
-
-    @staticmethod
-    def _token(stage: str) -> str | None:
-        name = (
-            "DATAFORGE_PRODUCTION_MILVUS_TOKEN"
-            if stage == "production"
-            else "DATAFORGE_TEST_MILVUS_TOKEN"
-        )
-        return os.getenv(name) or os.getenv("DATAFORGE_MILVUS_TOKEN")
+        self.resolver = resolver
 
     @staticmethod
     def _partitions(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -44,27 +35,22 @@ class RoutingDeliveryService:
                         or ""
                     )
                     if collection and partition:
-                        unique[(collection, partition)] = index
+                        value = dict(index)
+                        if library.get("authoring_target_revision_id"):
+                            value["authoring_target_revision_id"] = library["authoring_target_revision_id"]
+                        if library.get("authoring_connection_fingerprint"):
+                            value["authoring_connection_fingerprint"] = library["authoring_connection_fingerprint"]
+                        unique[(collection, partition)] = value
         return [unique[key] for key in sorted(unique)]
 
     def sync(self, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         stage = str(snapshot.get("release_stage") or "")
         if stage not in {"test", "production"}:
             raise ValueError("RoutingSnapshot release_stage 无效")
-        if stage == "test":
-            return []
-        deployment_id = str((snapshot.get("deployment") or {}).get("id") or "")
-        values = self.store.list_shared_deployments(allowed_deployment_id=deployment_id)
-        if len(values) != 1:
-            raise ValueError("RoutingSnapshot Deployment 不存在")
-        stage_targets = values[0].get("stage_targets") or {}
-        source_uri = str((stage_targets.get("test") or {}).get("milvus_url") or "")
-        target_uri = str((stage_targets.get("production") or {}).get("milvus_url") or "")
-        if not source_uri or not target_uri:
-            raise ValueError("Deployment 缺少 test 或 production Milvus Target")
-
-        source = V7Milvus(source_uri, self._token("test"))
-        target = V7Milvus(target_uri, self._token("production"))
+        if not self.resolver:
+            raise ValueError("Routing Delivery 缺少 Milvus Connection Resolver")
+        target_connection = self.resolver.snapshot(snapshot)
+        target = V7Milvus(target_connection.uri, target_connection.token)
         results: list[dict[str, Any]] = []
         backup_root = None
         backup_manifest: dict[str, Any] = {
@@ -110,6 +96,11 @@ class RoutingDeliveryService:
                 partition = str(index["partition_name"])
                 profile_revision_id = str(index.get("index_profile_revision_id") or "")
                 embedding = index.get("embedding") or {}
+                source_revision_id = str(index.get("authoring_target_revision_id") or "")
+                if not source_revision_id:
+                    raise ValueError(f"AssetVersion {partition} 缺少 Authoring Target Revision")
+                source_connection = self.resolver.revision(source_revision_id)
+                source = V7Milvus(source_connection.uri, source_connection.token)
                 if index.get("collection_policy") == "managed":
                     ManagedCollectionProvisioner(
                         self.store, target
@@ -120,6 +111,13 @@ class RoutingDeliveryService:
                         index.get("fields") or {},
                         int(embedding.get("dimension") or 0),
                     )
+
+                if source_connection.revision_id == target_connection.revision_id:
+                    target.validate_collection(collection, index.get("fields") or {}, int(embedding.get("dimension") or 0))
+                    if not target.partition_exists(collection, partition):
+                        raise ValueError(f"Partition {partition} 在共享 Authoring/Deployment Target 中不存在")
+                    results.append({"collection_name": collection, "partition_name": partition, "skipped": True})
+                    continue
 
                 exported_path = work / f"source-{sequence}.parquet"
                 source_meta = source.export_partition(

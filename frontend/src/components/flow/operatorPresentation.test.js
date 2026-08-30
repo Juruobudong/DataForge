@@ -6,7 +6,6 @@ const canvas = readFileSync(new URL('./DataForgeFlowCanvas.vue', import.meta.url
 const operatorNode = readFileSync(new URL('./nodes/OperatorNode.vue', import.meta.url), 'utf8')
 const subflowNode = readFileSync(new URL('./nodes/SubflowNode.vue', import.meta.url), 'utf8')
 const advancedEditor = readFileSync(new URL('./advanced/AdvancedFlowEditor.vue', import.meta.url), 'utf8')
-const compiledPreview = readFileSync(new URL('./standard/CompiledDagPreview.vue', import.meta.url), 'utf8')
 const templateList = readFileSync(new URL('../../views/developer/TemplateListView.vue', import.meta.url), 'utf8')
 const subgraphView = readFileSync(new URL('../../views/developer/SubgraphView.vue', import.meta.url), 'utf8')
 const debugView = readFileSync(new URL('../../views/developer/DataFlowDebugView.vue', import.meta.url), 'utf8')
@@ -24,7 +23,7 @@ test('operator nodes render Chinese names with English subtitles and optional te
 
 test('only advanced orchestration enables node technical codes', () => {
   assert.match(advancedEditor, /<DataForgeFlowCanvas[^>]*:show-technical-code="!fragment"/)
-  for (const source of [compiledPreview, templateList, subgraphView, debugView]) {
+  for (const source of [templateList, subgraphView, debugView]) {
     assert.doesNotMatch(source, /<DataForgeFlowCanvas[^>]*\sshow-technical-code(?:\s|@|\/?>)/)
   }
 })

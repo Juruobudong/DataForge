@@ -5,7 +5,6 @@ from copy import deepcopy
 import hashlib
 import json
 import math
-import os
 import re
 import time
 from typing import Any, Literal
@@ -106,10 +105,12 @@ def compile_filters(filters: list[RetrievalFilter], allowed: dict[str, str]) -> 
 
 
 class RetrievalDebugService:
-    def __init__(self, store, manager, *, embedding_registry=None, milvus_factory=V7Milvus):
+    def __init__(self, store, manager, *, embedding_registry=None, milvus_factory=V7Milvus,
+                 milvus_resolver=None):
         self.store, self.manager = store, manager
         self.embedding_registry = embedding_registry or EmbeddingServingRegistry(manager)
         self.milvus_factory = milvus_factory
+        self.milvus_resolver = milvus_resolver
 
     def snapshot(self, deployment_id, release_stage, route_mode, version_no=None):
         if route_mode == "historical":
@@ -226,9 +227,11 @@ class RetrievalDebugService:
             complete("embedding", {"serving_code": serving_code, "model_name": model_name,
                                    "expected_dimension": dimension, "observed_dimension": len(vectors[0])})
             active = "recall"
-            token = os.getenv("DATAFORGE_PRODUCTION_MILVUS_TOKEN" if request.release_stage == "production"
-                              else "DATAFORGE_TEST_MILVUS_TOKEN") or os.getenv("DATAFORGE_MILVUS_TOKEN")
-            milvus = self.milvus_factory(snapshot["milvus_target"]["milvus_url"], token)
+            if self.milvus_resolver:
+                connection = self.milvus_resolver.snapshot(snapshot)
+                milvus = self.milvus_factory(connection.uri, connection.token)
+            else:
+                milvus = self.milvus_factory(snapshot["milvus_target"]["milvus_url"], None)
             metric = str((profile.get("storage") or profile.get("embedding") or {}).get("metric_type", "")).upper()
             if metric not in {"COSINE", "IP", "L2"}:
                 raise RetrievalError("不支持所选向量度量")

@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+
+ORG_CODE_PRESETS_ENV = "DATAFORGE_ORG_CODE_PRESETS"
+
+
+@dataclass(frozen=True)
+class OrgCodePreset:
+    name: str
+    org_code: str
+
+
+DEFAULT_ORG_CODE_PRESETS = (
+    OrgCodePreset(name="厦门第一医院", org_code="KMDSRMYY"),
+    OrgCodePreset(name="厦门市中医院", org_code="XMSZ"),
+)
 
 
 def _read_secret(name: str) -> str | None:
@@ -28,6 +44,39 @@ def _positive_int_environment(name: str, default: int) -> int:
     if value <= 0:
         raise ValueError(f"{name} 必须是正整数")
     return value
+
+
+def _org_code_presets_environment() -> tuple[OrgCodePreset, ...]:
+    raw = os.getenv(ORG_CODE_PRESETS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ORG_CODE_PRESETS
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{ORG_CODE_PRESETS_ENV} 必须是合法 JSON 数组") from exc
+    if not isinstance(values, list):
+        raise ValueError(f"{ORG_CODE_PRESETS_ENV} 必须是 JSON 数组")
+    presets: list[OrgCodePreset] = []
+    seen_codes: set[str] = set()
+    required_fields = {"name", "org_code"}
+    for index, value in enumerate(values):
+        if not isinstance(value, dict) or set(value) != required_fields:
+            raise ValueError(
+                f"{ORG_CODE_PRESETS_ENV}[{index}] 只能包含 name 和 org_code"
+            )
+        name, org_code = value["name"], value["org_code"]
+        if not isinstance(name, str) or not isinstance(org_code, str):
+            raise ValueError(f"{ORG_CODE_PRESETS_ENV}[{index}] 的 name 和 org_code 必须是字符串")
+        normalized_name, normalized_code = name.strip(), org_code.strip()
+        if not normalized_name or not normalized_code:
+            raise ValueError(f"{ORG_CODE_PRESETS_ENV}[{index}] 的 name 和 org_code 不能为空")
+        if len(normalized_name) > 255 or len(normalized_code) > 120:
+            raise ValueError(f"{ORG_CODE_PRESETS_ENV}[{index}] 超出名称或编码长度限制")
+        if normalized_code in seen_codes:
+            raise ValueError(f"{ORG_CODE_PRESETS_ENV} 包含重复 org_code：{normalized_code}")
+        seen_codes.add(normalized_code)
+        presets.append(OrgCodePreset(name=normalized_name, org_code=normalized_code))
+    return tuple(presets)
 
 
 @dataclass(frozen=True)
@@ -56,6 +105,7 @@ class Settings:
     migration_trusted_public_keys: str | None = None
     migration_signing_key_id: str = "central-default"
     config_encryption_key: str | None = None
+    org_code_presets: tuple[OrgCodePreset, ...] = DEFAULT_ORG_CODE_PRESETS
 
     @classmethod
     def load(
@@ -96,6 +146,7 @@ class Settings:
             migration_trusted_public_keys=_read_secret("DATAFORGE_MIGRATION_TRUSTED_PUBLIC_KEYS"),
             migration_signing_key_id=os.getenv("DATAFORGE_MIGRATION_SIGNING_KEY_ID", "central-default").strip(),
             config_encryption_key=_read_secret("DATAFORGE_CONFIG_ENCRYPTION_KEY"),
+            org_code_presets=_org_code_presets_environment(),
         )
 
     @property

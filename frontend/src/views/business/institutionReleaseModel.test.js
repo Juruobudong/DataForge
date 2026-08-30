@@ -5,6 +5,7 @@ import {
   activationCanRun,
   frozenRoutesForStage,
   groupedAssetOptions,
+  institutionReleaseTarget,
   releaseCanFreeze,
   releaseSelectionSummary,
 } from './institutionReleaseModel.js'
@@ -42,4 +43,10 @@ test('Release 和 Activation 都以服务端 blocked 为最终门禁', () => {
   assert.equal(releaseCanFreeze({ preflight: { blocked: 1 } }), false)
   assert.equal(activationCanRun({ ready: true, blocked: 0, summary: { ready_candidates: 3 } }), true)
   assert.equal(activationCanRun({ ready: false, blocked: 1, summary: { ready_candidates: 3 } }), false)
+})
+
+test('机构发布请求同时携带内部 Deployment ID 与 institution_code', () => {
+  assert.deepEqual(institutionReleaseTarget({ id: 'deployment-a', institution_code: 'INST-A' }), {
+    target_deployment_id: 'deployment-a', target_institution_code: 'INST-A',
+  })
 })

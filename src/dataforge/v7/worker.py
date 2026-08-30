@@ -15,6 +15,7 @@ from ..config import Settings
 from .documents import DocumentDeletionService
 from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
+from .milvus_targets import MilvusConnectionResolver
 from .migration.exporter import MigrationExporter
 from .migration.importer import MigrationImporter
 from .provisioning import ManagedCollectionDeletionService
@@ -52,6 +53,15 @@ def _objects(resolved: Settings):
         else LocalObjectStore(resolved.state_dir / "v7-objects"))
 
 
+def _authoring_connection(store: V7Store, resolved: Settings):
+    instance = InstanceContext.load(store, resolved)
+    if instance.mode == "local":
+        return LocalMilvusConfigurationService(
+            store, resolved.config_encryption_key,
+        ).verified(instance.id, "current_target")
+    return MilvusConnectionResolver(store, resolved.config_encryption_key).authoring(instance.id)
+
+
 def _run_migration_once(store: V7Store, resolved: Settings, owner: str) -> int | None:
     claim_migration = getattr(store, "claim_migration_job", None)
     migration_job = claim_migration(owner) if claim_migration else None
@@ -61,10 +71,8 @@ def _run_migration_once(store: V7Store, resolved: Settings, owner: str) -> int |
     objects = _objects(resolved)
     try:
         if migration_job.direction == "export":
-            uri = os.getenv("DATAFORGE_MILVUS_URI")
-            if not uri:
-                raise ValueError("DATAFORGE_MILVUS_URI 未配置")
-            milvus = V7Milvus(uri, os.getenv("DATAFORGE_MILVUS_TOKEN"))
+            connection = _authoring_connection(store, resolved)
+            milvus = connection.client()
             if not resolved.migration_signing_private_key:
                 raise ValueError("未配置 migration Ed25519 签名私钥")
             MigrationExporter(
@@ -75,13 +83,16 @@ def _run_migration_once(store: V7Store, resolved: Settings, owner: str) -> int |
         else:
             if not resolved.migration_trusted_public_keys:
                 raise ValueError("未配置 migration 受信 Ed25519 公钥")
-            legacy_uri = os.getenv("DATAFORGE_MILVUS_URI")
-            milvus = V7Milvus(legacy_uri, os.getenv("DATAFORGE_MILVUS_TOKEN")) if legacy_uri else None
+            local_service = LocalMilvusConfigurationService(store, resolved.config_encryption_key)
+            try:
+                milvus = local_service.verified(instance.id, "current_target").client()
+            except ValueError:
+                milvus = None
             MigrationImporter(
                 store, objects, milvus, migration_dir=resolved.migration_dir,
                 trusted_public_keys=resolved.migration_trusted_public_keys,
                 instance=instance, routing_dir=resolved.routing_dir,
-                local_config=LocalMilvusConfigurationService(store, resolved.config_encryption_key),
+                local_config=local_service,
             ).run(migration_job.id)
         return 1
     except Exception as exc:
@@ -194,7 +205,10 @@ def _run_knowledge_dispatch(store: V7Store, dispatch_id: str) -> int:
 
 def _run_vector_sync_job(store: V7Store, job_id: str, owner: str) -> int:
     try:
-        result = VectorSyncService.from_environment(store).run(job_id, lease_owner=owner)
+        resolved = Settings.load()
+        result = VectorSyncService.from_connection(
+            store, _authoring_connection(store, resolved),
+        ).run(job_id, lease_owner=owner)
         if result["status"] == "failed":
             LOGGER.error("向量同步失败：%s", result.get("error"))
         return 1
@@ -213,17 +227,22 @@ def _run_vector_sync_job(store: V7Store, job_id: str, owner: str) -> int:
 def _run_maintenance_once(store: V7Store, resolved: Settings, owner: str) -> int | None:
     asset_gc_job = store.claim_knowledge_asset_gc_job()
     if asset_gc_job:
-        result = KnowledgeAssetGcService.from_environment(store).run(asset_gc_job.id)
+        milvus = _authoring_connection(store, resolved).client()
+        result = KnowledgeAssetGcService(
+            store, milvus, resolver=MilvusConnectionResolver(store, resolved.config_encryption_key),
+        ).run(asset_gc_job.id)
         if result["status"] == "failed": LOGGER.error("AssetVersion GC 失败：%s", result.get("error"))
         return 1
     vector_deletion_job = store.claim_vector_deletion_job(owner)
     if vector_deletion_job:
-        result = VectorDeletionService.from_environment(store).run(vector_deletion_job.id)
+        milvus = _authoring_connection(store, resolved).client()
+        result = VectorDeletionService(store, milvus).run(vector_deletion_job.id)
         if result["status"] == "failed": LOGGER.error("向量删除失败：%s", result.get("error"))
         return 1
     deletion_job = store.claim_library_deletion_job(owner)
     if deletion_job:
-        result = LibraryDeletionService.from_environment(store).run(deletion_job.id)
+        milvus = _authoring_connection(store, resolved).client()
+        result = LibraryDeletionService(store, milvus).run(deletion_job.id)
         if result["status"] == "failed": LOGGER.error("知识库删除失败：%s", result.get("error"))
         return 1
     document_deletion_job = store.claim_document_deletion_job(owner)
@@ -234,7 +253,8 @@ def _run_maintenance_once(store: V7Store, resolved: Settings, owner: str) -> int
     claim_collection_deletion = getattr(store, "claim_managed_collection_deletion_job", None)
     collection_deletion_job = claim_collection_deletion(owner) if claim_collection_deletion else None
     if collection_deletion_job:
-        result = ManagedCollectionDeletionService.from_environment(store).run(collection_deletion_job.id)
+        milvus = _authoring_connection(store, resolved).client()
+        result = ManagedCollectionDeletionService(store, milvus).run(collection_deletion_job.id)
         if result["status"] == "failed": LOGGER.error("受管 Collection 删除失败：%s", result.get("error"))
         return 1
     return None
