@@ -40,9 +40,12 @@ class MigrationPlanner:
         self.store = store
 
     def plan(self, project_deployment_id: str, knowledge_library_ids: list[str] | None = None,
-             *, include_full_document_library: bool = False, package_kind: str = "deployment_seed") -> dict[str, Any]:
+             *, release_stage: str, include_full_document_library: bool = False,
+             package_kind: str = "deployment_seed") -> dict[str, Any]:
         if package_kind not in {"deployment_seed", "knowledge_update"}:
             raise ValueError("package_kind 无效")
+        if release_stage not in {"test", "production"}:
+            raise ValueError("release_stage 只允许 test 或 production")
         with self.store.sessions() as session:
             project_deployment = session.get(ProjectDeployment, project_deployment_id)
             if not project_deployment: raise ValueError("ProjectDeployment 不存在")
@@ -105,7 +108,7 @@ class MigrationPlanner:
             dependencies = resolve_dependencies(session, sorted(selected_ids), include_full_document_library=include_full_document_library)
             latest_route = session.scalar(select(ProjectRouteVersion).where(
                 ProjectRouteVersion.project_deployment_id == project_deployment.id,
-                ProjectRouteVersion.release_stage == deployment.release_stage,
+                ProjectRouteVersion.release_stage == release_stage,
                 ProjectRouteVersion.status == "published",
             ).order_by(ProjectRouteVersion.version_no.desc()))
             if package_kind == "deployment_seed" and not latest_route:
@@ -116,7 +119,7 @@ class MigrationPlanner:
                                "institution_name": deployment.institution_name,
                                "institution_code": deployment.institution_code,
                                "scope": deployment.scope,
-                               "release_stage": deployment.release_stage},
+                               "release_stage": release_stage},
                 "project_deployment": {"id": project_deployment.id,
                                        "project_id": project_deployment.project_id,
                                        "deployment_id": project_deployment.deployment_id,
@@ -221,8 +224,7 @@ class InstitutionReleasePlanner:
             if len(route_stages) > 1:
                 raise ValueError("机构发布不能混合测试环境和生产环境的项目版本")
             selected_stage = (draft.selection_json or {}).get("release_stage")
-            release_stage = str(selected_stage or (next(iter(route_stages)) if route_stages
-                                                    else deployment.release_stage))
+            release_stage = str(selected_stage or (next(iter(route_stages)) if route_stages else ""))
             if release_stage not in {"test", "production"}:
                 raise ValueError("release_stage 只允许 test 或 production")
             if route_stages and route_stages != {release_stage}:

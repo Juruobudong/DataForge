@@ -372,32 +372,21 @@ class AuthoringMilvusTargetRequest(BaseModel):
 
 class DeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    code: str | None = None
-    name: str | None = None
     institution_name: str
     institution_code: str
-    scope: Literal["institution"] = "institution"
-    deployment_type: Literal["central", "local"] | None = None
-    milvus_target_id: str | None = None
-    test_milvus_uri: str | None = None
-    release_stage: Literal["test", "production"] = "test"
 
 
 class DeploymentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    name: str | None = None
     institution_name: str | None = None
     institution_code: str | None = None
     status: Literal["active", "disabled"] | None = None
-    milvus_target_id: str | None = None
-    release_stage: Literal["test", "production"] | None = None
-    confirm_production: bool = False
-    expected_target_uri: str | None = None
 
 
 class DeploymentTargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     milvus_target_id: str
+    milvus_target_revision_id: str
     confirm_production: bool = False
     expected_target_uri: str | None = None
 
@@ -407,17 +396,9 @@ class DeploymentProjectRequest(BaseModel):
     project_id: str
 
 
-class DeploymentStageRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    release_stage: Literal["test", "production"]
-    confirm_production: bool = False
-    expected_target_uri: str | None = None
-
-
 class RoutingActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    release_stage: Literal["test", "production"] | None = None
-    expected_release_stage: Literal["test", "production"] | None = None
+    release_stage: Literal["test", "production"]
     expected_target_uri: str | None = None
     confirm_production: bool = False
 
@@ -449,14 +430,6 @@ class DeploymentTaskPatch(BaseModel):
     enabled: bool = True
 
 
-class MigrationExportRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    project_deployment_id: str
-    knowledge_library_ids: list[str] | None = None
-    package_kind: Literal["deployment_seed", "knowledge_update"]
-    include_full_document_library: bool = False
-
-
 class MigrationImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str
@@ -473,7 +446,7 @@ class InstitutionReleaseDraftRequest(BaseModel):
     target_deployment_id: str
     target_institution_code: str = Field(min_length=1, max_length=120)
     package_kind: Literal["deployment_seed", "institution_release", "knowledge_update"]
-    release_stage: Literal["test", "production"] | None = None
+    release_stage: Literal["test", "production"]
     route_version_ids: list[str] = Field(default_factory=list)
     knowledge_library_ids: list[str] = Field(default_factory=list)
     extra_asset_version_ids: list[str] = Field(default_factory=list)
@@ -2197,7 +2170,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         binding_ids = {item["project_deployment_id"] for item in store.list_deployment_projects(deployment_id)}
         with app.state.routing_publications_lock:
             if binding_ids & app.state.routing_publications:
-                raise ValueError("Routing 发布或回滚运行期间禁止切换 release_stage")
+                raise ValueError("Routing 发布或回滚运行期间禁止切换环境 Target")
 
     @app.get("/api/deployments")
     def shared_deployments():
@@ -2209,25 +2182,17 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/deployments", status_code=201)
     def create_shared_deployment(payload: DeploymentRequest):
         _require_central_deployment_admin()
-        if payload.release_stage != "test":
-            raise _error(ValueError("新 Deployment 必须先以 test 阶段创建"))
-        if payload.milvus_target_id is not None or payload.test_milvus_uri is not None:
-            raise _error(ValueError("机构 Milvus 由私有化实例自行配置，中心创建机构时不能提交 Target"))
         try:
-            arguments = {
-                "code": payload.code, "name": payload.name, "scope": payload.scope,
-                "institution_name": payload.institution_name,
-                "institution_code": payload.institution_code,
-            }
-            return store.create_shared_deployment(**arguments)
+            return store.create_shared_deployment(
+                institution_name=payload.institution_name,
+                institution_code=payload.institution_code,
+            )
         except ValueError as exc: raise _error(exc) from exc
 
     @app.patch("/api/deployments/{deployment_id}")
     def patch_shared_deployment(deployment_id: str, payload: DeploymentPatch):
         _require_central_deployment_admin()
         try:
-            if payload.release_stage is not None:
-                _assert_deployment_idle(deployment_id)
             return store.patch_shared_deployment(deployment_id, **payload.model_dump())
         except ValueError as exc: raise _error(exc) from exc
 
@@ -2239,18 +2204,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             _assert_deployment_idle(deployment_id)
             return store.put_deployment_target(
                 deployment_id, release_stage, payload.milvus_target_id,
-                confirm_production=payload.confirm_production,
-                expected_target_uri=payload.expected_target_uri,
-            )
-        except ValueError as exc: raise _error(exc) from exc
-
-    @app.patch("/api/deployments/{deployment_id}/release-stage")
-    def patch_shared_deployment_stage(deployment_id: str, payload: DeploymentStageRequest):
-        _require_central_deployment_admin()
-        try:
-            _assert_deployment_idle(deployment_id)
-            return store.patch_shared_deployment(
-                deployment_id, release_stage=payload.release_stage,
+                payload.milvus_target_revision_id,
                 confirm_production=payload.confirm_production,
                 expected_target_uri=payload.expected_target_uri,
             )
@@ -2272,24 +2226,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         values = store.list_deployments(project_id, allowed_deployment_id=app.state.instance.bound_deployment_id if app.state.instance.mode == "local" else None)
         if app.state.instance.mode == "local" and not values: raise HTTPException(status_code=404, detail="Deployment 不存在")
         return values
-
-    @app.post("/api/projects/{project_id}/deployments", status_code=201)
-    def create_deployment(project_id: str, payload: DeploymentRequest):
-        raise HTTPException(
-            status_code=410,
-            detail="旧创建入口已停用；请使用 /api/deployments 和 /api/deployments/{id}/projects",
-        )
-
-    @app.patch("/api/projects/{project_id}/deployments/{deployment_id}")
-    def patch_deployment(project_id: str, deployment_id: str, payload: DeploymentPatch):
-        try:
-            deployment = app.state.instance.require_deployment(store, deployment_id)
-            if deployment.project_id != project_id: raise LookupError("Deployment 不存在")
-            if payload.release_stage is not None:
-                _assert_deployment_idle(deployment.deployment_id)
-            return store.patch_deployment(deployment_id, **payload.model_dump())
-        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/project-deployments/{deployment_id}/tasks")
     def deployment_tasks(deployment_id: str):
@@ -2374,33 +2310,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.put("/api/project-tasks/{task_id}/org-routes")
-    def put_route(task_id: str, payload: RouteRequest):
-        raise HTTPException(status_code=410, detail="请改用 DeploymentTask org-routes API")
-
-    @app.post("/api/projects/{project_id}/routing/validate")
-    def validate_routing(project_id: str):
-        raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
-    @app.get("/api/projects/{project_id}/routing/diff")
-    def routing_diff(project_id: str):
-        raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
-    @app.get("/api/projects/{project_id}/routing/versions")
-    def routing_versions(project_id: str): raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
-    @app.get("/api/projects/{project_id}/routing/versions/{version_no}")
-    def routing_version_detail(project_id: str, version_no: int):
-        raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
-    @app.post("/api/projects/{project_id}/routing/publish")
-    def publish_routing(project_id: str):
-        raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
-    @app.post("/api/projects/{project_id}/routing/rollback/{version_no}")
-    def rollback_routing(project_id: str, version_no: int):
-        raise HTTPException(status_code=410, detail="请改用 Deployment Routing API")
-
     def _deployment_boundary(deployment_id: str) -> None:
         try:
             app.state.instance.require_deployment(store, deployment_id)
@@ -2416,13 +2325,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def _end_routing_action(deployment_id: str) -> None:
         with app.state.routing_publications_lock:
             app.state.routing_publications.discard(deployment_id)
-
-    def _resolve_routing_stage(payload: RoutingActionRequest, deployment: dict) -> str:
-        if (payload.release_stage and payload.expected_release_stage
-                and payload.release_stage != payload.expected_release_stage):
-            raise ValueError("release_stage 与 legacy expected_release_stage 不一致")
-        # Legacy fallback only. New clients always send release_stage.
-        return str(payload.release_stage or payload.expected_release_stage or deployment["release_stage"])
 
     def _validate_target_routing(deployment_id: str, release_stage: Literal["test", "production"]):
         project_deployment = app.state.instance.require_deployment(store, deployment_id)
@@ -2476,12 +2378,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/project-deployments/{deployment_id}/routing/versions")
-    def deployment_routing_versions(deployment_id: str, release_stage: Literal["test", "production"] | None = None):
+    def deployment_routing_versions(deployment_id: str, release_stage: Literal["test", "production"]):
         _deployment_boundary(deployment_id); return store.list_route_versions(deployment_id, release_stage)
 
     @app.get("/api/project-deployments/{deployment_id}/routing/versions/{version_no}")
     def deployment_routing_version(deployment_id: str, version_no: int,
-                                   release_stage: Literal["test", "production"] | None = None):
+                                   release_stage: Literal["test", "production"]):
         _deployment_boundary(deployment_id)
         try: return store.route_version_detail(deployment_id, version_no, release_stage)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2498,19 +2400,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             raise _error(exc) from exc
 
     @app.post("/api/project-deployments/{deployment_id}/routing/publish")
-    def publish_deployment_routing(deployment_id: str, payload: RoutingActionRequest | None = None):
+    def publish_deployment_routing(deployment_id: str, payload: RoutingActionRequest):
         _deployment_boundary(deployment_id)
         _begin_routing_action(deployment_id)
         try:
-            payload = payload or RoutingActionRequest()
             project_deployment = app.state.instance.require_deployment(store, deployment_id)
             deployment = next(item for item in store.list_deployments(project_deployment.project_id)
                               if item["id"] == deployment_id)
             if app.state.instance.mode == "central" and deployment["scope"] == "institution":
                 raise ValueError("机构发布目标在智能中心只能冻结项目版本，不能直接发布生效")
-            stage = _resolve_routing_stage(payload, deployment)
+            stage = payload.release_stage
             target = store.deployment_stage_target(deployment_id, stage)
-            expected_uri = target["milvus_target"]["milvus_url"]
+            expected_uri = target["milvus_target"]["revision"]["milvus_url"]
             if stage == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
@@ -2541,26 +2442,27 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/project-deployments/{deployment_id}/routing/rollback/{version_no}")
     def rollback_deployment_routing(deployment_id: str, version_no: int,
-                                    payload: RoutingActionRequest | None = None):
+                                    payload: RoutingActionRequest):
         _deployment_boundary(deployment_id)
         _begin_routing_action(deployment_id)
         try:
-            payload = payload or RoutingActionRequest()
             project_deployment = app.state.instance.require_deployment(store, deployment_id)
             deployment = next(item for item in store.list_deployments(project_deployment.project_id)
                               if item["id"] == deployment_id)
             if app.state.instance.mode == "central" and deployment["scope"] == "institution":
                 raise ValueError("机构发布目标在智能中心不能执行在线回滚")
-            stage = _resolve_routing_stage(payload, deployment)
+            stage = payload.release_stage
             target = store.deployment_stage_target(deployment_id, stage)
-            expected_uri = target["milvus_target"]["milvus_url"]
+            expected_uri = target["milvus_target"]["revision"]["milvus_url"]
             if stage == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
                 raise ValueError("生产回滚必须再次确认当前生产环境的完整 Milvus URI")
             if payload.expected_target_uri and payload.expected_target_uri != expected_uri:
                 raise ValueError("回滚目标与 release_stage 不一致")
-            previous = store.published_route_version(deployment_id, version_no, stage)
+            previous = store.published_route_version(
+                deployment_id, version_no, release_stage=stage,
+            )
             store.restore_authorizations(deployment_id, previous.snapshot_json)
             check = _validate_target_routing(deployment_id, stage)
             if not check["valid"]: raise ValueError("回滚后的授权校验失败：" + "；".join(check["problems"]))
@@ -2901,14 +2803,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             )
         except ValueError as exc:
             raise _error(exc) from exc
-
-    @app.post("/api/migrations/export/plan")
-    def migration_export_plan(payload: MigrationExportRequest):
-        raise HTTPException(status_code=410, detail="新包只生成 schema v2；请使用机构发布部署 Draft/Release API")
-
-    @app.post("/api/migrations/export", status_code=202)
-    def migration_export(payload: MigrationExportRequest):
-        raise HTTPException(status_code=410, detail="新包只生成 schema v2；请使用机构发布部署 Draft/Release API")
 
     @app.get("/api/migrations")
     def migrations(direction: Literal["export", "import"] | None = None):

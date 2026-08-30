@@ -14,7 +14,7 @@ Project
               → knowledge_library_id[]
 ```
 
-- Deployment 表达机构或中心发布目标；中心只有在 Target current revision 已 verified 后才可按 `DeploymentTarget.release_stage` 绑定 test/production，机构 Deployment 在中心没有 Milvus Target。ProjectDeployment 表达 Project 关联。`Deployment.release_stage` 只保留 legacy 兼容。
+- Deployment 表达机构或中心发布目标；中心只有在 Target current revision 已 verified 且请求携带匹配的 Revision ID 时，才可按 `DeploymentTarget.release_stage` 把 test/production 绑定到精确 Revision。机构 Deployment 在中心没有 Milvus Target，ProjectDeployment 表达 Project 关联；Deployment 本身不存在全局当前环境。
 - 同一 Deployment 可以承载多个 Project，但任务、授权、RouteVersion、Snapshot、版本号和回滚互不共享。
 - `org_code` 属于 ProjectDeploymentTask 授权，只在已绑定的 Project、Deployment 与 Task 内选择知识库；唯一边界为 `(project_deployment_task_id, org_code)`，一个 Task 可有多个 org，同一 org 可跨 Task 复用。它不能选择机构 Deployment、环境、阶段或 Milvus Target，也不要求等于 `institution_code`。
 - 每个授权知识库在冻结前必须通过类型、Profile、Vector Ready 和目标 Partition 校验。

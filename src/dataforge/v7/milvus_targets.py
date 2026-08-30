@@ -118,15 +118,14 @@ class MilvusConnectionResolver:
         with self.store.sessions() as session:
             binding = session.get(ProjectDeployment, boundary_id)
             deployment_id = binding.deployment_id if binding else boundary_id
-            target = session.scalar(select(MilvusTarget).join(
-                DeploymentTarget, DeploymentTarget.milvus_target_id == MilvusTarget.id,
+            revision = session.scalar(select(MilvusTargetRevision).join(
+                DeploymentTarget,
+                DeploymentTarget.milvus_target_revision_id == MilvusTargetRevision.id,
             ).where(
                 DeploymentTarget.deployment_id == deployment_id,
                 DeploymentTarget.release_stage == release_stage,
                 DeploymentTarget.target_kind == "milvus",
             ))
-            revision = session.get(MilvusTargetRevision, target.current_revision_id) \
-                if target and target.current_revision_id else None
             if not revision:
                 raise ValueError(f"Deployment 尚未配置 verified {release_stage} Milvus Target")
             return self._resolved(revision)
@@ -283,13 +282,15 @@ class MilvusTargetService:
                 target = self.store.get_milvus_target(target_id)
                 if target.get("current_revision_id"):
                     result = self.check_current(target_id)
-                    status = result.get("health_status") or "unknown"
+                    status = (result.get("current_revision") or {}).get("health_status") or "unknown"
                 elif target.get("candidate_revision_id"):
                     result = self.verify(target_id)
+                    current = result.get("current_revision") or {}
+                    candidate = result.get("candidate_revision") or {}
                     status = (
-                        result.get("health_status")
+                        current.get("health_status")
                         if result.get("current_revision_id")
-                        else "unavailable" if result.get("candidate_verification_status") == "verification_failed"
+                        else "unavailable" if candidate.get("verification_status") == "verification_failed"
                         else "unknown"
                     )
                 else:
@@ -331,7 +332,8 @@ class MilvusTargetService:
               milvus_url: str | None = None, token: str | None = None,
               preserve_token: bool = True) -> dict[str, Any]:
         current = self.store.get_milvus_target(target_id)
-        uri = validate_milvus_uri(milvus_url if milvus_url is not None else current["milvus_url"])
+        current_revision = current.get("current_revision") or current.get("candidate_revision") or {}
+        uri = validate_milvus_uri(milvus_url if milvus_url is not None else current_revision.get("milvus_url"))
         changed = milvus_url is not None or token is not None or not preserve_token
         if not changed:
             return self.store.patch_milvus_target(target_id, name=name)

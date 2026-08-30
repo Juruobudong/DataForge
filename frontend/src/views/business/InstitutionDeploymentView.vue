@@ -185,7 +185,7 @@ onMounted(load)
         </div>
         <label v-else>知识库（完整当前快照）<select v-model="selectedLibraries" multiple><option v-for="library in libraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.knowledge_type }}</option></select></label>
         <label v-if="updateOnly"><input v-model="includeFullDocuments" type="checkbox"> 同时携带完整关联文档库与模板运行闭包</label>
-        <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedStage]?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
+        <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedStage]?.revision?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
         <label v-if="overrideUri">临时覆盖原因<textarea v-model="overrideReason" required rows="2"></textarea></label>
         <div class="actions"><button class="primary" :disabled="busy||!targetInstitutionCode||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)||(overrideUri&&!overrideReason.trim())" @click="createDraft">创建并检查草稿</button></div>
       </section>

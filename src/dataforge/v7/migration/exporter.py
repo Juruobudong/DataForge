@@ -91,6 +91,7 @@ class MigrationExporter:
             plan["release_id"] = release["id"]
         else:
             plan = MigrationPlanner(self.store).plan(job["project_deployment_id"], options.get("knowledge_library_ids"),
+                release_stage=str(options.get("release_stage") or ""),
                 include_full_document_library=bool(options.get("include_full_document_library")),
                 package_kind=job["package_kind"])
         work = self.migration_dir / job_id

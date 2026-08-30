@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, event, inspect, select
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, event, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
 
@@ -1260,17 +1260,6 @@ class MilvusTarget(Timestamped, Base):
     __tablename__ = "milvus_targets"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    milvus_url: Mapped[str] = mapped_column(String(1024), nullable=False)
-    verification_status: Mapped[str] = mapped_column(
-        String(32), default="pending_verification", server_default="pending_verification",
-        nullable=False, index=True,
-    )
-    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    candidate_milvus_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
-    candidate_verification_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    candidate_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    candidate_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Stable registry identity. Connection data lives in immutable revisions;
     # these two ids select the active and in-flight configurations.
     current_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
@@ -1281,6 +1270,7 @@ class MilvusTargetRevision(Timestamped, Base):
     __tablename__ = "milvus_target_revisions"
     __table_args__ = (
         UniqueConstraint("milvus_target_id", "revision_no", name="uq_milvus_target_revision_no"),
+        UniqueConstraint("id", "milvus_target_id", name="uq_milvus_target_revision_identity"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     milvus_target_id: Mapped[str] = mapped_column(ForeignKey("milvus_targets.id"), nullable=False, index=True)
@@ -1314,8 +1304,6 @@ class Deployment(Timestamped, Base):
     scope: Mapped[str] = mapped_column(String(32), default="institution", nullable=False, index=True)
     institution_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     institution_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    # Legacy compatibility field. New routing operations receive release_stage explicitly.
-    release_stage: Mapped[str] = mapped_column(String(16), default="test", nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     institution_code_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -1324,12 +1312,18 @@ class DeploymentTarget(Timestamped, Base):
     __tablename__ = "deployment_targets"
     __table_args__ = (
         UniqueConstraint("deployment_id", "release_stage", "target_kind", name="uq_deployment_stage_target"),
+        ForeignKeyConstraint(
+            ["milvus_target_revision_id", "milvus_target_id"],
+            ["milvus_target_revisions.id", "milvus_target_revisions.milvus_target_id"],
+            name="fk_deployment_target_revision_identity",
+        ),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     deployment_id: Mapped[str] = mapped_column(ForeignKey("deployments.id"), nullable=False, index=True)
     release_stage: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     target_kind: Mapped[str] = mapped_column(String(32), default="milvus", nullable=False)
     milvus_target_id: Mapped[str] = mapped_column(ForeignKey("milvus_targets.id"), nullable=False, index=True)
+    milvus_target_revision_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
 
 
 class ProjectDeployment(Timestamped, Base):

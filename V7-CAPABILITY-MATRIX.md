@@ -90,7 +90,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | DB Embedding Registry 默认 BCE 768；Profile/Contract/Milvus 强制维度一致，Vector Sync 按 Profile 动态选 Provider，AssetVersion 冻结血缘。 |
 | 图谱实体、详情、邻居、关系 Evidence | `DONE` | 深度限制为 1/2 跳，重复三元组聚合 Evidence。 |
 | 双图谱模式与受管 Collection | `DONE` | 顶层保持 graph；Triple/Semantic 使用两个专属 Storage Contract/Collection，文本与 QA 两路也纳入默认五个受管 Collection；同规格默认独立、仅显式选择兼容 ready 登记时复用。旧 `graph` Profile 仅供已有库冻结兼容，不参与受管供应或容量探测；真实供应仍属部署验收。 |
-| RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/显式环境隔离；Snapshot v3 指向 Ready `kl_*__vN`，legacy Deployment stage 不阻止另一环境 Runtime，local 单项目激活原子，批量明确非原子。 |
+| RoutingSnapshot / AssetVersion / ImportedRouteCandidate | `DONE` | 按 ProjectDeployment/显式环境隔离；DeploymentTarget 冻结 verified Milvus Revision，Snapshot v3 指向该 Revision 与 Ready `kl_*__vN`；Deployment 无全局 stage，local 单项目激活原子，批量明确非原子。 |
 | Instance / Deployment / local Milvus Target | `DONE` | 服务端实例身份不可由 URL 覆盖；唯一 Central 从 verified 注册表选择双环境 Target；机构由名称/机构代码生成 `inst-*`，中心不保存其 Milvus。local current/candidate 凭据 AES-GCM 入库、响应脱敏并自动验证。 |
 | `.dfm` v2 Seed / Institution Release / Knowledge Update | `DONE` | 多 frozen 项目、完整当前资产、差异/Tombstone、模板运行闭包、Ed25519、v1 导入兼容与检查点恢复。 |
 | Knowledge Type / Profile 发布契约 | `DONE` | 草稿只登记 planned 资源；发布自动 Provision 扩展/Manual create，实时校验 Manual attach，再冻结 Profile 与 Type Revision；同一 Type Revision 拒绝重复 Collection。 |

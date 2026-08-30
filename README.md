@@ -19,7 +19,7 @@ uv sync --extra web
 
 ## 初始化或升级 V7 Schema
 
-目标必须是空数据库或已有 V7 schema；命令会执行 Alembic 升级并写入 V7 种子。
+目标必须是空数据库；命令会执行当前不可变 V7 baseline 并幂等写入当前种子，不支持旧 V7 head 或旧测试数据升级。
 
 ```powershell
 conda activate sun

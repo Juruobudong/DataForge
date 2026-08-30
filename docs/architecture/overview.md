@@ -38,7 +38,7 @@ PC 浏览器
 
 ## 数据与存储边界
 
-- MySQL 与 MinIO 使用 `dataforge` 名称，只接受空环境或已有 V7 schema 的常规 Alembic 升级。
+- MySQL 与 MinIO 使用 `dataforge` 名称；测试阶段数据库只接受空环境执行当前单一 V7 baseline，不升级旧 V7 head。
 - V7 常规流程不读取、迁移或自动清理 DataForge V2 数据、旧 MinIO 对象、legacy/external Milvus Collection。
 - Source 是逻辑资料；SourceVersion 以 `(source_id, sha256)` 唯一并引用全局内容寻址 Blob。历史版本经确认可重新启用，但每次 activation 都由 Dispatch/Job/Sink Gate 独立复验；正式 SourceChunk、Evidence、Artifact 与 Flow Run 保留执行溯源。
 - KnowledgeLibrary 是逻辑当前态；正式向量资产是不可变 `KnowledgeAssetVersion`，物理 Partition 为 `kl_<knowledge_library_id>__v<asset_version_no>`。

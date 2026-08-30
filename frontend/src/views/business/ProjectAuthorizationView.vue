@@ -28,9 +28,9 @@ const local = computed(() => instance.value?.instance_mode === 'local')
 const central = computed(() => instance.value?.instance_mode === 'central')
 const selectedDeployment = computed(() => deployments.value.find(item => item.id === deploymentId.value))
 const freezesForInstitution = computed(() => central.value && selectedDeployment.value?.scope === 'institution')
-const currentStageTarget = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.milvus_url || '')
+const currentStageTarget = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.revision?.milvus_url || '')
 const currentStageTargetId = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.id || '')
-const verifiedMilvusTargets = computed(() => milvusTargets.value.filter(item => item.verification_status === 'verified'))
+const verifiedMilvusTargets = computed(() => milvusTargets.value.filter(item => item.current_revision?.verification_status === 'verified'))
 const isKgConsultation = computed(() => selectedProject.value?.code === 'kg-for-consultation')
 const unboundDeployments = computed(() => {
   const bound = new Set(deployments.value.map(item => item.deployment_id))
@@ -179,9 +179,10 @@ async function saveCentralTarget() {
   const target = verifiedMilvusTargets.value.find(item => item.id === selectedMilvusTargetId.value)
   if (!target) return
   const production = selectedStage.value === 'production'
-  if (production && !window.confirm(`确认切换中心生产环境 Milvus 服务？\nMilvus：${target.milvus_url}`)) return
+  const revision = target.current_revision
+  if (production && !window.confirm(`确认切换中心生产环境 Milvus 服务？\nMilvus：${revision.milvus_url}`)) return
   try {
-    await api.putDeploymentTarget(selectedDeployment.value.deployment_id, selectedStage.value, { milvus_target_id: target.id, confirm_production: production, expected_target_uri: production ? target.milvus_url : null })
+    await api.putDeploymentTarget(selectedDeployment.value.deployment_id, selectedStage.value, { milvus_target_id: target.id, milvus_target_revision_id: revision.id, confirm_production: production, expected_target_uri: production ? revision.milvus_url : null })
     await load(); await loadDeployment(); notice.value = `${statusLabel(selectedStage.value)} Milvus 服务已切换。`
   } catch (e) { error.value = e.message }
 }
@@ -239,7 +240,7 @@ onMounted(load)
     <PublishTargetPanel v-if="tab==='target'" :deployment="selectedDeployment" :selected-stage="selectedStage" :target-uri="currentStageTarget" @update:selected-stage="selectedStage=$event">
       <form v-if="selectedDeployment?.scope==='institution'" class="stack" @submit.prevent="saveInstitutionIdentity"><label>机构名称<input v-model="institutionName" required></label><label>机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"></label><button>保存机构身份</button></form>
       <p v-if="selectedDeployment?.scope==='institution'&&!local" class="notice">机构 Milvus 不在中心保存；私有化部署后由机构在“本地初始化”中注册并验证。</p>
-      <form v-if="selectedDeployment?.scope==='central'&&central" class="stack" @submit.prevent="saveCentralTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务<select v-model="selectedMilvusTargetId" required><option value="">选择已验证服务</option><option v-for="target in verifiedMilvusTargets" :key="target.id" :value="target.id">{{ target.name }} · {{ target.milvus_url }}</option></select></label><button>保存 Milvus 服务</button><RouterLink to="/business/milvus-targets">管理 Milvus 服务注册表</RouterLink></form>
+      <form v-if="selectedDeployment?.scope==='central'&&central" class="stack" @submit.prevent="saveCentralTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务<select v-model="selectedMilvusTargetId" required><option value="">选择已验证服务</option><option v-for="target in verifiedMilvusTargets" :key="target.id" :value="target.id">{{ target.name }} · {{ target.current_revision.milvus_url }}</option></select></label><button>保存 Milvus 服务</button><RouterLink to="/business/milvus-targets">管理 Milvus 服务注册表</RouterLink></form>
       <form v-if="!local" class="stack" @submit.prevent="createInstitutionDeployment"><h4>新增机构发布目标</h4><label>机构名称<input v-model="newInstitutionName" required></label><label>机构代码<input v-model="newInstitutionCode" required></label><button>创建并绑定当前项目</button></form>
       <form v-if="!local&&unboundDeployments.length" class="stack" @submit.prevent="bindExistingDeployment"><h4>绑定已有发布目标</h4><select v-model="bindDeploymentId" required><option value="">选择发布目标</option><option v-for="item in unboundDeployments" :key="item.id" :value="item.id">{{ item.name }} · {{ item.institution_code }}</option></select><button>绑定当前项目</button></form>
     </PublishTargetPanel>

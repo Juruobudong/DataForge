@@ -8,13 +8,20 @@ vi.mock('../../api/platform', () => ({ api: Object.fromEntries([
   'verifyMilvusTarget', 'checkMilvusTargetHealth', 'checkMilvusTargetCollections', 'putAuthoringMilvusTarget',
 ].map(name => [name, vi.fn()])) }))
 
-const target = (overrides = {}) => ({
-  id: 'milvus_dataforge_central_test', name: 'DataForge 中心测试 Milvus',
-  milvus_url: 'http://milvus-central-test:19531', token_configured: false,
-  verification_status: 'verified', current_revision_id: 'mtrev-test', candidate_revision_id: null,
-  health_status: 'healthy', health_checked_at: '2026-08-30T10:00:00+00:00',
-  health_latency_ms: 5, health_error: null, ...overrides,
-})
+const target = (overrides = {}) => {
+  const { current_revision: currentOverrides = {}, ...rest } = overrides
+  const current = {
+    id: 'mtrev-test', revision_no: 1, milvus_url: 'http://milvus-central-test:19531',
+    token_configured: false, verification_status: 'verified', health_status: 'healthy',
+    health_checked_at: '2026-08-30T10:00:00+00:00', health_latency_ms: 5, health_error: null,
+  }
+  return {
+    id: 'milvus_dataforge_central_test', name: 'DataForge 中心测试 Milvus',
+    current_revision_id: 'mtrev-test', candidate_revision_id: null,
+    current_revision: { ...current, ...currentOverrides },
+    candidate_revision: null, ...rest,
+  }
+}
 
 beforeEach(() => {
   vi.resetAllMocks()
@@ -22,7 +29,7 @@ beforeEach(() => {
   api.milvusTargets.mockResolvedValue([target()])
   api.sharedDeployments.mockResolvedValue([])
   api.checkMilvusTargetHealth.mockResolvedValue(target({
-    health_status: 'unavailable', health_error: 'connection refused',
+    current_revision: { health_status: 'unavailable', health_error: 'connection refused' },
   }))
   api.checkMilvusTargetCollections.mockResolvedValue({
     target_id: 'milvus_dataforge_central_test', status: 'available',

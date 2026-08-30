@@ -18,10 +18,12 @@ test('central Milvus registry creates, verifies, edits and exposes only verified
   assert.doesNotMatch(registry, /databaseName|tls_enabled|username/)
   assert.match(registry, /正在连接验证/)
   assert.match(registry, /候选地址连接失败/)
+  assert.match(registry, /新地址验证通过后不会自动切换/)
   assert.match(registry, /当前健康/)
   assert.match(registry, /启动 30 秒后自动检查连接/)
   assert.match(registry, /检查当前连接/)
   assert.match(registry, /检查 Collection/)
+  assert.match(registry, /\.status-stack \.badge\{justify-self:start\}/)
   assert.match(registry, /验证候选/)
   assert.match(registry, /默认知识写入目标/)
   assert.match(registry, /设为默认写入/)
@@ -33,6 +35,8 @@ test('central Milvus registry creates, verifies, edits and exposes only verified
   assert.match(api, /checkMilvusTargetCollections:.*\/collections-check/)
   assert.match(publishing, /verifiedMilvusTargets/)
   assert.match(publishing, /milvus_target_id: target\.id/)
+  assert.match(publishing, /milvus_target_revision_id: revision\.id/)
+  assert.doesNotMatch(api, /createDeployment:|patchDeployment:|migrationPlan:|exportMigration:/)
 })
 
 test('institution Milvus remains local and candidate save automatically verifies', () => {

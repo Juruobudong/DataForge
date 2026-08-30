@@ -25,6 +25,7 @@ secrets/
 !secrets/README.md
 .env.docker.example
 docs\Docker构建优化说明.md
+docs\archive\old-plan.md
 # ===== 本地专用忽略（不提交到仓库）=====
 # 含公司内网资产（具体 IP  与域名），禁止提交
 AGENTS.md

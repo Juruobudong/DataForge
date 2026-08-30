@@ -9,7 +9,7 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260830_milvus_health"
+CURRENT_SCHEMA_REVISION = "20260830_v7_baseline"
 
 
 def _config(database_url: str) -> Config:

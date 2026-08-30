@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import base64
-import importlib.util
 import json
 import zipfile
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,8 +50,10 @@ def seeded_qa_project(store: V7Store) -> dict:
             current = store.list_shared_deployments(allowed_deployment_id=central.id)[0]["stage_targets"]
             if stage not in current:
                 store.put_deployment_target(
-                    central.id, stage, target["id"], confirm_production=stage == "production",
-                    expected_target_uri=target["milvus_url"] if stage == "production" else None,
+                    central.id, stage, target["id"], target["current_revision_id"],
+                    confirm_production=stage == "production",
+                    expected_target_uri=(target["current_revision"]["milvus_url"]
+                                         if stage == "production" else None),
                 )
     return next(item for item in store.list_projects() if item["code"] == "qa-agent")
 
@@ -77,69 +77,6 @@ def record_and_approve_source(store: V7Store, source: dict, content: str = "迁�
     store.finish_flow_run(run["id"], status="completed")
     store.finish_source_preparation(preparation.id)
     store.approve_source_version(source["version"]["id"])
-
-
-def test_mysql_deployment_migration_backfills_text_without_server_default(monkeypatch):
-    migration_path = (
-        Path(__file__).parents[1]
-        / "src"
-        / "dataforge"
-        / "v7"
-        / "alembic"
-        / "versions"
-        / "20260817_01_deployment_migration.py"
-    )
-    spec = importlib.util.spec_from_file_location("v7_deployment_migration", migration_path)
-    assert spec and spec.loader
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
-
-    class Inspector:
-        def get_columns(self, table):
-            if table == "project_tasks":
-                return [{"name": "id"}, {"name": "knowledge_type"}]
-            return [
-                {"name": "flow_run_id", "nullable": True},
-                {"name": "origin_flow_run_id", "nullable": True},
-            ]
-
-    added, altered, executed = [], [], []
-
-    class Batch:
-        def __init__(self, table):
-            self.table = table
-
-        def add_column(self, column):
-            added.append((self.table, column))
-
-        def create_index(self, *_args, **_kwargs):
-            pass
-
-        def alter_column(self, column, **kwargs):
-            altered.append((self.table, column, kwargs))
-
-    @contextmanager
-    def batch_alter_table(table):
-        yield Batch(table)
-
-    monkeypatch.setattr(migration.op, "batch_alter_table", batch_alter_table)
-    monkeypatch.setattr(migration.op, "execute", lambda statement: executed.append(str(statement)))
-
-    migration._add_task_and_chunk_columns(Inspector())
-
-    assert len(added) == 1
-    table, column = added[0]
-    assert table == "project_tasks"
-    assert column.name == "description"
-    assert column.nullable is True
-    assert column.server_default is None
-    assert executed == ["UPDATE project_tasks SET description='' WHERE description IS NULL"]
-    assert len(altered) == 1
-    table, column_name, kwargs = altered[0]
-    assert (table, column_name) == ("project_tasks", "description")
-    assert isinstance(kwargs["existing_type"], migration.sa.Text)
-    assert kwargs["existing_nullable"] is True
-    assert kwargs["nullable"] is False
 
 
 def keys():
@@ -284,8 +221,8 @@ def test_central_deployment_routing_validation_uses_live_milvus_mode(tmp_path: P
     ).json()
     assert production["snapshot"]["release_stage"] == "production"
     assert calls == [
-        deployment["stage_targets"]["test"]["milvus_url"],
-        deployment["stage_targets"]["production"]["milvus_url"],
+        deployment["stage_targets"]["test"]["revision"]["milvus_url"],
+        deployment["stage_targets"]["production"]["revision"]["milvus_url"],
     ]
 
 
@@ -295,7 +232,7 @@ def test_migration_planner_rejects_dataforge_central_as_target(tmp_path: Path):
     project = seeded_qa_project(store)
     central = next(item for item in project["deployments"] if item["scope"] == "central")
     with pytest.raises(ValueError, match="目标机构.*DataForge 中心环境"):
-        MigrationPlanner(store).plan(central["id"])
+        MigrationPlanner(store).plan(central["id"], release_stage="test")
 
 
 def test_routing_snapshot_is_generated_from_deployment_authorization(tmp_path: Path, monkeypatch):
@@ -305,17 +242,15 @@ def test_routing_snapshot_is_generated_from_deployment_authorization(tmp_path: P
     library = store.create_knowledge_library("医院 FAQ", "qa")
     project = seeded_qa_project(store)
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
-    deployment = store.list_deployments(project["id"])[0]
-    deployment = store.patch_deployment(
-        deployment["id"], institution_name="医院 A", institution_code="KM001",
-    )
-    deployment_task = store.list_deployment_tasks(deployment["id"])[0]
+    deployment = bind_institution(store, project["id"], "医院 A", "KM001")
+    profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
+    deployment_task = store.create_deployment_task(deployment["id"], task["id"], profile["id"])
     store.put_deployment_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
     snapshot = store.routing_snapshot(deployment["id"], "test")
     assert snapshot["schema_version"] == 3
     assert snapshot["deployment"]["id"] == deployment["deployment_id"]
     assert snapshot["project_deployment"]["id"] == deployment["id"]
-    assert snapshot["milvus_target"]["id"] == deployment["milvus_target_id"]
+    assert snapshot["milvus_target"] is None
     assert snapshot["tasks"][0]["org_routes"][0]["knowledge_library_ids"] == [library["id"]]
     first = store.create_route_version(deployment["id"], snapshot)
     other = bind_institution(store, project["id"], "医院 B", "KM002")
@@ -397,7 +332,7 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     store.put_deployment_route(deployment_task["id"], "FREEZE-SCOPE", "冻结知识范围", [library["id"]])
     frozen = store.freeze_route_version(deployment["id"], "test")
     assert frozen["status"] == "frozen"
-    assert store.route_version_detail(deployment["id"], frozen["version_no"])["assets"]
+    assert store.route_version_detail(deployment["id"], frozen["version_no"], "test")["assets"]
     assert store.list_migration_jobs() == []
     production_frozen = store.freeze_route_version(deployment["id"], "production")
     production_draft = store.create_institution_release_draft(
@@ -410,7 +345,7 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     assert "milvus_preset" not in production_plan["deployment"]
     with pytest.raises(ValueError, match="不能混合测试环境和生产环境"):
         store.create_institution_release_draft(
-            deployment["deployment_id"], "institution_release",
+            deployment["deployment_id"], "institution_release", release_stage="test",
             target_institution_code=deployment["institution_code"],
             route_version_ids=[frozen["id"], production_frozen["id"]],
         )
@@ -445,12 +380,12 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     )
     second_frozen = store.freeze_route_version(second_binding["id"], "test")
     draft = store.create_institution_release_draft(
-        deployment["deployment_id"], "deployment_seed",
+        deployment["deployment_id"], "deployment_seed", release_stage="test",
         target_institution_code=deployment["institution_code"],
         route_version_ids=[frozen["id"], second_frozen["id"]],
     )
     required_asset_id = store.route_version_detail(
-        deployment["id"], frozen["version_no"],
+        deployment["id"], frozen["version_no"], "test",
     )["assets"][0]["knowledge_asset_version_id"]
     store.update_institution_release_draft(
         draft["id"], extra_asset_version_ids=[required_asset_id, required_asset_id],
@@ -479,7 +414,7 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
         required_asset = session.get(KnowledgeAssetVersion, required_asset_id)
         session.get(KnowledgeAssetVersion, other_asset_id).collection_name = required_asset.collection_name
     conflict_draft = store.create_institution_release_draft(
-        deployment["deployment_id"], "institution_release",
+        deployment["deployment_id"], "institution_release", release_stage="test",
         target_institution_code=deployment["institution_code"],
         route_version_ids=[frozen["id"], second_frozen["id"]],
         extra_asset_version_ids=[other_asset_id],
@@ -494,7 +429,7 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     release = store.freeze_institution_release_snapshot(draft["id"], plan)
     assert release["status"] == "frozen" and release["snapshot"]["asset_versions"]
     with pytest.raises(ValueError, match="机构代码已.*锁定"):
-        store.patch_deployment(deployment["id"], institution_code="FREEZE002")
+        store.patch_shared_deployment(deployment["deployment_id"], institution_code="FREEZE002")
     private, _public = keys()
     settings = Settings(
         project_root=tmp_path, state_dir=tmp_path / "freeze-state", database_url=url,
@@ -550,11 +485,13 @@ def test_institution_release_target_code_is_verified_for_draft_and_local_import(
     library = central.create_knowledge_library("目标校验知识", "text")
     with pytest.raises(ValueError, match="institution_code 与 Deployment 不匹配"):
         central.create_institution_release_draft(
-            deployment["id"], "knowledge_update", target_institution_code="INST-B",
+            deployment["id"], "knowledge_update", release_stage="test",
+            target_institution_code="INST-B",
             knowledge_library_ids=[library["id"]],
         )
     draft = central.create_institution_release_draft(
-        deployment["id"], "knowledge_update", target_institution_code="INST-A",
+        deployment["id"], "knowledge_update", release_stage="test",
+        target_institution_code="INST-A",
         knowledge_library_ids=[library["id"]],
     )
     assert draft["target_institution_code"] == "INST-A"
@@ -670,7 +607,7 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
     central.put_deployment_route(deployment_task["id"], "V2001", "医院 V2", [library_id])
     frozen = central.freeze_route_version(deployment["id"], "test")
     draft = central.create_institution_release_draft(
-        deployment["deployment_id"], "deployment_seed",
+        deployment["deployment_id"], "deployment_seed", release_stage="test",
         target_institution_code=deployment["institution_code"], route_version_ids=[frozen["id"]],
     )
     release_plan = InstitutionReleasePlanner(central).plan(draft["id"])
@@ -842,7 +779,7 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
             "content_hash": item["content_hash"],
         }], asset_count=1, asset_digest="d" * 64)
     update_draft = central.create_institution_release_draft(
-        deployment["deployment_id"], "knowledge_update",
+        deployment["deployment_id"], "knowledge_update", release_stage="test",
         target_institution_code=deployment["institution_code"], knowledge_library_ids=[library_id],
     )
     update_plan = InstitutionReleasePlanner(central).plan(update_draft["id"])
@@ -1020,7 +957,9 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     other_deployment = bind_institution(central, project["id"], "医院 B", "KM002")
     other_task = central.create_deployment_task(other_deployment["id"], task["id"], qa_question_profile["id"])
     central.put_deployment_route(other_task["id"], "KM002", "医院 B", [library["id"]])
-    plan = MigrationPlanner(central).plan(deployment["id"], [library["id"]])
+    plan = MigrationPlanner(central).plan(
+        deployment["id"], [library["id"]], release_stage="test",
+    )
     selected = plan["libraries"][0]; central_milvus = FakeOfflineMilvus({
         selected["collection_name"]: {selected["partition_name"]: [{"id": "vec-1", "vector": [0.1, 0.2],
             "knowledge_library_id": library["id"], "knowledge_item_id": item["id"], "source_knowledge_id": "faq-1"}]}})
@@ -1029,7 +968,8 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     central_instance = InstanceContext.load(central, settings)
     export_job = central.create_migration_job(direction="export", package_kind="deployment_seed",
         project_id=project["id"], project_deployment_id=deployment["id"], status="queued", stage="planned",
-        checkpoint={"options": {"knowledge_library_ids": [library["id"]], "include_full_document_library": False}},
+        checkpoint={"options": {"knowledge_library_ids": [library["id"]], "release_stage": "test",
+                                  "include_full_document_library": False}},
         items=[{"knowledge_library_id": library["id"], "collection_name": selected["collection_name"],
                 "partition_name": selected["partition_name"]}])
     exported = MigrationExporter(central, central_objects, central_milvus, migration_dir=tmp_path / "packages",
