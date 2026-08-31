@@ -38,6 +38,7 @@ const payload = computed(() => {
 })
 const derivedItems = computed(() => (props.content?.items || []).filter(item => item.source_chunk && typeof item.effective_text === 'string'))
 const evaluatedItems = computed(() => (props.content?.items || []).filter(item => item.evaluation_results))
+const deduplicatedItems = computed(() => (props.content?.items || []).filter(item => item.deduplication_results))
 </script>
 
 <template>
@@ -45,6 +46,7 @@ const evaluatedItems = computed(() => (props.content?.items || []).filter(item =
     <header><div><h3>{{ title }}</h3><small v-if="operator && !artifact" class="operator-bilingual">{{ operatorSubtitle(operator, true) }}</small><small v-if="node">{{ inspectorType }} · {{ node.node_id }}</small></div><span v-if="node" class="badge" :class="node.status==='failed'?'red':failure.hasFailure?'amber':node.status==='completed'?'green':'amber'">{{ node.status }}{{ node.status === 'completed' && failure.hasFailure ? ' · 有处理失败' : '' }}</span></header>
     <nav v-if="node && !artifact"><button v-for="item in tabs" :key="item.key" :class="{active:tab===item.key}" @click="tab=item.key">{{ item.label }}</button></nav>
     <div class="body" v-if="payload">
+      <p v-if="artifact && deduplicatedItems.length" role="note">语义标记只提示相似关系，不等于事实相同；标记节点保留全部记录，是否过滤由后续条件决定。</p>
       <p v-if="!artifact && failure.recoveredChunks && ['overview', 'logs'].includes(tab)" role="status">格式恢复后成功：{{ failure.recoveredChunks }} 块</p>
       <section v-if="!artifact && failure.hasFailure && ['overview', 'logs'].includes(tab)" class="failure-summary" aria-label="失败原因">
         <h4>{{ failure.title }}</h4>
@@ -63,7 +65,7 @@ const evaluatedItems = computed(() => (props.content?.items || []).filter(item =
         <p>保留 {{ derivedItems.filter(item=>item.disposition==='keep').length }} 条 · 过滤 {{ derivedItems.filter(item=>item.disposition==='filtered').length }} 条（当前页）</p>
         <article v-for="(item,index) in derivedItems" :key="index"><h4>{{ item.disposition === 'keep' ? '保留' : '正常过滤' }}</h4><h4>原始正文 · Evidence 保留</h4><pre>{{ item.source_chunk.content }}</pre><h4>处理后正文</h4><pre>{{ item.effective_text }}</pre><details><summary>来源与处理记录</summary><pre>{{ JSON.stringify(item,null,2) }}</pre></details></article>
       </section>
-      <section v-else-if="artifact && evaluatedItems.length" aria-label="QA质量评估"><p>以下为模型评分，不等于原始证据事实核验。</p><pre>{{ JSON.stringify(payload,null,2) }}</pre></section>
+      <section v-else-if="artifact && evaluatedItems.length" aria-label="质量评估"><p>以下为按节点保存的模型评分与理由，不等于原始证据事实核验。</p><pre>{{ JSON.stringify(payload,null,2) }}</pre></section>
       <pre v-else>{{ JSON.stringify(artifact ? payload : payload[tab], null, 2) }}</pre>
       <template v-if="node && ['input','output'].includes(tab)"><button v-for="id in payload[tab] || []" :key="id" class="artifact-link" @click="emit('inspect-artifact', id)">{{ id }}</button></template>
     </div>

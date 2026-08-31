@@ -5,6 +5,15 @@ import { consoleEventMessage } from '../../../views/developer/debugConsole'
 import { dataflowOperators } from '../__tests__/flowFixtures'
 
 describe('operator diagnostic rendering', () => {
+  it('labels generic scores and semantic markers as review signals rather than fact checks', () => {
+    const wrapper = mount(RuntimeInspector, { props: { artifact: { id: 'a', type: 'candidate:text' }, content: { items: [
+      { canonical_content: '知识', evaluation_results: { score: { scores: { score: 4 }, feedback: { score: '清晰' } } }, deduplication_results: { mark: { duplicate_of: null } } },
+    ] } } })
+    expect(wrapper.get('[aria-label="质量评估"]').text()).toContain('模型评分与理由')
+    expect(wrapper.get('[role="note"]').text()).toContain('保留全部记录')
+    expect(wrapper.text()).not.toContain('QA质量评估')
+    wrapper.unmount()
+  })
   it('shows failure reasons in overview and logs despite completed status, and clears them on node change', async () => {
     const node = { node_id: 'qa', status: 'completed', error_detail: {},
       metrics: { chunk_processing: [{ output_key: 'qa', successful_chunks: 3, failed_chunks: 2 }] },

@@ -1,15 +1,26 @@
 """Idempotent provisioning for DataForge-owned Milvus collections."""
 from __future__ import annotations
 
-import json
 import argparse
-from typing import Any
+import json
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 
-from .models import KnowledgeIndexProfileRevision, ManagedCollection, StorageContractRevision
-from .store import V7Store, new_id
+from .models import (
+    DataForgeInstance,
+    KnowledgeIndexProfileRevision,
+    ManagedCollection,
+    StorageContractRevision,
+)
+from .store import CENTRAL_STAGE_TARGETS, V7Store, new_id
 from .vector import ManagedCollectionIncompatible, V7Milvus
+
+if TYPE_CHECKING:
+    from dataforge.config import Settings
+    from .instance import InstanceContext
+    from .milvus_targets import ResolvedMilvusConnection
 
 
 OWNER_PREFIX = "dataforge-managed:"
@@ -152,24 +163,100 @@ class ManagedCollectionDeletionService:
             return self.store.finish_managed_collection_deletion(job_id, str(exc))
 
 
+def _resolve_provisioning_connection(
+        store: V7Store, settings: Settings, instance: InstanceContext,
+        milvus_factory: Callable[[str, str | None], V7Milvus] = V7Milvus,
+) -> ResolvedMilvusConnection | None:
+    """Resolve Authoring Milvus, bootstrapping only the central test Target."""
+    from .local_config import LocalMilvusConfigurationService
+    from .milvus_targets import MilvusConnectionResolver, MilvusTargetService
+
+    if instance.mode == "local":
+        local = LocalMilvusConfigurationService(store, settings.config_encryption_key)
+        current = local.get(instance.id, "current_target")
+        if (not current or current.get("status") != "verified"
+                or current.get("verified_fingerprint") != current.get("connection_fingerprint")):
+            return None
+        return local.verified(instance.id, "current_target")
+
+    resolver = MilvusConnectionResolver(store, settings.config_encryption_key)
+    with store.sessions() as session:
+        persisted = session.get(DataForgeInstance, instance.id)
+        if not persisted:
+            raise ValueError("DataForge 实例不存在")
+        authoring_target_id = persisted.authoring_milvus_target_id
+    if authoring_target_id:
+        return resolver.authoring(instance.id)
+
+    test_target_id = CENTRAL_STAGE_TARGETS["test"][0]
+    result = MilvusTargetService(
+        store, settings.config_encryption_key, milvus_factory,
+    ).check_startup_targets((test_target_id,))[0]
+    if result.get("status") != "healthy":
+        # A human choice may have won the race while the built-in check was in
+        # flight. Prefer that verified binding instead of failing or replacing it.
+        with store.sessions() as session:
+            persisted = session.get(DataForgeInstance, instance.id)
+            concurrent_target_id = persisted.authoring_milvus_target_id if persisted else None
+        if concurrent_target_id:
+            return resolver.authoring(instance.id)
+        # The API startup check may have promoted the exact same first
+        # candidate before this process committed its CAS result. Accept only
+        # that already-healthy current Revision; a replacement candidate with
+        # no current Revision remains a fail-closed stale result.
+        if result.get("error_type") == "StaleMilvusVerification":
+            target = store.get_milvus_target(test_target_id)
+            current = target.get("current_revision") or {}
+            if (target.get("current_revision_id")
+                    and current.get("verification_status") == "verified"
+                    and current.get("health_status") == "healthy"):
+                store.bind_authoring_milvus_target_if_unset(instance.id, test_target_id)
+                return resolver.authoring(instance.id)
+        status = str(result.get("status") or "failed")
+        raise ValueError(
+            f"中心测试 Milvus 启动验证未通过（{status}），不能初始化默认知识写入目标"
+        )
+
+    store.bind_authoring_milvus_target_if_unset(instance.id, test_target_id)
+    return resolver.authoring(instance.id)
+
+
+def _reconcile_managed_collections(
+        settings: Settings,
+        milvus_factory: Callable[[str, str | None], V7Milvus] = V7Milvus,
+) -> dict[str, Any]:
+    from .instance import InstanceContext
+
+    store = V7Store(settings.database_url)
+    instance = InstanceContext.load(store, settings)
+    connection = _resolve_provisioning_connection(
+        store, settings, instance, milvus_factory,
+    )
+    if connection is None:
+        return {
+            "status": "waiting_for_configuration",
+            "reason": "local_milvus_not_verified",
+            "collections": [],
+        }
+    results = ManagedCollectionProvisioner(
+        store, milvus_factory(connection.uri, connection.token),
+    ).reconcile()
+    incomplete = [item for item in results if item.get("status") != "ready"]
+    if incomplete:
+        summary = ", ".join(
+            f"{item.get('collection_name') or item.get('id')}:{item.get('status') or 'unknown'}"
+            for item in incomplete
+        )
+        raise ManagedCollectionIncompatible(f"受管 Collection Provision 未全部完成：{summary}")
+    return {"status": "completed", "reason": None, "collections": results}
+
+
 def main() -> None:
     from dataforge.config import Settings
-    from .instance import InstanceContext
-    from .local_config import LocalMilvusConfigurationService
-    from .milvus_targets import MilvusConnectionResolver
 
     parser = argparse.ArgumentParser(description="协调 DataForge 受管 Milvus Collection")
     parser.add_argument("--reconcile", action="store_true", help="幂等创建或校验全部受管 Collection")
     parser.parse_args()
     settings = Settings.load()
-    store = V7Store(settings.database_url)
-    instance = InstanceContext.load(store, settings)
-    connection = (
-        LocalMilvusConfigurationService(store, settings.config_encryption_key).verified(instance.id, "current_target")
-        if instance.mode == "local"
-        else MilvusConnectionResolver(store, settings.config_encryption_key).authoring(instance.id)
-    )
-    results = ManagedCollectionProvisioner(
-        store, connection.client(),
-    ).reconcile()
+    results = _reconcile_managed_collections(settings)
     print(json.dumps(results, ensure_ascii=False))

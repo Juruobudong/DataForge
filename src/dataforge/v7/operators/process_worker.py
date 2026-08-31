@@ -120,11 +120,16 @@ def execute(request):
             return values
 
     cls = load_approved_class(request["implementation"], package["name"])
+    serving = Serving() if request.get("uses_llm") and request["executor"] != "custom-native" else None
+    if governance:
+        special = governance.execute_special(request, cls, serving)
+        if special is not None:
+            return {"outputs": special}
     init = dict(request.get("init") or {})
     if governance:
         init = governance.prepare_init(request, init)
-    if request.get("uses_llm") and request["executor"] != "custom-native":
-        init["llm_serving"] = Serving()
+    if serving is not None:
+        init["llm_serving"] = serving
     operator = cls(**init)
     if governance:
         governance.configure_operator(request, operator)

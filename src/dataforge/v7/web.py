@@ -197,6 +197,9 @@ class OperatorCandidatesRequest(BaseModel):
     output_types: list[str] = Field(default_factory=list)
     source_node_id: str | None = None
     source_port: str = "output"
+    node_id: str | None = None
+    direction: Literal["upstream", "downstream"] = "downstream"
+    include_incompatible: bool = False
 
 
 class OperatorManifestRequest(BaseModel):
@@ -1526,7 +1529,11 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.post("/api/developer/operator-catalog/candidates")
     def operator_candidates(payload: OperatorCandidatesRequest):
-        try: return store.operator_candidates(payload.definition, payload.output_types, payload.source_node_id, payload.source_port)
+        try: return store.operator_candidates(
+            payload.definition, payload.output_types, payload.source_node_id, payload.source_port,
+            node_id=payload.node_id, direction=payload.direction,
+            include_incompatible=payload.include_incompatible,
+        )
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog/facets")

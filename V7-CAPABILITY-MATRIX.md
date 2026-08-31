@@ -1,6 +1,8 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-30
+更新日期：2026-08-31
+
+DataFlow 质量信号扩充（2026-08-31）：Catalog 登记26个唯一精选，新增通用评分、语义重复标记、句子/符号过滤和安全重复标点清理；GeneralFilter v2 显式消费上游信号。代码与受控本地链路已实施，Standard DAG 不变。语义CPU依赖独立安装，但真实权重下载/TLS受阻，模型资源Profile及Runner资源层构建仍未完成验收；不是26项全部Ready。详见[026实施状态](specs/026-dataflow-quality-signals/summary.md)和[来源基线](wiki/sources/dataflow-quality-signals-2026-08-31.md)。
 
 问答 Provider 分离（2026-08-28）：默认原生 `qa-extractor v1`，Advanced 另选上游 `Text2QAGenerator v8`；提示词、业务参数与 Provider 分离，共用结构约束、有限恢复和诊断。本地完整 Debug 调用 `.34` 真实 Qwen3-32B：原生三轮共15块、DataFlow一轮5块均成功；未部署新版容器。见[实施记录](wiki/sources/qa-provider-separation-2026-08-28.md)。
 
@@ -37,6 +39,8 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 ## 页面与操作
 
 算子库双体系与身份解耦（2026-08-29）：官方目录并列为 DataForge 算子和21个 DataFlow 精选，可信插件位于独立自定义算子区。Catalog 一等保存 `source/catalog_group/category`；执行只读取冻结 `runtime_requirements.driver/executor`：Driver 选择 Runner 顶层适配器，Executor 选择适配器内部协议。自定义 DataFlow 协议仍由 Custom Driver 包裹，来源与目录不参与分派。旧 code、alias、历史注册和退出身份不再 Seed 或执行。当前为本地实现，`.34`/Docker/真实模型仍待验收。来源：[实施基线](wiki/sources/operator-catalog-dual-system-2026-08-29.md)、[自定义算子收口](wiki/sources/custom-operator-identity-convergence-2026-08-29.md)。
+
+Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后可分别查看可接上游/下游，保留不可连接原因，并把 Contract 可连接与 Runner 依赖就绪拆成三态；兼容项可按服务端端口对直接添加节点和 Edge。候选发现与 Compiler 共用 Edge 校验，不按 Catalog 来源判定。本地后端、前端合同/组件测试与生产构建通过；未运行 Docker 或 `.34`。
 
 自定义流程当前草稿执行（2026-08-28）：`DONE`。Advanced 完整 DSL 直接编译；500ms 自动保存、运行前排空保存队列、草稿 checksum 冲突保护、不可变 Run DAG/来源/校验和展示已实现。删除必要转换节点返回端口错误，不补节点；正式 Job 仍使用发布快照。真实 `.34` 服务验收为 `CONNECT`。来源：[批准基线](wiki/sources/current-draft-execution-2026-08-28.md)。
 
@@ -97,6 +101,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 | qa_agent FAQ 专用文件生产与固定迁移 | `DONE` | `qa-agent-faq`、自动 Profile、受管 Collection、无 LLM CSV/XLSX 模板、固定 12 Partition CLI/Bash 和 qa_agent `legacy/shadow/primary` 已实现并完成本地定向测试；真实导入归 C-10。 |
 | Collection 与版本化 `kl_*__vN` Partition 生命周期 | `DONE` | 候选构建不 reset 运行版本；GC 引用保护、30 天和最近两版门禁，默认 dry-run 且只由显式 Job 执行。受管整库治理保持独立。 |
 | `/api/vector-storage/*` 实时库存与校验 | `DONE` | overview/list/detail 聚合实时 Milvus 与 MySQL，pymilvus 元数据先转为普通 JSON；业务列表默认仅托管并可切全量，API 缺省仍全量；verify 才全量 digest 并保存最近结果；load/release 每次复验 ownership/Contract/资产映射；本命名空间无 DELETE。 |
+| 数据库初始化安全门禁 | `LOCAL` | Alembic 前只读识别 EMPTY/CURRENT/需用户决策；仅空库创建 `20260830_v7_baseline`，当前合法库只校验并幂等 Seed，其他非空状态在任何升级/Seed 前以结构化报告和退出码 20 停止。SQLite 自动化已覆盖，真实 `.34` MySQL/Compose 空卷仍待同步验收。 |
 | V7 受控重建 | `DONE` | 仅 `dataforge-migrate --rebuild-v7 --confirm=REBUILD-V7`，基于 DB manifest 删除 V7 对象/分区/表数据，绝不删除 Collection 或旧资源。 |
 
 ## 尚未完成项（按执行顺序）
@@ -105,7 +110,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 
 | 顺序 | 未完成能力 | 状态 | 完成条件 |
 | --- | --- | --- | --- |
-| C-01 | 准备真实 V7 运行环境 | `CONNECT` | 提供空或已升级的 MySQL `dataforge`、MinIO、Milvus、`DATAFORGE_CONFIG_ENCRYPTION_KEY`、可写 RoutingSnapshot volume及 NVIDIA GPU；migrate 可用旧 YAML/Embedding 环境初始化，随后在模型服务页完成真实测试。 |
+| C-01 | 准备真实 V7 运行环境 | `CONNECT` | 提供空 MySQL `dataforge`（或已是当前 Baseline 且结构校验通过的数据库）、MinIO、Milvus、`DATAFORGE_CONFIG_ENCRYPTION_KEY`、可写 RoutingSnapshot volume及 NVIDIA GPU；migrate 不升级旧 schema，随后在模型服务页完成真实测试。 |
 | C-02 | 真实集成验收 | `CONNECT` | 执行 Compose config/Runner build/Serving Registry 默认项检查、Alembic 升级、MinerU 双路径 health 与局域网拒绝、文本/扫描 PDF、指定三分块 QA、真实向量同步、Partition load/search/release、Manual attach/create、扩展自动 Provision 与受管删除门禁；确认 external/非受管 Collection 不能删除。 |
 | C-03 | 三个目标项目接入 | `CONNECT` | 在 V7 中创建项目/任务/路由，使用新建 V7 知识库发布并核对各自 Snapshot；不迁移或读取 V2。 |
 | C-04 | 真实失败恢复验收 | `CONNECT` | 手动组件检查、匿名脱敏、Worker/Runner 心跳与前端告警已完成仓库自动化；仍须在 `.34` 验证 Milvus/Embedding/Runner/MinerU/MinIO 不可用、Worker lease 恢复和删除任务重试。 |
@@ -133,6 +138,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 - 2026-08-18：按新治理增加 `.34` 空卷遗留内置 Collection 手动清理 CLI；固定五项 allowlist、ownership/schema/index/Partition/行数门禁、dry-run/动态确认/显式 execute 和删除后复核已实现，真实 dry-run 识别 476 行但未执行删除。空卷 Provision 复验仍归 C-08/C-09。
 - 2026-08-18：部署实测发现镜像未注册清理 CLI；单 Bash 入口改为把自包含安全载荷只读挂载到现有 provision 容器执行，不再依赖镜像重建、源码安装或 console entry。静态与单元验证通过，真实删除/Provision 仍待用户重试。
 - 2026-08-18：实时盘点证明清理已创建五个 0 行新 Collection，但随机 seed token 在后续空卷再次失配；内置 token 改为稳定 ID+名称+Contract hash 的确定值，两个独立空库回归一致。首次升级仍需清理旧随机 marker，后续同 Contract 空卷重建不再复发。
+- 2026-08-30：修复空库首次 Provision 早于 API 延迟绑定而退出；central Provision 在 Authoring 为空时只验证并原子绑定内置测试 Target，人工目标优先，local 未配置返回等待态，生产 Target 不参与；任一 Collection 非 ready 时整体失败。仓库专项 9 passed、相关定向组合 31 passed；`.34` 只读复现已确认旧镜像时序，修复镜像的一次启动与五项 ready 仍归 C-01/C-02 空卷验收。
 - 2026-08-18：010 qa_agent FAQ 仓库实现完成；新增专用类型/受管 Collection、确定性 CSV/XLSX 模板、固定 `.34/faq` 导入 CLI 与单 Bash，以及 qa_agent 三阶段读取。DataForge 7 项、qa_agent 20 项定向测试通过；未执行 `.34` 写入、Routing 发布或模式切换，真实验收归 C-10。
 - 2026-08-19：FAQ 手工上传契约改为 `faq-{org_code}.csv|xlsx` 文件名承载机构，CSV 可省略机构列；导出12份修正版 CSV/manifest/checksum 共8,281行，DataForge定向12项和表格运行时12文件导入/渲染通过。部署 API 尚无 FAQ 类型/模板/文档库，预建与上传仍归 C-10。
 - 2026-08-24：015 SourceChunk 人工审核 Gate 仓库实现完成；Preparation、不可变 Chunk Revision/Review Snapshot、自动 Dispatch、Reviewed Flow、Sink/Vector/Routing fail-closed 与 PC 双栏审核工作区已落地。平台 53、迁移 13、前端 50 项及相关定向回归通过；真实 `.34` 顺序与服务验收归 C-11。

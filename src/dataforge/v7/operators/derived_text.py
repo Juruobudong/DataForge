@@ -87,7 +87,10 @@ def restore_evidence(outputs, originals, kind, context):
 
 
 def content_digest(value):
-    payload = {"canonical_content": value.get("canonical_content"),
-               "question": (value.get("data_json") or {}).get("question"),
-               "answer": (value.get("data_json") or {}).get("answer")}
+    if is_source(value):
+        payload = {"effective_text": value.get("effective_text") if "source_chunk" in value else value.get("content")}
+    else:
+        payload = {"canonical_content": value.get("canonical_content"),
+                   "question": (value.get("data_json") or {}).get("question"),
+                   "answer": (value.get("data_json") or {}).get("answer")}
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

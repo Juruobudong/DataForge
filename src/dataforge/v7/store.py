@@ -434,7 +434,7 @@ class V7Store:
         return assert_schema_current(self.database_url)
 
     def seed(self) -> None:
-        """Install immutable V7 defaults after Alembic creates an empty schema."""
+        """Idempotently install current V7 defaults after the schema gate succeeds."""
         with self.sessions.begin() as session:
             if not session.scalar(select(DataForgeInstance)):
                 instance_mode = os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower()
@@ -1757,27 +1757,84 @@ class V7Store:
             raise ValueError(status.get("reason", "算子依赖尚未就绪"))
         return status
 
-    def operator_candidates(self, definition, output_types, source_node_id=None, source_port="output"):
-        from .flow import _node_ports, _reachable_sink_contexts, _edge, resolve_port_contract, validate_edge_compatibility, FlowEdgeValidationError, input_type_for_node
+    def operator_candidates(self, definition, output_types, source_node_id=None, source_port="output", *,
+                            node_id=None, direction="downstream", include_incompatible=False):
+        from .flow import (_node_ports, _reachable_sink_contexts, _edge, resolve_port_contract,
+                           validate_edge_compatibility, FlowEdgeValidationError, input_type_for_node,
+                           evaluate_edge_candidate)
+        if direction not in {"upstream", "downstream"}:
+            raise ValueError("算子发现方向必须为 upstream 或 downstream")
         values = self.list_operator_catalog(surface="advanced-canvas")
         families = {normalise_output_key(value).split(":")[0] for value in output_types}
         with self.sessions() as session:
             catalog, subflows = load_catalog(session), self._published_subflows(session)
-        source = next((node for node in definition.get("nodes", []) if node["id"] == source_node_id), None)
-        if source_node_id and source is None:
+        anchor_id = node_id or source_node_id
+        source = next((node for node in definition.get("nodes", []) if node["id"] == anchor_id), None)
+        if anchor_id and source is None:
             raise ValueError("推荐来源节点不存在")
+        if include_incompatible and not source:
+            raise ValueError("上下文算子发现必须指定 node_id")
         contexts = {(normalise_output_key(value).split(":")[0], normalise_output_key(value).split(":")[1] if ":" in normalise_output_key(value) else None) for value in output_types}
         if source:
             by_id = {node["id"]: node for node in definition.get("nodes", [])}
             outgoing = {}
             for edge in map(_edge, definition.get("edges", [])):
                 outgoing.setdefault(edge["source"], []).append(edge["target"])
-            contexts = _reachable_sink_contexts(source_node_id, by_id, outgoing) or contexts
+            contexts = _reachable_sink_contexts(anchor_id, by_id, outgoing) or contexts
         result = []
         for item in values:
-            if not item["enabled"] or not item["approved"] or item["status"] != "published" or item["dependency_status"]["status"] != "ready": continue
-            if families and "*" not in item["knowledge_types"] and not families.intersection(item["knowledge_types"]): continue
-            if contexts and item.get("graph_modes") and not {mode for kind, mode in contexts if kind == "graph"}.intersection(item["graph_modes"]): continue
+            if not item["enabled"] or not item["approved"] or item["status"] != "published": continue
+            if not include_incompatible and item["dependency_status"]["status"] != "ready": continue
+            if not include_incompatible and families and "*" not in item["knowledge_types"] and not families.intersection(item["knowledge_types"]): continue
+            if not include_incompatible and contexts and item.get("graph_modes") and not {mode for kind, mode in contexts if kind == "graph"}.intersection(item["graph_modes"]): continue
+            if include_incompatible:
+                candidate_id = "__operator_candidate__"
+                while any(node.get("id") == candidate_id for node in definition.get("nodes", [])):
+                    candidate_id += "_"
+                candidate_node = {"id": candidate_id, "kind": "operator", "node_role": "operator",
+                                  "ref": item["code"], "operator_version": item["version"], "params": {}}
+                if direction == "downstream":
+                    source_ports = _node_ports(source, direction="output", catalog=catalog, subflows=subflows)
+                    if source_node_id and not node_id:
+                        source_ports = {source_port: source_ports[source_port]} if source_port in source_ports else {}
+                    target_ports = item.get("input_ports") or {}
+                else:
+                    source_ports = item.get("output_ports") or {}
+                    target_ports = _node_ports(source, direction="input", catalog=catalog, subflows=subflows)
+                attempts = []
+                for source_port_id in source_ports:
+                    for target_port_id, target_spec in target_ports.items():
+                        if str(target_spec.get("binding") or "edge") != "edge":
+                            continue
+                        edge = ({"source": source["id"], "source_port": source_port_id,
+                                 "target": candidate_id, "target_port": target_port_id}
+                                if direction == "downstream" else
+                                {"source": candidate_id, "source_port": source_port_id,
+                                 "target": source["id"], "target_port": target_port_id})
+                        attempts.append(evaluate_edge_candidate(
+                            definition, edge=edge, catalog=catalog, subflows=subflows,
+                            candidate_node=candidate_node,
+                        ))
+                compatible = next((attempt for attempt in attempts if attempt["compatible"]), None)
+                if compatible is None:
+                    compatible = attempts[0] if attempts else {
+                        "compatible": False,
+                        "reason_code": ("SOURCE_NODE_NO_OUTPUT"
+                                        if direction == "downstream" and not source_ports
+                                        else "TARGET_NODE_NO_INPUT"),
+                        "reason": "当前方向不存在可连接的 Edge 端口",
+                        "details": {},
+                    }
+                result.append({
+                    **item,
+                    "compatibility": {**compatible, "direction": direction},
+                    "runtime_status": item["dependency_status"],
+                    "matching_ports": ([compatible["target_port"]]
+                                       if compatible["compatible"] and direction == "downstream"
+                                       else [compatible["source_port"]]
+                                       if compatible["compatible"] else []),
+                })
+                continue
             if source:
                 source_spec = _node_ports(source, direction="output", catalog=catalog, subflows=subflows).get(source_port)
                 target_spec = item["input_ports"].get("input")

@@ -9,7 +9,12 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
 
-CURRENT_SCHEMA_REVISION = "20260830_v7_baseline"
+from .database_preflight import (
+    CURRENT_SCHEMA_REVISION,
+    DatabaseState,
+    DatabaseUserDecisionRequired,
+    inspect_database,
+)
 
 
 def _config(database_url: str) -> Config:
@@ -25,10 +30,32 @@ def _config(database_url: str) -> Config:
     return config
 
 
-def upgrade(database_url: str) -> dict[str, str]:
-    """Initialize or upgrade the V7 schema through Alembic only."""
-    command.upgrade(_config(database_url), "head")
-    return {"current_revision": assert_schema_current(database_url)}
+def initialize(database_url: str) -> dict[str, object]:
+    """Initialize an empty database or verify an already-current database."""
+    preflight = inspect_database(database_url)
+    if preflight.state == DatabaseState.CURRENT:
+        revision = assert_schema_current(database_url)
+        validate_current_schema(database_url)
+        return {
+            "status": "current",
+            "database_state": preflight.state.value,
+            "current_revision": revision,
+        }
+    if preflight.state == DatabaseState.EMPTY:
+        command.upgrade(_config(database_url), "head")
+        revision = assert_schema_current(database_url)
+        validate_current_schema(database_url)
+        return {
+            "status": "initialized",
+            "database_state": preflight.state.value,
+            "current_revision": revision,
+        }
+    raise DatabaseUserDecisionRequired(preflight)
+
+
+def upgrade(database_url: str) -> dict[str, object]:
+    """Compatibility alias for current-schema initialization."""
+    return initialize(database_url)
 
 
 def assert_schema_current(database_url: str) -> str:
@@ -46,3 +73,17 @@ def assert_schema_current(database_url: str) -> str:
             "请先运行 dataforge-migrate --upgrade-platform"
         )
     return revision
+
+
+def validate_current_schema(database_url: str) -> str:
+    """Require the current revision and the complete current structural contract."""
+    preflight = inspect_database(database_url)
+    if preflight.state == DatabaseState.CURRENT:
+        return preflight.current_revision or CURRENT_SCHEMA_REVISION
+    if preflight.current_revision != CURRENT_SCHEMA_REVISION:
+        raise RuntimeError(
+            f"V7 schema revision 必须为 {CURRENT_SCHEMA_REVISION}，当前为 "
+            f"{preflight.current_revision or '未初始化'}"
+        )
+    details = "；".join(preflight.schema_errors) or "Schema 状态未识别"
+    raise RuntimeError(f"V7 schema 与当前模型不一致：{details}")

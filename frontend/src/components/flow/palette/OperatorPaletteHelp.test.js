@@ -74,9 +74,21 @@ describe('operator help has no graph mutations', () => {
     expect(dialog()).toBeNull()
   })
   it('provides structured conditions and upstream evaluation selection', async () => {
-    wrapper = mount(FilterRulesEditor, { props: { modelValue: [{ field: 'length', operator: 'ge', value: 1 }], evaluationNodes: [{ id: 'score', label: 'QA评估' }] } })
+    wrapper = mount(FilterRulesEditor, { props: { modelValue: [{ field: 'length', operator: 'ge', value: 1 }], evaluationNodes: [{ id: 'score', operator: 'Text2QASampleEvaluator', label: 'QA评估' }] } })
     await wrapper.get('[aria-label="条件1字段"]').setValue('question_quality')
     expect(wrapper.emitted('update:modelValue').at(-1)[0][0]).toMatchObject({ field: 'question_quality', evaluation_node: 'score', operator: 'ge', value: 4 })
+  })
+  it('separates generic evaluation and semantic marker node references', async () => {
+    wrapper = mount(FilterRulesEditor, { props: {
+      modelValue: [{ field: 'length', operator: 'ge', value: 1 }],
+      evaluationNodes: [{ id: 'qa-score', operator: 'Text2QASampleEvaluator', label: 'QA评估' }, { id: 'generic-score', operator: 'PromptedEvaluator', label: '通用评估' }],
+      deduplicationNodes: [{ id: 'semantic', operator: 'SemDeduplicateFilter', label: '语义标记' }],
+    } })
+    await wrapper.get('[aria-label="条件1字段"]').setValue('evaluation_score')
+    expect(wrapper.emitted('update:modelValue').at(-1)[0][0]).toMatchObject({ evaluation_node: 'generic-score', value: 4 })
+    await wrapper.setProps({ modelValue: wrapper.emitted('update:modelValue').at(-1)[0] })
+    await wrapper.get('[aria-label="条件1字段"]').setValue('semantic_duplicate')
+    expect(wrapper.emitted('update:modelValue').at(-1)[0][0]).toMatchObject({ deduplication_node: 'semantic', operator: 'eq', value: false })
   })
   it('does not intercept Escape when no help is open', async () => {
     palette()
@@ -106,4 +118,27 @@ it('resolves source processing ports without weakening direct Sink checks', () =
   const edges = [{ id: 'one', source: 'source', target: 'filter' }]
   expect(checkEdgeCompatibility({ nodes, edges, sourceNodeId: 'filter', targetNodeId: 'mapper' }).allowed).toBe(true)
   expect(checkEdgeCompatibility({ nodes, edges, sourceNodeId: 'filter', targetNodeId: 'sink' }).allowed).toBe(false)
+})
+
+it('shows compatible, runtime-unready and incompatible operators without hiding reasons', async () => {
+  const catalog = [item('ready'), item('unready'), item('blocked')]
+  const candidateResults = [
+    { ...catalog[0], compatibility: { compatible: true, direction: 'downstream', source_port: 'output', target_port: 'input' }, runtime_status: { status: 'ready' } },
+    { ...catalog[1], compatibility: { compatible: true, direction: 'downstream', source_port: 'output', target_port: 'input' }, runtime_status: { status: 'missing', reason: 'Runner 缺少资源' } },
+    { ...catalog[2], compatibility: { compatible: false, direction: 'downstream', reason_code: 'PORT_TYPE_MISMATCH', reason: '端口数据类型不兼容：candidate:qa → candidate:text' }, runtime_status: { status: 'ready' } },
+  ]
+  const selectedNode = { id: 'qa', data: { meta: { name: '问答生成器' } } }
+  wrapper = mount(OperatorPalette, { props: { catalog, candidateResults, selectedNode, direction: 'downstream', outputTypes: ['qa'] }, attachTo: document.body })
+
+  expect(wrapper.text()).toContain('当前节点：问答生成器')
+  expect(wrapper.findAll('.compatibility-compatible')).toHaveLength(1)
+  expect(wrapper.findAll('.compatibility-unready')).toHaveLength(1)
+  expect(wrapper.findAll('.compatibility-incompatible')).toHaveLength(1)
+  expect(wrapper.text()).toContain('Runner 缺少资源')
+  expect(wrapper.text()).toContain('端口数据类型不兼容')
+  await wrapper.find('.compatibility-compatible').trigger('dblclick')
+  await wrapper.find('.compatibility-incompatible').trigger('dblclick')
+  expect(wrapper.emitted('add-item')).toHaveLength(1)
+  await wrapper.get('[role="tab"][aria-selected="false"]').trigger('click')
+  expect(wrapper.emitted('change-direction')[0]).toEqual(['upstream'])
 })

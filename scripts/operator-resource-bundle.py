@@ -88,8 +88,15 @@ def export_bundle(resources, descriptor, archive, lock):
                 # Store regular files, including dereferenced internal HF links.
                 output.write(path, path.relative_to(resources).as_posix())
         checker.verify_bundle(original)
-        manifest = {"schema": SCHEMA, "archive_sha256": file_hash(partial), **content,
-                    "ner_revision": original["ner_revision"], "nltk_revision": original["nltk_revision"]}
+        manifest = {"schema": SCHEMA, "archive_sha256": file_hash(partial), **content}
+        if "ner_revision" in original and "nltk_revision" in original:
+            manifest.update(ner_revision=original["ner_revision"], nltk_revision=original["nltk_revision"])
+        else:
+            metadata = {key: value for key, value in original.items()
+                        if key not in {"root", "digest"} and isinstance(value, (str, int, float, bool))}
+            if not metadata:
+                raise ValueError("Resource descriptor metadata is missing")
+            manifest["metadata"] = metadata
         lock.parent.mkdir(parents=True, exist_ok=True)
         partial.replace(archive)
         lock.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -98,16 +105,17 @@ def export_bundle(resources, descriptor, archive, lock):
     return manifest
 
 
-def import_bundle(archive, lock, resources, *, ner_revision, nltk_revision):
+def import_bundle(archive, lock, resources, *, ner_revision=None, nltk_revision=None, metadata=None):
     manifest = json.loads(lock.read_text(encoding="utf-8"))
-    if (manifest.get("schema") != SCHEMA or manifest.get("ner_revision") != ner_revision
-            or manifest.get("nltk_revision") != nltk_revision
+    metadata_valid = (manifest.get("metadata") == metadata if metadata is not None else
+                      manifest.get("ner_revision") == ner_revision and manifest.get("nltk_revision") == nltk_revision)
+    if (manifest.get("schema") != SCHEMA or not metadata_valid
             or not all(re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, ""))) for key in ("archive_sha256", "content_digest"))
             or type(manifest.get("file_count")) is not int or not 1 <= manifest["file_count"] <= 10000
             or type(manifest.get("unpacked_bytes")) is not int or not 0 < manifest["unpacked_bytes"] <= 4 * 1024**3):
         raise ValueError("Invalid or incompatible resource lock")
     if not archive.is_file():
-        raise FileNotFoundError("Offline NLP bundle is missing; sync runtime/dataflow/vendor-resources/pii-en-v1.zip with the source checkout")
+        raise FileNotFoundError("Offline operator resource bundle is missing; sync the reviewed archive with the source checkout")
     if file_hash(archive) != manifest["archive_sha256"]:
         raise ValueError("Offline NLP archive SHA-256 mismatch")
     resources = resources.resolve()

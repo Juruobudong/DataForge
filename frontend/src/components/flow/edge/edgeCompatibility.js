@@ -179,12 +179,12 @@ export function buildCompatibilityMap({ mode, flowContext, nodes, edges, sourceN
   if (mode === 'reconnecting-source') {
     for (const node of nodes) for (const portId of Object.keys(metaOf(node).outputs || {})) {
       const value = checkEdgeCompatibility({ flowContext, nodes, edges, sourceNodeId: node.id, sourcePortId: portId, targetNodeId, targetPortId, originalEdgeId })
-      result.set(portKey(node.id, 'output', portId), value)
+      result.set(portKey(node.id, 'output', portId), { ...value, connection: { source: node.id, sourceHandle: portId, target: targetNodeId, targetHandle: targetPortId } })
     }
   } else {
     for (const node of nodes) for (const portId of Object.keys(metaOf(node).inputs || {})) {
       const value = checkEdgeCompatibility({ flowContext, nodes, edges, sourceNodeId, sourcePortId, targetNodeId: node.id, targetPortId: portId, originalEdgeId })
-      result.set(portKey(node.id, 'input', portId), value)
+      result.set(portKey(node.id, 'input', portId), { ...value, connection: { source: sourceNodeId, sourceHandle: sourcePortId, target: node.id, targetHandle: portId } })
     }
   }
   return result

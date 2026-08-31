@@ -56,6 +56,14 @@ class OperatorRuntime:
                       and (not spec.get("dependency_lock_digest") or spec["dependency_lock_digest"] == value.get("dependency_lock_digest"))
                       and spec.get("environment_digest", runtime_fingerprint(value)) == runtime_fingerprint(value)), None)
         if match is None:
+            if spec.get("resource_profile") and any(
+                item.get("name") == spec.get("package") and item.get("version") == spec.get("package_version")
+                and item.get("digest") == spec.get("package_digest")
+                and value.get("dependency_lock_digest") == spec.get("dependency_lock_digest")
+                and spec["resource_profile"] not in value.get("resource_profiles", {})
+                for value in manifest.get("runtimes", [manifest]) for item in value.get("packages", [])
+            ):
+                raise ValueError("OPERATOR_RESOURCE_MISSING: 算子环境已安装，但审核模型资源尚未登记")
             raise ValueError("OPERATOR_PACKAGE_DRIFT: 包版本或摘要与冻结版本不一致")
         value, package = match
         python = Path(value["python"])
@@ -64,6 +72,9 @@ class OperatorRuntime:
         if spec.get("resource_profile"):
             from .resource_bundle import verify_bundle
             verify_bundle(value["resource_profiles"][spec["resource_profile"]])
+            if spec["resource_profile"] == "semantic-multilingual-v1":
+                from .semantic_contract import validate_model_bundle
+                validate_model_bundle(value["resource_profiles"][spec["resource_profile"]])
         return value, package
 
     def status(self, spec):

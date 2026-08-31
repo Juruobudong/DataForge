@@ -20,6 +20,19 @@ const visible = computed(() => catalog.value.filter(item =>
   (!status.value || item.status === status.value)
 ))
 
+const groupedVisible = computed(() => {
+  const groups = new Map()
+  for (const item of visible.value) {
+    const key = item.category || 'unknown'
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(item)
+  }
+  const orderedCategories = facets.value.categories?.map(item => item.name) || []
+  return [...orderedCategories, ...groups.keys()]
+    .filter((name, index, values) => values.indexOf(name) === index && groups.has(name))
+    .map(name => ({ name, items: groups.get(name) }))
+})
+
 const inspectedOperator = computed(() => visible.value.find(item => item.id === selected.value?.id) || visible.value[0])
 
 async function load() {
@@ -43,21 +56,26 @@ onMounted(load)
     <div class="catalog-layout">
       <div class="panel catalog-list">
         <section class="current-operators">
-          <div>
-            <button v-for="item in visible" :key="item.id" class="operator-row" :class="{ active: inspectedOperator?.id === item.id }" @click="selected = item">
-              <div>
-                <b>{{ operatorPrimaryName(item) }}</b>
-                <small class="operator-meta">
-                  <span class="operator-bilingual">{{ operatorSubtitle(item, true) }} · v{{ item.version }}</span>
-                  <span class="badge source-badge" :class="{ blue: item.source === 'dataforge', 'source-dataflow': item.source === 'dataflow' }">{{ SOURCES[item.source] || item.source || '未知来源' }}</span>
-                  <span>{{ CATEGORY_LABELS[item.category] || item.category }}</span>
-                </small>
-                <p>{{ item.summary }}</p>
-                <small v-if="item.dependency_status?.status !== 'ready'">{{ item.dependency_status?.reason || '依赖状态未知' }}</small>
-              </div>
-              <span class="badge" :class="item.exposure === 'public' ? 'green' : 'amber'">{{ EXPOSURE_LABELS[item.exposure] }}</span>
-            </button>
-          </div>
+          <section v-for="group in groupedVisible" :key="group.name" class="operator-category-group" :aria-labelledby="`operator-category-${group.name}`">
+            <header class="operator-category-head">
+              <h3 :id="`operator-category-${group.name}`">{{ CATEGORY_LABELS[group.name] || group.name }}</h3>
+              <span class="badge blue category-count">{{ group.items.length }}</span>
+            </header>
+            <div class="operator-category-items">
+              <button v-for="item in group.items" :key="item.id" class="operator-row" :class="{ active: inspectedOperator?.id === item.id }" @click="selected = item">
+                <div>
+                  <b>{{ operatorPrimaryName(item) }}</b>
+                  <small class="operator-meta">
+                    <span class="operator-bilingual">{{ operatorSubtitle(item, true) }} · v{{ item.version }}</span>
+                    <span class="badge source-badge" :class="{ blue: item.source === 'dataforge', 'source-dataflow': item.source === 'dataflow' }">{{ SOURCES[item.source] || item.source || '未知来源' }}</span>
+                  </small>
+                  <p>{{ item.summary }}</p>
+                  <small v-if="item.dependency_status?.status !== 'ready'">{{ item.dependency_status?.reason || '依赖状态未知' }}</small>
+                </div>
+                <span class="badge" :class="item.exposure === 'public' ? 'green' : 'amber'">{{ EXPOSURE_LABELS[item.exposure] }}</span>
+              </button>
+            </div>
+          </section>
         </section>
         <p v-if="!visible.length" class="empty-catalog">没有匹配的算子。</p>
       </div>
@@ -73,8 +91,14 @@ onMounted(load)
 .catalog-filters{display:flex;flex-wrap:wrap;gap:8px}.catalog-filters input{flex:1;min-width:220px}.catalog-filters select{min-width:150px}
 .catalog-layout{display:grid;grid-template-columns:minmax(600px,1fr) 380px;gap:12px;min-height:650px;align-items:start}
 .catalog-list{overflow:auto}
+.current-operators{display:grid;gap:18px}
+.operator-category-group{display:grid;gap:6px}
+.operator-category-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 12px;border-left:4px solid #2f6fed;border-radius:6px;background:#f1f6ff;color:#17325c}
+.operator-category-head h3{margin:0;font-size:14px;font-weight:700}
+.category-count{min-width:28px;text-align:center}
+.operator-category-items{display:grid;gap:6px}
 .empty-catalog{margin:0;padding:16px;color:#8491a3}
-.operator-row{display:flex;width:100%;justify-content:space-between;gap:16px;margin-top:6px;padding:12px;text-align:left}
+.operator-row{display:flex;width:100%;justify-content:space-between;gap:16px;margin:0;padding:12px;text-align:left}
 .operator-row.active{border-color:#2f6fed;background:#f1f6ff}
 .operator-row small{display:block;margin-top:3px;color:#7b8798}
 .operator-row .operator-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px}

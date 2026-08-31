@@ -1,4 +1,4 @@
-"""Thin artifact adapters. Algorithms execute exclusively in the upstream package."""
+"""Reviewed DataFlow identities with explicit, frozen DataForge artifact adaptations."""
 from __future__ import annotations
 
 from collections import defaultdict

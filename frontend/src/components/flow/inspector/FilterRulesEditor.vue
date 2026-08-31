@@ -1,14 +1,20 @@
 <script setup>
-const props = defineProps({ modelValue: { type: Array, default: () => [] }, evaluationNodes: { type: Array, default: () => [] }, disabled: Boolean })
+const props = defineProps({ modelValue: { type: Array, default: () => [] }, evaluationNodes: { type: Array, default: () => [] }, deduplicationNodes: { type: Array, default: () => [] }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue'])
-const fields = { text: '正文', question: '问题', answer: '答案', length: '正文长度', question_quality: '问题质量分', answer_alignment: '答案一致性分', answer_verifiability: '答案可核验性分', downstream_value: '下游价值分' }
+const fields = { text: '正文', question: '问题', answer: '答案', length: '正文长度', question_quality: '问题质量分', answer_alignment: '答案一致性分', answer_verifiability: '答案可核验性分', downstream_value: '下游价值分', evaluation_score: '通用质量分', semantic_duplicate: '是否语义重复', semantic_similarity: '语义相似度' }
 const operations = { eq: '等于', ne: '不等于', gt: '大于', ge: '大于等于', lt: '小于', le: '小于等于', contains: '包含', in: '属于集合', is_empty: '为空', not_empty: '不为空' }
-const scored = field => ['question_quality', 'answer_alignment', 'answer_verifiability', 'downstream_value'].includes(field)
-const numeric = field => field === 'length' || scored(field)
+const operationsFor = field => field === 'semantic_duplicate' ? { eq: operations.eq, ne: operations.ne } : operations
+const qaScored = field => ['question_quality', 'answer_alignment', 'answer_verifiability', 'downstream_value'].includes(field)
+const scored = field => qaScored(field) || field === 'evaluation_score'
+const semantic = field => ['semantic_duplicate', 'semantic_similarity'].includes(field)
+const numeric = field => field === 'length' || scored(field) || field === 'semantic_similarity'
+const evaluationOptions = field => props.evaluationNodes.filter(node => node.operator === (field === 'evaluation_score' ? 'PromptedEvaluator' : 'Text2QASampleEvaluator'))
 function patch(index, change) { emit('update:modelValue', props.modelValue.map((rule, i) => i === index ? { ...rule, ...change } : rule)) }
 function field(index, value) {
   const rule = { field: value, operator: numeric(value) ? 'ge' : 'contains', value: numeric(value) ? 0 : '' }
-  if (scored(value)) { rule.value = 4; rule.evaluation_node = props.evaluationNodes[0]?.id || '' }
+  if (scored(value)) { rule.value = 4; rule.evaluation_node = evaluationOptions(value)[0]?.id || '' }
+  if (value === 'semantic_duplicate') { rule.operator = 'eq'; rule.value = false; rule.deduplication_node = props.deduplicationNodes[0]?.id || '' }
+  if (value === 'semantic_similarity') { rule.value = .95; rule.deduplication_node = props.deduplicationNodes[0]?.id || '' }
   emit('update:modelValue', props.modelValue.map((item, i) => i === index ? rule : item))
 }
 function value(index, rule, raw) {
@@ -21,13 +27,15 @@ function value(index, rule, raw) {
   <section class="filter-rules" aria-label="保留条件"><b>保留条件 · 全部满足</b>
     <article v-for="(rule,index) in modelValue" :key="index">
       <select :aria-label="`条件${index+1}字段`" :value="rule.field" :disabled="disabled" @change="field(index,$event.target.value)"><option v-for="(label,key) in fields" :key="key" :value="key">{{ label }}</option></select>
-      <select v-if="scored(rule.field)" :aria-label="`条件${index+1}评分节点`" :value="rule.evaluation_node" :disabled="disabled" @change="patch(index,{evaluation_node:$event.target.value})"><option value="">选择上游评估节点</option><option v-for="node in evaluationNodes" :key="node.id" :value="node.id">{{ node.label || node.id }}</option><option v-if="rule.evaluation_node && !evaluationNodes.some(node => node.id === rule.evaluation_node)" :value="rule.evaluation_node">{{ rule.evaluation_node }}（上游不可用）</option></select>
-      <select :aria-label="`条件${index+1}比较方式`" :value="rule.operator" :disabled="disabled" @change="patch(index,{operator:$event.target.value})"><option v-for="(label,key) in operations" :key="key" :value="key">{{ label }}</option></select>
-      <input v-if="!['is_empty','not_empty'].includes(rule.operator)" :aria-label="`条件${index+1}比较值`" :type="numeric(rule.field) && rule.operator !== 'in' ? 'number' : 'text'" :value="Array.isArray(rule.value) ? rule.value.join(', ') : rule.value" :placeholder="rule.operator === 'in' ? '逗号分隔的值' : '比较值'" :disabled="disabled" @input="value(index,rule,$event.target.value)">
+      <select v-if="scored(rule.field)" :aria-label="`条件${index+1}评分节点`" :value="rule.evaluation_node" :disabled="disabled" @change="patch(index,{evaluation_node:$event.target.value})"><option value="">选择上游评估节点</option><option v-for="node in evaluationOptions(rule.field)" :key="node.id" :value="node.id">{{ node.label || node.id }}</option><option v-if="rule.evaluation_node && !evaluationOptions(rule.field).some(node => node.id === rule.evaluation_node)" :value="rule.evaluation_node">{{ rule.evaluation_node }}（上游不可用）</option></select>
+      <select v-if="semantic(rule.field)" :aria-label="`条件${index+1}语义标记节点`" :value="rule.deduplication_node" :disabled="disabled" @change="patch(index,{deduplication_node:$event.target.value})"><option value="">选择上游语义标记节点</option><option v-for="node in deduplicationNodes" :key="node.id" :value="node.id">{{ node.label || node.id }}</option><option v-if="rule.deduplication_node && !deduplicationNodes.some(node => node.id === rule.deduplication_node)" :value="rule.deduplication_node">{{ rule.deduplication_node }}（上游不可用）</option></select>
+      <select :aria-label="`条件${index+1}比较方式`" :value="rule.operator" :disabled="disabled" @change="patch(index,{operator:$event.target.value})"><option v-for="(label,key) in operationsFor(rule.field)" :key="key" :value="key">{{ label }}</option></select>
+      <select v-if="rule.field === 'semantic_duplicate' && !['is_empty','not_empty'].includes(rule.operator)" :aria-label="`条件${index+1}比较值`" :value="String(rule.value)" :disabled="disabled" @change="patch(index,{value:$event.target.value === 'true'})"><option value="false">否</option><option value="true">是</option></select>
+      <input v-else-if="!['is_empty','not_empty'].includes(rule.operator)" :aria-label="`条件${index+1}比较值`" :type="numeric(rule.field) && rule.operator !== 'in' ? 'number' : 'text'" :value="Array.isArray(rule.value) ? rule.value.join(', ') : rule.value" :placeholder="rule.operator === 'in' ? '逗号分隔的值' : '比较值'" :disabled="disabled" @input="value(index,rule,$event.target.value)">
       <button v-if="!disabled" type="button" @click="emit('update:modelValue',modelValue.filter((_,i)=>i!==index))">删除条件</button>
     </article>
     <button v-if="!disabled" type="button" @click="emit('update:modelValue',[...modelValue,{field:'length',operator:'ge',value:1}])">＋ 添加条件</button>
-    <small>仅支持业务字段和上游评分，不接受代码。正文改变后需重新评分。</small>
+    <small>仅支持业务字段和上游评分/语义标记，不接受代码。正文改变后需重新评估或标记。</small>
   </section>
 </template>
 

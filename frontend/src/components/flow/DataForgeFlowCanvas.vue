@@ -44,7 +44,7 @@ let flashTimer = 0
 provide('dataforge-edge-interaction', interaction)
 const effectiveFlowContext = computed(() => ({ schemaVersion: 3, outputTypes: [], ...props.flowContext }))
 const { fitView, screenToFlowCoordinate, setCenter, endConnection } = useVueFlow(props.canvasId)
-const { isValidConnection, addTypedEdge, reconnectTypedEdge } = useFlowConnections(nodes, edges, effectiveFlowContext, issue => emit('connection-error', issue))
+const { isValidConnection: validateConnection, addTypedEdge, reconnectTypedEdge } = useFlowConnections(nodes, edges, effectiveFlowContext, issue => emit('connection-error', issue))
 const { selectedNodes, selectedEdges } = useFlowSelection(nodes, edges)
 
 const allowedTargetCount = computed(() => [...interaction.value.compatiblePorts.values()].filter(value => value.allowed).length)
@@ -90,11 +90,16 @@ function showDropError(value, event) {
 }
 function resetInteraction() {
   interaction.value = idleEdgeInteraction(); pendingReconnectEdge.value = null; hoverTooltip.value = null
+  emit('connection-source', null)
 }
 function connectEnd(event) {
-  if (!connectionCommitted.value && !connectionCancelled.value) {
-    const result = interaction.value.compatiblePorts.get(interaction.value.hoveredPortKey)
-    showDropError(result, event)
+  if (editable.value && !connectionCommitted.value && !connectionCancelled.value && interaction.value.hoveredPortKey) {
+    // Resolve the release position again: the cursor may have left the highlighted port.
+    const result = nearestHandle(event)?.compatibility
+    if (result?.allowed && result.connection) {
+      if (pendingReconnectEdge.value) edgeUpdate({ edge: pendingReconnectEdge.value, connection: result.connection })
+      else connect(result.connection)
+    } else showDropError(result, event)
   }
   resetInteraction(); connectionCommitted.value = false; connectionCancelled.value = false
 }
@@ -105,14 +110,21 @@ function edgeUpdate({ edge, connection }) {
   if (connectionCommitted.value) emit('select-edge', edges.value.find(item => item.id === edge.id) || edge)
 }
 function edgeUpdateEnd() { if (interaction.value.mode !== 'idle') resetInteraction() }
-function pointerMove(event) {
-  if (interaction.value.mode === 'idle' || !root.value) return
+function isValidConnection(connection) {
+  return validateConnection({ ...connection, id: connection.id || interaction.value.originalEdgeId })
+}
+function nearestHandle(event) {
+  if (interaction.value.mode === 'idle' || !root.value || !Number.isFinite(event?.clientX) || !Number.isFinite(event?.clientY)) return null
   const direction = interaction.value.mode === 'reconnecting-source' ? 'output' : 'input'
   const handles = [...root.value.querySelectorAll(`.typed-handle[data-port-key*="::${direction}::"]`)].map(element => {
     const bounds = element.getBoundingClientRect()
     return { key: element.dataset.portKey, x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }
   })
-  const nearest = nearestPort({ x: event.clientX, y: event.clientY }, handles, interaction.value.compatiblePorts, SNAP_RADIUS)
+  return nearestPort({ x: event.clientX, y: event.clientY }, handles, interaction.value.compatiblePorts, SNAP_RADIUS)
+}
+function pointerMove(event) {
+  if (interaction.value.mode === 'idle' || !root.value) return
+  const nearest = nearestHandle(event)
   interaction.value = { ...interaction.value, hoveredPortKey: nearest?.key, snapTargetKey: nearest?.compatibility?.allowed ? nearest.key : undefined }
   if (nearest?.compatibility && !nearest.compatibility.allowed) {
     const bounds = root.value.getBoundingClientRect()
@@ -225,6 +237,8 @@ defineExpose({ autoLayout, deleteEdge, focusElement, fit, screenToFlowCoordinate
 </template>
 
 <style scoped>
+.flow-canvas :deep(.vue-flow__node > article){overflow:visible}
+.flow-canvas :deep(.vue-flow__node > article > footer){border-radius:0 0 11px 11px}
 .flow-canvas{position:relative;min-width:620px;overflow:hidden;border:1px solid #dbe3ef;border-radius:12px;background:#f7f9fc;box-shadow:var(--shadow)}.flow-canvas.mode-mini{min-width:0;border:0;border-radius:8px;box-shadow:none}.flow-canvas :deep(.vue-flow){height:100%}.flow-canvas :deep(.vue-flow__node){border:0;background:transparent;padding:0}.flow-canvas :deep(.vue-flow__node.selected){box-shadow:none}.flow-canvas :deep(.vue-flow__controls){overflow:hidden;border:1px solid #dbe3ef;border-radius:9px;box-shadow:0 5px 18px rgba(30,51,82,.12)}.flow-canvas :deep(.vue-flow__controls-button){width:30px;height:30px;border-bottom-color:#edf0f4}.flow-canvas :deep(.vue-flow__minimap){overflow:hidden;border:1px solid #dbe3ef;border-radius:9px;background:#fff;box-shadow:0 5px 18px rgba(30,51,82,.1)}.flow-canvas :deep(.vue-flow__edge.selected .vue-flow__edge-path){stroke:#2f6fed;stroke-width:3}.flow-canvas :deep(marker path){fill:context-stroke;stroke:context-stroke}.canvas-chip{position:absolute;z-index:7;top:12px;left:12px;padding:6px 9px;border:1px solid #dce4ef;border-radius:8px;color:#65748a;background:rgba(255,255,255,.92);font-size:8px;font-weight:800;pointer-events:none}.canvas-chip.connecting{border-color:#b8cef5;color:#2f6fed;background:#f4f8ff;box-shadow:0 5px 18px rgba(47,111,237,.12)}
 .flow-canvas :deep(.vue-flow__handle.connecting:not(.valid)){background:#c4ccd7!important;box-shadow:0 0 0 2px rgba(201,74,74,.12)}
 .edge-tooltip{position:absolute;z-index:20;display:grid;max-width:260px;gap:3px;padding:9px 11px;border:1px solid #e7bcbc;border-radius:8px;color:#a33f3f;background:#fff7f7;box-shadow:0 8px 24px rgba(72,31,31,.16);pointer-events:none}.edge-tooltip b{font-size:10px}.edge-tooltip span{font-size:10px}.edge-tooltip small{color:#7d5b5b;font:9px/1.4 monospace}.edge-context-menu{position:absolute;z-index:22;display:grid;min-width:190px;gap:7px;padding:8px;border:1px solid #d7deea;border-radius:9px;background:#fff;box-shadow:0 12px 34px rgba(30,41,59,.2)}.edge-context-menu small{color:#68758a;font:9px/1.4 monospace}.edge-context-menu button{text-align:left;color:#b33d3d;background:#fff7f7;border-color:#efd0d0}

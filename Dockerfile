@@ -86,8 +86,29 @@ RUN --network=none /opt/dataforge-operators/dataflow-1.0.10-pii-v2/bin/python sc
     --dependency-lock runtime/dataflow/requirements-pii-v2.lock \
     --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
 
+FROM operator-governance-resources AS operator-semantic-deps
+COPY runtime/dataflow/requirements-semantic-v1.lock ./runtime/dataflow/
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv venv --python /usr/local/bin/python /opt/dataforge-operators/dataflow-1.0.10-semantic-v1 \
+    && uv pip sync --python /opt/dataforge-operators/dataflow-1.0.10-semantic-v1/bin/python \
+        --torch-backend cpu --require-hashes --only-binary=:all: runtime/dataflow/requirements-semantic-v1.lock \
+    && uv pip install --no-deps --python /opt/dataforge-operators/dataflow-1.0.10-semantic-v1/bin/python \
+        /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+FROM operator-semantic-deps AS operator-semantic-resources
+COPY scripts/prepare-semantic-resources.py ./scripts/
+COPY runtime/dataflow/semantic-model-v1.lock.json ./runtime/dataflow/
+# vendor-resources was copied by the preceding resource stage. Missing reviewed
+# semantic files fail closed here; model downloads never occur in this layer.
+RUN --network=none /opt/dataforge-operators/dataflow-1.0.10-semantic-v1/bin/python scripts/prepare-semantic-resources.py \
+    --download-only --offline-model-directory /tmp/operator-resource-bundle/semantic-multilingual-v1 \
+    --resources /opt/dataforge-operators/resources-semantic-v1 \
+    --manifest /opt/dataforge-operators/operator-runtime.json \
+    --dependency-lock runtime/dataflow/requirements-semantic-v1.lock \
+    --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
 # 旧环境注册只读取已安装环境与审核wheel，禁止网络和再次安装。
-FROM operator-governance-resources AS operator-runtime
+FROM operator-semantic-resources AS operator-runtime
 
 COPY scripts/register-operator-runtime.py ./scripts/
 
@@ -104,6 +125,11 @@ RUN --network=none \
         --register-only --resources /opt/dataforge-operators/resources-pii-v1 \
         --manifest /opt/dataforge-operators/operator-runtime.json \
         --dependency-lock runtime/dataflow/requirements-pii-v2.lock \
+        --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
+    && /opt/dataforge-operators/dataflow-1.0.10-semantic-v1/bin/python scripts/prepare-semantic-resources.py \
+        --register-only --resources /opt/dataforge-operators/resources-semantic-v1 \
+        --manifest /opt/dataforge-operators/operator-runtime.json \
+        --dependency-lock runtime/dataflow/requirements-semantic-v1.lock \
         --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
 
 # -----------------------------------------------------------------------------

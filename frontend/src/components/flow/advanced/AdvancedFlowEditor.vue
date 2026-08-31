@@ -11,6 +11,7 @@ import SubflowExtractionDialog from '../SubflowExtractionDialog.vue'
 import { deserializeDefinition, makeCanvasNode, serializeDefinition, validateFlow, validateSubflow, subflowNodeDefinition, resolveSubflow, operatorAvailable, keepCompatibleParams, connectionIssue } from '../flowModel'
 import { useFlowHistory } from '../composables/useFlowHistory'
 import { removeEntityReferences } from '../../graph/entityTypeModel'
+import { upstreamSignals } from '../upstreamSignals.js'
 
 const props = defineProps({
   catalog: { type: Array, default: () => [] },
@@ -24,16 +25,12 @@ const emit = defineEmits(['dirty', 'error', 'open-subflow', 'subflow-created'])
 const extraction = ref(null)
 
 const selectedNode = ref(null), selectedEdge = ref(null)
-const evaluationNodes = computed(() => {
-  const ancestors = new Set(), queue = [selectedNode.value?.id]
-  while (queue.length) {
-    const id = queue.pop()
-    for (const edge of edges.value.filter(edge => edge.target === id)) if (!ancestors.has(edge.source)) { ancestors.add(edge.source); queue.push(edge.source) }
-  }
-  return nodes.value.filter(node => ancestors.has(node.id) && node.data.definition.ref === 'Text2QASampleEvaluator').map(node => ({ id: node.id, label: `${node.data.meta.name} · ${node.id}` }))
-})
+const discoveryDirection = ref('downstream')
+const signalNodes = computed(() => upstreamSignals(nodes.value, edges.value, selectedNode.value?.id, props.catalog, props.subflows))
+const evaluationNodes = computed(() => signalNodes.value.filter(node => node.operator !== 'SemDeduplicateFilter'))
+const deduplicationNodes = computed(() => signalNodes.value.filter(node => node.operator === 'SemDeduplicateFilter'))
 const connectionSource = ref(null)
-const candidateCodes = ref(null), candidateError = ref(''), candidatesLoading = ref(false)
+const candidateResults = ref(null), candidateError = ref(''), candidatesLoading = ref(false)
 let candidateTimer, candidateSequence = 0
 const issues = ref([]), focusedIssue = ref(null), connectionError = ref(null)
 const nodes = ref([]), edges = ref([])
@@ -104,14 +101,14 @@ function loadDefinition(value) {
   nodes.value = graph.nodes; edges.value = graph.edges
   graphConfig.value = normalizeGraphConfig(value?.graph_config)
   graphConfigOpen.value = false
-  selectedNode.value = null; selectedEdge.value = null; issues.value = []; connectionError.value = null
+  selectedNode.value = null; selectedEdge.value = null; candidateResults.value = null; issues.value = []; connectionError.value = null
   clearHistory()
   nextTick(() => canvas.value?.fit())
 }
 function reset() {
   graphNavigation++; promptNodeId.value = ''
   connectionSource.value = null
-  selectedNode.value = null; selectedEdge.value = null
+  selectedNode.value = null; selectedEdge.value = null; candidateResults.value = null
   nodes.value = []; edges.value = []
   graphConfig.value = normalizeGraphConfig(null); graphConfigOpen.value = false
   issues.value = []; connectionError.value = null; clearHistory()
@@ -128,23 +125,41 @@ function addDefinition(raw, position) {
   }
   beforeChange()
   const definition = { ...raw, id: uniqueId(raw.kind === 'subflow' ? raw.ref : raw.ref || 'node') }
-  nodes.value.push(makeCanvasNode(definition, { x: position.x - 135, y: position.y - 70 }, props.catalog, props.subflows))
+  const node = makeCanvasNode(definition, { x: position.x - 135, y: position.y - 70 }, props.catalog, props.subflows)
+  nodes.value.push(node)
+  return node
 }
 function addItem(item, kind) {
+  const discovery = selectedNode.value && kind === 'operator'
+    ? candidateResults.value?.find(value => value.code === item.code)?.compatibility : null
+  const canConnect = discovery?.compatible
+  if (discovery && !canConnect) return
   const rect = editor.value?.getBoundingClientRect()
-  const position = canvas.value?.screenToFlowCoordinate({ x: (rect?.left || 500) + (rect?.width || 900) / 2, y: (rect?.top || 200) + 300 }) || { x: 320, y: 200 }
-  addDefinition(subflowNodeDefinition(item, kind), position)
+  const anchor = selectedNode.value
+  const position = canConnect
+    ? { x: anchor.position.x + (discoveryDirection.value === 'downstream' ? 405 : -135), y: anchor.position.y + 70 }
+    : canvas.value?.screenToFlowCoordinate({ x: (rect?.left || 500) + (rect?.width || 900) / 2, y: (rect?.top || 200) + 300 }) || { x: 320, y: 200 }
+  const node = addDefinition(subflowNodeDefinition(item, kind), position)
+  if (!node || !canConnect) return
+  const edge = discoveryDirection.value === 'downstream'
+    ? { source: anchor.id, sourceHandle: discovery.source_port, target: node.id, targetHandle: discovery.target_port }
+    : { source: node.id, sourceHandle: discovery.source_port, target: anchor.id, targetHandle: discovery.target_port }
+  edges.value.push({ id: uniqueId('edge'), type: 'dataforge', ...edge, data: { status: 'idle' } })
+  nodes.value.forEach(value => { value.selected = value.id === node.id })
+  selectedNode.value = node; selectedEdge.value = null; discoveryDirection.value = 'downstream'
 }
 function refreshCandidates() {
   clearTimeout(candidateTimer)
   const sequence = ++candidateSequence
-  if (props.purpose !== 'knowledge') { candidateCodes.value = null; return }
-  candidatesLoading.value = true; candidateCodes.value = []; candidateError.value = ''
+  if (props.purpose !== 'knowledge') { candidateResults.value = null; return }
+  candidatesLoading.value = true; candidateResults.value = []; candidateError.value = ''
   candidateTimer = setTimeout(async () => {
     try {
-      const values = await api.operatorCandidates({ definition: serialize(), output_types: props.outputTypes,
-        source_node_id: connectionSource.value?.nodeId, source_port: connectionSource.value?.port || 'output' })
-      if (sequence === candidateSequence) candidateCodes.value = values.map(item => item.code)
+      const context = selectedNode.value && !connectionSource.value
+        ? { node_id: selectedNode.value.id, direction: discoveryDirection.value, include_incompatible: true }
+        : { source_node_id: connectionSource.value?.nodeId, source_port: connectionSource.value?.port || 'output' }
+      const values = await api.operatorCandidates({ definition: serialize(), output_types: props.outputTypes, ...context })
+      if (sequence === candidateSequence) candidateResults.value = values
     } catch (error) {
       if (sequence === candidateSequence) candidateError.value = error.message || '算子候选查询失败'
     } finally {
@@ -152,7 +167,7 @@ function refreshCandidates() {
     }
   }, 150)
 }
-watch(() => [serialize(), connectionSource.value, props.outputTypes, props.catalog], refreshCandidates, { deep: true })
+watch(() => [serialize(), connectionSource.value, selectedNode.value?.id, discoveryDirection.value, props.outputTypes, props.catalog], refreshCandidates, { deep: true })
 onBeforeUnmount(() => { clearTimeout(candidateTimer); candidateSequence++ })
 function extractSelection() {
   const ids = nodes.value.filter(node => node.selected).map(node => node.id)
@@ -172,12 +187,19 @@ function changeSubflowRevision(item) {
   selectedNode.value.data.meta = makeCanvasNode(selectedNode.value.data.definition, selectedNode.value.position, props.catalog, props.subflows).data.meta
   issues.value = props.fragment ? validateSubflow(nodes.value, edges.value) : validateFlow(nodes.value, edges.value, props.outputTypes)
 }
-function addSink(outputKey) {
+function addSink(outputKey, compatibility = null) {
   if (nodes.value.some(node => node.data.definition.kind === 'knowledge_sink' && node.data.definition.output_key === outputKey)) { emit('error', `输出 ${outputKey} 已有 Knowledge Sink`); return }
   beforeChange()
   const family = outputFamily(outputKey), mode = outputKey.includes(':') ? outputKey.split(':')[1] : null
   const definition = { id: uniqueId(`sink-${outputKey.replace(':', '-')}`), kind: 'knowledge_sink', knowledge_type: family, graph_mode: mode, output_key: outputKey }
-  nodes.value.push(makeCanvasNode(definition, { x: 760, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows))
+  const anchor = selectedNode.value
+  const node = makeCanvasNode(definition, compatibility?.compatible && anchor ? { x: anchor.position.x + 270, y: anchor.position.y } : { x: 760, y: 120 + nodes.value.length * 14 }, props.catalog, props.subflows)
+  nodes.value.push(node)
+  if (compatibility?.compatible && anchor) {
+    edges.value.push({ id: uniqueId('edge'), type: 'dataforge', source: anchor.id, sourceHandle: compatibility.source_port, target: node.id, targetHandle: compatibility.target_port, data: { status: 'idle' } })
+    nodes.value.forEach(value => { value.selected = value.id === node.id })
+    selectedNode.value = node; selectedEdge.value = null; discoveryDirection.value = 'downstream'
+  }
 }
 function applyParameters(value) {
   if (!selectedNode.value) return
@@ -248,8 +270,8 @@ function applyGraphConfig(value) {
   nodes.value = cleaned.nodes
   if (selectedNode.value) selectedNode.value = nodes.value.find(node => node.id === selectedNode.value.id) || null
 }
-function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null; connectionSource.value = node ? { nodeId: node.id, port: 'output' } : null }
-function selectEdge(edge) { selectedEdge.value = edge; selectedNode.value = null; connectionError.value = null }
+function selectNode(node) { selectedNode.value = node; selectedEdge.value = null; connectionError.value = null; connectionSource.value = null; discoveryDirection.value = 'downstream' }
+function selectEdge(edge) { selectedEdge.value = edge; selectedNode.value = null; connectionSource.value = null; connectionError.value = null }
 function deleteEdge(edgeId) { canvas.value?.deleteEdge(edgeId) }
 function reportConnectionError(issue) { connectionError.value = issue; if (issue) emit('error', issue.message) }
 function focusIssue(issue) { focusedIssue.value = issue; canvas.value?.focusElement(issue) }
@@ -286,10 +308,10 @@ onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown',
       <div><span class="selection-state">{{ nodes.length }} 节点 · {{ edges.length }} 连线</span><button v-if="!fragment" :disabled="!nodes.some(node => node.selected)" @click="extractSelection">另存为可复用子流程</button><button v-if="hasGraphOutput" ref="graphConfigButton" :class="{ active: graphConfigOpen }" :aria-expanded="graphConfigOpen" aria-controls="graph-config-panel" @click="openGraphConfig()">图谱抽取配置</button></div>
     </div>
     <div ref="editor" class="flow-workspace">
-      <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :candidate-codes="candidateCodes" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
+      <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :selected-node="selectedNode" :direction="discoveryDirection" :candidate-results="candidateResults" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @change-direction="discoveryDirection = $event" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
       <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" height="var(--flow-canvas-height)" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @change="markDirty" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
-      <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :purpose="purpose" :output-types="outputTypes" :entity-types="graphConfig.entity_types" :evaluation-nodes="evaluationNodes" :issue="selectedIssue" :sample-result="sampleResult" @replace-operator="replaceOperator" @apply-parameters="applyParameters" @open-graph-config="openGraphConfig" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
+      <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :purpose="purpose" :output-types="outputTypes" :entity-types="graphConfig.entity_types" :evaluation-nodes="evaluationNodes" :deduplication-nodes="deduplicationNodes" :issue="selectedIssue" :sample-result="sampleResult" @replace-operator="replaceOperator" @apply-parameters="applyParameters" @open-graph-config="openGraphConfig" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
     </div>
     <section v-if="graphConfigOpen && hasGraphOutput" id="graph-config-panel" ref="graphConfigPanel" class="graph-config-panel" tabindex="-1" aria-label="全流程图谱规则">
       <header class="graph-config-heading"><div><h3>全流程图谱规则</h3><p>实体与关系抽取器共用的类型定义；结果仍经过图谱结构、质量校验。业务抽取要求在各节点中编辑。</p></div><div><button type="button" @click="returnToCanvas()">返回画布</button><button type="button" @click="returnToCanvas(true)">收起</button></div></header>

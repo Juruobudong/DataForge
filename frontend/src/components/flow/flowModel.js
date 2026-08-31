@@ -216,6 +216,7 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
     source: item?.source || 'dataforge', catalogGroup: item?.catalog_group || 'dataforge',
     driver: item?.driver || item?.runtime_requirements?.driver,
     executor: item?.executor || item?.runtime_requirements?.executor,
+    runtimeRequirements: item?.runtime_requirements || {},
     dependencyStatus: catalogVersion?.dependency_status || { status: 'unknown', reason: '该版本不在当前可用目录中' },
     known: Boolean(item),
     inputs: normalizedPorts(item?.input_ports, DEFAULT_INPUT), outputs: normalizedPorts(item?.output_ports, DEFAULT_OUTPUT),

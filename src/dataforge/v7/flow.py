@@ -393,6 +393,26 @@ def validate_flow_edges(definition: dict[str, Any], *, catalog: dict[str, dict[s
     return normalized
 
 
+def evaluate_edge_candidate(definition: dict[str, Any], *, edge: dict[str, str],
+                            catalog: dict[str, dict[str, Any]],
+                            subflows: dict[str, dict[str, Any]],
+                            candidate_node: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Evaluate one proposed authoring edge through the compiler's edge rules."""
+    simulated = deepcopy(definition)
+    simulated["nodes"] = [deepcopy(node) for node in simulated.get("nodes", [])]
+    if candidate_node is not None:
+        simulated["nodes"].append(deepcopy(candidate_node))
+    simulated["edges"] = [deepcopy(value) for value in simulated.get("edges", [])]
+    simulated["edges"].append(deepcopy(edge))
+    try:
+        validate_flow_edges(simulated, catalog=catalog, subflows=subflows)
+    except FlowEdgeValidationError as exc:
+        return {"compatible": False, "reason_code": exc.code, "reason": exc.message,
+                "details": exc.details}
+    return {"compatible": True, "source_port": edge["source_port"],
+            "target_port": edge["target_port"]}
+
+
 def _contains_knowledge_library_binding(value: Any) -> bool:
     if isinstance(value, dict):
         return any(key == "knowledge_library_id" or _contains_knowledge_library_binding(item)
@@ -425,8 +445,9 @@ class FlowCompiler:
                 node["id"] = f"{prefix}{node_id}"
                 if node.get("ref") == "GeneralFilter":
                     for rule in (node.get("params") or {}).get("rules", []):
-                        if isinstance(rule.get("evaluation_node"), str) and rule["evaluation_node"].split("::", 1)[0] in ids:
-                            rule["evaluation_node"] = f"{prefix}{rule['evaluation_node']}"
+                        for field in ("evaluation_node", "deduplication_node"):
+                            if isinstance(rule.get(field), str) and rule[field].split("::", 1)[0] in ids:
+                                rule[field] = f"{prefix}{rule[field]}"
                 node["node_role"] = node_role(node)
                 node["origin_path"] = [part for part in f"{prefix}{node_id}".split("::") if part]
                 if definition.get("_subgraph_code"):
@@ -577,9 +598,10 @@ class FlowCompiler:
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
             if code == "GeneralFilter":
-                from .governance_catalog import RULE_SCHEMA, SCORES
+                from .governance_catalog import GENERIC_SCORE, RULE_SCHEMA, SCORES, SEMANTIC_FIELDS
                 from jsonschema import Draft202012Validator
-                errors = list(Draft202012Validator(RULE_SCHEMA).iter_errors(params.get("rules")))
+                rule_schema = item.get("parameter_schema", {}).get("properties", {}).get("rules", RULE_SCHEMA)
+                errors = list(Draft202012Validator(rule_schema).iter_errors(params.get("rules")))
                 if errors:
                     raise FlowValidationError(f"节点 {node_id} 保留条件非法：{errors[0].message}")
                 ancestors, pending = set(), list(incoming[node_id])
@@ -589,8 +611,18 @@ class FlowCompiler:
                         continue
                     ancestors.add(parent); pending.extend(incoming[parent])
                 for rule in params["rules"]:
-                    if rule["field"] in SCORES and (rule.get("evaluation_node") not in ancestors or by_id[rule["evaluation_node"]].get("ref") != "Text2QASampleEvaluator"):
-                        raise FlowValidationError(f"节点 {node_id} 必须选择上游QA评估节点")
+                    if rule["field"] in SCORES:
+                        ref = rule.get("evaluation_node")
+                        if ref not in ancestors or by_id[ref].get("ref") != "Text2QASampleEvaluator":
+                            raise FlowValidationError(f"节点 {node_id} 必须选择上游QA评估节点")
+                    elif rule["field"] == GENERIC_SCORE:
+                        ref = rule.get("evaluation_node")
+                        if ref not in ancestors or by_id[ref].get("ref") != "PromptedEvaluator":
+                            raise FlowValidationError(f"节点 {node_id} 必须选择上游通用质量评估节点")
+                    elif rule["field"] in SEMANTIC_FIELDS:
+                        ref = rule.get("deduplication_node")
+                        if ref not in ancestors or by_id[ref].get("ref") != "SemDeduplicateFilter":
+                            raise FlowValidationError(f"节点 {node_id} 必须选择上游语义重复标记节点")
             if code == "schema-validator":
                 if not source_types or any(value not in {"candidate:graph:triple", "candidate:graph:semantic"} for value in source_types):
                     raise FlowValidationError("schema-validator 仅支持 Graph Candidate")

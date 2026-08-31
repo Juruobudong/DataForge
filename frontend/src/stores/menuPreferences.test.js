@@ -10,9 +10,16 @@ test('旧偏好自动插入新菜单并忽略删除和重复 key', () => {
     hidden: [],
   } })
   assert.deepEqual(merged.order, [
-    'dashboard', 'knowledge', 'vector-storage', 'milvus-targets', 'authorization',
+    'dashboard', 'milvus-targets', 'knowledge', 'vector-storage', 'authorization',
     'documents', 'jobs', 'institution-deployments',
   ])
+})
+
+test('默认业务菜单将 Milvus 服务固定在工作台之后', () => {
+  assert.deepEqual(
+    mergeMenuPreference(BUSINESS_MENU_REGISTRY).order.slice(0, 2),
+    ['dashboard', 'milvus-targets'],
+  )
 })
 
 test('required 菜单不能隐藏，普通菜单保留隐藏状态', () => {

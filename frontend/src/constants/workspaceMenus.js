@@ -1,10 +1,10 @@
 export const BUSINESS_MENU_REGISTRY = [
   { key: 'dashboard', label: '工作台', caption: '整体运行状态', icon: '⌂', to: '/business/dashboard', required: true },
+  { key: 'milvus-targets', label: 'Milvus 服务', caption: '服务注册与连接验证', icon: '◉', to: '/business/milvus-targets' },
   { key: 'documents', label: '文档管理', caption: '文档库与原始资料', icon: '▣', to: '/business/documents' },
   { key: 'jobs', label: '处理任务', caption: '运行、日志与重试', icon: '⇄', to: '/business/jobs' },
   { key: 'knowledge', label: '知识库', caption: '文 / 问 / 图', icon: '◆', to: '/business/knowledge' },
   { key: 'vector-storage', label: '向量存储', caption: 'Collection / Partition', icon: '◈', to: '/business/vector-storage' },
-  { key: 'milvus-targets', label: 'Milvus 服务', caption: '服务注册与连接验证', icon: '◉', to: '/business/milvus-targets' },
   { key: 'authorization', label: '项目发布', caption: 'Deployment 与知识授权', icon: '✓', to: '/business/authorization' },
   { key: 'institution-deployments', label: '机构发布部署', caption: '多项目 Seed / Release / Update', icon: '⇲', to: '/institution-deployments/new', activePrefix: '/institution-deployments/' },
 ]

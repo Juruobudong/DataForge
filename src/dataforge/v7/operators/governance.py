@@ -1,13 +1,15 @@
-"""Governed field adapters; filtering/generation algorithms remain upstream."""
+"""Governed artifacts and explicit DataForge adaptations of reviewed DataFlow identities."""
 from copy import deepcopy
 import hashlib
 import json
 import math
 import re
+import unicodedata
 
 from .base import OperatorResult
 from .derived_text import content_digest, derived_record, is_source, prepare_generation, restore_evidence
-from ..governance_catalog import SCORES
+from ..governance_catalog import GENERIC_SCORE, SCORES, SEMANTIC_FIELDS, SEMANTIC_MODEL
+from .semantic_contract import MAX_GROUP_RECORDS, REVISION as SEMANTIC_REVISION
 
 
 def business_parameters(executor, params):
@@ -26,7 +28,7 @@ def business_parameters(executor, params):
             raise ValueError("PARAMETER_RANGE_INVALID: 参数不能为NaN或Infinity")
     finite(result)
     Draft202012Validator(executor.parameter_schema).validate(result)
-    for low, high in (("min_length", "max_length"), ("min_mtld", "max_mtld"), ("min_hdd", "max_hdd"), ("min_score", "max_score")):
+    for low, high in (("min_length", "max_length"), ("min_mtld", "max_mtld"), ("min_hdd", "max_hdd"), ("min_score", "max_score"), ("min_sentences", "max_sentences")):
         if low in result and result[low] > result[high]:
             raise ValueError("PARAMETER_RANGE_INVALID: 最小值不能大于最大值")
     return result
@@ -77,14 +79,28 @@ def guarded_serving(adapter, callback):
 
 def condition_value(rule, value, text):
     field, operation = rule["field"], rule["operator"]
-    if field in SCORES:
+    if field in [*SCORES, GENERIC_SCORE]:
         node = rule.get("evaluation_node")
         evaluation = (value.get("evaluation_results") or {}).get(node)
         if not evaluation or evaluation.get("content_digest") != content_digest(value):
             raise ValueError("EVALUATION_MISSING_OR_STALE: 所需评分缺失或正文已改变")
-        current = evaluation.get("scores", {}).get(field)
+        if field == GENERIC_SCORE and evaluation.get("operator") != "PromptedEvaluator":
+            raise ValueError("EVALUATION_MISSING_OR_STALE: 评分来源不是通用质量评估器")
+        score_key = "score" if field == GENERIC_SCORE else field
+        current = evaluation.get("scores", {}).get(score_key)
         if type(current) not in (int, float) or not 1 <= current <= 5:
             raise ValueError("QA_SCORE_INVALID: 所需评分非法")
+    elif field in SEMANTIC_FIELDS:
+        node = rule.get("deduplication_node")
+        annotation = (value.get("deduplication_results") or {}).get(node)
+        if (not annotation or annotation.get("content_digest") != content_digest(value)
+                or annotation.get("operator") != "SemDeduplicateFilter"
+                or annotation.get("status") != "evaluated"
+                or annotation.get("model_revision") != SEMANTIC_REVISION):
+            raise ValueError("DEDUPLICATION_MISSING_OR_STALE: 所需语义标记缺失或正文已改变")
+        current = bool(annotation.get("duplicate_of")) if field == "semantic_duplicate" else annotation.get("similarity_score")
+        if field == "semantic_similarity" and (type(current) not in (int, float) or not math.isfinite(current) or not -1 <= current <= 1):
+            raise ValueError("SEMANTIC_SIMILARITY_INVALID: 语义相似度缺失或非法")
     elif field == "text":
         current = text
     elif field == "length":
@@ -120,6 +136,10 @@ def execute_governance(executor, values, params, context, invoke):
         return multihop(values, init, context, invoke)
     if adapter == "governance-evaluate-v1":
         return evaluate(values, context, invoke)
+    if adapter == "governance-evaluate_generic-v1":
+        return evaluate_generic(executor, values, business, params, context, invoke)
+    if adapter == "governance-semantic-v1":
+        return semantic_deduplicate(executor, values, business, params, context, invoke)
     sources = all(is_source(value) for value in values)
     if not sources and any(is_source(value) for value in values):
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 不能混合来源和候选")
@@ -127,6 +147,7 @@ def execute_governance(executor, values, params, context, invoke):
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 正文治理仅支持Text/QA")
     originals = [derived_record(value) for value in values] if sources else deepcopy(values)
     records, skipped = [], set()
+    semicolon_as_boundary = init.pop("semicolon_as_boundary", False) if adapter == "governance-sentence-v1" else False
     for index, value in enumerate(originals):
         if sources:
             if value["disposition"] == "filtered":
@@ -140,7 +161,17 @@ def execute_governance(executor, values, params, context, invoke):
             raise ValueError("OPERATOR_INPUT_INVALID: 正文必须是字符串")
         if adapter == "governance-lexical-v1" and not 50 < len(text.split()) < 1000:
             skipped.add(index); continue
-        record = {"_df_row": index, "text": text}
+        analysis_text = text
+        if adapter == "governance-sentence-v1":
+            boundaries = r"[.!?。！？]+|\n+"
+            if semicolon_as_boundary:
+                boundaries = r"[.!?。！？;；]+|\n+"
+            pieces = [part.strip() for part in re.split(boundaries, text) if part.strip()]
+            analysis_text = ".".join("sentence" for _ in pieces)
+        elif adapter == "governance-symbol_ratio-v1":
+            analysis_text = " ".join("#" if unicodedata.category(char)[:1] in {"P", "S"} else "w"
+                                     for char in text if not char.isspace())
+        record = {"_df_row": index, "text": analysis_text}
         if adapter == "governance-conditions-v1":
             for number, rule in enumerate(init["rules"]):
                 record[f"rule_{number}"] = condition_value(rule, value, text)
@@ -149,7 +180,8 @@ def execute_governance(executor, values, params, context, invoke):
         init = {"min_scores": {"mtld": init["min_mtld"], "hdd": init["min_hdd"]},
                 "max_scores": {"mtld": init["max_mtld"], "hdd": init["max_hdd"]}}
     run = {} if adapter == "governance-conditions-v1" else {"input_key": "text"}
-    if adapter == "governance-anonymize-v1" and not sources and params.get("knowledge_type") == "qa":
+    refiner = adapter in {"governance-anonymize-v1", "governance-punctuation-v1"}
+    if refiner and not sources and params.get("knowledge_type") == "qa":
         records = []
         for index, value in enumerate(originals):
             for offset, field in enumerate(("question", "answer")):
@@ -157,25 +189,34 @@ def execute_governance(executor, values, params, context, invoke):
                 if not isinstance(text, str) or not text.strip():
                     raise ValueError("QA_OUTPUT_INVALID: 匿名化需要合法问题和答案")
                 records.append({"_df_row": index * 2 + offset, "text": text})
-    rows = checked_rows(invoke(records, init=init, run_arguments=run) if records else [],
-                        {row["_df_row"] for row in records}, complete=adapter == "governance-anonymize-v1")
+    action = "governance_punctuation_refine" if adapter == "governance-punctuation-v1" else "execute"
+    rows = checked_rows(invoke(records, init=init, run_arguments=run, action=action) if records else [],
+                        {row["_df_row"] for row in records}, complete=refiner)
     result = []
     for index, value in enumerate(originals):
+        before_digest = content_digest(value)
         retained = index in rows or index in skipped
-        if adapter == "governance-anonymize-v1" and not sources and params.get("knowledge_type") == "qa":
+        if refiner and not sources and params.get("knowledge_type") == "qa":
             retained = True
             question, answer = rows[index * 2]["text"], rows[index * 2 + 1]["text"]
             if any(not isinstance(text, str) or not text.strip() for text in (question, answer)):
-                raise ValueError("PII_OUTPUT_INVALID: 匿名化后的问答不能为空")
+                raise ValueError("REFINER_OUTPUT_INVALID: 处理后的问答不能为空")
             value["data_json"].update(question=question, answer=answer)
             value["canonical_content"] = f"{question} {answer}"
-        elif retained and adapter == "governance-anonymize-v1":
+        elif retained and refiner:
             text = rows[index]["text"]
             if not isinstance(text, str):
-                raise ValueError("PII_OUTPUT_INVALID: 匿名化正文必须为字符串")
+                raise ValueError("REFINER_OUTPUT_INVALID: 处理后的正文必须为字符串")
             value["effective_text" if sources else "canonical_content"] = text
+        if adapter == "governance-punctuation-v1" and not sources:
+            value.setdefault("processing_records", []).append({"node_id": context.node_id, "operator": executor.code,
+                "version": executor.version, "status": "refined" if content_digest(value) != before_digest else "unchanged"})
         if sources:
-            if value["disposition"] == "keep":
+            if adapter == "governance-punctuation-v1":
+                if value["disposition"] == "keep":
+                    value["processing_records"].append({"node_id": context.node_id, "operator": executor.code,
+                        "version": executor.version, "status": "refined" if content_digest(value) != before_digest else "unchanged"})
+            elif value["disposition"] == "keep":
                 value["disposition"] = "keep" if retained else "filtered"
                 value["processing_records"].append({"node_id": context.node_id, "operator": executor.code,
                     "version": executor.version, "status": "not_scored" if index in skipped else value["disposition"]})
@@ -187,6 +228,115 @@ def execute_governance(executor, values, params, context, invoke):
     kept = sum(row["disposition"] == "keep" for row in result) if sources else len(result)
     return OperatorResult(outputs=result, metrics={"input_records": len(values), "output_records": len(result),
         "retained_records": kept, "filtered_records": len(values) - kept, "not_scored_records": len(skipped)})
+
+
+def evaluate_generic(executor, values, business, params, context, invoke):
+    if params.get("knowledge_type") not in {"text", "qa"}:
+        raise ValueError("OPERATOR_CONTRACT_MISMATCH: 通用评估仅支持Text/QA Candidate")
+    prompt = params.get("_resolved_prompt_template") or {}
+    prompt_body = prompt.get("body")
+    prompt_revision_id = params.get("prompt_template_revision_id")
+    if not prompt_body or not prompt_revision_id or prompt.get("id", prompt_revision_id) != prompt_revision_id:
+        raise ValueError("PROMPT_REVISION_NOT_PUBLISHED: 通用评估必须使用已冻结Prompt Revision")
+    records = []
+    for index, value in enumerate(values):
+        if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+            raise ValueError("SOURCE_LINEAGE_MISSING: 评估候选缺少来源身份")
+        text = value.get("canonical_content")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("OPERATOR_INPUT_INVALID: 评估正文必须为非空字符串")
+        if params.get("knowledge_type") == "qa":
+            qa = value.get("data_json") or {}
+            if any(not isinstance(qa.get(key), str) or not qa[key].strip() for key in ("question", "answer")):
+                raise ValueError("QA_OUTPUT_INVALID: 通用评估需要非空问题和答案")
+            text = json.dumps({key: qa[key] for key in ("question", "answer")}, ensure_ascii=False)
+        records.append({"_df_row": index, "text": text})
+    rows = checked_rows(invoke(records, init={"system_prompt": prompt_body},
+        action="governance_generic_evaluate"), set(range(len(records))), complete=True)
+    result = deepcopy(values)
+    for index, value in enumerate(result):
+        score, reason = rows[index].get("score"), rows[index].get("reason")
+        if type(score) is not int or not 1 <= score <= 5 or not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+            raise ValueError("GENERIC_EVALUATION_INVALID: 评分必须为1–5整数且理由非空")
+        value.setdefault("evaluation_results", {})[context.node_id] = {
+            "operator": executor.code, "version": executor.version,
+            "content_digest": content_digest(value), "criterion_revision_id": str(prompt_revision_id),
+            "scores": {"score": score}, "feedback": {"score": reason.strip()},
+        }
+    return OperatorResult(outputs=result, metrics={"input_records": len(values), "output_records": len(result)})
+
+
+def semantic_deduplicate(executor, values, business, params, context, invoke):
+    sources = all(is_source(value) for value in values)
+    if not sources and any(is_source(value) for value in values):
+        raise ValueError("OPERATOR_CONTRACT_MISMATCH: 不能混合来源和候选")
+    if not sources and params.get("knowledge_type") not in {"text", "qa"}:
+        raise ValueError("OPERATOR_CONTRACT_MISMATCH: 语义去重仅支持Text/QA")
+    originals = [derived_record(value) for value in values] if sources else deepcopy(values)
+    records, skipped, group_counts, identities = [], [], {}, set()
+    for index, value in enumerate(originals):
+        if sources:
+            source = value["source_chunk"]
+            text = value["effective_text"]
+            versions = [source["source_version_id"]]
+            identity = source["source_chunk_id"]
+            if value["disposition"] == "filtered":
+                skipped.append(index)
+                continue
+        else:
+            if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+                raise ValueError("SOURCE_LINEAGE_MISSING: 语义标记缺少来源身份")
+            text = value.get("canonical_content")
+            versions = value["source_version_ids"]
+            identity = value["source_knowledge_id"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("OPERATOR_INPUT_INVALID: 语义去重正文必须为非空字符串")
+        if not isinstance(versions, list) or any(not isinstance(version, str) or not version for version in versions):
+            raise ValueError("SOURCE_LINEAGE_MISSING: 来源版本列表非法")
+        group = "flow_input" if business["scope"] == "flow_input" else json.dumps(sorted(set(versions)), ensure_ascii=True)
+        if not isinstance(identity, str) or not identity or identity in identities:
+            raise ValueError("SOURCE_LINEAGE_MISMATCH: 语义标记记录身份必须非空且唯一")
+        identities.add(identity)
+        group_counts[group] = group_counts.get(group, 0) + 1
+        if group_counts[group] > MAX_GROUP_RECORDS:
+            raise ValueError("SEMANTIC_DEDUP_GROUP_TOO_LARGE: 每个比较组最多5000条记录")
+        records.append({"_df_row": index, "_df_group": group, "_df_identity": str(identity), "text": text})
+    rows = checked_rows(invoke(records, init={"threshold": business["threshold"]},
+        action="governance_semantic_deduplicate") if records else [], {row["_df_row"] for row in records}, complete=True)
+    known_representatives = {}
+    for record in records:
+        row = rows[record["_df_row"]]
+        target, score = row.get("duplicate_of"), row.get("similarity_score")
+        if (not isinstance(row.get("duplicate_cluster_id"), str) or not row["duplicate_cluster_id"]
+                or row.get("model_revision") != SEMANTIC_REVISION
+                or type(score) not in (int, float) or not math.isfinite(score) or not -1 <= score <= 1):
+            raise ValueError("SEMANTIC_OUTPUT_INVALID: 语义标记输出契约非法")
+        if target is not None:
+            representative = known_representatives.get((record["_df_group"], target))
+            if (representative is None or score < business["threshold"]
+                    or representative != row["duplicate_cluster_id"]):
+                raise ValueError("SEMANTIC_OUTPUT_INVALID: 重复项未指向同组既有代表项")
+        else:
+            known_representatives[(record["_df_group"], record["_df_identity"])] = row["duplicate_cluster_id"]
+    result = deepcopy(originals)
+    for index, value in enumerate(result):
+        row = rows.get(index)
+        annotation = {
+            "operator": executor.code, "version": executor.version, "content_digest": content_digest(value),
+            "scope": business["scope"], "model": SEMANTIC_MODEL,
+            "model_revision": row.get("model_revision") if row else None,
+            "duplicate_cluster_id": row.get("duplicate_cluster_id") if row else None,
+            "duplicate_of": row.get("duplicate_of") if row else None,
+            "similarity_score": row.get("similarity_score") if row else None,
+            "status": "skipped_filtered" if index in skipped else "evaluated",
+        }
+        value.setdefault("deduplication_results", {})[context.node_id] = annotation
+        if sources:
+            value["processing_records"].append({"node_id": context.node_id, "operator": executor.code,
+                "version": executor.version, "status": annotation["status"]})
+    duplicates = sum(bool((value.get("deduplication_results") or {}).get(context.node_id, {}).get("duplicate_of")) for value in result)
+    return OperatorResult(outputs=result, metrics={"input_records": len(values), "output_records": len(result),
+        "duplicate_records": duplicates, "skipped_records": len(skipped)})
 
 
 def evaluate(values, context, invoke):

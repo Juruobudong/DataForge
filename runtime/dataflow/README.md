@@ -1,6 +1,30 @@
 # 精选算子运行环境
 
-API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中调用 `open-dataflow==1.0.10`，当前为21个精选算子，不扫描全Registry。原四个和六个扩充算子的历史版本/环境保留；新增11项治理能力，QA v7、三项正文过滤器v2及原生生成器新版本支持派生正文。MinHash的同Chunk/短文本保护不变。
+API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中调用 `open-dataflow==1.0.10`，当前 Catalog 登记26个精选算子，不扫描全Registry。新质量信号的适配行为在 Catalog 明确声明；MinHash的同Chunk/短文本保护不变。注册数量不等于所有模型环境均已Ready。
+
+## semantic-v1 独立多语言模型（2026-08-31）
+
+新增 `requirements-semantic-v1.in/lock`，锁摘要 `59032efef5ff7783d5023f371a578bffc48e204991bde9e38bd767181fa8c447`。Windows全新环境已实际安装47个依赖加open-dataflow；不包含PII/Presidio/spaCy，原环境和Manifest条目不覆盖。
+
+固定模型为 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`，commit `e8f8c211226b894fcb81acc59f3b34ba3efd5f42`。`semantic-model-v1.lock.json` 固定11个文件及大小、Git blob或LFS SHA256；模型权重本身约471MB。运行按128-token窗口覆盖全部正文，以attention mask池化；语义重复只标记，不删除。
+
+当前实际权重尚未下载成功：主站连接超时，镜像文件下载元数据缺失/TLS断流。资源Profile未登记，`SemDeduplicateFilter`返回`OPERATOR_RESOURCE_MISSING`。真实模型验收和Runner资源层构建仍未完成，不能把受控向量测试作为模型效果验收。
+
+先激活 `sun`，新环境安装（已存在环境不要再次运行）：
+
+```powershell
+python scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl --environment .dataforge/operator-env-semantic-v1 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-semantic-v1.lock --torch-backend cpu
+```
+
+在可联网机器准备同一审核提交的11个文件后，将文件按原相对目录放入 `runtime/dataflow/vendor-resources/semantic-multilingual-v1/`。本地离线导入/校验/登记：
+
+```powershell
+.dataforge/operator-env-semantic-v1/Scripts/python.exe scripts/prepare-semantic-resources.py --offline-model-directory runtime/dataflow/vendor-resources/semantic-multilingual-v1 --resources .dataforge/operator-resources-semantic-v1 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-semantic-v1.lock --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl
+```
+
+也可在联网机器直接运行准备脚本（省略 `--offline-model-directory`，默认官方站点；公开镜像需显式 `--download-endpoint https://hf-mirror.com`）。不论来源均验证固定文件哈希，下载失败不登记资源；不接受任意模型名或浮动修订。需要只准备不登记时加 `--download-only`。离线归档继续复用 `operator-resource-bundle.py`，新语义描述符使用独立模型metadata，不改变PII归档格式。
+
+Runner新增独立semantic依赖层和`--network=none`资源层；构建必须额外同步上述11个模型文件，缺失立即失败，不在构建期回退下载。资源登记和运行验证模型修订、资源树摘要与冻结环境指纹。
 
 ## 英文治理资源环境
 

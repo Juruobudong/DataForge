@@ -17,9 +17,9 @@ uv sync --extra web
 
 精选 QA、去重、修订算子还需要 Runner 的独立 Python 3.12 CPU 环境。安装与自定义包审核登记见 [算子运行环境](runtime/dataflow/README.md)。Runner 镜像已包含锁定的 DataFlow 环境；API/Worker 不安装 DataFlow，不在任务执行期间自动下载依赖。
 
-## 初始化或升级 V7 Schema
+## 初始化或校验 V7 Schema
 
-目标必须是空数据库；命令会执行当前不可变 V7 baseline 并幂等写入当前种子，不支持旧 V7 head 或旧测试数据升级。
+空数据库会执行当前不可变 V7 baseline；已经是当前合法 schema 时只校验并幂等写入当前种子。其他非空状态不会执行 Alembic、Seed、回填或删除：非交互环境返回 `DATABASE_USER_DECISION_REQUIRED` 和退出码 `20`，交互终端只询问“清空重建”或“保留并先做兼容性分析”。
 
 ```powershell
 conda activate sun

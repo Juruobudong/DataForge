@@ -499,8 +499,8 @@ _native_qa["parameter_schema"]["required"] = []
 CATALOG_SEEDS += (_native_qa,)
 
 DATAFLOW_TEXT_GENERATION = {"Text2QAGenerator", "Text2MultiHopQAGenerator"}
-DATAFLOW_DEDUPLICATION = {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "NgramHashDeduplicateFilter", "SimHashDeduplicateFilter"}
-DATAFLOW_TEXT_CLEANING = {"PromptedRefiner", "PIIAnonymizeRefiner"}
+DATAFLOW_DEDUPLICATION = {"HashDeduplicateFilter", "MinHashDeduplicateFilter", "NgramHashDeduplicateFilter", "SimHashDeduplicateFilter", "SemDeduplicateFilter"}
+DATAFLOW_TEXT_CLEANING = {"PromptedRefiner", "PIIAnonymizeRefiner", "RemoveRepetitionsPunctuationRefiner"}
 DATAFORGE_CONTENT_PROCESSING = {"reviewed-source-chunk-input", "faq-record-mapper", "text-knowledge-mapper", "qa-extractor"}
 DATAFORGE_QUALITY_PROCESSING = {"schema-validator", "graph-quality-validator"}
 
