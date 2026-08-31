@@ -28,7 +28,7 @@ def build_runtime_registry(runner_callable, definition):
         runtime = validate_runtime_requirements(spec.get("runtime_requirements"))
         driver = runtime["driver"]
         if driver == "builtin":
-            registry.register(BuiltinOperatorExecutor(code, version, runner_callable))
+            registry.register(BuiltinOperatorExecutor(code, version, runner_callable, spec["parameter_schema"]))
         elif driver == "dataflow":
             registry.register(DataFlowOperatorExecutor(spec))
         elif driver == "custom":

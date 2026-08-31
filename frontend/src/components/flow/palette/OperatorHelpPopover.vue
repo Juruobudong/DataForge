@@ -6,7 +6,7 @@ const props = defineProps({ items: { type: Array, default: () => [] } })
 const state = ref(null), element = ref(null), position = ref({})
 let anchor = null, closeTimer
 const title = computed(() => operatorPrimaryName(state.value?.item || {}))
-const runtime = computed(() => state.value?.item?.runtime_requirements || {})
+const runtime = computed(() => state.value?.item?.runtime_summary || state.value?.item?.runtime_requirements || {})
 const source = computed(() => ({ dataforge: 'DataForge', dataflow: 'DataFlow', custom: '扩展' }[state.value?.item?.source] || '未声明'))
 const summary = computed(() => state.value?.item?.summary || state.value?.item?.description || '用途未声明')
 const scenarios = computed(() => [...new Set(state.value?.item?.scenarios || [])].filter(value => value !== summary.value && value !== state.value?.item?.description && value !== runtime.value.limitations))
@@ -72,6 +72,7 @@ defineExpose({ show, leave, toggle, close, isOpen: code => state.value?.mode ===
         <template v-if="scenarios.length"><h4>适用场景</h4><ul><li v-for="item in scenarios" :key="item">{{ item }}</li></ul></template>
         <dl><dt>输入</dt><dd>{{ ports('input') }}</dd><dt>输出</dt><dd>{{ ports('output') }}</dd><dt>数据行为</dt><dd>{{ runtime.data_behavior || '未声明' }}</dd><dt>模型调用</dt><dd>{{ runtime.uses_llm === true ? '需要 LLM 模型服务' : runtime.uses_llm === false ? '不使用 LLM' : '未声明' }}</dd><dt>运行资源</dt><dd>{{ runtime.resources || '未声明' }}<span v-if="runtime.model"> · {{ runtime.model }}</span></dd><dt>依赖状态</dt><dd>{{ state.item.dependency_status?.status === 'ready' ? '已就绪' : state.item.dependency_status?.reason || '未声明' }}</dd></dl>
         <h4>重要限制</h4><p>{{ runtime.limitations || '未声明' }}</p>
+        <details v-if="runtime.model_revision"><summary>技术详情</summary><p>固定模型：{{ runtime.model }}</p><p>Revision：{{ runtime.model_revision }}</p><p>资源 Profile：{{ runtime.resource_profile }}</p></details>
         <small class="usage">{{ state.pinned ? '已固定 · Esc 或点击外部关闭' : '点击 i 可固定说明' }}</small>
       </template>
     </section>

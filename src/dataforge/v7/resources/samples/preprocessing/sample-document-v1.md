@@ -42,6 +42,10 @@
 
 本示例文档用于演示文档预处理与知识抽取流水线。知识生产系统应保留每个结论对应的原文证据和位置锚点。自动抽取结果在进入正式知识库之前，需要经过 Schema 校验、质量门禁和来源绑定检查，确保每条知识都可追溯到原始文档的具体片段，从而在审核、发布与后续修订环节保持可解释性与可追溯性。
 
+## PII 匿名化测试语句（虚构）
+
+The fictional project coordinator John Smith can be reached at john.smith@example.com or +1 415-555-0136. His office is located at 123 Market Street, San Francisco, California 94105. A sample access log recorded the IP address 203.0.113.42 for his account. These details are synthetic test data and should be anonymized before downstream use.
+
 
 ## 版本与溯源说明
 

@@ -6,6 +6,7 @@ Legacy versions retain their custom-body contract and Schema Validator.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from .graph_schema import GraphExtractionConfig, normalize_graph_config, prompt_blocks
@@ -139,7 +140,47 @@ def _literal_rules(enabled: tuple[str, ...]) -> str:
     return "、".join(names.get(item, item) for item in enabled) or "（无）"
 
 
-def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str, *, instructions: str = "") -> str:
+def entity_output_schema(graph_mode: str | None, base_schema: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Describe entity output in prompts without changing response validators."""
+    schema = deepcopy(_ENTITY_JSON_SCHEMA if base_schema is None else base_schema)
+    if graph_mode == "semantic":
+        item = schema["properties"]["entities"]["items"]
+        # Omitted object_kind means entity; only an explicit literal is exempt.
+        item["if"] = {"required": ["object_kind"], "properties": {"object_kind": {"const": "literal"}}}
+        item["else"] = {
+            "required": ["description"],
+            "properties": {"description": {"type": "string", "minLength": 1, "pattern": r"\S"}},
+        }
+    return schema
+
+
+def entity_description_prompt(config: GraphExtractionConfig, graph_mode: str | None, *, joint: bool = False) -> str:
+    if graph_mode != "semantic":
+        return ""
+    example = {"entities": [{
+        "name": "<当前分块中的实体原名>",
+        "type": config.entity_types[0].code if config.entity_types else "<原文语言的实体类型>",
+        "description": "<仅根据当前分块原文生成的简短实体描述>",
+        "object_kind": "entity",
+    }]}
+    empty = {"entities": []}
+    if joint:
+        example["entities"][0]["id"] = "e1"
+        example["relations"] = []
+        empty["relations"] = []
+    return (
+        "语义图谱实体描述要求：每个实体必须先根据当前来源分块生成简短 description，并写入返回 JSON。"
+        "description 为必填字符串，不得缺失、为 null、空字符串或仅含空白；"
+        "只能概括原文明示的信息，保持原文语言，不得编造原文未提供的信息。"
+        "object_kind=literal 的字面值不是语义实体，不要求生成描述，也不得为通过校验而补造成实体。"
+        f"没有符合要求的实体时返回 {_schema_text(empty)}。\n\n"
+        "实体输出格式示例（尖括号内容仅说明字段，须替换为当前原文对应内容；不得照抄为抽取事实）：\n"
+        f"{_schema_text(example)}\n\n"
+    )
+
+
+def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str, *, instructions: str = "",
+                         graph_mode: str | None = None) -> str:
     """Generated prompt requesting typed entities from one source chunk."""
     blocks = prompt_blocks(config)
     forbidden = (
@@ -171,11 +212,12 @@ def render_entity_prompt(config: GraphExtractionConfig, source_chunk: str, *, in
         f"{type_note}"
         "除 Graph Schema 要求的 type 技术 code 外，所有实体文本字段必须保持当前来源分块的原文语言，不得翻译；"
         "中文原文用中文，英文原文用英文。\n\n"
+        f"{entity_description_prompt(config, graph_mode)}"
         f"{_instruction_block(instructions)}"
         "当前来源分块：\n"
         f"{source_chunk}\n\n"
         "返回 JSON 对象，其 entities 数组的每一项都符合以下 JSON Schema：\n"
-        f"{_schema_text(_ENTITY_JSON_SCHEMA)}"
+        f"{_schema_text(entity_output_schema(graph_mode))}"
     )
 
 
@@ -262,7 +304,8 @@ def graph_node_prompt(config: GraphExtractionConfig, params: dict[str, Any], ope
     governed = uses_graph_guidance(operator_code, operator_version)
     if operator_code == "entity-extractor":
         if governed:
-            return _ENTITY_SYSTEM, render_entity_prompt(config, source_chunk, instructions=params.get("extraction_instructions", ""))
+            return _ENTITY_SYSTEM, render_entity_prompt(config, source_chunk, instructions=params.get("extraction_instructions", ""),
+                                                        graph_mode=params.get("graph_mode"))
         return entity_prompt_for(config, source_chunk)
     if operator_code == "relation-extractor":
         if governed:

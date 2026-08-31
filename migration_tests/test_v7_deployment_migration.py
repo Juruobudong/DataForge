@@ -23,7 +23,7 @@ from dataforge.v7.migration.manifest import validate_manifest
 from dataforge.v7.migration.planner import InstitutionReleasePlanner, MigrationPlanner
 from dataforge.v7.migration.verifier import ActivationPreflightVerifier
 from dataforge.v7.migrations import upgrade
-from dataforge.v7.models import DataForgeInstance, Deployment, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
+from dataforge.v7.models import DataForgeInstance, Deployment, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import V7Store
 from dataforge.v7.vector import V7Milvus
@@ -319,6 +319,9 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
         "source_version_ids": [source["version"]["id"]],
     }])
     item = store.list_knowledge_items(library["id"])[0]
+    item = store.review_knowledge_item(
+        item["id"], status="approved", expected_review_revision=item["review_revision"],
+    )
     for sync in store.create_vector_sync_jobs(library["id"]):
         store.finish_vector_sync(sync["id"], [{
             "knowledge_item_id": item["id"], "vector_id": f"vec-{sync['index_profile_id']}",
@@ -592,6 +595,9 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
     }])
     central.complete_job(processing_job["id"])
     item = central.list_knowledge_items(library_id)[0]
+    item = central.review_knowledge_item(
+        item["id"], status="approved", expected_review_revision=item["review_revision"],
+    )
     for sync in central.create_vector_sync_jobs(library_id):
         central.finish_vector_sync(sync["id"], [{
             "knowledge_item_id": item["id"], "vector_id": f"vec-{sync['index_profile_id']}",
@@ -642,6 +648,7 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         assert archive.read("metadata/document_library_processing_baselines.jsonl").strip()
         exported_asset_items = [json.loads(line) for line in archive.read("metadata/knowledge_asset_items.jsonl").splitlines()]
         assert exported_asset_items and exported_asset_items[0]["evidence_json"]
+        assert exported_asset_items[0]["knowledge_review_json"]["status"] == "approved"
         assert "asset_item_snapshots" in manifest_v2["required_features"]
 
     monkeypatch.setenv("DATAFORGE_INSTANCE_MODE", "local")
@@ -944,6 +951,9 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
         "canonical_content": "问题：挂号？答案：窗口。", "data_json": {"question": "挂号？", "answer": "窗口。"},
         "source_version_ids": [source["version"]["id"]]}])
     item = central.list_knowledge_items(library["id"])[0]
+    item = central.review_knowledge_item(
+        item["id"], status="approved", expected_review_revision=item["review_revision"],
+    )
     for sync in central.create_vector_sync_jobs(library["id"]):
         central.finish_vector_sync(sync["id"], [{"knowledge_item_id": item["id"],
             "vector_id": f'vec-{sync["index_profile_id"]}', "content_hash": item["content_hash"]}])
@@ -1005,7 +1015,9 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     assert local_milvus.verify_partition(selected["collection_name"], selected["partition_name"])["count"] == 1
     with local.sessions() as session:
         imported_version = session.scalar(select(SourceVersion))
+        imported_item = session.scalar(select(KnowledgeItem))
         imported_evidence = session.scalar(select(KnowledgeItemSource))
         assert imported_version and imported_version.review_status == "approved"
+        assert imported_item and imported_item.review_status == "approved" and imported_item.review_revision == 2
         assert session.get(SourceReviewSnapshot, imported_version.current_review_snapshot_id)
         assert imported_evidence and imported_evidence.source_chunk_revision_id and imported_evidence.source_review_snapshot_id

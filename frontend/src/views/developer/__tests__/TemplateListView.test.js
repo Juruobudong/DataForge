@@ -9,6 +9,7 @@ vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => ({ query
 vi.mock('../../../api/platform', () => ({ api: Object.fromEntries([
   'flowTemplates', 'operatorCatalog', 'flowSubgraphs', 'knowledgeTypes', 'managedFlowTemplates',
   'modelServings', 'qualityProfiles', 'detachFlowToAdvanced', 'previewFlowToAdvanced', 'materializeManagedFlow', 'createFlowTemplate', 'updateFlowTemplate', 'publishFlowTemplate',
+  'validateFlowTemplate',
 ].map(name => [name, vi.fn()])) }))
 vi.mock('../../../components/flow/advanced/AdvancedFlowEditor.vue', () => ({ default: {
   template: '<div class="advanced-editor-test"></div>',
@@ -32,8 +33,9 @@ beforeEach(() => {
   api.materializeManagedFlow.mockResolvedValue({ output_types: ['text'], definition: advanced.definition })
   api.createFlowTemplate.mockResolvedValue({ id: 'converted', revision: 1, status: 'draft' })
   api.updateFlowTemplate.mockResolvedValue({ revision: 2, revision_id: 'r2', source_definition_checksum: 'checksum2', status: 'draft' })
+  api.validateFlowTemplate.mockResolvedValue({ valid: true, compiled_checksum: 'compiled' })
 })
-afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.useRealTimers() })
+afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; delete HTMLElement.prototype.scrollIntoView; vi.unstubAllGlobals(); vi.useRealTimers() })
 async function render() {
   wrapper = mount(TemplateListView, { attachTo: document.body })
   await flushPromises()
@@ -305,6 +307,28 @@ describe('temporary Advanced conversion', () => {
 })
 
 describe('knowledge flow editing toolbar', () => {
+  it('keeps the current viewport after successful compilation and only jumps to Console on failure', async () => {
+    const scrollIntoView = vi.fn(), scrollTo = vi.fn()
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { configurable: true, value: scrollIntoView })
+    vi.stubGlobal('scrollTo', scrollTo)
+    vi.spyOn(window, 'scrollX', 'get').mockReturnValue(17)
+    vi.spyOn(window, 'scrollY', 'get').mockReturnValue(260)
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+
+    await button('编译校验').trigger('click'); await flushPromises()
+    expect(api.validateFlowTemplate).toHaveBeenCalledWith('custom')
+    expect(wrapper.get('.action-console').text()).toContain('compiled')
+    expect(scrollIntoView).not.toHaveBeenCalled()
+    expect(scrollTo).toHaveBeenLastCalledWith({ left: 17, top: 260, behavior: 'auto' })
+
+    scrollTo.mockClear()
+    api.validateFlowTemplate.mockRejectedValueOnce(new Error('PORT_TYPE_MISMATCH'))
+    await button('编译校验').trigger('click'); await flushPromises()
+    expect(wrapper.get('.action-console').text()).toContain('PORT_TYPE_MISMATCH')
+    expect(scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(scrollIntoView).toHaveBeenCalledWith(expect.objectContaining({ block: 'start' }))
+    expect(scrollTo).not.toHaveBeenCalled()
+  })
   it('runs a clean published flow without manufacturing a new draft', async () => {
     api.flowTemplates.mockResolvedValue([{ ...advanced, revision_status: 'published' }])
     await render(); await wrapper.get('.template-list button').trigger('click')

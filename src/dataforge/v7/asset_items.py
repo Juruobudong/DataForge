@@ -1,5 +1,6 @@
 """Freeze and read content/evidence at the AssetVersion boundary."""
 from copy import deepcopy
+from datetime import timezone
 from types import SimpleNamespace
 import uuid
 
@@ -34,6 +35,15 @@ def freeze_asset_items(session, asset, items):
             id=f"kai_{uuid.uuid4().hex}", asset_version_id=asset.id, knowledge_item_id=item.id,
             source_knowledge_id=item.source_knowledge_id, canonical_content=item.canonical_content,
             data_json=deepcopy(item.data_json), content_hash=item.content_hash, evidence_json=evidence,
+            knowledge_review_json={
+                "status": item.review_status,
+                "revision": item.review_revision,
+                "reviewed_by": item.reviewed_by,
+                "reviewed_at": ((item.reviewed_at if item.reviewed_at.tzinfo else
+                                  item.reviewed_at.replace(tzinfo=timezone.utc)).isoformat()
+                                 if item.reviewed_at else None),
+                "note": item.review_note,
+            },
         ))
 
 

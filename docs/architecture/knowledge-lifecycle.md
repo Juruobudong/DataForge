@@ -17,7 +17,8 @@ Parser 为全部原生格式建立 `SourceAnchorV2`：PDF 保留页码和 `0~1` 
   → 不可变 FlowExecutionSnapshot
   → Worker / Runner / Knowledge Sink
   → KnowledgeLibrary 单一当前态 + KnowledgeChange 历史
-  → Vector Sync / Ready KnowledgeAssetVersion
+  → KnowledgeItem 人工审核（Text / QA）
+  → 手动全量向量发布 / Ready KnowledgeAssetVersion
   → RouteVersion / RoutingSnapshot
 ```
 
@@ -68,7 +69,9 @@ KnowledgeLibrary 保存业务查询使用的单一当前知识集合，不要求
 
 ## 向量化、发布与删除
 
-- Vector Sync 从当前知识创建新的不可变 AssetVersion；只有 count、digest、load 与冒烟验证通过后才标记 Ready。
+- Knowledge Job 完成只提交逻辑当前态，不自动创建 VectorSyncJob。Text/QA 新增或内容变化后进入 pending；内容 hash 不变时保留原审核结论。Graph 与扩展类型不做逐条审核，但同样需要手动入库。
+- 手动全量发布从当前知识创建新的不可变 AssetVersion：Text/QA 要求 pending 为零并只冻结 approved，Graph/扩展冻结全部 active。KnowledgeAssetItem 同时冻结正文、业务数据、Evidence 和知识审核快照。
+- 发布摘要覆盖选择集合、内容 hash 和 Evidence Revision；同内容 Evidence 更新不重新审核，但会让当前知识显示“有更新”。只有 count、digest、load 与冒烟验证通过后才标记 Ready，失败候选标记 failed。
 - Routing 只引用 Ready AssetVersion，查询始终限定到 Snapshot 指定的版本化 Partition。
 - 删除文件先做影响预检并异步清理对象与失效向量；运行任务会阻断删除。
 - 删除知识库时，Draft/已发布路由引用和运行中的 Sink 任务会阻断；门禁通过后只删除该库的 `kl_*` Partition，不删除 Collection。
@@ -78,6 +81,7 @@ KnowledgeLibrary 保存业务查询使用的单一当前知识集合，不要求
 - 实现：`src/dataforge/v7/runner.py`、`store.py`、`worker.py`、`vector.py`、`routing.py`。
 - 详细事实：[`wiki/pages/core-workflows.md`](../../wiki/pages/core-workflows.md)、[`wiki/pages/domain-model.md`](../../wiki/pages/domain-model.md)。
 - 决策：[ADR-001 单一当前知识](../adr/ADR-001-single-current-knowledge.md)、[ADR-002 不可变资产版本](../adr/ADR-002-immutable-asset-version.md)、[ADR-006 ChunkSet 提升](../adr/ADR-006-source-chunk-set-promotion.md)、[ADR-007 SourceAnchor 血缘](../adr/ADR-007-source-anchor-provenance.md)、[ADR-008 Debug Sandbox](../adr/ADR-008-debug-execution-sandbox.md)。
+- 知识级审核与手动发布：[ADR-010](../adr/ADR-010-knowledge-review-vector-publish.md)。
 
 ## AssetVersion 条目冻结（2026-08-29）
 

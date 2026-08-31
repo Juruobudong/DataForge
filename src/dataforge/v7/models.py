@@ -388,6 +388,11 @@ class KnowledgeItem(Timestamped, Base):
     data_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    review_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class KnowledgeItemSource(Timestamped, Base):
@@ -412,7 +417,7 @@ class KnowledgeItemSource(Timestamped, Base):
 class KnowledgeChange(Timestamped, Base):
     __tablename__ = "knowledge_changes"
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
+    knowledge_job_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=True, index=True)
     knowledge_library_id: Mapped[str] = mapped_column(ForeignKey("knowledge_libraries.id"), nullable=False, index=True)
     knowledge_item_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_items.id"), nullable=True)
     change_type: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -1109,6 +1114,12 @@ class ManagedCollectionDeletionJob(Timestamped, Base):
 
 class VectorSyncJob(Timestamped, Base):
     __tablename__ = "vector_sync_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "knowledge_library_id", "index_profile_id", "publish_idempotency_key",
+            name="uq_vector_publish_idempotency",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_library_id: Mapped[str] = mapped_column(ForeignKey("knowledge_libraries.id"), nullable=False, index=True)
     index_profile_id: Mapped[str] = mapped_column(ForeignKey("knowledge_index_profiles.id"), nullable=False)
@@ -1122,6 +1133,7 @@ class VectorSyncJob(Timestamped, Base):
     asset_version_id: Mapped[str | None] = mapped_column(
         ForeignKey("knowledge_asset_versions.id"), nullable=True, index=True
     )
+    publish_idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class KnowledgeAssetVersion(Timestamped, Base):
@@ -1183,6 +1195,7 @@ class KnowledgeAssetItem(Timestamped, Base):
     data_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     evidence_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    knowledge_review_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class VectorRecordState(Timestamped, Base):

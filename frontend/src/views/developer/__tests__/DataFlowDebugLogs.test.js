@@ -57,7 +57,7 @@ async function prepareRun({ history = true, options = { revision: { id: 'rev', s
   api.flowTemplates.mockResolvedValue([{ id: 'flow', name: '测试流程', revision_status: 'draft' }])
   api.flowRuns.mockResolvedValue(history ? [{ id: 'r', template_id: 'flow', debug_input_snapshot_id: 's' }] : [])
   api.debugRunOptions.mockResolvedValue(options)
-  api.debugRunPreflight.mockResolvedValue({ input_count: 1, output_keys: ['text'] })
+  api.debugRunPreflight.mockResolvedValue({ valid: true, issues: [], input_count: 1, output_keys: ['text'] })
   api.createDebugRun.mockResolvedValue({ id: 'new' })
   api.flowRun.mockImplementation(async id => ({ ...initial, id }))
   wrapper = mount(DataFlowDebugView, { attachTo: document.body })
@@ -98,6 +98,20 @@ it('shows automatic preflight progress, blocks start on failure, and allows manu
   expect(api.debugRunPreflight).toHaveBeenCalledTimes(2)
 })
 
+it.each([false, true])('honors semantic preflight valid=%s and displays node-level issues', async valid => {
+  api.debugRunPreflight.mockResolvedValueOnce({ valid, input_count: 8000, output_keys: ['text'],
+    issues: [{ severity: valid ? 'warning' : 'error', node_id: 'mark', message: valid ? '上游数量未知，执行前检查' : '8000条超过5000条上限' }] })
+  await prepareRun()
+  expect(wrapper.get('.drawer').text()).toContain(valid ? '上游数量未知' : '8000条超过5000条上限')
+  const start = wrapper.findAll('button').find(button => button.text() === '开始运行')
+  expect(start.element.disabled).toBe(!valid)
+  if (!valid) {
+    await start.trigger('click')
+    expect(api.createDebugRun).not.toHaveBeenCalled()
+    expect(wrapper.get('.drawer').text()).not.toContain('预检通过')
+  } else expect(wrapper.get('.drawer').text()).toContain('仍有执行时检查项')
+})
+
 it('waits for all business input selections before automatically preflighting again', async () => {
   await prepareRun({ options: {
     revision: { id: 'rev', status: 'draft' },
@@ -129,12 +143,12 @@ it.each(['success', 'error'])('ignores a stale preflight %s after changing sampl
   ] } })
   api.debugRunPreflight.mockImplementationOnce(() => new Promise(resolve => { resolveNew = resolve }))
   await wrapper.get('.sample-card select').setValue('two'); await flushPromises()
-  if (outcome === 'success') resolveOld({ input_count: 99, output_keys: ['过期结果'] })
+  if (outcome === 'success') resolveOld({ valid: true, issues: [], input_count: 99, output_keys: ['过期结果'] })
   else rejectOld(new Error('过期错误'))
   await flushPromises()
   expect(wrapper.get('.drawer [role="status"]').text()).toBe('正在运行预检…')
   expect(wrapper.text()).not.toContain('过期')
-  resolveNew({ input_count: 2, output_keys: ['text'] }); await flushPromises()
+  resolveNew({ valid: true, issues: [], input_count: 2, output_keys: ['text'] }); await flushPromises()
   expect(wrapper.get('.drawer .success').text()).toContain('2 个文档块')
   expect(api.debugRunPreflight).toHaveBeenLastCalledWith(expect.objectContaining({ sample_code: 'two' }))
 })
@@ -159,7 +173,7 @@ it.each(['options', 'preflight'])('ignores late %s after closing and reopening p
   await prepareRun()
   await clickButton('关闭')
   await clickButton('准备运行')
-  resolveOld(phase === 'options' ? { revision: { id: 'stale-rev' } } : { input_count: 99, output_keys: ['stale'] })
+  resolveOld(phase === 'options' ? { revision: { id: 'stale-rev' } } : { valid: true, issues: [], input_count: 99, output_keys: ['stale'] })
   await flushPromises()
   expect(wrapper.get('.drawer .success').text()).toContain('1 个文档块')
   expect(wrapper.text()).not.toContain('stale')
@@ -172,7 +186,7 @@ it('preflights a flow deep link automatically but not a changed draft checksum',
   api.flowTemplates.mockResolvedValue([{ id: 'flow', name: '测试流程', revision_status: 'draft' }])
   api.flowRuns.mockResolvedValue([])
   api.debugRunOptions.mockResolvedValue({ revision: { id: 'rev' }, source_definition_checksum: 'expected' })
-  api.debugRunPreflight.mockResolvedValue({ input_count: 1, output_keys: ['text'] })
+  api.debugRunPreflight.mockResolvedValue({ valid: true, issues: [], input_count: 1, output_keys: ['text'] })
   wrapper = mount(DataFlowDebugView); await flushPromises()
   expect(api.debugRunPreflight).toHaveBeenCalledTimes(1)
   expect(api.createDebugRun).not.toHaveBeenCalled()

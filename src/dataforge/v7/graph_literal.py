@@ -21,6 +21,7 @@ _NUM = r"\d+(?:\.\d+)?"
 _UNIT = r"[A-Za-zµμ℃°%/]{1,12}"
 _DATE_RE = re.compile(r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})$")
 _PERCENT_RE = re.compile(rf"^({_NUM})\s*%$")
+_PERCENTILE_RE = re.compile(rf"^(?:第\s*)?({_NUM})\s*(?:百分位|百分位数|percentile)$", re.IGNORECASE)
 _TEMP_RANGE_RE = re.compile(rf"^({_NUM})\s*[~～\-]\s*({_NUM})\s*[℃°]C?$")
 _TEMP_RE = re.compile(rf"^({_NUM})\s*[℃°]C?$")
 _DURATION_RE = re.compile(rf"^(?:<\s*)?({_NUM})\s*(s|sec|min|h|hr|ms|秒|分钟|小时|天|d)$", re.IGNORECASE)
@@ -55,6 +56,10 @@ def detect_literal(value: str) -> LiteralValue | None:
     match = _PERCENT_RE.match(text)
     if match:
         return LiteralValue("percentage", text, _number(match.group(1)), "%")
+
+    match = _PERCENTILE_RE.match(text)
+    if match:
+        return LiteralValue("percentage", text, _number(match.group(1)), "percentile")
 
     match = _TEMP_RANGE_RE.match(text)
     if match:

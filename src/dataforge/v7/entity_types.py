@@ -139,9 +139,9 @@ def clean_removed_entity_references(definition: dict[str, Any], previous: dict[s
     clean(new_graph.get("relation_types", []))
     for node in definition.get("nodes", []):
         params = node.get("params") or {}
-        if node.get("ref") == "entity-extractor" and isinstance(params.get("entity_types"), list):
+        if node.get("ref") in {"entity-extractor", "entity-relation-extractor"} and isinstance(params.get("entity_types"), list):
             if "entity_type_scope" not in params:
                 params["entity_type_scope"] = "subset" if params["entity_types"] else "all"
             params["entity_types"] = [code for code in params["entity_types"] if code not in removed]
-        if node.get("ref") == "relation-extractor":
+        if node.get("ref") in {"relation-extractor", "entity-relation-extractor"}:
             clean(params.get("relation_constraints") or [])

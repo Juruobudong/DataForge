@@ -92,6 +92,19 @@ class SelectedDocumentSourcesRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
 
 
+class DocumentSourceReviewTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: str = Field(min_length=1)
+    source_version_id: str | None = Field(min_length=1)
+    activation_no: int | None = Field(ge=1)
+    chunk_set_id: str | None = Field(min_length=1)
+
+
+class DocumentSourcesBatchReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[DocumentSourceReviewTarget] = Field(min_length=1, max_length=50)
+
+
 class SourceChunkUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: str
@@ -153,6 +166,35 @@ class DocumentDeletionRequest(BaseModel):
 
 class KnowledgeLibraryDeletionRequest(BaseModel):
     library_ids: list[str] = Field(min_length=1)
+
+
+class KnowledgeItemUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    data: dict | None = None
+    canonical_content: str | None = None
+    expected_review_revision: int = Field(ge=1)
+
+
+class KnowledgeItemReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["approved", "rejected"]
+    expected_review_revision: int = Field(ge=1)
+    review_note: str | None = Field(default=None, max_length=2000)
+
+
+class KnowledgeItemBatchReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    item_ids: list[str] = Field(min_length=1, max_length=200)
+    action: Literal["approve", "reject"]
+    expected_revisions: dict[str, int]
+    review_note: str | None = Field(default=None, max_length=2000)
+
+
+class KnowledgeVectorPublishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scope: Literal["all_approved", "all_active"]
+    expected_snapshot_digest: str = Field(min_length=64, max_length=64)
+    idempotency_key: str = Field(min_length=1, max_length=64)
 
 
 class KnowledgeJobRequest(BaseModel):
@@ -1004,6 +1046,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.document_tree(library_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.post("/api/document-libraries/{library_id}/sources/review/approve-batch")
+    def approve_document_sources_batch(library_id: str, payload: DocumentSourcesBatchReviewRequest):
+        try:
+            return store.approve_document_sources_batch(library_id, [item.model_dump() for item in payload.items])
+        except ValueError as exc:
+            raise _error(exc) from exc
+
     @app.get("/api/document-libraries/{library_id}/template-bindings")
     def document_library_template_bindings(library_id: str):
         try: return store.list_document_library_template_bindings(library_id)
@@ -1335,8 +1384,65 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
 
     @app.get("/api/knowledge-libraries/{library_id}/qa-pairs")
     def qa_pairs(library_id: str, q: str = "", status: Literal["active", "inactive", "all"] = "active",
+                 review_status: Literal["pending", "approved", "rejected", "all"] = "all",
                  page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200)):
-        try: return store.list_qa_pairs(library_id, keyword=q, status=status, page=page, page_size=page_size)
+        try: return store.list_qa_pairs(library_id, keyword=q, status=status, review_status=review_status,
+                                        page=page, page_size=page_size)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.patch("/api/knowledge/items/{item_id}")
+    def update_knowledge_item(item_id: str, payload: KnowledgeItemUpdateRequest):
+        try:
+            return store.update_knowledge_item(
+                item_id, data=payload.data, canonical_content=payload.canonical_content,
+                expected_review_revision=payload.expected_review_revision,
+            )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge/items/{item_id}/review")
+    def review_knowledge_item(item_id: str, payload: KnowledgeItemReviewRequest):
+        try:
+            return store.review_knowledge_item(
+                item_id, status=payload.status, expected_review_revision=payload.expected_review_revision,
+                review_note=payload.review_note,
+            )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge-libraries/{library_id}/review/batch")
+    def batch_review_knowledge_items(library_id: str, payload: KnowledgeItemBatchReviewRequest):
+        try:
+            return store.batch_review_knowledge_items(
+                library_id, item_ids=payload.item_ids, action=payload.action,
+                expected_revisions=payload.expected_revisions, review_note=payload.review_note,
+            )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/knowledge-libraries/{library_id}/review-summary")
+    def knowledge_review_summary(library_id: str):
+        target_available, target_error = True, None
+        try:
+            _authoring_connection()
+        except HTTPException as exc:
+            target_available, target_error = False, str(exc.detail)
+        try:
+            return store.knowledge_review_summary(
+                library_id, target_available=target_available, target_error=target_error,
+            )
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge-libraries/{library_id}/vector-publish", status_code=202)
+    def publish_knowledge_vectors(library_id: str, payload: KnowledgeVectorPublishRequest):
+        _authoring_connection()
+        try:
+            return store.publish_knowledge_vectors(
+                library_id, scope=payload.scope,
+                expected_snapshot_digest=payload.expected_snapshot_digest,
+                idempotency_key=payload.idempotency_key,
+            )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/knowledge-libraries/{library_id}/graph")
@@ -2087,12 +2193,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/developer/index-profiles/{profile_id}/archive")
     def archive_index_profile(profile_id: str):
         try: return store.archive_index_profile(profile_id)
-        except ValueError as exc: raise _error(exc) from exc
-
-    @app.post("/api/knowledge-libraries/{library_id}/vector-sync-jobs", status_code=202)
-    def create_vector_sync_jobs(library_id: str):
-        try: return store.create_vector_sync_jobs(library_id)
-        except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/vector-sync-jobs")

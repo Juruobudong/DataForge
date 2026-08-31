@@ -147,8 +147,8 @@ def semantic_annotations(request, records):
                 or not isinstance(row.get("_df_identity"), str) or not isinstance(row.get("text"), str)):
             raise ValueError("OPERATOR_INPUT_INVALID: 语义标记输入非法")
         grouped[row["_df_group"]].append(row)
-    if any(len(group) > 5000 for group in grouped.values()):
-        raise ValueError("SEMANTIC_DEDUP_GROUP_TOO_LARGE: 每个比较组最多5000条记录")
+    for group, rows in grouped.items():
+        _semantic_contract.require_group_size(len(rows), group=group)
     _semantic_contract.validate_model_bundle(bundle)
 
     from pathlib import Path

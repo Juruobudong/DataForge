@@ -1147,6 +1147,11 @@ def upgrade():
     sa.Column('data_json', sa.JSON(), nullable=False),
     sa.Column('content_hash', sa.String(length=64), nullable=False),
     sa.Column('status', sa.String(length=32), nullable=False),
+    sa.Column('review_status', sa.String(length=32), nullable=False),
+    sa.Column('review_revision', sa.Integer(), nullable=False),
+    sa.Column('reviewed_at', sa.DateTime(timezone=True), nullable=True),
+    sa.Column('reviewed_by', sa.String(length=255), nullable=True),
+    sa.Column('review_note', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['knowledge_library_id'], ['knowledge_libraries.id'], ),
@@ -1154,6 +1159,7 @@ def upgrade():
     sa.UniqueConstraint('knowledge_library_id', 'source_knowledge_id', name='uq_library_source_knowledge')
     )
     op.create_index(op.f('ix_knowledge_items_knowledge_library_id'), 'knowledge_items', ['knowledge_library_id'], unique=False)
+    op.create_index(op.f('ix_knowledge_items_review_status'), 'knowledge_items', ['review_status'], unique=False)
     op.create_index(op.f('ix_knowledge_items_status'), 'knowledge_items', ['status'], unique=False)
     op.create_table('knowledge_library_deletion_jobs',
     sa.Column('id', sa.String(length=64), nullable=False),
@@ -1359,6 +1365,7 @@ def upgrade():
     sa.Column('data_json', sa.JSON(), nullable=False),
     sa.Column('content_hash', sa.String(length=64), nullable=False),
     sa.Column('evidence_json', sa.JSON(), nullable=False),
+    sa.Column('knowledge_review_json', sa.JSON(), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['asset_version_id'], ['knowledge_asset_versions.id'], ),
@@ -1368,7 +1375,7 @@ def upgrade():
     op.create_index(op.f('ix_knowledge_asset_items_asset_version_id'), 'knowledge_asset_items', ['asset_version_id'], unique=False)
     op.create_table('knowledge_changes',
     sa.Column('id', sa.String(length=64), nullable=False),
-    sa.Column('knowledge_job_id', sa.String(length=64), nullable=False),
+    sa.Column('knowledge_job_id', sa.String(length=64), nullable=True),
     sa.Column('knowledge_library_id', sa.String(length=64), nullable=False),
     sa.Column('knowledge_item_id', sa.String(length=64), nullable=True),
     sa.Column('change_type', sa.String(length=16), nullable=False),
@@ -1471,15 +1478,18 @@ def upgrade():
     sa.Column('lease_expires_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('error', sa.Text(), nullable=True),
     sa.Column('asset_version_id', sa.String(length=64), nullable=True),
+    sa.Column('publish_idempotency_key', sa.String(length=64), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['asset_version_id'], ['knowledge_asset_versions.id'], ),
     sa.ForeignKeyConstraint(['index_profile_id'], ['knowledge_index_profiles.id'], ),
     sa.ForeignKeyConstraint(['knowledge_library_id'], ['knowledge_libraries.id'], ),
-    sa.PrimaryKeyConstraint('id')
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('knowledge_library_id', 'index_profile_id', 'publish_idempotency_key', name='uq_vector_publish_idempotency')
     )
     op.create_index(op.f('ix_vector_sync_jobs_asset_version_id'), 'vector_sync_jobs', ['asset_version_id'], unique=False)
     op.create_index(op.f('ix_vector_sync_jobs_knowledge_library_id'), 'vector_sync_jobs', ['knowledge_library_id'], unique=False)
+    op.create_index(op.f('ix_vector_sync_jobs_publish_idempotency_key'), 'vector_sync_jobs', ['publish_idempotency_key'], unique=False)
     op.create_index(op.f('ix_vector_sync_jobs_status'), 'vector_sync_jobs', ['status'], unique=False)
     op.create_table('debug_run_flow_materializations',
     sa.Column('id', sa.String(length=64), nullable=False),
@@ -1948,6 +1958,7 @@ def downgrade():
     op.drop_index(op.f('ix_debug_run_flow_materializations_action'), table_name='debug_run_flow_materializations')
     op.drop_table('debug_run_flow_materializations')
     op.drop_index(op.f('ix_vector_sync_jobs_status'), table_name='vector_sync_jobs')
+    op.drop_index(op.f('ix_vector_sync_jobs_publish_idempotency_key'), table_name='vector_sync_jobs')
     op.drop_index(op.f('ix_vector_sync_jobs_knowledge_library_id'), table_name='vector_sync_jobs')
     op.drop_index(op.f('ix_vector_sync_jobs_asset_version_id'), table_name='vector_sync_jobs')
     op.drop_table('vector_sync_jobs')
@@ -2014,6 +2025,7 @@ def downgrade():
     op.drop_index(op.f('ix_knowledge_library_deletion_jobs_knowledge_library_id'), table_name='knowledge_library_deletion_jobs')
     op.drop_table('knowledge_library_deletion_jobs')
     op.drop_index(op.f('ix_knowledge_items_status'), table_name='knowledge_items')
+    op.drop_index(op.f('ix_knowledge_items_review_status'), table_name='knowledge_items')
     op.drop_index(op.f('ix_knowledge_items_knowledge_library_id'), table_name='knowledge_items')
     op.drop_table('knowledge_items')
     op.drop_index(op.f('ix_knowledge_chunk_generations_status'), table_name='knowledge_chunk_generations')

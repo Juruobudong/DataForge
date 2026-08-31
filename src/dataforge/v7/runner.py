@@ -518,6 +518,12 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
         return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
     if ref == "text-knowledge-mapper":
         return [candidate for value in values if (candidate := _text_knowledge_candidate(value)) is not None]
+    if ref == "entity-relation-extractor":
+        return [{**value, "entities": [
+            {"name": "高血压", "type": "disease", "type_label": "疾病", "object_kind": "entity", "description": "常见心血管疾病", "aliases": [], "confidence": 0.9},
+            {"name": "阿司匹林", "type": "drug", "type_label": "药物", "object_kind": "entity", "description": "原文提及的药物", "aliases": [], "confidence": 0.9},
+        ], "relations": [{"source": "高血压", "type": "uses_drug", "type_label": "使用药物", "target": "阿司匹林",
+                           "description": "高血压使用阿司匹林", "keywords": [], "weight": None}]} for value in values]
     if ref == "entity-extractor":
         return [{**value, "entities": [
             {"name": "高血压", "type": "disease", "type_label": "疾病", "object_kind": "entity", "description": "常见心血管疾病", "aliases": [], "confidence": 0.9},
@@ -1170,6 +1176,11 @@ def _normalize_entities(record: dict[str, Any], library_id: str, config: GraphEx
     for item in merged:
         item["entity_id"] = _graph_entity_id(library_id, item.get("type"), item["name"])
     value["entities"] = merged
+    if "relations" in value:
+        # Joint extraction references the pre-normalized names. Keep edges in
+        # lockstep with deterministic canonicalization, including aliases.
+        endpoints = TripleEndpoints(merged, config, _normalized_name)
+        value["relations"] = [endpoints.relation(relation) for relation in value["relations"]]
     return value
 
 
@@ -1863,12 +1874,14 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         if lease_owner:
             store.assert_work_lease("knowledge", job_id, lease_owner)
         store.complete_job(job_id, warnings=warnings)
-        vector_jobs = {
-            library_id: store.create_vector_sync_jobs(library_id)
-            for output_key, library_id in sink_libraries.items()
-            if output_key in committed_sinks
+        return {
+            "id": job_id, "status": "completed_with_warnings" if warnings else "completed",
+            "flow_run_id": flow_run["id"], "changes": changes, "warnings": warnings,
+            "vector_sync_jobs": {}, "vector_publish_required": sorted(
+                library_id for output_key, library_id in sink_libraries.items()
+                if output_key in committed_sinks
+            ),
         }
-        return {"id": job_id, "status": "completed_with_warnings" if warnings else "completed", "flow_run_id": flow_run["id"], "changes": changes, "warnings": warnings, "vector_sync_jobs": vector_jobs}
     except Exception as exc:
         if lease_owner:
             try:
@@ -2195,6 +2208,18 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def runtime_status(authorization: str | None = Header(None)):
         verify(authorization)
         return runtime
+
+    @app.post("/internal/operators/status-batch")
+    def operator_status_batch(payload: dict, authorization: str | None = Header(None)):
+        verify(authorization)
+        from .operators.runtime import OperatorRuntime
+        requirements = payload.get("requirements")
+        if not isinstance(requirements, list) or len(requirements) > 1024:
+            raise HTTPException(status_code=422, detail="requirements 必须是最多1024项的数组")
+        try:
+            return {"statuses": OperatorRuntime().status_batch(requirements)}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/internal/operators/check")
     def check_operator(payload: dict, authorization: str | None = Header(None)):

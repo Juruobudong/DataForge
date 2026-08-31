@@ -45,10 +45,11 @@ class OperatorRuntime:
         self.path = Path(manifest_path or os.getenv("DATAFORGE_OPERATOR_RUNTIME_MANIFEST") or
                          Path(os.getenv("DATAFORGE_STATE_DIR", ".dataforge")) / "operator-runtime.json")
 
-    def resolve(self, spec):
-        if not self.path.is_file():
-            raise ValueError("OPERATOR_DEPENDENCY_MISSING: 维护人员尚未安装算子运行环境")
-        manifest = json.loads(self.path.read_text(encoding="utf-8"))
+    def resolve(self, spec, *, manifest=None, verified=None):
+        if manifest is None:
+            if not self.path.is_file():
+                raise ValueError("OPERATOR_DEPENDENCY_MISSING: 维护人员尚未安装算子运行环境")
+            manifest = json.loads(self.path.read_text(encoding="utf-8"))
         match = next(((value, item) for value in manifest.get("runtimes", [manifest]) for item in value.get("packages", [])
                       if item["name"] == spec.get("package") and item["version"] == spec.get("package_version")
                       and item["digest"] == spec.get("package_digest")
@@ -71,21 +72,47 @@ class OperatorRuntime:
             raise ValueError("OPERATOR_DEPENDENCY_MISSING: 算子 Python 不存在")
         if spec.get("resource_profile"):
             from .resource_bundle import verify_bundle
-            verify_bundle(value["resource_profiles"][spec["resource_profile"]])
+            bundle = value["resource_profiles"][spec["resource_profile"]]
+            identity = digest(bundle)
+            if verified is None:
+                verify_bundle(bundle)
+            else:
+                if identity not in verified:
+                    try:
+                        verify_bundle(bundle)
+                        verified[identity] = None
+                    except (ValueError, OSError) as exc:
+                        verified[identity] = exc
+                if verified[identity] is not None:
+                    raise verified[identity]
             if spec["resource_profile"] == "semantic-multilingual-v1":
                 from .semantic_contract import validate_model_bundle
                 validate_model_bundle(value["resource_profiles"][spec["resource_profile"]])
         return value, package
 
-    def status(self, spec):
+    def status(self, spec, *, manifest=None, verified=None):
         validate_runtime_requirements(spec)
         if spec["executor"] == "dataforge-native":
             return {"status": "ready"}
         try:
-            runtime, _ = self.resolve(spec)
+            runtime, _ = self.resolve(spec, manifest=manifest, verified=verified)
             return {"status": "ready", "runtime_digest": runtime_fingerprint(runtime)}
         except (ValueError, OSError, KeyError) as exc:
             return {"status": "missing", "reason": str(exc)}
+
+    def status_batch(self, requirements):
+        from ..operator_status import RUNNER_STATUS_CACHE
+        for spec in requirements:
+            validate_runtime_requirements(spec)
+        try:
+            manifest = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = {}
+        namespace = (str(self.path.resolve()), digest(manifest))
+        def fetch(specs):
+            verified = {}
+            return [self.status(spec, manifest=manifest, verified=verified) for spec in specs]
+        return RUNNER_STATUS_CACHE.get_many(namespace, requirements, fetch)
 
     def call(self, spec, *, records, init=None, run_arguments=None, context=None, params=None,
              serving=None, cancelled=None, timeout=None, action="execute", implementation=None, diagnostics=None):

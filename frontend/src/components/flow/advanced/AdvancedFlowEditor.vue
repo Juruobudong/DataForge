@@ -31,6 +31,8 @@ const evaluationNodes = computed(() => signalNodes.value.filter(node => node.ope
 const deduplicationNodes = computed(() => signalNodes.value.filter(node => node.operator === 'SemDeduplicateFilter'))
 const connectionSource = ref(null)
 const candidateResults = ref(null), candidateError = ref(''), candidatesLoading = ref(false)
+const graphWarnings = computed(() => candidateResults.value?.find(item => item.compatibility?.graph_warnings?.length)?.compatibility.graph_warnings || [])
+const runtimeUnknown = computed(() => candidateResults.value?.some(item => item.runtime_status?.status === 'unknown'))
 let candidateTimer, candidateSequence = 0
 const issues = ref([]), focusedIssue = ref(null), connectionError = ref(null)
 const nodes = ref([]), edges = ref([])
@@ -151,13 +153,15 @@ function addItem(item, kind) {
 function refreshCandidates() {
   clearTimeout(candidateTimer)
   const sequence = ++candidateSequence
-  if (props.purpose !== 'knowledge') { candidateResults.value = null; return }
+  if (props.purpose !== 'knowledge' || (!selectedNode.value && !connectionSource.value)) {
+    candidateResults.value = null; candidatesLoading.value = false; candidateError.value = ''; return
+  }
   candidatesLoading.value = true; candidateResults.value = []; candidateError.value = ''
   candidateTimer = setTimeout(async () => {
     try {
       const context = selectedNode.value && !connectionSource.value
         ? { node_id: selectedNode.value.id, direction: discoveryDirection.value, include_incompatible: true }
-        : { source_node_id: connectionSource.value?.nodeId, source_port: connectionSource.value?.port || 'output' }
+        : { source_node_id: connectionSource.value?.nodeId, source_port: connectionSource.value?.port || 'output', include_incompatible: true }
       const values = await api.operatorCandidates({ definition: serialize(), output_types: props.outputTypes, ...context })
       if (sequence === candidateSequence) candidateResults.value = values
     } catch (error) {
@@ -313,6 +317,8 @@ onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown',
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
       <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :purpose="purpose" :output-types="outputTypes" :entity-types="graphConfig.entity_types" :evaluation-nodes="evaluationNodes" :deduplication-nodes="deduplicationNodes" :issue="selectedIssue" :sample-result="sampleResult" @replace-operator="replaceOperator" @apply-parameters="applyParameters" @open-graph-config="openGraphConfig" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
     </div>
+    <section v-if="runtimeUnknown" class="validation-panel" role="status">部分算子运行状态暂不可用，连线兼容性仍有效。<button :disabled="candidatesLoading" @click="refreshCandidates">刷新运行状态</button></section>
+    <section v-if="graphWarnings.length" class="validation-panel" aria-label="草稿已有问题"><h3>草稿已有问题（不影响无关候选）</h3><button v-for="(warning,index) in graphWarnings" :key="index" @click="focusIssue({ ...warning, nodeId: warning.details?.target_node_id })">{{ warning.message }}</button></section>
     <section v-if="graphConfigOpen && hasGraphOutput" id="graph-config-panel" ref="graphConfigPanel" class="graph-config-panel" tabindex="-1" aria-label="全流程图谱规则">
       <header class="graph-config-heading"><div><h3>全流程图谱规则</h3><p>实体与关系抽取器共用的类型定义；结果仍经过图谱结构、质量校验。业务抽取要求在各节点中编辑。</p></div><div><button type="button" @click="returnToCanvas()">返回画布</button><button type="button" @click="returnToCanvas(true)">收起</button></div></header>
       <GraphSchemaEditor ref="graphSchemaEditor" :model-value="graphConfig" @update:model-value="applyGraphConfig" />

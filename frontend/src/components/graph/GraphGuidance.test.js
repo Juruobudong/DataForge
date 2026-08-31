@@ -40,6 +40,18 @@ afterEach(() => {
 })
 async function settlePreview() { await nextTick(); await vi.advanceTimersByTimeAsync(220); await flushPromises() }
 
+it('offers joint extraction in the existing prompt preview without upstream entity input', async () => {
+  wrapper = mount(PromptPreview, { props: { definition: { nodes: [
+    { id: 'joint', kind: 'operator', ref: 'entity-relation-extractor', params: {
+      entity_extraction_instructions: '设备和模块', relation_extraction_instructions: '组成关系' } },
+  ], edges: [] } } })
+  await settlePreview()
+  expect(wrapper.get('option').text()).toContain('实体关系联合抽取器')
+  const request = api.previewGraphPrompt.mock.calls.at(-1)[0]
+  expect(request.node_id).toBe('joint')
+  expect(request.definition.nodes[0].params.relation_extraction_instructions).toBe('组成关系')
+})
+
 it('edits an entity atomically, preserves code, cancels, and protects renamed presets', async () => {
   wrapper = mount(EntityTypeEditor, { props: { modelValue: clone(entityTypeCatalog.presets[0].entity_types),
     'onUpdate:modelValue': value => wrapper.setProps({ modelValue: value }) } })

@@ -12,6 +12,64 @@ function palette(catalog = [item()]) { wrapper = mount(OperatorPalette, { props:
 const info = () => wrapper.get('.operator-info')
 const dialog = () => document.querySelector('[role="dialog"]')
 
+describe('operators already on the canvas', () => {
+  const node = (id, ref, kind = 'operator', version = 1) => ({ id, data: { definition: { id, kind, ref, operator_version: version } } })
+
+  it('marks direct operator identities across providers and versions, not matching names or subflow refs', async () => {
+    const catalog = [item('native', 'dataforge'), item('dataflow'), item('custom', 'custom'), item('unused')]
+    palette(catalog)
+    await wrapper.setProps({ nodes: [node('a', 'native', 'operator', 2), node('b', 'dataflow'), node('c', 'custom'), node('d', 'unused', 'subflow'), { id: 'unknown' }] })
+    expect(wrapper.findAll('.is-in-canvas')).toHaveLength(3)
+    expect(wrapper.findAll('.canvas-used-badge').map(badge => badge.text())).toEqual(['已在画布', '已在画布', '已在画布'])
+    const unused = wrapper.findAll('.palette-entry').find(card => card.text().includes('unused'))
+    expect(unused.classes()).not.toContain('is-in-canvas')
+    expect(wrapper.emitted('add-item')).toBeUndefined()
+  })
+
+  it('updates after adding/removing/restoring nodes and still permits repeated insertion', async () => {
+    palette()
+    const first = node('one', 'HtmlEntityFilter'), second = node('two', 'HtmlEntityFilter')
+    await wrapper.setProps({ nodes: [first, second] })
+    expect(wrapper.get('.palette-entry').classes()).toContain('is-in-canvas')
+    expect(wrapper.get('.entry-body').attributes('aria-label')).toContain('已在画布')
+    await wrapper.get('.palette-entry').trigger('dblclick')
+    await wrapper.get('.entry-body').trigger('keydown', { key: 'Enter' })
+    await wrapper.get('.palette-entry').trigger('dragstart')
+    expect(wrapper.emitted('add-item')).toHaveLength(2)
+    expect(wrapper.emitted('drag-start')).toHaveLength(1)
+    await wrapper.setProps({ nodes: [second] })
+    expect(wrapper.find('.canvas-used-badge').exists()).toBe(true)
+    await wrapper.setProps({ nodes: [] })
+    expect(wrapper.find('.is-in-canvas').exists()).toBe(false)
+    await wrapper.setProps({ nodes: [first] })
+    expect(wrapper.find('.canvas-used-badge').exists()).toBe(true)
+    await wrapper.get('input').setValue('no-match')
+    expect(wrapper.find('.palette-entry').exists()).toBe(false)
+    await wrapper.get('input').setValue('')
+    expect(wrapper.find('.canvas-used-badge').exists()).toBe(true)
+  })
+
+  it('keeps compatibility and dependency restrictions separate from used highlighting', async () => {
+    const catalog = [item('ready'), item('unready'), item('blocked')]
+    palette(catalog)
+    await wrapper.setProps({
+      nodes: catalog.map(entry => node(entry.code, entry.code)), selectedNode: node('selected', 'ready'),
+      candidateResults: catalog.map((entry, index) => ({ ...entry,
+        compatibility: { compatible: index !== 2, reason: index === 2 ? '端口不兼容' : '', source_port: 'output', target_port: 'input' },
+        runtime_status: index === 1 ? { status: 'missing', reason: '运行依赖未就绪' } : { status: 'ready' },
+      })),
+    })
+    for (const state of ['compatible', 'unready', 'incompatible']) {
+      expect(wrapper.get(`.compatibility-${state}`).classes()).toContain('is-in-canvas')
+    }
+    await wrapper.get('.compatibility-unready').trigger('dblclick')
+    await wrapper.get('.compatibility-incompatible').trigger('dblclick')
+    expect(wrapper.emitted('add-item')).toBeUndefined()
+    expect(wrapper.text()).toContain('运行依赖未就绪')
+    expect(wrapper.text()).toContain('端口不兼容')
+  })
+})
+
 describe('operator help has no graph mutations', () => {
   it('keeps names only, reveals a two-line summary without a native title', async () => {
     palette()

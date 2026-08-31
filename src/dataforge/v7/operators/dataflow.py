@@ -68,6 +68,8 @@ class DataFlowOperatorExecutor:
     @capture_operator_diagnostics
     @capture_generation_metrics
     def execute(self, *, inputs, params, context):
+        from ..operator_parameters import validate_parameters
+        params = validate_parameters(self.parameter_schema, params, node_id=context.node_id, runtime=True)
         values = deepcopy(inputs)
         if not values:
             return OperatorResult()
@@ -124,12 +126,8 @@ class DataFlowOperatorExecutor:
         return OperatorResult(outputs=outputs, metrics=metrics)
 
     def _filter_candidates(self, values, params, invoke):
-        from jsonschema import Draft202012Validator
-
-        properties = self.parameter_schema.get("properties", {})
-        business = {key: deepcopy(params[key] if key in params else spec["default"])
-                    for key, spec in properties.items() if key in params or "default" in spec}
-        Draft202012Validator(self.parameter_schema).validate(business)
+        from ..operator_parameters import business_parameters
+        business = business_parameters(self.parameter_schema, params)
         if params.get("knowledge_type") not in {"text", "qa"}:
             raise ValueError("精选过滤器仅支持文本与问答候选")
         init = {key: value for key, value in business.items() if key not in {"llm_serving", "prompt_template_revision_id"}}

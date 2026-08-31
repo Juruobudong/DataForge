@@ -48,6 +48,8 @@ class CustomOperatorExecutor:
 
     @capture_operator_diagnostics
     def execute(self, *, inputs, params, context):
+        from ..operator_parameters import validate_parameters
+        params = validate_parameters(self.definition["parameter_schema"], params, node_id=context.node_id, runtime=True)
         if not self.spec.get("approved") and not context.runtime.get("validation"):
             raise ValueError("自定义算子尚未获批")
         if not inputs:

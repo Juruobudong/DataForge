@@ -68,7 +68,12 @@ class DatabaseUserDecisionRequired(RuntimeError):
         }
 
 
-def _expected_foreign_keys(table) -> set[tuple[tuple[str, ...], str, tuple[str, ...]]]:
+def _fk_action(value):
+    action = str(value or "NO ACTION").upper()
+    return "RESTRICT" if action in {"NO ACTION", "RESTRICT"} else action
+
+
+def _expected_foreign_keys(table):
     result = set()
     for constraint in table.constraints:
         if not isinstance(constraint, ForeignKeyConstraint):
@@ -78,16 +83,39 @@ def _expected_foreign_keys(table) -> set[tuple[tuple[str, ...], str, tuple[str, 
             tuple(element.parent.name for element in elements),
             elements[0].column.table.name,
             tuple(element.column.name for element in elements),
+            (_fk_action(constraint.ondelete), _fk_action(constraint.onupdate)),
         ))
     return result
 
 
-def _actual_foreign_keys(inspector, table_name: str) -> set[tuple[tuple[str, ...], str, tuple[str, ...]]]:
+def _actual_foreign_keys(inspector, table_name: str):
+    if inspector.bind.dialect.name == "sqlite":
+        # SQLite's SQL text reflection can omit actions on inline REFERENCES.
+        # PRAGMA reports the actual engine contract, including composite order.
+        from contextlib import nullcontext
+        from sqlalchemy.engine import Connection
+        bind = inspector.bind
+        quoted = bind.dialect.identifier_preparer.quote_identifier(table_name)
+        with (nullcontext(bind) if isinstance(bind, Connection) else bind.connect()) as connection:
+            rows = connection.exec_driver_sql(f"PRAGMA foreign_key_list({quoted})").mappings().all()
+        groups = {}
+        for row in rows:
+            groups.setdefault(row["id"], []).append(row)
+        result = set()
+        for rows in groups.values():
+            rows.sort(key=lambda row: row["seq"])
+            remote = rows[0]["table"]
+            primary = inspector.get_pk_constraint(remote).get("constrained_columns") or () if any(row["to"] is None for row in rows) else ()
+            columns = tuple(row["to"] if row["to"] is not None else primary[row["seq"]] for row in rows)
+            result.add((tuple(row["from"] for row in rows), remote, columns,
+                        (_fk_action(rows[0]["on_delete"]), _fk_action(rows[0]["on_update"]))))
+        return result
     return {
         (
             tuple(item.get("constrained_columns") or ()),
             str(item.get("referred_table") or ""),
             tuple(item.get("referred_columns") or ()),
+            (_fk_action((item.get("options") or {}).get("ondelete")), _fk_action((item.get("options") or {}).get("onupdate"))),
         )
         for item in inspector.get_foreign_keys(table_name)
     }
@@ -98,7 +126,7 @@ def _expected_unique_constraints(table) -> set[tuple[str, ...]]:
         tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
-    }
+    } | {tuple(column.name for column in index.columns) for index in table.indexes if index.unique}
 
 
 def _actual_unique_constraints(inspector, table_name: str) -> set[tuple[str, ...]]:
@@ -126,6 +154,11 @@ def schema_validation_errors(inspector, actual_tables: set[str]) -> tuple[str, .
 
     for table_name in sorted(expected_tables & actual_tables):
         expected_table = Base.metadata.tables[table_name]
+        from .database_schema_contract import column_and_index_errors
+        try:
+            errors.extend(column_and_index_errors(inspector, expected_table))
+        except (ValueError, KeyError, NotImplementedError) as exc:
+            errors.append(f"{table_name} 无法确认结构契约：{exc}")
         actual_columns = {item["name"] for item in inspector.get_columns(table_name)}
         for column_name in sorted(set(expected_table.columns.keys()) - actual_columns):
             errors.append(f"{table_name} 缺少列：{column_name}")
@@ -133,10 +166,10 @@ def schema_validation_errors(inspector, actual_tables: set[str]) -> tuple[str, .
         missing_foreign_keys = _expected_foreign_keys(expected_table) - _actual_foreign_keys(
             inspector, table_name,
         )
-        for local_columns, remote_table, remote_columns in sorted(missing_foreign_keys):
+        for local_columns, remote_table, remote_columns, actions in sorted(missing_foreign_keys):
             errors.append(
                 f"{table_name} 缺少外键：{','.join(local_columns)} -> "
-                f"{remote_table}({','.join(remote_columns)})"
+                f"{remote_table}({','.join(remote_columns)}) [DELETE {actions[0]}, UPDATE {actions[1]}]"
             )
 
         missing_uniques = _expected_unique_constraints(expected_table) - _actual_unique_constraints(
@@ -144,6 +177,10 @@ def schema_validation_errors(inspector, actual_tables: set[str]) -> tuple[str, .
         )
         for columns in sorted(missing_uniques):
             errors.append(f"{table_name} 缺少唯一约束：{','.join(columns)}")
+        for columns in sorted(_actual_unique_constraints(inspector, table_name) - _expected_unique_constraints(expected_table)):
+            errors.append(f"{table_name} 存在未声明唯一约束：{','.join(columns)}")
+        for columns, remote, remote_columns, actions in sorted(_actual_foreign_keys(inspector, table_name) - _expected_foreign_keys(expected_table)):
+            errors.append(f"{table_name} 存在未声明外键：{','.join(columns)} -> {remote}({','.join(remote_columns)}) [DELETE {actions[0]}, UPDATE {actions[1]}]")
 
     return tuple(errors)
 

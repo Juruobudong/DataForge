@@ -1077,7 +1077,8 @@ class MigrationImporter:
                             original = evidence.get(field)
                             evidence[field] = id_maps.get(mapping, {}).get(original, original)
                 _upsert(session, KnowledgeAssetItem, payload, immutable=(
-                    "asset_version_id", "source_knowledge_id", "canonical_content", "data_json", "content_hash", "evidence_json"))
+                    "asset_version_id", "source_knowledge_id", "canonical_content", "data_json", "content_hash",
+                    "evidence_json", "knowledge_review_json"))
 
     def _finish_asset_versions(self, manifest: dict[str, Any], selected: set[str],
                                id_maps: dict[str, dict[str, str]], job_id: str) -> None:

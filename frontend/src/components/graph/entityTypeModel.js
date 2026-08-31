@@ -26,13 +26,13 @@ export function removeEntityReferences(graphConfig, nodes, removedCodes) {
     graphConfig: { ...graphConfig, relation_types: (graphConfig.relation_types || []).map(clean) },
     nodes: nodes.map(node => {
       const definition = node.data.definition
-      if (!['entity-extractor', 'relation-extractor'].includes(definition.ref)) return node
+      if (!['entity-extractor', 'relation-extractor', 'entity-relation-extractor'].includes(definition.ref)) return node
       const params = { ...(definition.params || {}) }
-      if (definition.ref === 'entity-extractor' && Array.isArray(params.entity_types)) {
+      if (['entity-extractor', 'entity-relation-extractor'].includes(definition.ref) && Array.isArray(params.entity_types)) {
         params.entity_type_scope ??= params.entity_types.length ? 'subset' : 'all'
         params.entity_types = params.entity_types.filter(code => !removed.has(code))
       }
-      if (definition.ref === 'relation-extractor') params.relation_constraints = (params.relation_constraints || []).map(clean)
+      if (['relation-extractor', 'entity-relation-extractor'].includes(definition.ref)) params.relation_constraints = (params.relation_constraints || []).map(clean)
       return { ...node, data: { ...node.data, definition: { ...definition, params } } }
     }),
   }

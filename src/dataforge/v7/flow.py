@@ -14,8 +14,7 @@ from .operator_runtime_contract import validate_runtime_requirements
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
 
 
-class FlowValidationError(ValueError):
-    pass
+from .flow_errors import FlowValidationError
 
 
 def _reject_unknown_operators(definition, catalog):
@@ -324,93 +323,53 @@ def input_type_for_node(node_id, definition, catalog, subflows, trail=frozenset(
 
 def validate_flow_edges(definition: dict[str, Any], *, catalog: dict[str, dict[str, Any]],
                         subflows: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
-    """Validate the authoring graph before subflow expansion and return normalized edges."""
-    schema_version = int(definition.get("schema_version", 2))
-    if schema_version not in {2, 3}:
-        raise FlowEdgeValidationError(
-            "FLOW_DSL_VERSION_UNSUPPORTED",
-            "仅支持 Flow DSL schema_version=2 或 3",
-            details={},
-        )
-    nodes = [dict(node) for node in definition.get("nodes", []) if isinstance(node, dict)]
-    by_id = {str(node.get("id") or ""): node for node in nodes if node.get("id")}
-    normalized = [_edge(value) for value in definition.get("edges", [])]
-    outgoing: dict[str, list[str]] = defaultdict(list)
-    for edge in normalized:
-        outgoing[edge["source"]].append(edge["target"])
-
-    accepted: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
-    incoming_counts: dict[tuple[str, str], int] = defaultdict(int)
-    for edge in normalized:
-        details = _edge_details(edge)
-        source = by_id.get(edge["source"])
-        target = by_id.get(edge["target"])
-        if not source:
-            raise _edge_error("SOURCE_NODE_NO_OUTPUT", "连线来源节点不存在", edge)
-        if not target:
-            raise _edge_error("TARGET_NODE_NO_INPUT", "连线目标节点不存在", edge)
-        if source["id"] == target["id"]:
-            raise _edge_error("EDGE_SELF_LOOP", "节点不能连接自身", edge)
-        if source.get("kind") == "knowledge_sink" or node_role(source) == "knowledge_output":
-            raise _edge_error("SINK_NODE_CANNOT_HAVE_OUTGOING", "Knowledge Sink 不允许作为上游节点", edge)
-        if node_role(target) == "flow_input":
-            raise _edge_error("INPUT_NODE_CANNOT_HAVE_INCOMING", "INPUT 节点不允许存在 Incoming Edge", edge)
-
-        source_ports = _node_ports(source, direction="output", catalog=catalog, subflows=subflows)
-        target_ports = _node_ports(target, direction="input", catalog=catalog, subflows=subflows)
-        source_port = source_ports.get(edge["source_port"])
-        target_port = target_ports.get(edge["target_port"])
-        if not source_port and edge["source_port"] in _node_ports(source, direction="input", catalog=catalog, subflows=subflows):
-            raise _edge_error("EDGE_DIRECTION_INVALID", "Edge 必须从 output port 指向 input port", edge)
-        if not target_port and edge["target_port"] in _node_ports(target, direction="output", catalog=catalog, subflows=subflows):
-            raise _edge_error("EDGE_DIRECTION_INVALID", "Edge 必须从 output port 指向 input port", edge)
-        if not source_port:
-            raise _edge_error("SOURCE_NODE_NO_OUTPUT", f"来源节点不存在输出端口 {edge['source_port']}", edge)
-        if not target_port:
-            raise _edge_error("TARGET_NODE_NO_INPUT", f"目标节点不存在输入端口 {edge['target_port']}", edge)
-        if str(target_port.get("binding") or "edge") != "edge":
-            raise _edge_error("INPUT_NODE_CANNOT_HAVE_INCOMING", "目标输入端口由系统或运行时绑定，不能连接 Edge", edge)
-
-        identity = (edge["source"], edge["source_port"], edge["target"], edge["target_port"])
-        if identity in seen:
-            raise _edge_error("EDGE_DUPLICATED", "相同端口之间已经存在连线", edge)
-        target_key = (edge["target"], edge["target_port"])
-        if str(target_port.get("cardinality") or "one") != "many" and incoming_counts[target_key] >= 1:
-            raise _edge_error("INPUT_PORT_ALREADY_CONNECTED", f"输入端口 {edge['target_port']} 已经有上游节点", edge)
-        if _would_create_cycle(accepted, edge):
-            raise _edge_error("EDGE_WOULD_CREATE_CYCLE", "该连接会形成循环依赖，Flow 必须是有向无环图", edge)
-
-        source_context = {"contexts": _reachable_sink_contexts(edge["source"], by_id, outgoing),
-                          "input_type": input_type_for_node(edge["source"], definition, catalog, subflows)}
-        target_context = {"contexts": _reachable_sink_contexts(edge["target"], by_id, outgoing)}
-        source_contract = resolve_port_contract(source_context, source, source_port)
-        target_contract = resolve_port_contract(target_context, target, target_port)
-        validate_edge_compatibility(source_contract, target_contract, details=details)
-        seen.add(identity)
-        incoming_counts[target_key] += 1
-        accepted.append(edge)
-    return normalized
+    from .edge_validation import FlowEdgeValidationContext
+    context = FlowEdgeValidationContext(definition, catalog=catalog, subflows=subflows)
+    for index in range(len(context.edges)):
+        context.validate(index)
+    return context.edges
 
 
 def evaluate_edge_candidate(definition: dict[str, Any], *, edge: dict[str, str],
-                            catalog: dict[str, dict[str, Any]],
-                            subflows: dict[str, dict[str, Any]],
-                            candidate_node: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Evaluate one proposed authoring edge through the compiler's edge rules."""
-    simulated = deepcopy(definition)
-    simulated["nodes"] = [deepcopy(node) for node in simulated.get("nodes", [])]
+                            catalog: dict[str, dict[str, Any]], subflows: dict[str, dict[str, Any]],
+                            candidate_node: dict[str, Any] | None = None, context=None) -> dict[str, Any]:
+    """Check the new edge and newly introduced failures in its dependency component."""
+    from .edge_validation import FlowEdgeValidationContext
+    context = context or FlowEdgeValidationContext(definition, catalog=catalog, subflows=subflows)
+    warnings = list(context.diagnostics.values())
+    simulated = {**definition, "nodes": [*definition.get("nodes", [])],
+                 "edges": [*context.edges, edge]}
     if candidate_node is not None:
-        simulated["nodes"].append(deepcopy(candidate_node))
-    simulated["edges"] = [deepcopy(value) for value in simulated.get("edges", [])]
-    simulated["edges"].append(deepcopy(edge))
-    try:
-        validate_flow_edges(simulated, catalog=catalog, subflows=subflows)
-    except FlowEdgeValidationError as exc:
-        return {"compatible": False, "reason_code": exc.code, "reason": exc.message,
-                "details": exc.details}
+        simulated["nodes"].append(candidate_node)
+    proposed = FlowEdgeValidationContext(simulated, catalog=catalog, subflows=subflows)
+    issue = proposed.issue(len(proposed.edges) - 1)
+    if issue is None and edge["source"] in context.by_id:
+        anchor = context.by_id[edge["source"]]
+        port = proposed.ports(anchor, "output").get(edge["source_port"], {})
+        if port.get("output_by_input") and proposed.input_type(anchor["id"]) not in port["output_by_input"]:
+            issue = {"code": "OPERATOR_CONTRACT_MISMATCH", "message": "来源节点尚未连接可解析的输入，无法确定输出契约",
+                     "details": _edge_details(edge)}
+    affected, pending = set(), [edge["source"], edge["target"]]
+    while pending:
+        node_id = pending.pop()
+        if node_id in affected:
+            continue
+        affected.add(node_id)
+        pending.extend(proposed.outgoing[node_id])
+        pending.extend(value["source"] for value in proposed.incoming[node_id])
+    if issue is None:
+        for index, existing in enumerate(context.edges):
+            if existing["source"] not in affected and existing["target"] not in affected:
+                continue
+            changed = proposed.issue(index)
+            if changed and changed != context.diagnostics.get(index):
+                issue = changed
+                break
+    if issue:
+        return {"compatible": False, "reason_code": issue["code"], "reason": issue["message"],
+                "details": issue["details"], "graph_warnings": warnings}
     return {"compatible": True, "source_port": edge["source_port"],
-            "target_port": edge["target_port"]}
+            "target_port": edge["target_port"], "graph_warnings": warnings}
 
 
 def _contains_knowledge_library_binding(value: Any) -> bool:
@@ -597,6 +556,18 @@ class FlowCompiler:
                 params = {}
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
+            from .operator_parameters import validate_parameters, FlowParameterError
+            parser_keys = set(params) - {"knowledge_type", "graph_mode"}
+            if code == "document-parser" and parser_keys:
+                raise FlowParameterError("PARAMETER_SCHEMA_INVALID",
+                    f"节点 {node_id} 的 Document Parser 当前不接受参数 {sorted(parser_keys)[0]}；"
+                    "PDF 固定使用 MinerU backend=pipeline、parse_method=auto", node_id=node_id, field=sorted(parser_keys)[0])
+            contexts = _reachable_sink_contexts(node_id, by_id, outgoing)
+            system = {}
+            if len(contexts) == 1:
+                knowledge_type, graph_mode = next(iter(contexts))
+                system = {"knowledge_type": knowledge_type, "graph_mode": graph_mode}
+            params = validate_parameters(item.get("parameter_schema") or {}, params, node_id=node_id, system=system)
             if code == "GeneralFilter":
                 from .governance_catalog import GENERIC_SCORE, RULE_SCHEMA, SCORES, SEMANTIC_FIELDS
                 from jsonschema import Draft202012Validator
@@ -633,11 +604,6 @@ class FlowCompiler:
                 if not isinstance(instructions, str):
                     raise FlowValidationError("QA 提取要求必须是字符串")
                 params["extraction_instructions"] = instructions.strip() or DEFAULT_QA_EXTRACTION_INSTRUCTIONS
-            if code == "document-parser" and params:
-                raise FlowValidationError(
-                    f"节点 {node_id} 的 Document Parser 当前不接受参数；"
-                    "PDF 固定使用 MinerU backend=pipeline、parse_method=auto"
-                )
             if code == "semantic-chunker":
                 try:
                     params = normalize_chunker_params(params)

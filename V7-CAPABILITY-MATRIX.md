@@ -8,6 +8,8 @@ DataFlow 质量信号扩充（2026-08-31）：Catalog 登记26个唯一精选，
 
 图谱业务抽取要求与规则编辑（2026-08-28）：实体/关系抽取器 v7 接入真实模型请求通道，版本化指令、统一只读提示词预览、实体名称/描述编辑和配置区定位已实现；本地验证统计见[实施记录](wiki/sources/graph-guidance-2026-08-28.md)。真实模型效果及远程验收仍为 CONNECT。
 
+实体关系联合抽取器（2026-08-31）：`LOCAL`。DataForge 原生 `entity-relation-extractor v1` 在一次模型响应中返回实体和 ID 引用关系，内置 Triple/Semantic/Multi Triple 已切换；每块正常一次调用，协议错误最多完整修复一次，保留严格校验、分块隔离、Evidence 和 Sink。受控模型、真实 Runner/Sink 与前端本地回归通过；`.34` 原任务只读预验收首轮 7/14，修复后原失败 7 块重跑 7/7，尚未完成修正后连续 14/14、远程部署和正式 Sink 验收。来源：[实施基线](wiki/sources/joint-graph-extraction-2026-08-31.md)。
+
 四个内置流程原始高级 DAG（2026-08-28）：`DONE`。文本、问答、三元组、语义图谱转换后经过真实 Vue 编辑器保存、调试、发布及正式写入，本地受控模型回归通过；不修改默认拓扑或运行契约。真实模型效果和远程验收仍为 `CONNECT`。证据及测试隔离修正见[验收记录](wiki/sources/four-builtin-advanced-dags-2026-08-28.md)。
 
 PII完整资源离线导入（2026-08-28）：固定NER/NLTK归档与审核清单、资源构建层强制禁网、安全导入及真实本地离线推理回归已实现；需额外同步不入Git的443MB资源ZIP。详见[离线资源记录](wiki/sources/pii-offline-resources-2026-08-28.md)，尚未运行Docker验收。
@@ -40,7 +42,7 @@ DataFlow治理与添加节点说明（2026-08-28）：当前21个精选唯一入
 
 算子库双体系与身份解耦（2026-08-29）：官方目录并列为 DataForge 算子和21个 DataFlow 精选，可信插件位于独立自定义算子区。Catalog 一等保存 `source/catalog_group/category`；执行只读取冻结 `runtime_requirements.driver/executor`：Driver 选择 Runner 顶层适配器，Executor 选择适配器内部协议。自定义 DataFlow 协议仍由 Custom Driver 包裹，来源与目录不参与分派。旧 code、alias、历史注册和退出身份不再 Seed 或执行。当前为本地实现，`.34`/Docker/真实模型仍待验收。来源：[实施基线](wiki/sources/operator-catalog-dual-system-2026-08-29.md)、[自定义算子收口](wiki/sources/custom-operator-identity-convergence-2026-08-29.md)。
 
-Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后可分别查看可接上游/下游，保留不可连接原因，并把 Contract 可连接与 Runner 依赖就绪拆成三态；兼容项可按服务端端口对直接添加节点和 Edge。候选发现与 Compiler 共用 Edge 校验，不按 Catalog 来源判定。本地后端、前端合同/组件测试与生产构建通过；未运行 Docker 或 `.34`。
+Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节点上下游推荐及自动连线；新增Runtime Profile批量状态/短期缓存、无锚点停止查询、无关坏边与候选错误隔离。Compiler与执行器统一严格参数校验。语义去重补每组5000条预检，模型仍每次加载，不宣称生产规模Ready。详见[五项修复记录](wiki/sources/advanced-five-fixes-2026-08-31.md)；未运行Docker或`.34`。
 
 自定义流程当前草稿执行（2026-08-28）：`DONE`。Advanced 完整 DSL 直接编译；500ms 自动保存、运行前排空保存队列、草稿 checksum 冲突保护、不可变 Run DAG/来源/校验和展示已实现。删除必要转换节点返回端口错误，不补节点；正式 Job 仍使用发布快照。真实 `.34` 服务验收为 `CONNECT`。来源：[批准基线](wiki/sources/current-draft-execution-2026-08-28.md)。
 
@@ -50,6 +52,7 @@ Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后�
 | 业务工作区 | 文档管理：目录树、递归上传、SourceChunk 人工审核 Gate、模板绑定与安全删除 | `DONE` | 上传/替换自动 Parse/Clean/Chunk 后停在待审核；双栏工作区支持 PDF.js 多页 bbox、DOCX 结构块证据定位，以及修改、拆分、连续合并、删除、通过/拒绝/重开，文档批准后自动调度已绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
 | 业务工作区 | 处理任务：监控、停止、重试、删除、日志 | `DONE` | 任务只从文档库模板绑定发起；模板和目标知识库名称优先于技术 ID，`completed_with_warnings` 显示失败分块数与日志明细，重试仅执行失败组合；删除不会物理删除已形成的正式知识。 |
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
+| 业务工作区 | KnowledgeItem 二次审核与手动全量向量发布 | `LOCAL` | Text/QA 支持编辑、单条/批量 CAS 审核，pending 清零后只冻结 approved；Graph/扩展不逐条审核但手动 all_active 入库。任务不再自动向量化，失败候选不影响旧 Ready/Routing；真实 `.34` Milvus/浏览器验收待执行。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
 | 业务工作区 | 向量存储：Collection/Partition 库存、资产映射与受控运维 | `DONE` | 实时聚合 Milvus 与 AssetVersion/Routing/Release/GC；普通刷新只读 stats，显式 verify 持久化最近 count/digest；load/release 仅限严格受管版本 Partition，无任意 drop。`.34` 真实对账仍为 `CONNECT`。 |
 | 业务工作区 | Milvus Connection Contract 与启动健康复核 | `LOCAL` | 中心 Target 使用不可变 URI/加密 Token Revision、CAS `list_collections` 验证和实例级 Authoring 绑定；central 正式数据库 API 启动 30 秒后并行复核内置测试/生产 current，健康失败不撤销 verified Revision 或绑定，页面也可人工复核。Seed 不绑定，机构 Milvus 不进中心，由 local URI/Token Candidate 使用相同 CAS。真实 `.34` 启动检查与双绑定仍为 `CONNECT`。 |
@@ -89,6 +92,7 @@ Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后�
 | 派生 Run 与 Sink 暂存提交 | `DONE` | `node_only/from_node` 复用同快照可重放 Artifact；Sink 默认 `awaiting_commit`，以 checksum、当前态冲突检测和幂等键确认提交。 |
 | Debug Run / Debug Input Snapshot / 流程物化 | `DONE` | Debug owner 与业务 Job 分离，冻结 input source/descriptor/resolved chunks/digest 和 authoring+execution definition；Sample/真实输入共用 Runner，Debug Sink 永远 Preview Only。 |
 | Knowledge Sink Schema/来源/质量 Gate | `DONE` | `review` 与失败候选阻断该 Sink；多 Sink 独立事务写入。 |
+| KnowledgeItem Review / Vector Publish Gate | `LOCAL` | KnowledgeItem 保存审核状态与 Revision；人工编辑写现有 Change 历史。显式发布复验 Profile、Target、Evidence、审核集合和摘要，冻结审核快照并幂等排队；不提供 selected-items，不写 Routing。 |
 | Model Serving 分块生成、失败保留与局部重试 | `DONE` | DB Registry 默认 `qwen3_32b`，新默认策略 120 秒/2 次重试；Flow 发布健康门禁，Snapshot 冻结 code，分块失败隔离不变。 |
 | PDF MinerU Pipeline GPU OCR | `DONE` | 所有 PDF 固定调用 MinerU 3.4.4 `pipeline + auto + ch`；Markdown、`0~1` 多位置 SourceAnchor 与 Middle JSON Artifact 已纳入失败保真、精确删除和 V7 重建。本地自动化完成，真实 GPU/坐标验收归 C-01～C-04/C-11。 |
 | OpenAI-like Embedding 与发布 Profile 约束 | `DONE` | DB Embedding Registry 默认 BCE 768；Profile/Contract/Milvus 强制维度一致，Vector Sync 按 Profile 动态选 Provider，AssetVersion 冻结血缘。 |
@@ -101,7 +105,7 @@ Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后�
 | qa_agent FAQ 专用文件生产与固定迁移 | `DONE` | `qa-agent-faq`、自动 Profile、受管 Collection、无 LLM CSV/XLSX 模板、固定 12 Partition CLI/Bash 和 qa_agent `legacy/shadow/primary` 已实现并完成本地定向测试；真实导入归 C-10。 |
 | Collection 与版本化 `kl_*__vN` Partition 生命周期 | `DONE` | 候选构建不 reset 运行版本；GC 引用保护、30 天和最近两版门禁，默认 dry-run 且只由显式 Job 执行。受管整库治理保持独立。 |
 | `/api/vector-storage/*` 实时库存与校验 | `DONE` | overview/list/detail 聚合实时 Milvus 与 MySQL，pymilvus 元数据先转为普通 JSON；业务列表默认仅托管并可切全量，API 缺省仍全量；verify 才全量 digest 并保存最近结果；load/release 每次复验 ownership/Contract/资产映射；本命名空间无 DELETE。 |
-| 数据库初始化安全门禁 | `LOCAL` | Alembic 前只读识别 EMPTY/CURRENT/需用户决策；仅空库创建 `20260830_v7_baseline`，当前合法库只校验并幂等 Seed，其他非空状态在任何升级/Seed 前以结构化报告和退出码 20 停止。SQLite 自动化已覆盖，真实 `.34` MySQL/Compose 空卷仍待同步验收。 |
+| 数据库初始化安全门禁 | `LOCAL` | Alembic前只读识别EMPTY/CURRENT/需用户决策；CURRENT校验精确表/列、类型/长度、nullable、PK、Unique、FK、必要Index、server default与Check。仅空库创建Baseline，当前合法库幂等Seed，其他非空状态以退出码20停止，不自动修复。SQLite及MySQL方言契约本地验证，真实`.34` MySQL/Compose空卷仍待验收。 |
 | V7 受控重建 | `DONE` | 仅 `dataforge-migrate --rebuild-v7 --confirm=REBUILD-V7`，基于 DB manifest 删除 V7 对象/分区/表数据，绝不删除 Collection 或旧资源。 |
 
 ## 尚未完成项（按执行顺序）
@@ -124,6 +128,8 @@ Advanced 上下文兼容算子发现（2026-08-30）：`DONE`。选择节点后�
 | C-11 | 向量存储 `.34` 实时库存验收 | `CONNECT` | 对一个精确 DataForge-owned 测试 AssetVersion 核对 overview/list/详情，证明普通刷新无 full scan，执行 verify 与 load/release；GC 只 dry-run，未托管资源保持只读。 |
 
 ## 执行记录
+
+- 2026-08-31：KnowledgeItem 二次审核与手动全量向量发布完成本地实现；Text/QA 新知识待审、编辑回待审、同内容 Evidence 更新保留审核但标记 stale，Graph/扩展手动发布。空库 schema、后端定向、前端契约/组件与生产构建已验证；真实 `.34` 待验收。来源：[实施基线](wiki/sources/knowledge-review-vector-publish-2026-08-31.md)。
 
 - 本矩阵创建时已完成本期唯一可本地完成的导航收口：开发区第四页为只读「DataFlow 调试台」，向量状态作为其诊断面板的一部分保留。
 - 2026-08-13：MinerU 3.4.4 Pipeline GPU OCR 仓库实现完成；相关 V7 回归 60 passed，覆盖 Adapter、文本/扫描 PDF Runner、Artifact 补偿与删除生命周期、失败保真和 Compose 静态契约。真实 CUDA/模型、文本/扫描 PDF、回环端口和服务恢复仍需 C-01～C-04 部署验收。

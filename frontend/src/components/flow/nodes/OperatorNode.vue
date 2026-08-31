@@ -23,6 +23,7 @@ const businessSummary = computed(() => {
   if (code === 'quality-evaluator' || code === 'quality-filter') return params.quality_profile_revision_id || `可配置 ${editableCount.value}`
   if (code === 'entity-extractor') return `${(params.entity_type_scope || (params.entity_types?.length ? 'subset' : 'all')) === 'all' ? '全部实体类型' : `${(params.entity_types || []).length} 种实体`} · ≥${Number(params.confidence_threshold ?? .7).toFixed(2)}`
   if (code === 'relation-extractor') return `${(params.relation_types || []).length} 种关系`
+  if (code === 'entity-relation-extractor') return '实体＋关系 · 每块一次联合抽取'
   return `可配置 ${editableCount.value}`
 })
 onMounted(async () => { if (usesServing.value) { try { servings.value = await api.modelServings() } catch { servings.value = [] } } })

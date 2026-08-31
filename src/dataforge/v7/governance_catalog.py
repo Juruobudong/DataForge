@@ -78,8 +78,8 @@ GOVERNANCE_SPECS = {
         "llm_serving": LLM,
         "prompt_template_revision_id": {"type": "string", "title": "评估标准 Prompt", "x-dataforge-ui": {"widget": "prompt-template-selector"}},
     }),
-    "SemDeduplicateFilter": ("语义重复标记器", "质量治理", "general_text", "semantic", "使用固定多语言CPU模型在当前Artifact内标记语义重复；DataForge适配保留全部记录，不执行上游直接删行行为。", {
-        "scope": {"type": "string", "enum": ["source_version", "flow_input"], "default": "source_version", "title": "比较范围"},
+    "SemDeduplicateFilter": ("语义重复标记器", "质量治理", "general_text", "semantic", "CPU重型算子：每组最多5000条，每次执行加载固定多语言模型。仅在当前Artifact内标记重复并保留全部记录；尚未完成生产规模性能验收。", {
+        "scope": {"type": "string", "enum": ["source_version", "flow_input"], "default": "source_version", "title": "比较范围", "description": "source_version 按完整来源版本集合分组，[V1] 与 [V1,V2] 不互相比较；flow_input 在当前节点输入内统一比较。"},
         "threshold": number("语义相似度阈值", .95, 0, 1),
     }),
     "SentenceNumberFilter": ("句子数量过滤器", "文本处理", "general_text", "sentence", "按中英文句末和换行统计句子数；DataForge先生成分析副本，再由DataFlow过滤，原文不改写。", {

@@ -18,6 +18,7 @@ const sampleId = ref('guideline-md'), settingsOpen = ref(false), dirty = ref(fal
 const editing = ref(false)
 const wizardOpen = ref(false)
 const advancedEditor = ref(null)
+const actionConsole = ref(null)
 const pendingSubflow = ref(null), navigationSaving = ref(false)
 const saving = ref(false), saveFailed = ref(false)
 const pendingConversion = ref(null), converting = ref(false)
@@ -43,6 +44,17 @@ function markDirty() {
   if (authoringMode.value === 'advanced' && !pendingConversion.value && code.value.trim() && name.value.trim()) {
     saveTimer = setTimeout(() => { if (dirty.value) save() }, 500)
   }
+}
+function currentViewport() { return { left: window.scrollX, top: window.scrollY } }
+async function restoreViewport(position) {
+  await nextTick()
+  window.scrollTo({ ...position, behavior: 'auto' })
+}
+async function revealActionConsole() {
+  await nextTick()
+  actionConsole.value?.scrollIntoView({
+    behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start',
+  })
 }
 onBeforeUnmount(resetSaveState)
 
@@ -288,11 +300,24 @@ async function saveOnce() {
 }
 async function action(kind) {
   clearPublishNotice()
-  if ((dirty.value || saving.value) && ['validate', 'publish'].includes(kind) && !await save()) return
+  const validateViewport = kind === 'validate' ? currentViewport() : null
+  if (kind === 'validate') result.value = null
+  if ((dirty.value || saving.value) && ['validate', 'publish'].includes(kind) && !await save()) {
+    if (kind === 'validate') await revealActionConsole()
+    return
+  }
   if (!selected.value) { error.value = '请先保存模板草稿'; return }
   if (kind === 'validate') {
-    if (authoringMode.value === 'advanced' && !advancedEditor.value?.validate()) return
-    if (dirty.value) { error.value = '当前画布尚未保存，请先保存草稿后再执行服务端编译校验'; return }
+    if (authoringMode.value === 'advanced' && !advancedEditor.value?.validate()) {
+      error.value = '当前画布存在校验问题，未执行服务端编译校验'
+      await revealActionConsole()
+      return
+    }
+    if (dirty.value) {
+      error.value = '当前画布尚未保存，请先保存草稿后再执行服务端编译校验'
+      await revealActionConsole()
+      return
+    }
   }
   if (dirty.value && ['publish', 'default', 'sample'].includes(kind)) { error.value = '当前画布尚未保存，请先保存草稿，避免操作旧修订'; return }
   const target = selected.value, session = editorSession, generation = editGeneration
@@ -315,7 +340,13 @@ async function action(kind) {
     if (generation !== editGeneration) return
     await load()
     if (session === editorSession) selected.value = templates.value.find(item => item.id === target.id) || null
-  } catch (e) { if (session === editorSession) handleFlowError(e) }
+    if (kind === 'validate' && session === editorSession) await restoreViewport(validateViewport)
+  } catch (e) {
+    if (session === editorSession) {
+      handleFlowError(e)
+      if (kind === 'validate') await revealActionConsole()
+    }
+  }
 }
 onMounted(async () => {
   await load()
@@ -393,7 +424,10 @@ onMounted(async () => {
         <AdvancedFlowEditor v-else ref="advancedEditor" :catalog="catalog" :subflows="subflows" :output-types="outputTypes" :sample-result="sampleResult" @dirty="onEditorDirty" @error="onEditorError" @open-subflow="requestSubflow" @subflow-created="refreshSubflows" />
     </template>
     <div v-if="wizardOpen" class="wizard-backdrop" @click.self="wizardOpen=false"><section class="wizard"><header><div><h3>选择知识生产目标</h3><p>普通路径只选择业务目标，不需要理解 Node、Edge 或 Port。</p></div><button @click="wizardOpen=false">关闭</button></header><div class="goal-grid"><button v-for="item in managedTemplates" :key="item.code" @click="startNew(item.code)"><b>{{ item.name }}</b><small>{{ (item.output_types || []).join(' + ') }}</small></button></div><div class="advanced-choice"><span>高级</span><button @click="startNew('')"><b>空白高级流程</b><small>从 Authoring DAG 开始</small></button></div></section></div>
-    <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
+    <section v-if="error || result" ref="actionConsole" class="action-console" aria-label="Console">
+      <header><b>Console</b></header>
+      <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
+    </section>
   </section>
 </template>
 
@@ -404,7 +438,7 @@ onMounted(async () => {
 .toast-enter-from,.toast-leave-to{opacity:0;transform:translateY(-7px)}
 .conversion-notice{padding:10px 14px;border:1px solid var(--border);border-radius:8px;background:var(--blue-soft);color:var(--text-secondary,#536177);font-size:var(--font-assist,13px)}
 .template-page-head .template-revisions,.template-list .template-revisions{color:var(--text-secondary,#536177);font-size:var(--font-assist,13px);line-height:1.5;overflow-wrap:anywhere}
-.template-page{min-width:1164px}.template-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:12px}.title-row{display:flex;align-items:center;gap:9px}.title-row h2{margin:0;font-size:21px}.dsl-badge{padding:5px 8px;border:1px solid #d8e4ff;border-radius:999px;color:#2f6fed;background:#eaf1ff;font-size:8px;font-weight:850}.template-page-head p{margin:5px 0 0;color:#778499;font-size:10px}.header-actions{display:flex;align-items:center;gap:7px}.save-state{display:inline-flex;align-items:center;gap:6px;margin-right:4px;color:#627087;font-size:8px;font-weight:800}.save-state i{width:7px;height:7px;border-radius:50%;background:#1d8c65}.save-state.dirty i{background:#b97917}.page-tabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #dfe5ed}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:#2f6fed;color:#2f6fed}.template-strip{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:10px;margin-bottom:9px}.new-template{white-space:nowrap}.template-groups{display:grid;gap:9px;min-width:0}.template-group{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:start;gap:8px}.template-group>header{display:grid;gap:2px;padding-top:8px;color:#34445a}.template-group>header small{color:#8a97a8}.template-list{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.template-list button{display:grid;min-width:190px;max-width:250px;text-align:left}.template-list button.active{border-color:#b9cff7;color:#2f6fed;background:#eff5ff}.template-card-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.template-list b,.template-list small{display:block}.template-list small{margin-top:3px;color:#8290a3;font-size:7px}.builtin-tag{padding:2px 6px;border:1px solid #c9dafb;border-radius:999px;color:#2f6fed;background:#edf4ff;font-size:7px;font-weight:800}.template-list .output-summary{color:#6b7a8f;font-size:7px}.upgrade-tag{padding:2px 6px;border:1px solid #efcf91;border-radius:999px;color:#986316;background:#fff7e7;font-size:7px;font-weight:800}.template-settings{display:grid;grid-template-columns:minmax(180px,1fr) minmax(200px,1.4fr);gap:10px;padding:14px;border:1px solid var(--border);border-radius:11px;background:#fff;margin-bottom:9px}.template-settings>label{display:grid;align-content:start;gap:4px;color:#536177;font-weight:700}.template-settings input,.template-settings select{border:1px solid #dfe5ed}.template-settings input[aria-invalid="true"]{border-color:#d66b6b}.template-settings .field-error{color:#b5473c;font-size:11px;font-weight:500}.template-settings fieldset{border:1px solid #dfe5ed;border-radius:8px}.template-settings fieldset legend{color:#536177;font-weight:700}.template-settings fieldset label{display:inline-flex;align-items:center;gap:5px;margin-right:12px;color:#536177;font-weight:400}.settings-actions{display:flex;gap:6px;align-items:center}.settings-actions .danger{color:#c0392b;border-color:#f0c4bc}.flow-toolbar{display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:9px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:12px;background:#fff}.flow-toolbar .mode-bar{display:flex;align-items:center}.selection-state{color:#66758a;font-size:12px;margin-right:8px}.action-result{margin-top:12px;padding:12px;background:#182231;color:#d9e2ee;border-radius:10px;font:11px monospace;max-height:300px;overflow:auto}
+.template-page{min-width:1164px}.template-page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:12px}.title-row{display:flex;align-items:center;gap:9px}.title-row h2{margin:0;font-size:21px}.dsl-badge{padding:5px 8px;border:1px solid #d8e4ff;border-radius:999px;color:#2f6fed;background:#eaf1ff;font-size:8px;font-weight:850}.template-page-head p{margin:5px 0 0;color:#778499;font-size:10px}.header-actions{display:flex;align-items:center;gap:7px}.save-state{display:inline-flex;align-items:center;gap:6px;margin-right:4px;color:#627087;font-size:8px;font-weight:800}.save-state i{width:7px;height:7px;border-radius:50%;background:#1d8c65}.save-state.dirty i{background:#b97917}.page-tabs{display:flex;gap:4px;margin-bottom:10px;border-bottom:1px solid #dfe5ed}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:#2f6fed;color:#2f6fed}.template-strip{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:start;gap:10px;margin-bottom:9px}.new-template{white-space:nowrap}.template-groups{display:grid;gap:9px;min-width:0}.template-group{display:grid;grid-template-columns:84px minmax(0,1fr);align-items:start;gap:8px}.template-group>header{display:grid;gap:2px;padding-top:8px;color:#34445a}.template-group>header small{color:#8a97a8}.template-list{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.template-list button{display:grid;min-width:190px;max-width:250px;text-align:left}.template-list button.active{border-color:#b9cff7;color:#2f6fed;background:#eff5ff}.template-card-title{display:flex;align-items:center;justify-content:space-between;gap:8px}.template-list b,.template-list small{display:block}.template-list small{margin-top:3px;color:#8290a3;font-size:7px}.builtin-tag{padding:2px 6px;border:1px solid #c9dafb;border-radius:999px;color:#2f6fed;background:#edf4ff;font-size:7px;font-weight:800}.template-list .output-summary{color:#6b7a8f;font-size:7px}.upgrade-tag{padding:2px 6px;border:1px solid #efcf91;border-radius:999px;color:#986316;background:#fff7e7;font-size:7px;font-weight:800}.template-settings{display:grid;grid-template-columns:minmax(180px,1fr) minmax(200px,1.4fr);gap:10px;padding:14px;border:1px solid var(--border);border-radius:11px;background:#fff;margin-bottom:9px}.template-settings>label{display:grid;align-content:start;gap:4px;color:#536177;font-weight:700}.template-settings input,.template-settings select{border:1px solid #dfe5ed}.template-settings input[aria-invalid="true"]{border-color:#d66b6b}.template-settings .field-error{color:#b5473c;font-size:11px;font-weight:500}.template-settings fieldset{border:1px solid #dfe5ed;border-radius:8px}.template-settings fieldset legend{color:#536177;font-weight:700}.template-settings fieldset label{display:inline-flex;align-items:center;gap:5px;margin-right:12px;color:#536177;font-weight:400}.settings-actions{display:flex;gap:6px;align-items:center}.settings-actions .danger{color:#c0392b;border-color:#f0c4bc}.flow-toolbar{display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:9px 12px;margin-bottom:10px;border:1px solid var(--border);border-radius:12px;background:#fff}.flow-toolbar .mode-bar{display:flex;align-items:center}.selection-state{color:#66758a;font-size:12px;margin-right:8px}.action-console{margin-top:12px;scroll-margin-block:88px 16px;overflow:hidden;border-radius:10px;background:#182231;color:#d9e2ee}.action-console>header{padding:10px 14px;border-bottom:1px solid #344155}.action-console .page-error{margin:0;padding:12px 14px}.action-result{margin:0;padding:12px 14px;background:transparent;color:inherit;border-radius:0;font:11px monospace;max-height:300px;overflow:auto}
 .wizard-backdrop{position:fixed;z-index:40;inset:0;display:grid;place-items:center;background:rgba(16,24,40,.42)}.wizard{width:min(760px,90vw);padding:22px;border-radius:15px;background:#fff;box-shadow:0 24px 70px rgba(15,23,42,.24)}.wizard>header{display:flex;justify-content:space-between;gap:20px}.wizard h3{margin:0}.wizard p{color:#6d7b8e}.goal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px}.goal-grid button,.advanced-choice button{display:grid;gap:5px;padding:16px;text-align:left}.goal-grid small,.advanced-choice small{color:#748197}.advanced-choice{display:grid;grid-template-columns:80px 1fr;gap:10px;align-items:center;margin-top:16px;padding-top:16px;border-top:1px solid #e2e7ee}.advanced-choice>span{font-weight:800;color:#7a8799}
 .authoring-mode-actions{display:flex;align-items:center;gap:8px}.toolbar-exit{white-space:nowrap}
 </style>

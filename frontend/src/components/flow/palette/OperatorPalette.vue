@@ -17,6 +17,11 @@ const categoryLabels = {
   'text-cleaning': '文本清洗', 'content-filtering': '内容过滤', deduplication: '去重', 'text-generation': '文本生成',
 }
 const discoveryActive = computed(() => Boolean(props.selectedNode && !props.source))
+const canvasOperatorCodes = computed(() => new Set(props.nodes
+  .map(node => node.data?.definition)
+  .filter(definition => definition?.kind === 'operator')
+  .map(definition => definition.ref)))
+function inCanvas(item) { return canvasOperatorCodes.value.has(item.code) }
 const resultByCode = computed(() => new Map((props.candidateResults || []).map(item => [item.code, item])))
 function candidate(item) { return resultByCode.value.get(item.code) }
 function compatibility(item) { return candidate(item)?.compatibility }
@@ -113,8 +118,8 @@ function toggle(key) {
         <template v-if="searching || expanded.has(category)">
           <template v-for="([business, values]) in businessGroups(group, items)" :key="business">
           <h4 v-if="business">{{ business }}</h4>
-          <div v-for="item in values" :key="item.code" class="palette-entry" :class="`compatibility-${state(item)}`" :draggable="insertable(item)" role="group" :aria-label="operatorPrimaryName(item)" :aria-disabled="!insertable(item)" :title="compatibilityText(item)" @mouseenter="help?.show($event,item,'summary')" @mouseleave="help?.leave()" @dragstart="dragOperator($event, item)" @dblclick="addOperator(item)">
-            <div class="entry-body" role="button" :tabindex="insertable(item) ? 0 : -1" :aria-label="`${insertable(item) ? '添加' : '查看'}${operatorPrimaryName(item)}`" @focus="help?.show($event,item,'summary')" @blur="help?.leave()" @keydown.enter.self.prevent="addOperator(item)" @keydown.space.self.prevent="addOperator(item)"><b>{{ operatorPrimaryName(item) }}</b><small>{{ item.code }} · v{{ item.version }}</small><small v-if="discoveryActive" class="compatibility-note">{{ compatibilityText(item) }}</small></div>
+          <div v-for="item in values" :key="item.code" class="palette-entry" :class="[`compatibility-${state(item)}`, { 'is-in-canvas': inCanvas(item) }]" :draggable="insertable(item)" role="group" :aria-label="operatorPrimaryName(item)" :aria-disabled="!insertable(item)" :title="compatibilityText(item)" @mouseenter="help?.show($event,item,'summary')" @mouseleave="help?.leave()" @dragstart="dragOperator($event, item)" @dblclick="addOperator(item)">
+            <div class="entry-body" role="button" :tabindex="insertable(item) ? 0 : -1" :aria-label="`${insertable(item) ? '添加' : '查看'}${operatorPrimaryName(item)}${inCanvas(item) ? '，已在画布' : ''}`" @focus="help?.show($event,item,'summary')" @blur="help?.leave()" @keydown.enter.self.prevent="addOperator(item)" @keydown.space.self.prevent="addOperator(item)"><b>{{ operatorPrimaryName(item) }}</b><small>{{ item.code }} · v{{ item.version }}</small><span v-if="inCanvas(item)" class="canvas-used-badge">已在画布</span><small v-if="discoveryActive" class="compatibility-note">{{ compatibilityText(item) }}</small></div>
             <button type="button" class="operator-info" data-operator-info draggable="false" :aria-label="`查看${operatorPrimaryName(item)}说明`" aria-haspopup="dialog" :aria-expanded="Boolean(help?.isOpen(item.code))" @mouseenter="help?.show($event,item,'detail')" @mouseleave="help?.leave()" @focus="help?.show($event,item,'detail')" @blur="help?.leave()" @pointerdown.stop @mousedown.stop @click.stop="help?.toggle($event,item)" @dblclick.stop @keydown.stop @dragstart.stop.prevent>i</button>
           </div>
           </template>
@@ -176,4 +181,10 @@ function toggle(key) {
 .palette-scroll h3{margin:12px 4px 8px;font-size:15px}.palette-entry{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;margin:6px 0;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;cursor:grab}.palette-entry:hover{border-color:#c9d8f3;background:#f8fbff}.palette-entry:active{cursor:grabbing}.palette-entry:focus-visible{outline:2px solid #2f6fed;outline-offset:2px}.palette-entry b,.palette-entry small{grid-column:1/-1;white-space:normal;font-size:13px}.palette-entry small{font-size:12px}.palette-entry select{min-width:0;max-width:120px;cursor:default}.subflow-section{border-top:1px solid #e2e8f0}.subflow-section>p{font-size:13px;color:#748198}.palette-title h3{font-size:15px}.palette-title small,.hint{font-size:12px}
 </style>
 <style scoped>.palette-entry b,.palette-entry small{overflow-wrap:anywhere;overflow:visible;text-overflow:clip;white-space:normal}</style>
+<style scoped>
+.palette-entry.is-in-canvas{box-shadow:inset 3px 0 0 #2f6fed}
+.palette-entry.is-in-canvas.compatibility-available{border-color:#87acf1;background:#edf4ff}
+.palette-entry.is-in-canvas.compatibility-available:hover{border-color:#2f6fed;background:#e5efff}
+.canvas-used-badge{display:inline-block;margin-top:5px;padding:2px 6px;border-radius:4px;background:#dbe9ff;color:#245bb5;font-size:11px;font-weight:700;line-height:1.4}
+</style>
 <style scoped>.palette-entry.compatibility-compatible{border-color:#9ed7bf;background:#f4fbf8}.palette-entry.compatibility-unready{border-color:#e5c983;background:#fffaf0;cursor:not-allowed}.palette-entry.compatibility-incompatible{opacity:.52;cursor:not-allowed}.compatibility-note{color:#5d718b!important;font-size:11px!important}.compatibility-compatible .compatibility-note{color:#167553!important}.compatibility-unready .compatibility-note{color:#8b6a16!important}</style>

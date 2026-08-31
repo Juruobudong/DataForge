@@ -14,7 +14,7 @@ const tab = ref('parameters'), params = ref({})
 const advancedOpen = ref(false)
 watch(() => props.node, node => { params.value = { ...(node?.data.definition.params || {}) }; advancedOpen.value = false }, { immediate: true })
 const documentParser = computed(() => props.node?.data.meta.code === 'document-parser')
-const graphExtractor = computed(() => ['entity-extractor', 'relation-extractor'].includes(props.node?.data.definition.ref))
+const graphExtractor = computed(() => ['entity-extractor', 'relation-extractor', 'entity-relation-extractor'].includes(props.node?.data.definition.ref))
 const editable = computed(() => hasEditableParameters(props.node))
 const nodeRun = computed(() => props.node ? props.sampleResult?.node_runs?.[props.node.id] || null : null)
 const nodeSubtitle = computed(() => {

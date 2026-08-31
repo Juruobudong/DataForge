@@ -1,14 +1,17 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
 import { documentProductionStage, reviewActionLabel } from './documentReviewModel'
 
-const route = useRoute(), router = useRouter(), libraryId = route.params.libraryId
+const route = useRoute(), router = useRouter()
+let libraryId = route.params.libraryId, viewEpoch = 0, loadRequest = 0, active = true
 const library = ref(null), tree = ref({ children: [] }), listing = ref({ items: [], total: 0 }), selectedPath = ref(null)
 const keyword = ref(''), status = ref(''), fileType = ref(''), page = ref(1), selectedSources = ref([])
 const queued = ref([]), preview = ref(null), results = ref([]), error = ref(''), notice = ref(''), dragging = ref(false), duplicatePolicy = ref('skip'), bindings = ref([]), templates = ref([]), templateIds = ref([]), bindingTemplates = ref(false)
 const directoryInput = ref(null), fileInput = ref(null), replaceInput = ref(null), replaceTarget = ref(null)
+const reviewBusy = ref(false), loading = ref(false), batchReviewResult = ref(null)
+const reviewResultLabels = { approved: '已通过', already_approved: '此前已通过', skipped: '已跳过', failed: '失败' }
 const files = computed(() => listing.value.items || [])
 const hasActiveBinding = computed(() => bindings.value.some(item => item.status === 'active'))
 const hasResultCleanupInProgress = computed(() => bindings.value.some(binding =>
@@ -23,6 +26,7 @@ const allTemplatesSelected = computed(() => availableTemplates.value.length > 0 
   availableTemplates.value.every(item => templateIds.value.includes(item.id)))
 const someTemplatesSelected = computed(() => templateIds.value.length > 0 && !allTemplatesSelected.value)
 const allPageSourcesSelected = computed(() => files.value.length > 0 && files.value.every(source => selectedSources.value.includes(source.id)))
+const somePageSourcesSelected = computed(() => selectedSources.value.length > 0 && !allPageSourcesSelected.value)
 const flatTree = computed(() => {
   const output = []
   const visit = (node, depth = 0) => (node.children || []).forEach(child => { output.push({ ...child, depth }); visit(child, depth + 1) })
@@ -40,16 +44,52 @@ const queuedFiles = computed(() => {
   }))
 })
 
-async function load() {
+async function load(afterReview = false) {
+  if (!active || (reviewBusy.value && afterReview !== true)) return
+  const requestId = ++loadRequest, requestLibraryId = libraryId
+  loading.value = true
   try {
     const [libraries, nextTree, nextList, nextBindings, nextTemplates] = await Promise.all([
       api.documentLibraries(),
-      api.documentTree(libraryId),
-      api.librarySources(libraryId, { path: selectedPath.value, keyword: keyword.value, status: status.value, file_type: fileType.value, page: page.value, page_size: 50 }), api.documentTemplateBindings(libraryId), api.flowTemplates(),
+      api.documentTree(requestLibraryId),
+      api.librarySources(requestLibraryId, { path: selectedPath.value, keyword: keyword.value, status: status.value, file_type: fileType.value, page: page.value, page_size: 50 }), api.documentTemplateBindings(requestLibraryId), api.flowTemplates(),
     ])
-    library.value = libraries.find(item => item.id === libraryId) || null
+    if (!active || requestId !== loadRequest || requestLibraryId !== libraryId) return
+    library.value = libraries.find(item => item.id === requestLibraryId) || null
     tree.value = nextTree; listing.value = nextList; bindings.value = nextBindings; templates.value = nextTemplates; selectedSources.value = []
-  } catch (e) { error.value = e.message }
+  } catch (e) { if (active && requestId === loadRequest && requestLibraryId === libraryId) error.value = e.message }
+  finally { if (active && requestId === loadRequest) loading.value = false }
+}
+
+async function approveSelectedSources() {
+  if (reviewBusy.value || loading.value || !active) return
+  const selected = files.value.filter(source => selectedSources.value.includes(source.id))
+  if (!selected.length) return
+  const items = selected.map(source => ({
+    source_id: source.id, source_version_id: source.version?.id || source.current_version_id || null,
+    activation_no: source.version?.activation_no ?? null,
+    chunk_set_id: source.version?.candidate_chunk_set_id || source.version?.active_chunk_set_id || null,
+  }))
+  if (!confirm(`将通过所选 ${items.length} 个文件的全部待审文档块并完成审核；已绑定的知识模板将自动运行。\n未完成解析或含拒绝块的文件将跳过。确定继续吗？`)) return
+  const epoch = viewEpoch, requestLibraryId = libraryId
+  reviewBusy.value = true; batchReviewResult.value = null; notice.value = ''; error.value = ''; ++loadRequest
+  try {
+    const result = await api.approveDocumentSourcesBatch(requestLibraryId, items)
+    if (!active || epoch !== viewEpoch) return
+    batchReviewResult.value = { ...result, results: result.results.map(item => ({
+      ...item, filename: item.filename || selected.find(source => source.id === item.source_id)?.original_filename || item.source_id,
+    })) }
+    notice.value = `批量审核完成：通过 ${result.counts.approved}，此前已通过 ${result.counts.already_approved}，跳过 ${result.counts.skipped}，失败 ${result.counts.failed}。`
+    selectedSources.value = []
+    await load(true)
+  } catch (e) {
+    if (active && epoch === viewEpoch) error.value = `批量审核结果未确认：${e.message}。请刷新核对后重试，已通过文件不会重复调度。`
+  } finally { if (active && epoch === viewEpoch) reviewBusy.value = false }
+}
+
+function openBatchReview(item) {
+  const source = files.value.find(source => source.id === item.source_id)
+  if (source) openReviewWorkbench(source)
 }
 
 function normalizePath(file, folder = false) {
@@ -59,6 +99,7 @@ function normalizePath(file, folder = false) {
 }
 
 async function queueFiles(fileList, folder = false) {
+  if (reviewBusy.value) return
   queued.value = [...fileList].map(file => ({ file, relative_path: normalizePath(file, folder) }))
   results.value = []
   try { preview.value = await api.sourceImportPreflight(libraryId, queued.value.map(item => ({ relative_path: item.relative_path, size_bytes: item.file.size }))) } catch (e) { error.value = e.message }
@@ -77,6 +118,7 @@ async function readDropEntry(entry, prefix = '') {
 }
 async function onDrop(event) {
   event.preventDefault(); dragging.value = false
+  if (reviewBusy.value || loading.value) return
   const entries = [...event.dataTransfer.items || []].map(item => item.webkitGetAsEntry?.()).filter(Boolean)
   if (entries.length) {
     const dropped = (await Promise.all(entries.map(entry => readDropEntry(entry)))).flat()
@@ -121,6 +163,7 @@ async function upload() {
 }
 
 function openReviewWorkbench(source) {
+  if (reviewBusy.value || loading.value) return
   const versionId = source.version?.id || source.current_version_id
   if (!versionId) return
   router.push(`/business/documents/${libraryId}/sources/${source.id}/versions/${versionId}/review`)
@@ -149,10 +192,10 @@ async function replaceFile(event) {
   }
 }
 async function hardDelete() {
-  if (!selectedSources.value.length) return
+  if (reviewBusy.value || !selectedSources.value.length) return
   try { const body = { source_ids: selectedSources.value }; const check = await api.documentDeletionPreflight(body); if (!check.deletable) throw new Error('存在运行任务，整批不能彻底删除。'); if (!confirm(`将彻底删除 ${check.source_count} 个文件，并影响 ${check.impact.knowledge_item_count} 个知识项、${check.impact.vector_record_count} 条向量。\n此操作不可撤销，确定继续吗？`)) return; await api.requestDocumentDeletion(body); selectedSources.value = []; await load() } catch (e) { error.value = e.message }
 }
-function toggleAllPageSources(event) { selectedSources.value = event.target.checked ? files.value.map(source => source.id) : [] }
+function toggleAllPageSources(event) { if (!reviewBusy.value && !loading.value) selectedSources.value = event.target.checked ? files.value.map(source => source.id) : [] }
 function toggleAllTemplates(event) { templateIds.value = event.target.checked ? availableTemplates.value.map(item => item.id) : [] }
 async function bindTemplates() {
   if (!templateIds.value.length || bindingTemplates.value) return
@@ -162,17 +205,44 @@ async function bindTemplates() {
 async function unbindTemplate(binding) { try { if (!confirm(`解绑 ${binding.template.name}？结果知识库不会删除。`)) return; await api.unbindDocumentTemplate(libraryId, binding.template.id); await load() } catch (e) { error.value = e.message } }
 function formatBytes(value) { return value >= 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MiB` : `${Math.ceil(value / 1024)} KiB` }
 onMounted(load)
+watch(() => route.params.libraryId, value => {
+  libraryId = value; ++viewEpoch; ++loadRequest
+  reviewBusy.value = false; batchReviewResult.value = null; notice.value = ''; error.value = ''
+  library.value = null; listing.value = { items: [], total: 0 }; tree.value = { children: [] }
+  selectedSources.value = []; selectedPath.value = null; page.value = 1; bindings.value = []; templateIds.value = []
+  load()
+})
+onBeforeUnmount(() => { active = false; ++viewEpoch; ++loadRequest })
 </script>
 
 <template>
   <section>
+    <fieldset class="document-controls" :disabled="reviewBusy || loading" :aria-busy="reviewBusy">
     <div class="page-head"><div><button @click="router.push('/business/documents')">← 文档库</button><h2>{{ library?.name || '文档库文件' }}</h2><p>上传后自动解析与分块；人工审核通过后，系统自动运行已绑定知识模板。</p></div><div class="page-actions"><button @click="fileInput?.click()">上传文件</button><button class="primary" @click="directoryInput?.click()">上传文件夹</button></div></div>
     <input ref="fileInput" class="sr-only" type="file" multiple accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="chooseFiles">
     <input ref="directoryInput" class="sr-only" type="file" multiple webkitdirectory accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="chooseFolder">
     <input ref="replaceInput" class="sr-only" type="file" accept=".pdf,.csv,.xlsx,.md,.doc,.docx,.txt,.json,.jsonl" @change="replaceFile">
     <p v-if="notice" role="status" aria-live="polite" class="copy-notice">{{ notice }}</p>
     <div class="document-browser"><aside class="panel directory-tree"><b>目录</b><button :class="{ active: selectedPath === null }" @click="selectedPath=null; page=1; load()">▾ 全部文件</button><button v-for="node in flatTree" :key="node.path" :class="{ active: selectedPath === node.path }" :style="{ paddingLeft: `${12 + node.depth * 16}px` }" @click="selectedPath=node.path; page=1; load()">▸ {{ node.name }} <small>{{ node.file_count }}</small></button></aside>
-      <div class="panel file-area" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop="onDrop"><div class="actions"><input v-model="keyword" placeholder="搜索文件" @keyup.enter="page=1; load()"><select v-model="status" @change="page=1; load()"><option value="">全部状态</option><option value="uploaded">已上传</option><option value="deleted">已删除</option></select><select v-model="fileType" @change="page=1; load()"><option value="">全部格式</option><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="xlsx">XLSX</option></select><button @click="load">刷新 / 筛选</button><span class="badge amber">已选当前页 {{ selectedSources.length }} 个</span><button class="danger" :disabled="!selectedSources.length" @click="hardDelete">彻底删除</button></div><div v-if="dragging" class="drop-zone">拖拽文件或文件夹到此处</div><div v-else-if="!files.length" class="drop-zone">拖拽文件或文件夹到此处，或使用顶部上传入口</div><table><thead><tr><th><input type="checkbox" :checked="allPageSourcesSelected" :disabled="!files.length" aria-label="全选当前页文件" @click.stop @change="toggleAllPageSources"> 全选当前页</th><th>名称</th><th>类型</th><th>生产阶段</th><th>Chunk</th><th>更新时间</th><th>操作</th></tr></thead><tbody><tr v-for="source in files" :key="source.id" class="source-row" tabindex="0" @click="openReviewWorkbench(source)" @keydown.enter="openReviewWorkbench(source)"><td @click.stop><input v-model="selectedSources" type="checkbox" :value="source.id"></td><td><b>{{ source.original_filename }}</b><small>{{ source.relative_path }}</small></td><td>{{ source.original_filename.split('.').pop()?.toUpperCase() }}</td><td><span class="badge" :class="source.version?.review_status === 'approved' ? 'green' : source.version?.preparation_status === 'failed' || source.version?.review_status === 'rejected' ? 'red' : 'amber'">{{ stageLabel(source) }}</span></td><td>{{ source.version?.preparation_status === 'completed' ? source.version?.chunk_count || 0 : '—' }}</td><td>{{ source.updated_at }}</td><td><button class="primary" @click.stop="openReviewWorkbench(source)">{{ reviewActionLabel(source) }}</button><button @click.stop="chooseReplace(source)">替换</button><a :href="api.sourceDownloadUrl(source.id, source.version?.id)" @click.stop>下载</a></td></tr></tbody></table><p>共 {{ listing.total }} 个文件；全选仅作用于当前页。</p></div></div>
+      <div class="panel file-area" @dragover.prevent="dragging=true" @dragleave="dragging=false" @drop="onDrop">
+        <div class="actions">
+          <input v-model="keyword" placeholder="搜索文件" @keyup.enter="page=1; load()">
+          <select v-model="status" aria-label="文件状态" @change="page=1; load()"><option value="">全部状态</option><option value="uploaded">已上传</option><option value="deleted">已删除</option></select>
+          <select v-model="fileType" aria-label="文件格式" @change="page=1; load()"><option value="">全部格式</option><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="xlsx">XLSX</option></select>
+          <button @click="load">刷新 / 筛选</button><span class="badge amber">已选当前页 {{ selectedSources.length }} 个</span>
+          <button class="primary batch-review-button" :disabled="!selectedSources.length || reviewBusy || loading" @click="approveSelectedSources">{{ reviewBusy ? '审核提交中…' : '审核通过所选文件' }}</button>
+          <button class="danger" :disabled="!selectedSources.length" @click="hardDelete">彻底删除</button>
+        </div>
+        <div v-if="dragging" class="drop-zone">拖拽文件或文件夹到此处</div><div v-else-if="!files.length" class="drop-zone">拖拽文件或文件夹到此处，或使用顶部上传入口</div>
+        <table><thead><tr><th><input type="checkbox" :checked="allPageSourcesSelected" :indeterminate="somePageSourcesSelected" :disabled="!files.length" aria-label="全选当前页文件" @click.stop @change="toggleAllPageSources"> 全选当前页</th><th>名称</th><th>类型</th><th>生产阶段</th><th>Chunk</th><th>更新时间</th><th>操作</th></tr></thead>
+          <tbody><tr v-for="source in files" :key="source.id" class="source-row" tabindex="0" @click="openReviewWorkbench(source)" @keydown.enter="openReviewWorkbench(source)"><td @click.stop><input v-model="selectedSources" type="checkbox" :value="source.id" :aria-label="`选择文件 ${source.original_filename}`"></td><td><b>{{ source.original_filename }}</b><small>{{ source.relative_path }}</small></td><td>{{ source.original_filename.split('.').pop()?.toUpperCase() }}</td><td><span class="badge" :class="source.version?.review_status === 'approved' ? 'green' : source.version?.preparation_status === 'failed' || source.version?.review_status === 'rejected' ? 'red' : 'amber'">{{ stageLabel(source) }}</span></td><td>{{ source.version?.preparation_status === 'completed' ? source.version?.chunk_count || 0 : '—' }}</td><td>{{ source.updated_at }}</td><td><button class="primary" @click.stop="openReviewWorkbench(source)">{{ reviewActionLabel(source) }}</button><button @click.stop="chooseReplace(source)">替换</button><a :href="api.sourceDownloadUrl(source.id, source.version?.id)" @click.stop>下载</a></td></tr></tbody>
+        </table><p>共 {{ listing.total }} 个文件；全选仅作用于当前页。</p>
+        <section v-if="batchReviewResult" class="batch-review-results" aria-label="批量审核结果">
+          <h3>本次批量审核结果</h3>
+          <ul><li v-for="item in batchReviewResult.results" :key="item.source_id"><b>{{ item.filename }}</b><span class="badge" :class="item.status === 'approved' || item.status === 'already_approved' ? 'green' : item.status === 'failed' ? 'red' : 'amber'">{{ reviewResultLabels[item.status] }}</span><span>{{ item.message }}</span><button v-if="files.some(source => source.id === item.source_id && (source.version?.id || source.current_version_id))" @click="openBatchReview(item)">查看审核</button></li></ul>
+        </section>
+      </div>
+    </div>
     <section class="panel">
       <div class="panel-head"><div><h3>审核通过后自动运行的知识模板</h3><p>可提前绑定多个已发布模板；绑定只声明审核通过后要运行的知识流程。</p></div><span class="badge blue">服务端审核 Gate</span></div>
       <form class="actions template-binding-form" @submit.prevent="bindTemplates">
@@ -191,10 +261,16 @@ onMounted(load)
     <section v-if="queued.length" class="panel"><div class="panel-head"><h3>上传预检</h3><button class="primary" @click="upload">开始上传</button></div><p>准备上传 {{ uploadStats.count }} 个文件，{{ formatBytes(uploadStats.bytes) }}</p><p>{{ Object.entries(uploadStats.types).map(([type, count]) => `${type} ${count}`).join(' · ') }}</p><ul class="queued-file-list" aria-label="待上传文件"><li v-for="item in queuedFiles" :key="item.relative_path"><div><b>{{ item.file.name }}</b><small>{{ item.relative_path }} · {{ formatBytes(item.file.size) }}</small></div><span class="badge" :class="item.issue ? (item.issue === '同路径文件' ? 'amber' : 'red') : 'blue'">{{ item.issue || '准备上传' }}</span></li></ul><label v-if="preview?.duplicates?.length">同路径文件 {{ preview.duplicates.join('、') }}：<select v-model="duplicatePolicy"><option value="skip">跳过</option><option value="replace">替换原文件</option><option value="keep_both">保留两份（自动重命名）</option></select></label><p v-if="preview?.unsupported?.length" class="error">不支持：{{ preview.unsupported.map(item => item.relative_path).join('、') }}</p><p v-if="preview?.oversized?.length" class="error">超过 200 MiB：{{ preview.oversized.join('、') }}</p></section>
     <details v-if="results.length" class="panel" open><summary>本次上传结果</summary><ul><li v-for="item in results" :key="`${item.relative_path}-${item.status}`">{{ item.relative_path }}：{{ item.status }}{{ item.error ? `（${item.error}）` : '' }}</li></ul></details>
     <p v-if="error" class="error">{{ error }}</p>
+    </fieldset>
   </section>
 </template>
 
 <style scoped>
+.document-controls { min-width: 0; margin: 0; padding: 0; border: 0; }
+.batch-review-results { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--blue-soft); }
+.batch-review-results ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.batch-review-results li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.batch-review-results li b { overflow-wrap: anywhere; }
 .template-binding-form { align-items: flex-start; }
 .template-multiselect { position: relative; min-width: min(360px, 100%); }
 .template-multiselect summary { min-height: 40px; padding: 9px 36px 9px 13px; border: 1px solid var(--border); border-radius: 8px; color: #405069; background: #fff; font-size: var(--font-assist); cursor: pointer; }

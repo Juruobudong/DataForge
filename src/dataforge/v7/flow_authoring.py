@@ -42,6 +42,8 @@ _GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
                          "x-dataforge-ui": {"widget": "entity-type-editor"},
                          "description": "实体类型用于约束模型识别哪些对象；未配置的领域实体可通过添加实体类型补充。"},
         "relation_types": {"type": "array", "title": "关系类型", "items": {"type": "string"}, "description": "允许抽取的关系类型 code 列表"},
+        "entity_extraction_instructions": {"type": "string", "title": "实体抽取要求", "default": "", "x-dataforge-ui": {"widget": "extraction-instructions"}},
+        "relation_extraction_instructions": {"type": "string", "title": "关系抽取要求", "default": "", "x-dataforge-ui": {"widget": "extraction-instructions"}},
     },
     "additionalProperties": False,
 }
@@ -96,21 +98,20 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
         _INPUT_STAGE,
         _generation("实体关系抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
-                    operator_refs=("entity-extractor", "literal-detector", "relation-extractor", "triple-builder")),
+                    operator_refs=("entity-relation-extractor", "literal-detector", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-semantic", name="语义图谱", output_types=("graph:semantic",), stages=(
         _INPUT_STAGE,
         _generation("语义图谱抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
-                    operator_refs=("entity-extractor", "literal-detector", "entity-normalizer",
-                                   "relation-extractor", "semantic-relation-builder", "evidence-binder")),
+                    operator_refs=("entity-relation-extractor", "literal-detector", "entity-normalizer",
+                                   "semantic-relation-builder", "evidence-binder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph:triple"), stages=(
         _INPUT_STAGE, _TEXT_MAPPING_STAGE,
         _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_QA_CONFIG_SCHEMA["properties"]}},
-                    operator_refs=("qa-extractor", "entity-extractor", "literal-detector",
-                                   "relation-extractor", "triple-builder")),
+                    operator_refs=("qa-extractor", "entity-relation-extractor", "literal-detector", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
 )
@@ -291,10 +292,14 @@ class ManagedFlowCompiler:
                 params["extraction_instructions"] = config["extraction_instructions"]
             if ref == "prompt-generator" and "prompt_template_revision_id" in config:
                 params["prompt_template_revision_id"] = config["prompt_template_revision_id"]
-            if ref == "entity-extractor" and "entity_types" in config:
+            if ref == "entity-relation-extractor":
+                for key in ("entity_extraction_instructions", "relation_extraction_instructions"):
+                    if key in config:
+                        params[key] = config[key]
+            if ref in {"entity-extractor", "entity-relation-extractor"} and "entity_types" in config:
                 params["entity_types"] = [item["code"] for item in config["entity_types"]]
                 params["entity_type_scope"] = "all"
-            if ref == "relation-extractor" and "relation_types" in config:
+            if ref in {"relation-extractor", "entity-relation-extractor"} and "relation_types" in config:
                 params["relation_types"] = [item["code"] for item in relations]
         if "entity_types" in config or "relation_types" in config:
             graph_config = baseline.setdefault("graph_config", {})

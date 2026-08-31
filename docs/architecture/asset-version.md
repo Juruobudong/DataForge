@@ -15,10 +15,11 @@ DataForge 将用户编辑与查看的逻辑知识库和供检索、发布使用�
 
 ## 版本构建
 
-1. Vector Sync 或离线导入为知识库分配新的版本号和候选 Partition。
-2. 任务只向候选 Partition 写入，稳定向量 ID 由 Profile、知识库和知识身份确定。
-3. 系统核对记录数、内容摘要、Partition load 和冒烟检索；全部通过后版本才成为 Ready。
-4. RouteVersion 冻结时把每个授权知识库解析到明确的 Ready AssetVersion；RoutingSnapshot 保存该版本化 Partition，而不是逻辑前缀。
+1. 用户在知识库显式执行全量发布，或运行离线导入工具，为知识库分配新的版本号和候选 Partition；Knowledge Job 本身不再自动发布。
+2. Text/QA 只冻结当前 approved 且 Evidence 合规的完整集合，并要求没有 pending；Graph 与扩展类型冻结全部 active。每个 KnowledgeAssetItem 固化知识审核快照。
+3. 任务只向候选 Partition 写入，稳定向量 ID 由 Profile、知识库和知识身份确定。
+4. 系统核对记录数、内容摘要、Partition load 和冒烟检索；全部通过后版本才成为 Ready，失败候选不改变旧 Ready。
+5. RouteVersion 冻结时把每个授权知识库解析到明确的 Ready AssetVersion；RoutingSnapshot 保存该版本化 Partition，而不是逻辑前缀。知识库发布不自动切换 Routing。
 
 运行中的 Ready Partition 不执行 `reset_partition()`，也不被后续构建原地覆盖。新数据要么更新逻辑当前态后生成新版本，要么在离线导入中生成新的候选版本。
 

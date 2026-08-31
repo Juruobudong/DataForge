@@ -76,6 +76,27 @@ describe('reusable subflow production and consumption', () => {
     wrapper.findComponent(OperatorPalette).vm.$emit('change-direction', 'upstream')
     await vi.waitFor(() => expect(api.operatorCandidates).toHaveBeenCalledWith(expect.objectContaining({ node_id: 'quality-node', direction: 'upstream', include_incompatible: true })))
   })
+  it('does not query without an anchor and discards results after clearing selection', async () => {
+    vi.useFakeTimers()
+    try {
+      wrapper = mount(AdvancedFlowEditor, { props: { catalog, subflows: [], outputTypes: ['text'] } })
+      wrapper.vm.loadDefinition({ nodes: [{ id: 'q', kind: 'operator', ref: 'quality' }], edges: [] })
+      await flushPromises(); await vi.advanceTimersByTimeAsync(200)
+      expect(api.operatorCandidates).not.toHaveBeenCalled()
+      let resolve
+      api.operatorCandidates.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+      const canvas = wrapper.findComponent({ name: 'CanvasStub' })
+      canvas.vm.$emit('select-node', wrapper.vm.nodes[0])
+      await flushPromises(); await vi.advanceTimersByTimeAsync(200)
+      expect(api.operatorCandidates).toHaveBeenCalledTimes(1)
+      canvas.vm.$emit('select-node', null)
+      await flushPromises()
+      resolve([{ ...catalog[0], compatibility: { compatible: true } }])
+      await flushPromises()
+      expect(wrapper.findComponent(OperatorPalette).props('candidateResults')).toBeNull()
+      expect(wrapper.findComponent(OperatorPalette).props('loading')).toBe(false)
+    } finally { vi.useRealTimers() }
+  })
   it('adds a compatible discovery result with its validated edge', async () => {
     const result = { ...catalog[0], compatibility: { compatible: true, direction: 'downstream', source_port: 'output', target_port: 'input' }, runtime_status: { status: 'ready' } }
     api.operatorCandidates.mockResolvedValue([result])

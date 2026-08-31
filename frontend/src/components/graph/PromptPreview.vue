@@ -4,7 +4,8 @@ import { api } from '../../api/platform'
 
 const props = defineProps({ definition: { type: Object, required: true }, selectedNodeId: { type: String, default: '' } })
 const emit = defineEmits(['update:selectedNodeId'])
-const nodes = computed(() => (props.definition.nodes || []).filter(node => node.kind === 'operator' && ['entity-extractor', 'relation-extractor'].includes(node.ref)))
+const names = { 'entity-extractor': '实体抽取器', 'relation-extractor': '关系抽取器', 'entity-relation-extractor': '实体关系联合抽取器' }
+const nodes = computed(() => (props.definition.nodes || []).filter(node => node.kind === 'operator' && names[node.ref]))
 const selected = ref(''), result = ref(null), error = ref(''), loading = ref(false)
 watch(selected, value => emit('update:selectedNodeId', value))
 let sequence = 0, timer
@@ -32,7 +33,7 @@ onBeforeUnmount(() => { clearTimeout(timer); sequence++ })
   <section class="prompt-preview" aria-label="完整提示词预览">
     <h4>完整提示词预览</h4>
     <p class="muted">与实际执行共用后端拼装。业务要求在节点设置中编辑；Schema、原文输入和 JSON 格式由系统维护。</p>
-    <label v-if="nodes.length">抽取节点<select v-model="selected" aria-label="提示词预览节点"><option v-for="node in nodes" :key="node.id" :value="node.id">{{ node.ref === 'entity-extractor' ? '实体抽取器' : '关系抽取器' }} · {{ node.id }}</option></select></label>
+    <label v-if="nodes.length">抽取节点<select v-model="selected" aria-label="提示词预览节点"><option v-for="node in nodes" :key="node.id" :value="node.id">{{ names[node.ref] }} · {{ node.id }}</option></select></label>
     <p v-else class="muted">当前流程没有实体或关系抽取节点。</p>
     <p v-if="loading" role="status">正在生成提示词预览…</p>
     <div v-else-if="error" role="alert"><p>{{ error }}</p><button type="button" @click="refresh">重试预览</button></div>

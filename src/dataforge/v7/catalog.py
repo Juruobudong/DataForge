@@ -80,6 +80,7 @@ OPERATOR_DESCRIPTIONS: dict[str, str] = {
     "qa-extractor": "基于业务要求从审核原文直接提取完整问答；DataForge 原生单阶段生成",
     "graph-extractor": "从来源文本块提取图谱知识",
     "entity-extractor": "识别文本中的实体候选",
+    "entity-relation-extractor": "一次模型调用联合抽取实体和关系；每块最多一次完整结果修复，失败整块隔离",
     "relation-extractor": "识别实体之间的关系候选",
     "triple-builder": "构造主谓宾三元组知识",
     "entity-normalizer": "合并并规范同义实体",
@@ -113,6 +114,7 @@ OPERATOR_DISPLAY_NAMES_ZH: dict[str, str] = {
     "HashDeduplicateFilter": "哈希去重过滤器", "MinHashDeduplicateFilter": "MinHash 相似去重过滤器",
     "prompt-generator": "提示词生成器", "Text2QAGenerator": "QA 生成器",
     "graph-extractor": "图谱抽取器", "entity-extractor": "实体抽取器", "relation-extractor": "关系抽取器",
+    "entity-relation-extractor": "实体关系联合抽取器",
     "triple-builder": "三元组构建器", "entity-normalizer": "实体规范器", "semantic-relation-builder": "语义关系构建器",
     "evidence-binder": "证据绑定器", "literal-detector": "字面值识别器", "graph-quality-validator": "图谱质量校验器", "artifact-merge": "产物合并器", "structured-knowledge-generator": "结构化知识生成器",
     "schema-validator": "结构校验器", "mineru-pipeline-gpu-adapter": "MinerU GPU 解析适配器",
@@ -129,6 +131,7 @@ SUBFLOW_DISPLAY_NAMES_ZH: dict[str, str] = {
 
 
 def _catalog_category(code: str, previous: str) -> tuple[str, str]:
+    if code == "entity-relation-extractor": return "知识生成", "图谱"
     if code == "document-parser": return "文档输入", "文档解析"
     if code in {"semantic-chunker", "source-chunk-builder", "kbc-chunker-batch"}: return "知识切分", previous
     if code in {"Text2QAGenerator", "graph-extractor", "entity-extractor", "relation-extractor", "triple-builder", "entity-normalizer", "semantic-relation-builder", "evidence-binder", "structured-knowledge-generator", "multihop-qa", "literal-detector"}: return "知识生成", previous
@@ -298,7 +301,7 @@ def operator_surfaces(code: str, input_type: str, exposure: str = "canvas") -> l
     if exposure == "internal" or input_type in {"source_file", "document_ir", "chunk_set"}:
         return ["system-internal"]
     standard = {"reviewed-source-chunk-input", "text-knowledge-mapper", "Text2QAGenerator", "qa-extractor",
-                "entity-extractor", "literal-detector", "relation-extractor", "triple-builder",
+                "entity-extractor", "entity-relation-extractor", "literal-detector", "relation-extractor", "triple-builder",
                 "entity-normalizer", "semantic-relation-builder", "evidence-binder",
                 "schema-validator", "graph-quality-validator"}
     return (["standard-template"] if code in standard else []) + ["advanced-canvas"]
@@ -478,6 +481,32 @@ for _item in CATALOG_SEEDS:
         _item["runtime_requirements"] = {**_item["runtime_requirements"], "triple_endpoint_repair_attempts": 1}
         _item["description"] = _item["summary"] = _item["description"] + "；Triple 未知实体端点最多重抽取一次，仍不合法则隔离整块；Semantic 不变。"
 
+# Joint extraction shares business controls, not the two-call execution path.
+_joint_params = {}
+for _source in CATALOG_SEEDS:
+    if _source["code"] in {"entity-extractor", "relation-extractor"}:
+        for _key, _schema in _source["parameter_schema"]["properties"].items():
+            if _key == "llm_serving":
+                continue
+            if _key == "extraction_instructions":
+                _key = "entity_extraction_instructions" if _source["code"] == "entity-extractor" else "relation_extraction_instructions"
+            _joint_params[_key] = {"schema": deepcopy(_schema), "doc": _source["parameter_docs"].get(_key, _schema.get("description", _key))}
+_joint = _curated_entry(_entry("entity-relation-extractor", "Entity Relation Extractor", "图谱",
+    "source_chunk_set", "relation_candidate_set", "entity_relation_extractor", uses_llm=True,
+    version=1, extra_params=_joint_params))
+_joint["input_example"] = {"input": [{"content": "设备A包含控制模块。", "source_chunk_id": "chunk-example-001"}]}
+_joint["output_example"] = {"output": [{"source_chunk_id": "chunk-example-001",
+    "entities": [{"name": "设备A", "type": "concept"}, {"name": "控制模块", "type": "concept"}],
+    "relations": [{"source": "设备A", "target": "控制模块", "type": "包含", "type_label": "包含"}]}]}
+_joint["runtime_requirements"].update(joint_extraction=True, protocol_repair_attempts=1)
+CATALOG_SEEDS += (_joint,)
+for _item in CATALOG_SEEDS:
+    if _item["code"] in {"literal-detector", "entity-normalizer"}:
+        _item["version"] = 4
+        _item["input_ports"]["input"]["accepted_types"] = ["entity_candidate_set", "relation_candidate_set"]
+        _item["output_ports"]["output"]["output_by_input"] = {
+            "entity_candidate_set": "entity_candidate_set", "relation_candidate_set": "relation_candidate_set"}
+
 for _item in CATALOG_SEEDS:
     if _item["code"] == "Text2QAGenerator":
         _item["version"] = 8
@@ -553,21 +582,19 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
         graph_edges: list[list[str]] = []
         if kind == "graph:triple":
             graph_prefix = [
-                {"id": f"entities-{kind}", "kind": "operator", "ref": "entity-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
+                {"id": f"extract-{kind}", "kind": "operator", "ref": "entity-relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
                 {"id": f"literals-{kind}", "kind": "operator", "ref": "literal-detector", "params": {"knowledge_type": "graph", "graph_mode": mode}},
-                {"id": f"relations-{kind}", "kind": "operator", "ref": "relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
             ]
-            graph_edges = [["reviewed-input", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"relations-{kind}"], [f"relations-{kind}", generator]]
+            graph_edges = [["reviewed-input", f"extract-{kind}"], [f"extract-{kind}", f"literals-{kind}"], [f"literals-{kind}", generator]]
             generator_ref = "triple-builder"
         elif kind == "graph:semantic":
             graph_prefix = [
-                {"id": f"entities-{kind}", "kind": "operator", "ref": "entity-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
+                {"id": f"extract-{kind}", "kind": "operator", "ref": "entity-relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
                 {"id": f"literals-{kind}", "kind": "operator", "ref": "literal-detector", "params": {"knowledge_type": "graph", "graph_mode": mode}},
                 {"id": f"normalize-{kind}", "kind": "operator", "ref": "entity-normalizer", "params": {"knowledge_type": "graph", "graph_mode": mode}},
-                {"id": f"relations-{kind}", "kind": "operator", "ref": "relation-extractor", "params": {"knowledge_type": "graph", "graph_mode": mode, "llm_serving": DEFAULT_LLM_SERVING_ID}},
                 {"id": f"build-{kind}", "kind": "operator", "ref": "semantic-relation-builder", "params": {"knowledge_type": "graph", "graph_mode": mode}},
             ]
-            graph_edges = [["reviewed-input", f"entities-{kind}"], [f"entities-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"normalize-{kind}"], [f"normalize-{kind}", f"relations-{kind}"], [f"relations-{kind}", f"build-{kind}"], [f"build-{kind}", generator]]
+            graph_edges = [["reviewed-input", f"extract-{kind}"], [f"extract-{kind}", f"literals-{kind}"], [f"literals-{kind}", f"normalize-{kind}"], [f"normalize-{kind}", f"build-{kind}"], [f"build-{kind}", generator]]
             generator_ref = "evidence-binder"
         if generator_ref in {"prompt-generator", "structured-knowledge-generator"}:
             generator_params["prompt_template_revision_id"] = "promptrev_default"

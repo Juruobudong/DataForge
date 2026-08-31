@@ -9,29 +9,12 @@ import unicodedata
 from .base import OperatorResult
 from .derived_text import content_digest, derived_record, is_source, prepare_generation, restore_evidence
 from ..governance_catalog import GENERIC_SCORE, SCORES, SEMANTIC_FIELDS, SEMANTIC_MODEL
-from .semantic_contract import MAX_GROUP_RECORDS, REVISION as SEMANTIC_REVISION
+from .semantic_contract import REVISION as SEMANTIC_REVISION, group_key, require_group_size
 
 
 def business_parameters(executor, params):
-    from jsonschema import Draft202012Validator
-    properties = executor.parameter_schema.get("properties", {})
-    result = {key: deepcopy(params[key] if key in params else spec["default"])
-              for key, spec in properties.items() if key in params or "default" in spec}
-    def finite(value):
-        if isinstance(value, dict):
-            for item in value.values():
-                finite(item)
-        elif isinstance(value, list):
-            for item in value:
-                finite(item)
-        elif isinstance(value, float) and not math.isfinite(value):
-            raise ValueError("PARAMETER_RANGE_INVALID: 参数不能为NaN或Infinity")
-    finite(result)
-    Draft202012Validator(executor.parameter_schema).validate(result)
-    for low, high in (("min_length", "max_length"), ("min_mtld", "max_mtld"), ("min_hdd", "max_hdd"), ("min_score", "max_score"), ("min_sentences", "max_sentences")):
-        if low in result and result[low] > result[high]:
-            raise ValueError("PARAMETER_RANGE_INVALID: 最小值不能大于最大值")
-    return result
+    from ..operator_parameters import business_parameters as validated_business
+    return validated_business(executor.parameter_schema, params)
 
 
 def checked_rows(rows, allowed, complete=False):
@@ -293,14 +276,14 @@ def semantic_deduplicate(executor, values, business, params, context, invoke):
             raise ValueError("OPERATOR_INPUT_INVALID: 语义去重正文必须为非空字符串")
         if not isinstance(versions, list) or any(not isinstance(version, str) or not version for version in versions):
             raise ValueError("SOURCE_LINEAGE_MISSING: 来源版本列表非法")
-        group = "flow_input" if business["scope"] == "flow_input" else json.dumps(sorted(set(versions)), ensure_ascii=True)
+        group = group_key(business["scope"], versions)
         if not isinstance(identity, str) or not identity or identity in identities:
             raise ValueError("SOURCE_LINEAGE_MISMATCH: 语义标记记录身份必须非空且唯一")
         identities.add(identity)
         group_counts[group] = group_counts.get(group, 0) + 1
-        if group_counts[group] > MAX_GROUP_RECORDS:
-            raise ValueError("SEMANTIC_DEDUP_GROUP_TOO_LARGE: 每个比较组最多5000条记录")
         records.append({"_df_row": index, "_df_group": group, "_df_identity": str(identity), "text": text})
+    for group, count in group_counts.items():
+        require_group_size(count, node_id=context.node_id, group=group)
     rows = checked_rows(invoke(records, init={"threshold": business["threshold"]},
         action="governance_semantic_deduplicate") if records else [], {row["_df_row"] for row in records}, complete=True)
     known_representatives = {}
