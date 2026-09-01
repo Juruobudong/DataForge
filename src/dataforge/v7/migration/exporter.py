@@ -18,12 +18,12 @@ from ..models import (
     DocumentLibraryProcessingBaseline, DocumentLibraryProcessingRecord,
     DocumentLibraryTemplateBinding, DocumentLibraryTemplateOutput, EmbeddingProfile,
     FlowExecutionSnapshot, FlowSubgraph, FlowSubgraphRevision,
-    KnowledgeIndexProfile, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeItemSource,
+    KnowledgeIndexProfile, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeEvidence,
     KnowledgeFlowTemplate, KnowledgeFlowTemplateRevision, KnowledgeLibrary, KnowledgeType,
     KnowledgeTypeIndexBinding, KnowledgeTypeModeRevision, KnowledgeTypeRevision,
-    OperatorDefinition, OperatorVersion, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
-    ProjectOrgRouteLibrary, ProjectRouteVersion, ProjectTask, Source, SourceChunk, SourceChunkRevision,
-    SourceReviewSnapshot, SourceReviewSnapshotChunk, SourceVersion,
+    OperatorDefinition, OperatorVersion, ParseJob, ParsedDocument, Project, ProjectDeployment, ProjectReleaseTask, ProjectOrgRoute,
+    ProjectOrgRouteLibrary, ProjectRouteVersion, ProjectTask, Source, FlowChunk, FlowChunkSet, FlowChunkRevision,
+    FlowChunkReviewSnapshot, FlowChunkReviewSnapshotItem, SourceVersion,
     PromptTemplate, PromptTemplateRevision, QualityProfile, QualityProfileRevision,
     StorageContract, StorageContractRevision,
     KnowledgeAssetItem,
@@ -53,13 +53,16 @@ def jsonl_payloads(items: list[dict[str, Any]]) -> bytes:
                                separators=(",", ":")).encode("utf-8") + b"\n" for item in items)
 
 
-def _filtered_baseline(snapshot: dict[str, Any] | None, selected_ids: set[str]) -> dict[str, Any] | None:
+def _filtered_baseline(snapshot: dict[str, Any] | None, selected_ids: set[str],
+                       target_org_code: str | None = None) -> dict[str, Any] | None:
     if not snapshot: return None
     value = json.loads(json.dumps(snapshot))
     flat = []
     for task in value.get("tasks", []):
         kept_routes = []
         for route in task.get("org_routes", []):
+            if target_org_code and route.get("org_code") != target_org_code:
+                continue
             route["libraries"] = [item for item in route.get("libraries", [])
                                   if item.get("knowledge_library_id") in selected_ids]
             route["knowledge_library_ids"] = [item["knowledge_library_id"] for item in route["libraries"]]
@@ -193,8 +196,8 @@ class MigrationExporter:
                 for item in items:
                     digest.update(json.dumps(model_payload(item), ensure_ascii=False, sort_keys=True,
                                              separators=(",", ":")).encode()); digest.update(b"\n")
-                    links = list(session.scalars(select(KnowledgeItemSource).where(
-                        KnowledgeItemSource.knowledge_item_id == item.id).order_by(KnowledgeItemSource.id)))
+                    links = list(session.scalars(select(KnowledgeEvidence).where(
+                        KnowledgeEvidence.knowledge_item_id == item.id).order_by(KnowledgeEvidence.id)))
                     for link in links:
                         digest.update(json.dumps(model_payload(link), ensure_ascii=False, sort_keys=True,
                                                  separators=(",", ":")).encode()); digest.update(b"\n")
@@ -208,7 +211,7 @@ class MigrationExporter:
                 (DocumentLibrary, DocumentLibrary.id, deps["document_library_ids"]),
                 (Source, Source.id, deps["source_ids"]),
                 (SourceVersion, SourceVersion.id, deps["source_version_ids"]),
-                (SourceChunk, SourceChunk.id, deps["source_chunk_ids"]),
+                (FlowChunk, FlowChunk.id, deps["flow_chunk_ids"]),
                 (KnowledgeLibrary, KnowledgeLibrary.id, plan["knowledge_library_ids"]),
             )
             for model, column, identifiers in queries:
@@ -222,17 +225,20 @@ class MigrationExporter:
         with self.store.sessions() as session:
             project_deployment = session.get(ProjectDeployment, plan["project_deployment"]["id"])
             project = session.get(Project, project_deployment.project_id)
-            dts = list(session.scalars(select(ProjectDeploymentTask).where(
-                ProjectDeploymentTask.project_deployment_id == project_deployment.id)))
+            dts = list(session.scalars(select(ProjectReleaseTask).where(
+                ProjectReleaseTask.project_id == project_deployment.project_id)))
             tasks = list(session.scalars(select(ProjectTask).where(ProjectTask.id.in_([item.project_task_id for item in dts]))))
-            routes = list(session.scalars(select(ProjectOrgRoute).where(ProjectOrgRoute.project_deployment_task_id.in_([item.id for item in dts]))))
+            routes = list(session.scalars(select(ProjectOrgRoute).where(ProjectOrgRoute.project_release_task_id.in_([item.id for item in dts]))))
+            target_org_code = str(plan.get("deployment", {}).get("institution_code") or "")
+            if target_org_code:
+                routes = [item for item in routes if item.org_code == target_org_code]
             links = list(session.scalars(select(ProjectOrgRouteLibrary).where(ProjectOrgRouteLibrary.project_org_route_id.in_([item.id for item in routes])))) if routes else []
             selected = set(plan["knowledge_library_ids"])
             links = [item for item in links if item.knowledge_library_id in selected]
             kept_route_ids = {item.project_org_route_id for item in links}
             routes = [item for item in routes if item.id in kept_route_ids]
             if plan["package_kind"] == "knowledge_update": routes, links = [], []
-            baseline = (_filtered_baseline(plan["base_route_snapshot"], selected)
+            baseline = (_filtered_baseline(plan["base_route_snapshot"], selected, target_org_code)
                         if plan["package_kind"] == "deployment_seed" else None)
             control = {"project": model_payload(project), "deployment": plan["deployment"],
                 "project_deployment": model_payload(project_deployment),
@@ -261,23 +267,28 @@ class MigrationExporter:
                 "document_libraries": list(session.scalars(select(DocumentLibrary).where(DocumentLibrary.id.in_(ids["document_library_ids"])))) if ids["document_library_ids"] else [],
                 "sources": list(session.scalars(select(Source).where(Source.id.in_(ids["source_ids"])))) if ids["source_ids"] else [],
                 "source_versions": list(session.scalars(select(SourceVersion).where(SourceVersion.id.in_(ids["source_version_ids"])))) if ids["source_version_ids"] else [],
-                "source_chunks": list(session.scalars(select(SourceChunk).where(SourceChunk.id.in_(ids["source_chunk_ids"])))) if ids["source_chunk_ids"] else [],
+                "flow_chunks": list(session.scalars(select(FlowChunk).where(FlowChunk.id.in_(ids["flow_chunk_ids"])))) if ids["flow_chunk_ids"] else [],
                 "document_library_members": list(session.scalars(select(DocumentLibraryMember).where(DocumentLibraryMember.source_id.in_(ids["source_ids"])))) if ids["source_ids"] else [],
                 "knowledge_libraries": list(session.scalars(select(KnowledgeLibrary).where(KnowledgeLibrary.id.in_(plan["knowledge_library_ids"])))),
             }
             items = list(session.scalars(select(KnowledgeItem).where(KnowledgeItem.knowledge_library_id.in_(plan["knowledge_library_ids"]))))
             metadata["knowledge_items"] = items
-            metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeItemSource).where(
-                KnowledgeItemSource.knowledge_item_id.in_([item.id for item in items])))) if items else []
-            chunk_ids = [item.id for item in metadata["source_chunks"]]
-            review_snapshot_ids = {item.source_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.source_review_snapshot_id}
-            metadata["source_chunk_revisions"] = list(session.scalars(select(SourceChunkRevision).where(
-                SourceChunkRevision.source_chunk_id.in_(chunk_ids)))) if chunk_ids else []
-            metadata["source_review_snapshots"] = list(session.scalars(select(SourceReviewSnapshot).where(
-                SourceReviewSnapshot.id.in_(review_snapshot_ids), SourceReviewSnapshot.status == "approved"))) if review_snapshot_ids else []
-            metadata["source_review_snapshot_chunks"] = list(session.scalars(select(SourceReviewSnapshotChunk).where(
-                SourceReviewSnapshotChunk.source_review_snapshot_id.in_(review_snapshot_ids),
-                SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
+            metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeEvidence).where(
+                KnowledgeEvidence.knowledge_item_id.in_([item.id for item in items])))) if items else []
+            chunk_ids = [item.id for item in metadata["flow_chunks"]]
+            review_snapshot_ids = {item.flow_chunk_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.flow_chunk_review_snapshot_id}
+            parsed_ids = {item.parsed_document_id for item in metadata["knowledge_item_sources"]}
+            metadata["parsed_documents"] = self._parsed_revision_closure(session, parsed_ids)
+            parse_job_ids = {item.parse_job_id for item in metadata["parsed_documents"] if item.parse_job_id}
+            metadata["parse_jobs"] = list(session.scalars(select(ParseJob).where(ParseJob.id.in_(parse_job_ids)))) if parse_job_ids else []
+            metadata["flow_chunk_sets"] = list(session.scalars(select(FlowChunkSet).where(FlowChunkSet.id.in_({item.flow_chunk_set_id for item in metadata["flow_chunks"]})))) if chunk_ids else []
+            metadata["flow_chunk_revisions"] = list(session.scalars(select(FlowChunkRevision).where(
+                FlowChunkRevision.flow_chunk_id.in_(chunk_ids)))) if chunk_ids else []
+            metadata["flow_chunk_review_snapshots"] = list(session.scalars(select(FlowChunkReviewSnapshot).where(
+                FlowChunkReviewSnapshot.id.in_(review_snapshot_ids), FlowChunkReviewSnapshot.status == "frozen"))) if review_snapshot_ids else []
+            metadata["flow_chunk_review_snapshot_items"] = list(session.scalars(select(FlowChunkReviewSnapshotItem).where(
+                FlowChunkReviewSnapshotItem.flow_chunk_review_snapshot_id.in_(review_snapshot_ids),
+                FlowChunkReviewSnapshotItem.flow_chunk_id.in_(chunk_ids),
             ))) if review_snapshot_ids and chunk_ids else []
             for name, values in metadata.items(): builder.add_bytes(f"metadata/{name}.jsonl", jsonl(values))
             for version in {item.sha256: item for item in metadata["source_versions"]}.values():
@@ -286,6 +297,7 @@ class MigrationExporter:
                 if copied.sha256 != version.sha256 or copied.size_bytes != version.size_bytes:
                     raise ValueError(f"对象文件导出期间发生变化：{version.id}")
                 builder.add_file(f"blobs/{version.sha256}", target)
+            self._add_parsed_objects(builder, metadata["parsed_documents"])
 
     def _add_metadata_v2(self, builder: MigrationPackageBuilder, plan: dict[str, Any], work: Path) -> None:
         builder.add_bytes("control/release.json", json.dumps({
@@ -323,8 +335,8 @@ class MigrationExporter:
                     Source.id.in_(ids["source_ids"])))) if ids["source_ids"] else [],
                 "source_versions": list(session.scalars(select(SourceVersion).where(
                     SourceVersion.id.in_(ids["source_version_ids"])))) if ids["source_version_ids"] else [],
-                "source_chunks": list(session.scalars(select(SourceChunk).where(
-                    SourceChunk.id.in_(ids["source_chunk_ids"])))) if ids["source_chunk_ids"] else [],
+                "flow_chunks": list(session.scalars(select(FlowChunk).where(
+                    FlowChunk.id.in_(ids["flow_chunk_ids"])))) if ids["flow_chunk_ids"] else [],
                 "document_library_members": list(session.scalars(select(DocumentLibraryMember).where(
                     DocumentLibraryMember.source_id.in_(ids["source_ids"])))) if ids["source_ids"] else [],
                 "knowledge_libraries": list(session.scalars(select(KnowledgeLibrary).where(
@@ -334,17 +346,22 @@ class MigrationExporter:
                 KnowledgeItem.knowledge_library_id.in_(plan["knowledge_library_ids"]),
                 KnowledgeItem.status == "active")))
             metadata["knowledge_items"] = items
-            metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeItemSource).where(
-                KnowledgeItemSource.knowledge_item_id.in_([item.id for item in items])))) if items else []
-            chunk_ids = [item.id for item in metadata["source_chunks"]]
-            review_snapshot_ids = {item.source_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.source_review_snapshot_id}
-            metadata["source_chunk_revisions"] = list(session.scalars(select(SourceChunkRevision).where(
-                SourceChunkRevision.source_chunk_id.in_(chunk_ids)))) if chunk_ids else []
-            metadata["source_review_snapshots"] = list(session.scalars(select(SourceReviewSnapshot).where(
-                SourceReviewSnapshot.id.in_(review_snapshot_ids), SourceReviewSnapshot.status == "approved"))) if review_snapshot_ids else []
-            metadata["source_review_snapshot_chunks"] = list(session.scalars(select(SourceReviewSnapshotChunk).where(
-                SourceReviewSnapshotChunk.source_review_snapshot_id.in_(review_snapshot_ids),
-                SourceReviewSnapshotChunk.source_chunk_id.in_(chunk_ids),
+            metadata["knowledge_item_sources"] = list(session.scalars(select(KnowledgeEvidence).where(
+                KnowledgeEvidence.knowledge_item_id.in_([item.id for item in items])))) if items else []
+            chunk_ids = [item.id for item in metadata["flow_chunks"]]
+            review_snapshot_ids = {item.flow_chunk_review_snapshot_id for item in metadata["knowledge_item_sources"] if item.flow_chunk_review_snapshot_id}
+            parsed_ids = {item.parsed_document_id for item in metadata["knowledge_item_sources"]}
+            metadata["parsed_documents"] = self._parsed_revision_closure(session, parsed_ids)
+            parse_job_ids = {item.parse_job_id for item in metadata["parsed_documents"] if item.parse_job_id}
+            metadata["parse_jobs"] = list(session.scalars(select(ParseJob).where(ParseJob.id.in_(parse_job_ids)))) if parse_job_ids else []
+            metadata["flow_chunk_sets"] = list(session.scalars(select(FlowChunkSet).where(FlowChunkSet.id.in_({item.flow_chunk_set_id for item in metadata["flow_chunks"]})))) if chunk_ids else []
+            metadata["flow_chunk_revisions"] = list(session.scalars(select(FlowChunkRevision).where(
+                FlowChunkRevision.flow_chunk_id.in_(chunk_ids)))) if chunk_ids else []
+            metadata["flow_chunk_review_snapshots"] = list(session.scalars(select(FlowChunkReviewSnapshot).where(
+                FlowChunkReviewSnapshot.id.in_(review_snapshot_ids), FlowChunkReviewSnapshot.status == "frozen"))) if review_snapshot_ids else []
+            metadata["flow_chunk_review_snapshot_items"] = list(session.scalars(select(FlowChunkReviewSnapshotItem).where(
+                FlowChunkReviewSnapshotItem.flow_chunk_review_snapshot_id.in_(review_snapshot_ids),
+                FlowChunkReviewSnapshotItem.flow_chunk_id.in_(chunk_ids),
             ))) if review_snapshot_ids and chunk_ids else []
             self._add_runtime_closure(session, metadata, plan)
             asset_ids = [item.get("asset_version_id") or item.get("id") for item in plan.get("asset_versions", [])]
@@ -364,6 +381,32 @@ class MigrationExporter:
                 if copied.sha256 != version.sha256 or copied.size_bytes != version.size_bytes:
                     raise ValueError(f"对象文件导出期间发生变化：{version.id}")
                 builder.add_file(f"blobs/{version.sha256}", target)
+            self._add_parsed_objects(builder, metadata["parsed_documents"])
+
+    @staticmethod
+    def _parsed_revision_closure(session, parsed_ids: set[str]) -> list[ParsedDocument]:
+        found: dict[str, ParsedDocument] = {}
+        frontier = set(parsed_ids)
+        while frontier:
+            batch = list(session.scalars(select(ParsedDocument).where(ParsedDocument.id.in_(frontier))))
+            frontier = {
+                item.parent_parsed_document_id for item in batch
+                if item.parent_parsed_document_id and item.parent_parsed_document_id not in found
+            }
+            found.update({item.id: item for item in batch})
+        return sorted(found.values(), key=lambda item: (item.source_version_id, item.revision_no, item.id))
+
+    def _add_parsed_objects(self, builder: MigrationPackageBuilder, documents: list[ParsedDocument]) -> None:
+        added: set[str] = set()
+        for document in documents:
+            for reference in (document.content_ref, document.anchor_map_ref):
+                if not reference.startswith("object:///"):
+                    raise ValueError("ParsedDocument 只允许当前 object:/// 内容引用")
+                key = reference.removeprefix("object:///")
+                if key in added:
+                    continue
+                added.add(key)
+                builder.add_bytes(f"parsed-objects/{key}", self.objects.get_bytes(key))
 
     @staticmethod
     def _referenced_revision_ids(value: Any, key: str) -> set[str]:

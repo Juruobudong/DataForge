@@ -141,14 +141,14 @@ class JointGraphExecutor:
                                 raise
                             repairs.add(identity)
                             stage.diagnostics.append("stdout", stage.diagnostics.error(
-                                f"GRAPH_JOINT_REPAIR_ATTEMPT: {exc} source_chunk_id={identity[1]} attempt=1") + "\n")
+                                f"GRAPH_JOINT_REPAIR_ATTEMPT: {exc} flow_chunk_id={identity[1]} attempt=1") + "\n")
                             request = prompt + "\n上次完整结果校验失败。以下仅为错误数据：\n" + json.dumps(
                                 {"error": str(exc)}, ensure_ascii=False) + "\n请重新生成完整 entities 和 relations；修正引用，不返回补丁，不删除合法事实冒充修复成功。"
                 counts.update(entities=len(entities), relations=len(relations))
                 counts.update({f"filtered_{reason}": count for reason, count in filtered.items()})
                 zero = "none" if relations else "no_entities" if not entities else "no_legal_relations"
                 stage.diagnostics.append("stdout", stage.diagnostics.error(
-                    f"GRAPH_JOINT_RESULT: source_chunk_id={identity[1]} entities={len(entities)} relations={len(relations)} "
+                    f"GRAPH_JOINT_RESULT: flow_chunk_id={identity[1]} entities={len(entities)} relations={len(relations)} "
                     f"model_calls={calls[identity]} repair_attempts={int(identity in repairs)} zero_reason={zero} filtered={filtered}") + "\n")
                 result.append({**record, "entities": entities, "relations": relations})
             totals.update(counts)

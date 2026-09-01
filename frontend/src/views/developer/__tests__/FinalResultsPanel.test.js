@@ -12,8 +12,8 @@ function run(id = 'r', keys = ['text', 'qa', 'graph:triple', 'graph:semantic', '
 function response(body, offset = 0) { return { items: [{
   source_knowledge_id: 'knowledge-001', canonical_content: body,
   data_json: { question: '问题', answer: '答案', filename: 'a.pdf', chunk_index: 0 },
-  source_anchor: 'a.pdf#chunk-0', source_version_ids: ['version-001'], source_chunk_id: 'chunk-001',
-  source_chunk_revision_id: 'chunk-revision-001', source_review_snapshot_id: 'review-001',
+  source_anchor: 'a.pdf#chunk-0', source_version_ids: ['version-001'], flow_chunk_id: 'chunk-001',
+  flow_chunk_revision_id: 'chunk-revision-001', flow_chunk_review_snapshot_id: 'review-001',
   evidence_text: '原文证据', anchor_json: { page: 1, section: '诊疗建议', file: 'a.pdf', chunk_index: 0 },
 }], total: 51, offset, limit: 50, has_more: offset === 0 } }
 const button = text => wrapper.findAll('button').find(item => item.text().includes(text))
@@ -81,8 +81,8 @@ it.each([
   await button('查看详情').trigger('click')
   const detail = wrapper.get('.result-detail').text()
   for (const value of ['知识标识', 'knowledge-001', '来源文件', 'a.pdf', '切片位置', '第 1 个切片',
-    '来源版本', 'version-001', '切片标识', 'chunk-001', '切片修订', 'chunk-revision-001',
-    '审核信息', '业务审核快照', '审核快照', 'review-001']) expect(detail).toContain(value)
+    '来源版本', 'version-001', 'FlowChunk', 'chunk-001', '切片修订', 'chunk-revision-001',
+    '审核信息', 'Flow 输入快照', '审核快照', 'review-001']) expect(detail).toContain(value)
 })
 
 it('describes builtin sample review truth without fabricating database review ids', async () => {
@@ -92,7 +92,7 @@ it('describes builtin sample review truth without fabricating database review id
     ...response('示例正文'), items: [{
       source_knowledge_id: 'sample-knowledge', canonical_content: '示例正文',
       data_json: { filename: 'DataForge 示例审核数据', chunk_index: 0 },
-      source_version_ids: ['sample-version:reviewed-medical-v2:2'], source_chunk_id: 'sample-001',
+      source_version_ids: ['sample-version:reviewed-medical-v2:2'], flow_chunk_id: 'sample-001',
       source_anchor: 'DataForge 示例审核数据#chunk-0', evidence_text: '示例正文',
       anchor_json: { page: 1, section: '综合评估', chunk_index: 0 },
     }], total: 1, has_more: false,

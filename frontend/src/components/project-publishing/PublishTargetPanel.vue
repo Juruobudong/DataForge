@@ -1,20 +1,16 @@
 <script setup>
-import DomainTerm from '../common/DomainTerm.vue'
 import EnvironmentTabs from './EnvironmentTabs.vue'
-import { FIELD_HELP } from '../../constants/fieldHelp'
-import { statusLabel } from '../../constants/statusLabels'
 
-defineProps({ deployment: { type: Object, default: null }, selectedStage: { type: String, required: true }, targetUri: { type: String, default: '' } })
+defineProps({ target: { type: Object, default: null }, selectedStage: { type: String, required: true }, targetUri: { type: String, default: '' }, showEnvironment: { type: Boolean, default: true } })
 defineEmits(['update:selectedStage'])
 </script>
 
 <template>
   <section class="panel stack">
-    <div class="panel-head"><div><h3><DomainTerm term="deployment" :help="FIELD_HELP.deployment" /></h3><p>{{ deployment?.name || '暂无发布目标' }}</p></div><span v-if="deployment" class="badge blue">{{ statusLabel(deployment.scope) }}</span></div>
-    <template v-if="deployment">
-      <p v-if="deployment.scope==='institution'"><b>机构代码</b> · <code>{{ deployment.institution_code }}</code></p>
-      <EnvironmentTabs :model-value="selectedStage" :target-uri="targetUri" @update:model-value="$emit('update:selectedStage',$event)" />
-      <details><summary>高级信息</summary><div class="grid2"><p>Deployment Code<br><code>{{ deployment.code }}</code></p><p>ProjectDeployment ID<br><code>{{ deployment.id }}</code></p></div></details>
+    <div class="panel-head"><div><h3>Milvus 发布目标</h3><p>{{ targetUri || '当前环境尚未绑定 Milvus Target' }}</p></div><span v-if="target" class="badge blue">所有项目共用</span></div>
+    <template v-if="target">
+      <EnvironmentTabs v-if="showEnvironment" :model-value="selectedStage" :target-uri="targetUri" @update:model-value="$emit('update:selectedStage',$event)" />
+      <p>Target Revision 已固定；修改 Registry 不会自动改变当前环境绑定。</p>
     </template>
     <slot />
   </section>

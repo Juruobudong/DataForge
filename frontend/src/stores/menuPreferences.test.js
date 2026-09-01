@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { loadMenuPreference, MENU_PREFERENCE_KEY, mergeMenuPreference } from './menuPreferences.js'
-import { BUSINESS_MENU_REGISTRY, businessMenuRegistry } from '../constants/workspaceMenus.js'
+import { BUSINESS_MENU_GROUPS, BUSINESS_MENU_REGISTRY, businessMenuRegistry, groupMenuRegistry } from '../constants/workspaceMenus.js'
 
 test('旧偏好自动插入新菜单并忽略删除和重复 key', () => {
   const merged = mergeMenuPreference(BUSINESS_MENU_REGISTRY, { business: {
@@ -10,16 +10,21 @@ test('旧偏好自动插入新菜单并忽略删除和重复 key', () => {
     hidden: [],
   } })
   assert.deepEqual(merged.order, [
-    'dashboard', 'milvus-targets', 'knowledge', 'vector-storage', 'authorization',
-    'documents', 'jobs', 'institution-deployments',
+    'dashboard', 'knowledge', 'documents', 'jobs',
+    'authorization', 'institution-deployments', 'milvus-targets', 'vector-storage',
   ])
 })
 
-test('默认业务菜单将 Milvus 服务固定在工作台之后', () => {
+test('默认业务菜单按知识生产、发布交付和平台运维固定分组', () => {
   assert.deepEqual(
-    mergeMenuPreference(BUSINESS_MENU_REGISTRY).order.slice(0, 2),
-    ['dashboard', 'milvus-targets'],
+    groupMenuRegistry(mergeMenuPreference(BUSINESS_MENU_REGISTRY).visible).map(group => [group.label, group.children.map(item => item.key)]),
+    [
+      ['知识生产', ['dashboard', 'documents', 'jobs', 'knowledge']],
+      ['发布与交付', ['authorization', 'institution-deployments']],
+      ['平台运维', ['milvus-targets', 'vector-storage']],
+    ],
   )
+  assert.equal(BUSINESS_MENU_GROUPS.length, 3)
 })
 
 test('required 菜单不能隐藏，普通菜单保留隐藏状态', () => {
@@ -35,6 +40,13 @@ test('local-only 菜单只在 local registry 中出现', () => {
   assert.equal(mergeMenuPreference(businessMenuRegistry('central')).order.includes('local-initialization'), false)
   assert.equal(mergeMenuPreference(businessMenuRegistry('local')).order.includes('milvus-targets'), false)
   assert.equal(mergeMenuPreference(businessMenuRegistry('local')).order.at(-1), 'local-initialization')
+})
+
+test('隐藏整组菜单时侧栏不保留空分组标题', () => {
+  const merged = mergeMenuPreference(BUSINESS_MENU_REGISTRY, { business: {
+    order: BUSINESS_MENU_REGISTRY.map(item => item.key), hidden: ['milvus-targets', 'vector-storage'],
+  } })
+  assert.deepEqual(groupMenuRegistry(merged.visible).map(group => group.label), ['知识生产', '发布与交付'])
 })
 
 test('损坏 localStorage 回退为 null', () => {

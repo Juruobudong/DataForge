@@ -2,8 +2,8 @@
 from copy import deepcopy
 from .operators.semantic_contract import MODEL as SEMANTIC_MODEL, PROFILE as SEMANTIC_RESOURCE_PROFILE, REVISION as SEMANTIC_REVISION
 
-TEXT_INPUTS = ["source_chunk_set", "derived_text_set", "candidate:text", "candidate:qa"]
-TEXT_OUTPUTS = {"source_chunk_set": "derived_text_set", "derived_text_set": "derived_text_set",
+TEXT_INPUTS = ["flow_chunk_review_snapshot", "derived_text_set", "candidate:text", "candidate:qa"]
+TEXT_OUTPUTS = {"flow_chunk_review_snapshot": "derived_text_set", "derived_text_set": "derived_text_set",
                 "candidate:text": "candidate:text", "candidate:qa": "candidate:qa"}
 SCORES = ["question_quality", "answer_alignment", "answer_verifiability", "downstream_value"]
 GENERIC_SCORE = "evaluation_score"
@@ -112,7 +112,7 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
             text_ports(item)
         if code in {"Text2QAGenerator", "text-knowledge-mapper", "prompt-generator", "structured-knowledge-generator"}:
             legacy.append(deepcopy(item)); item["version"] += 1
-            item["input_ports"]["input"]["accepted_types"] = ["source_chunk_set", "derived_text_set"]
+            item["input_ports"]["input"]["accepted_types"] = ["flow_chunk_review_snapshot", "derived_text_set"]
             item["runtime_requirements"]["derived_text"] = True
             # Omission means the system's current default; Compiler freezes the
             # concrete Serving. Historical schemas remain in the saved version.
@@ -166,13 +166,13 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
             )
         if adapter in {"evaluate_generic", "semantic", "sentence", "symbol_ratio", "punctuation"}:
             item["runtime_requirements"]["adapted_behavior"] = description
-            example = {"source_knowledge_id": "candidate-example", "source_chunk_id": "chunk-example",
+            example = {"source_knowledge_id": "candidate-example", "flow_chunk_id": "chunk-example",
                        "source_version_ids": ["version-example"], "canonical_content": "设备维护应记录检查结果。",
                        "data_json": {}, "evidence_text": "设备维护应记录检查结果。", "anchor_json": {"page": 1}}
             item["input_example"], item["output_example"] = {"input": [example]}, {"output": [deepcopy(example)]}
         if adapter == "multihop":
-            item["input"] = "source_chunk_set"; item["output"] = "candidate:qa"
-            item["input_ports"]["input"].update(artifact_type="source_chunk_set", accepted_types=["source_chunk_set", "derived_text_set"])
+            item["input"] = "flow_chunk_review_snapshot"; item["output"] = "candidate:qa"
+            item["input_ports"]["input"].update(artifact_type="flow_chunk_review_snapshot", accepted_types=["flow_chunk_review_snapshot", "derived_text_set"])
             item["output_ports"]["output"]["artifact_type"] = "candidate:qa"
         elif adapter in {"evaluate", "evaluate_generic"}:
             item["input"] = item["output"] = "candidate:qa"

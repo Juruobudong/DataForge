@@ -1,7 +1,9 @@
 # ADR-006：SourceChunkSet 候选审核与原子提升
 
-**状态**：Accepted  
+**状态**：Superseded by [ADR-011](ADR-011-parsed-document-flow-owned-chunking.md)
 **日期**：2026-08-25
+
+> 本文保留历史决策。当前 Set、审核与 Snapshot 归属 Flow Revision，不再归属 Source Preparation 或 SourceVersion。
 
 ## 决策
 

@@ -205,7 +205,7 @@ class QAChunkSession:
 
 
 def qa_candidate(chunk, row):
-    if row.get("_df_row") != chunk["source_chunk_id"]:
+    if row.get("_df_row") != chunk["flow_chunk_id"]:
         raise ValueError("SOURCE_LINEAGE_MISMATCH: 上游来源关联错误")
     if any(not isinstance(row.get(k), str) or not row[k].strip() for k in ("question", "answer")):
         raise ValueError("QA_OUTPUT_INVALID: 问题和答案必须为非空文本")
@@ -213,9 +213,9 @@ def qa_candidate(chunk, row):
     identity = f"{chunk['source_id']}|qa|{chunk.get('chunk_index', 0)}|{data['question']}"
     return {"source_knowledge_id": hashlib.sha256(identity.encode()).hexdigest(),
             "canonical_content": f"{data['question']} {data['answer']}", "data_json": data,
-            "source_version_ids": [chunk["source_version_id"]], "source_chunk_id": chunk["source_chunk_id"],
-            "source_chunk_revision_id": chunk.get("source_chunk_revision_id"),
-            "source_review_snapshot_id": chunk.get("source_review_snapshot_id"),
+            "source_version_ids": [chunk["source_version_id"]], "flow_chunk_id": chunk["flow_chunk_id"],
+            "flow_chunk_revision_id": chunk.get("flow_chunk_revision_id"),
+            "flow_chunk_review_snapshot_id": chunk.get("flow_chunk_review_snapshot_id"),
             "source_anchor": f"{chunk.get('filename', '')}#chunk-{chunk.get('chunk_index', 0)}",
             "anchor_json": deepcopy(chunk.get("anchor_json") or chunk.get("anchor") or {}),
             "evidence_text": chunk["content"], "is_primary": True}
@@ -226,20 +226,20 @@ def generate_qa_chunks(values, params, context, invoke, *, allow_no_match=False)
     outcome = runtime.setdefault("generation", {}).setdefault("qa", {"successful": [], "failed": [], "targeted": []})
     store, job, count = runtime.get("store"), runtime.get("job_id"), question_count(params)
     for chunk in values:
-        scope = ("qa", str(chunk.get("source_version_id", "")), str(chunk.get("source_chunk_id", "")))
+        scope = ("qa", str(chunk.get("source_version_id", "")), str(chunk.get("flow_chunk_id", "")))
         if runtime.get("retry_scope") is not None and scope not in runtime["retry_scope"]:
             continue
         outcome["targeted"].append(chunk)
         try:
             if runtime.get("cancelled") and runtime["cancelled"]():
                 raise ValueError("OPERATOR_CANCELLED: 算子已取消")
-            if not all(chunk.get(key) for key in ("source_id", "source_version_id", "source_chunk_id")):
+            if not all(chunk.get(key) for key in ("source_id", "source_version_id", "flow_chunk_id")):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 来源 Chunk 身份缺失")
             if not isinstance(chunk.get("content"), str):
                 raise ValueError("来源正文必须是字符串")
             generated = []
             if chunk["content"].strip():
-                generated = invoke([{"text": chunk["content"], "_df_row": chunk["source_chunk_id"]}],
+                generated = invoke([{"text": chunk["content"], "_df_row": chunk["flow_chunk_id"]}],
                                    run_arguments={"input_key": "text", "input_question_num": count,
                                                   "output_question_key": "question", "output_answer_key": "answer"})
                 if allow_no_match and isinstance(generated, OperatorEarlyResult):
@@ -250,7 +250,7 @@ def generate_qa_chunks(values, params, context, invoke, *, allow_no_match=False)
             outcome["successful"].append(chunk)
             outputs.extend(candidates)
             if store and job:
-                store.record_chunk_generation(job, "qa", chunk, status="completed", candidate_count=len(candidates))
+                store.record_chunk_generation(job, "qa", chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
         except Exception as exc:
             error = runtime["_operator_diagnostics"].error(exc)
             runtime["_operator_diagnostics"].append("stderr", error + "\n")

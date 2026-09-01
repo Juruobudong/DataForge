@@ -17,7 +17,7 @@ from copy import deepcopy
 import re
 from typing import Any
 
-from .catalog import builtin_flow_definition, catalog_by_code, QA_EXTRACTION_SCHEMA
+from .catalog import builtin_flow_definition, catalog_by_code, QA_EXTRACTION_SCHEMA, DEFAULT_CHUNKER_PARAMS
 from .operator_catalog import technical_projection
 from .flow import FlowCompiler, FlowValidationError
 from .entity_types import custom_type_code, entity_type_catalog, normalize_entity_types
@@ -70,10 +70,29 @@ class ManagedFlowDefinition:
     stages: tuple[ManagedStageDefinition, ...]
 
 
-_INPUT_STAGE = ManagedStageDefinition(code="input", name="已审核文档输入", locked=True,
-                                      operator_refs=("reviewed-source-chunk-input",))
+_INPUT_STAGE = ManagedStageDefinition(code="input", name="文档输入", locked=True,
+                                      operator_refs=("document-input",))
+_CHUNK_CONFIG_SCHEMA: dict[str, Any] = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "split_method": {"type": "string", "title": "切分方式", "enum": ["recursive", "sentence"],
+                         "default": "recursive", "x-dataforge-ui": {"supported_by_runtime": ["recursive", "sentence"]}},
+        "chunk_size": {"type": "integer", "title": "目标大小", "minimum": 100, "maximum": 4000, "default": 900},
+        "chunk_overlap": {"type": "integer", "title": "片段重叠", "minimum": 0, "maximum": 1000,
+                          "default": 90, "x-dataforge-ui": {"enabled_if": {"split_method": ["recursive", "sentence"]},
+                                                              "supported_by_runtime": True}},
+        "tokenizer_name": {"type": "string", "title": "Tokenizer", "default": "Qwen/Qwen3-32B",
+                           "x-dataforge-ui": {"visible_if": {"split_method": ["recursive", "sentence"]},
+                                               "supported_by_runtime": True}},
+    },
+}
+_CHUNK_STAGE = ManagedStageDefinition(code="chunking", name="文档切分", locked=True, configurable=True,
+                                      input_contract="parsed_document", output_contract="candidate_flow_chunk_set",
+                                      config_schema=_CHUNK_CONFIG_SCHEMA, operator_refs=("document-chunker",))
+_GATE_STAGE = ManagedStageDefinition(code="input_review", name="自动冻结输入", locked=True,
+                                     input_contract="candidate_flow_chunk_set",
+                                     output_contract="flow_chunk_review_snapshot")
 _TEXT_MAPPING_STAGE = ManagedStageDefinition(
-    code="mapping", name="文本知识映射", input_contract="source_chunk_set",
+    code="mapping", name="文本知识映射", input_contract="flow_chunk_review_snapshot",
     output_contract="candidate:text", operator_refs=("text-knowledge-mapper",),
 )
 _QUALITY_STAGE = ManagedStageDefinition(code="quality", name="图谱校验", locked=True,
@@ -88,28 +107,28 @@ def _generation(name: str, *, config_schema: dict[str, Any] = _LLM_CONFIG_SCHEMA
 
 _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
     ManagedFlowDefinition(code="standard-text", name="文本知识", output_types=("text",), stages=(
-        _INPUT_STAGE, _TEXT_MAPPING_STAGE,
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _TEXT_MAPPING_STAGE,
         _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
-        _INPUT_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-extractor",)),
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-extractor",)),
         _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-triple", name="三元组图谱", output_types=("graph:triple",), stages=(
-        _INPUT_STAGE,
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE,
         _generation("实体关系抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
                     operator_refs=("entity-relation-extractor", "literal-detector", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-graph-semantic", name="语义图谱", output_types=("graph:semantic",), stages=(
-        _INPUT_STAGE,
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE,
         _generation("语义图谱抽取", config_schema=_GRAPH_CONFIG_SCHEMA,
                     operator_refs=("entity-relation-extractor", "literal-detector", "entity-normalizer",
                                    "semantic-relation-builder", "evidence-binder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
     ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph:triple"), stages=(
-        _INPUT_STAGE, _TEXT_MAPPING_STAGE,
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _TEXT_MAPPING_STAGE,
         _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_QA_CONFIG_SCHEMA["properties"]}},
                     operator_refs=("qa-extractor", "entity-relation-extractor", "literal-detector", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
@@ -180,7 +199,14 @@ class ManagedFlowCatalog:
 
     def default_stage_config(self, code: str) -> dict[str, Any]:
         definition = self.get(code)
-        stages = {}
+        presets = {
+            "standard-text": {"split_method": "recursive", "chunk_size": 900, "chunk_overlap": 90},
+            "standard-qa": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 120},
+            "standard-graph-triple": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 0},
+            "standard-graph-semantic": {"split_method": "recursive", "chunk_size": 1100, "chunk_overlap": 0},
+            "standard-multi": {"split_method": "sentence", "chunk_size": 1000, "chunk_overlap": 120},
+        }
+        stages = {"chunking": {"config": {**DEFAULT_CHUNKER_PARAMS, **presets[code]}}}
         if code in {"standard-graph-triple", "standard-graph-semantic", "standard-multi"}:
             stages["generation"] = {"config": {"entity_types": entity_type_catalog()["base"]}}
         return {"schema_version": 1, "template_code": definition.code, "stages": stages}
@@ -257,7 +283,9 @@ class ManagedFlowCompiler:
             for ref in stage.operator_refs:
                 stage_by_ref[ref] = stage
         for node in baseline.get("nodes", []):
-            stage = stage_by_ref.get(node.get("ref")) or (stage_by_code.get("submit") if node.get("kind") == "knowledge_sink" else None)
+            stage = (stage_by_code.get("input_review") if node.get("kind") == "execution_gate"
+                     else stage_by_ref.get(node.get("ref"))
+                     or (stage_by_code.get("submit") if node.get("kind") == "knowledge_sink" else None))
             if stage:
                 node["stage_id"] = stage.code
                 node["stage_code"] = stage.code
@@ -284,6 +312,8 @@ class ManagedFlowCompiler:
             if ref not in stage.operator_refs:
                 continue
             params = node.setdefault("params", {})
+            if ref == "document-chunker":
+                params.update(config)
             if "llm_serving" in config and "llm_serving" in params:
                 params["llm_serving"] = config["llm_serving"]
             if ref == "qa-extractor" and "questions_per_chunk" in config:

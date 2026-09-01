@@ -20,14 +20,13 @@ import SubgraphView from '../views/developer/SubgraphView.vue'
 import ModelServicesView from '../views/developer/ModelServicesView.vue'
 import OperatorCatalogView from '../views/developer/OperatorCatalogView.vue'
 import SubflowListView from '../views/developer/SubflowListView.vue'
-import KnowledgeTypesView from '../views/developer/KnowledgeTypesView.vue'
 
 const routes = [{ path: '/', redirect: '/business/dashboard' }, {
   path: '/', component: WorkspaceLayout, children: [
     { path: '/business/dashboard', component: DashboardView },
     { path: '/business/documents', component: DocumentManagementView },
     { path: '/business/documents/:libraryId', component: DocumentLibraryDetailView, props: true },
-    { path: '/business/documents/:libraryId/sources/:sourceId/versions/:versionId/review', component: DocumentReviewWorkbenchView, props: true, meta: { hideTopbar: true } },
+    { path: '/business/documents/:libraryId/sources/:sourceId/versions/:versionId/parsed', component: DocumentReviewWorkbenchView, props: true, meta: { hideTopbar: true } },
     { path: '/business/jobs', component: JobListView },
     { path: '/business/knowledge', component: KnowledgeBaseView },
     { path: '/business/knowledge/:libraryId', component: KnowledgeLibraryDetailView, props: true },
@@ -42,7 +41,7 @@ const routes = [{ path: '/', redirect: '/business/dashboard' }, {
     { path: '/local/initialization', component: LocalInitializationView },
     { path: '/local/imports/:jobId', component: ImportTaskDetailView },
     { path: '/developer/model-services', component: ModelServicesView },
-    { path: '/developer/knowledge-types', component: KnowledgeTypesView },
+    { path: '/developer/knowledge-types', redirect: '/developer/flow-templates?tab=output-types' },
     { path: '/developer/standard-pipelines', component: PipelineListView },
     { path: '/developer/flow-templates', component: TemplateListView },
     { path: '/developer/flow-templates/subgraphs/:subflowId/revisions/:revision', component: SubgraphView },

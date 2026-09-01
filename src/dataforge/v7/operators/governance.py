@@ -137,7 +137,7 @@ def execute_governance(executor, values, params, context, invoke):
                 continue
             text = value["effective_text"]
         else:
-            if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+            if not all(value.get(key) for key in ("source_knowledge_id", "flow_chunk_id", "source_version_ids")):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 候选来源缺失")
             text = value.get("canonical_content")
         if not isinstance(text, str) and not (executor.code == "ContentNullFilter" and text is None):
@@ -223,7 +223,7 @@ def evaluate_generic(executor, values, business, params, context, invoke):
         raise ValueError("PROMPT_REVISION_NOT_PUBLISHED: 通用评估必须使用已冻结Prompt Revision")
     records = []
     for index, value in enumerate(values):
-        if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+        if not all(value.get(key) for key in ("source_knowledge_id", "flow_chunk_id", "source_version_ids")):
             raise ValueError("SOURCE_LINEAGE_MISSING: 评估候选缺少来源身份")
         text = value.get("canonical_content")
         if not isinstance(text, str) or not text.strip():
@@ -262,12 +262,12 @@ def semantic_deduplicate(executor, values, business, params, context, invoke):
             source = value["source_chunk"]
             text = value["effective_text"]
             versions = [source["source_version_id"]]
-            identity = source["source_chunk_id"]
+            identity = source["flow_chunk_id"]
             if value["disposition"] == "filtered":
                 skipped.append(index)
                 continue
         else:
-            if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+            if not all(value.get(key) for key in ("source_knowledge_id", "flow_chunk_id", "source_version_ids")):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 语义标记缺少来源身份")
             text = value.get("canonical_content")
             versions = value["source_version_ids"]
@@ -328,7 +328,7 @@ def evaluate(values, context, invoke):
         data = value.get("data_json") or {}
         if any(not isinstance(data.get(field), str) or not data[field].strip() for field in ("question", "answer")):
             raise ValueError("QA_OUTPUT_INVALID: 评估需要问题和答案")
-        if not value.get("source_chunk_id") or not value.get("source_version_ids"):
+        if not value.get("flow_chunk_id") or not value.get("source_version_ids"):
             raise ValueError("SOURCE_LINEAGE_MISSING: 评估候选来源缺失")
         records.append({"_df_row": index, "question": data["question"], "answer": data["answer"]})
     arguments = {"input_question_key": "question", "input_answer_key": "answer"}
@@ -370,11 +370,11 @@ def multihop(values, init, context, invoke):
                 identity = f"{chunk['source_id']}|qa|{chunk.get('chunk_index', 0)}|{data['question']}"
                 candidates.append({"source_knowledge_id": hashlib.sha256(identity.encode()).hexdigest(),
                     "canonical_content": f"{data['question']} {data['answer']}", "data_json": data,
-                    "source_version_ids": [chunk["source_version_id"]], "source_chunk_id": chunk["source_chunk_id"],
+                    "source_version_ids": [chunk["source_version_id"]], "flow_chunk_id": chunk["flow_chunk_id"],
                     "source_anchor": f"{chunk.get('filename', '')}#chunk-{chunk.get('chunk_index', 0)}", "is_primary": True})
             outcome["successful"].append(chunk); result.extend(candidates)
             if runtime.get("store") and runtime.get("job_id"):
-                runtime["store"].record_chunk_generation(runtime["job_id"], "qa", chunk, status="completed", candidate_count=len(candidates))
+                runtime["store"].record_chunk_generation(runtime["job_id"], "qa", chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
         except Exception as exc:
             if "OPERATOR_CANCELLED" in str(exc):
                 raise

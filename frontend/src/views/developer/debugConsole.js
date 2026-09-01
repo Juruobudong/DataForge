@@ -7,7 +7,7 @@ export function consoleNodeLabels(runtimeNodes = []) {
     const definition = node.data?.definition || {}
     const role = meta.nodeRole || definition.node_role
     let label = meta.known === false ? '' : operatorLabel(meta)
-    if (role === 'flow_input') label = '已审核文档块'
+    if (role === 'flow_input') label = '文档输入'
     else if (role === 'knowledge_output' || definition.kind === 'knowledge_sink') label = '知识输出'
     return [node.id, label || node.id]
   }))

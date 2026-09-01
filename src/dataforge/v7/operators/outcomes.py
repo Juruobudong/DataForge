@@ -3,7 +3,7 @@ from functools import wraps
 
 
 def _chunk_key(value):
-    version, chunk = value.get("source_version_id"), value.get("source_chunk_id")
+    version, chunk = value.get("source_version_id"), value.get("flow_chunk_id")
     return (str(version), str(chunk)) if version and chunk else None
 
 

@@ -15,7 +15,7 @@ from .operators.custom import CustomOperatorExecutor, PROTECTED, validate_record
 from .operators.runtime import OperatorRuntime, digest
 
 
-ARTIFACT_TYPES = {"source_chunk_set", "entity_candidate_set", "relation_candidate_set", "semantic_relation_set",
+ARTIFACT_TYPES = {"parsed_document", "document_row_set", "flow_chunk_review_snapshot", "entity_candidate_set", "relation_candidate_set", "semantic_relation_set",
                   "candidate:text", "candidate:qa", "candidate:graph:triple", "candidate:graph:semantic"}
 
 
@@ -52,7 +52,7 @@ def validate_manifest(raw):
     Draft202012Validator.check_schema(schema)
     if schema.get("type") != "object" or schema.get("additionalProperties") is not False:
         raise ValueError("参数 Schema 必须显式禁止额外参数")
-    if any(key.startswith("_") or key in {"knowledge_type", "graph_mode", "knowledge_library_id", "source_review_snapshot_id"}
+    if any(key.startswith("_") or key in {"knowledge_type", "graph_mode", "knowledge_library_id", "flow_chunk_review_snapshot_id"}
            for key in schema.get("properties", {})):
         raise ValueError("参数 Schema 不能开放系统运行参数")
     kinds = value.get("knowledge_types", ["text", "qa", "graph"])

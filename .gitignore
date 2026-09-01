@@ -56,3 +56,4 @@ frontend/dist/
 # 临时迁移/审查用的本地 SQLite（含内网地址，二进制文件，禁止提交）
 .tmp-review-migration.db
 .tmp-*.db
+a.py

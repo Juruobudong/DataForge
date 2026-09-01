@@ -7,7 +7,7 @@ import { useFlowHistory } from './composables/useFlowHistory.js'
 import { dataflowOperators } from './__tests__/flowFixtures.js'
 
 const catalog = [
-  { code: 'source', name: 'Source', category: '文档', input_ports: { input: { artifact_type: 'source_file', cardinality: 'one' } }, output_ports: { output: { artifact_type: 'chunk_set', cardinality: 'many' } }, input_example: { input: [{ filename: 'guide.md' }] }, output_example: { output: [{ content: 'example' }] } },
+  { code: 'source', name: 'Source', node_role: 'flow_input', category: '文档', input_ports: { input: { artifact_type: 'parsed_document', cardinality: 'one', binding: 'runtime_input' } }, output_ports: { output: { artifact_type: 'chunk_set', cardinality: 'many' } }, input_example: { input: [{ filename: 'guide.md' }] }, output_example: { output: [{ content: 'example' }] } },
   { code: 'split', name: 'Split', category: '生成', input_ports: { input: { artifact_type: 'chunk_set', cardinality: 'many' } }, output_ports: { qa: { artifact_type: 'candidate:qa' }, text: { artifact_type: 'candidate:text' } } },
 ]
 const node = (id, ref, x = 0) => makeCanvasNode({ id, kind: 'operator', ref, params: {} }, { x, y: 0 }, catalog, [])
@@ -26,7 +26,7 @@ test('multi-port catalog metadata is preserved and subflow ports resolve from en
   assert.deepEqual(Object.keys(resolveNodeMetadata({ kind: 'operator', ref: 'split' }, catalog).outputs), ['qa', 'text'])
   const subflow = { code: 'pipeline', name: 'Pipeline', revision: 2, definition: { entry_node: 'a', exit_node: 'b', nodes: [{ id: 'a', kind: 'operator', ref: 'source' }, { id: 'b', kind: 'operator', ref: 'split' }] } }
   const meta = resolveNodeMetadata({ kind: 'subflow', ref: 'pipeline' }, catalog, [subflow])
-  assert.equal(meta.inputs.input.artifact_type, 'source_file')
+  assert.equal(meta.inputs.input.artifact_type, 'parsed_document')
   assert.equal(meta.outputs.qa.artifact_type, 'candidate:qa')
   assert.deepEqual(meta.inputExample.input, [{ filename: 'guide.md' }])
 })
@@ -34,7 +34,7 @@ test('multi-port catalog metadata is preserved and subflow ports resolve from en
 test('runtime artifact labels use Chinese business terms and readable counts', () => {
   assert.equal(runtimeArtifactLabel('candidate:*', 5), '候选知识 · 5 条')
   assert.equal(runtimeArtifactLabel('candidate:text', 3), '文本候选 · 3 条')
-  assert.equal(runtimeArtifactLabel('approved_source_chunks', 0), '已审核文档块 · 0 条')
+  assert.equal(runtimeArtifactLabel('flow_chunk_review_snapshot', 0), '冻结 Flow 输入快照 · 0 条')
   assert.equal(runtimeArtifactLabel('custom_extension', 2), 'custom_extension · 2 条')
   assert.match(edgeView, /:title="data\?\.technicalLabel \|\| data\?\.label"/)
 })
@@ -122,8 +122,8 @@ test('connection validation covers legal, illegal, duplicate and cardinality cas
   assert.equal(connectionIssue({ source: 'source-2', sourceHandle: 'output', target: 'one', targetHandle: 'input' }, [nodes[0], alternate, oneInput], [{ id: 'used', source: 'source', sourceHandle: 'output', target: 'one', targetHandle: 'input' }]).code, 'INPUT_PORT_ALREADY_CONNECTED')
 })
 
-test('source file input remains a root-only port', () => {
-  const sourceFileProducer = makeCanvasNode({ id: 'file', kind: 'operator', ref: 'file' }, { x: 0, y: 0 }, [{ code: 'file', input_ports: {}, output_ports: { output: { artifact_type: 'source_file' } } }])
+test('ParsedDocument input remains a root-only port', () => {
+  const sourceFileProducer = makeCanvasNode({ id: 'file', kind: 'operator', ref: 'file' }, { x: 0, y: 0 }, [{ code: 'file', input_ports: {}, output_ports: { output: { artifact_type: 'parsed_document' } } }])
   const parser = node('parser', 'source')
   assert.equal(connectionIssue({ source: 'file', sourceHandle: 'output', target: 'parser', targetHandle: 'input' }, [sourceFileProducer, parser], []).code, 'INPUT_NODE_CANNOT_HAVE_INCOMING')
 })

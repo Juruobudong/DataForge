@@ -14,7 +14,7 @@ async function load() {
   finally { if (current === request) pending.value = false }
 }
 watch(() => `${props.item.id}:${props.item.revision}`, load, { immediate: true })
-const label = row => row.purpose === 'source_preparation' ? '系统内置 · 文档预处理' : `${row.authoring_mode === 'standard' ? 'Standard' : 'Advanced'} · ${row.is_builtin ? '内置' : '自定义'}`
+const label = row => `${row.authoring_mode === 'standard' ? 'Standard' : 'Advanced'} · ${row.is_builtin ? '内置' : '自定义'}`
 </script>
 <template>
   <section class="references panel" aria-label="子流程引用">

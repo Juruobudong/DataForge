@@ -1,93 +1,141 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
-import SourcePreviewPane from '../../components/source-review/SourcePreviewPane.vue'
-import ChunkCard from '../../components/source-review/ChunkCard.vue'
-import RechunkDialog from '../../components/source-review/RechunkDialog.vue'
-import SplitChunkDialog from '../../components/source-review/SplitChunkDialog.vue'
-import { shouldPollPreparation } from './documentReviewModel'
+import PdfSourcePreview from '../../components/source-review/PdfSourcePreview.vue'
 
 const route = useRoute(), router = useRouter()
 const libraryId = route.params.libraryId, sourceId = route.params.sourceId, versionId = route.params.versionId
-const detail = ref(null), review = ref(null), latestChunker = ref(null), error = ref(''), busy = ref(false)
-const keyword = ref(''), filter = ref('all'), selectedIds = ref([]), focusedChunkId = ref(''), selectedSourceAnchor = ref({ precision: 'unavailable' })
-const editingId = ref(''), editContent = ref(''), showRechunk = ref(false), showSplit = ref(false), splitTarget = ref(null)
-const metaDetails = ref(null)
-let pollTimer = null
+const detail = ref(null), content = ref(null), anchors = ref(null), selectedAnchor = ref({ precision: 'unavailable' })
+const sheetIndex = ref(0), rowOffset = ref(0), error = ref(''), busy = ref(false)
+const markdownDraft = ref(''), originalMarkdown = ref(''), originalTablePage = ref(null)
+const reviewBusy = ref(false), notice = ref('')
+let active = true, pollTimer = null
 
-const chunks = computed(() => (review.value?.chunks || []).filter(item => {
-  const matchesStatus = filter.value === 'all' || item.review_status === filter.value
-  return matchesStatus && (!keyword.value.trim() || item.content.toLowerCase().includes(keyword.value.trim().toLowerCase()))
-}))
-const selectedChunks = computed(() => (review.value?.chunks || []).filter(item => selectedIds.value.includes(item.id)))
-const reviewableChunks = computed(() => chunks.value.filter(item => item.review_status !== 'approved'))
-const allSelected = computed(() => reviewableChunks.value.length > 0 && reviewableChunks.value.every(item => selectedIds.value.includes(item.id)))
-const someSelected = computed(() => !allSelected.value && reviewableChunks.value.some(item => selectedIds.value.includes(item.id)))
-const canComplete = computed(() => Number(review.value?.counts?.total || 0) > 0 && Number(review.value?.counts?.approved || 0) === Number(review.value?.counts?.total || 0))
-const prep = computed(() => detail.value?.preparation || {})
-const compactChunkSet = computed(() => {
-  const active = detail.value?.chunk_sets?.active
-  if (active) return `当前生效 ${active.chunk_count} Chunk`
-  const candidate = detail.value?.chunk_sets?.candidate
-  return candidate ? `候选 ${candidate.chunk_count} Chunk` : '暂无分块'
-})
+const parsed = computed(() => detail.value?.parsed_document || null)
+const parseJob = computed(() => detail.value?.parse_job || null)
+const source = computed(() => detail.value?.source || {})
+const isPdf = computed(() => String(source.value?.version?.original_filename || source.value?.original_filename || '').toLowerCase().endsWith('.pdf'))
+const anchorItems = computed(() => anchors.value?.anchors || anchors.value?.items || anchors.value?.cells || (Array.isArray(anchors.value) ? anchors.value : []))
+const tableRows = computed(() => content.value?.rows || [])
+const tableColumns = computed(() => Array.from({ length: Number(content.value?.sheet?.column_count || 0) }, (_, index) => index))
+const dirty = computed(() => parsed.value?.kind === 'textual'
+  ? markdownDraft.value !== originalMarkdown.value
+  : JSON.stringify(content.value?.rows || []) !== JSON.stringify(originalTablePage.value?.rows || []))
 
-function schedulePolling() {
-  clearInterval(pollTimer); pollTimer = null
-  if (shouldPollPreparation(prep.value.status)) pollTimer = setInterval(load, 2000)
+function parseLabel() {
+  return { pending: '待解析', queued: '待解析', running: '解析中', completed: '解析成功', failed: '解析失败' }[source.value?.version?.parse_status || parseJob.value?.status] || '待解析'
+}
+function sourceAnchor(item) { return item?.source_anchor || item?.anchor || item || { precision: 'unavailable' } }
+function anchorName(item, index) {
+  const anchor = sourceAnchor(item)
+  if (anchor.page || anchor.page_no) return `第 ${anchor.page || anchor.page_no} 页${anchor.bbox ? ' · 区域' : ''}`
+  if (anchor.sheet_index != null || anchor.row_index != null) return `${anchor.sheet || `Sheet ${Number(anchor.sheet_index || 0) + 1}`} · 行 ${anchor.row_index ?? '—'} · 列 ${anchor.column_index ?? '—'}`
+  return anchor.block_id || anchor.paragraph_id || anchor.markdown_range?.start != null ? `定位 ${index + 1}` : `Anchor ${index + 1}`
+}
+async function loadParsedContent() {
+  if (!parsed.value) { content.value = null; anchors.value = null; return }
+  const params = parsed.value.kind === 'tabular' ? { sheet: sheetIndex.value, offset: rowOffset.value, limit: 200 } : {}
+  const [nextContent, nextAnchors] = await Promise.all([
+    api.parsedDocumentContent(parsed.value.id, params), api.parsedDocumentAnchors(parsed.value.id),
+  ])
+  if (!active) return
+  content.value = nextContent; anchors.value = nextAnchors
+  if (parsed.value.kind === 'textual') {
+    markdownDraft.value = nextContent.markdown || ''; originalMarkdown.value = markdownDraft.value
+  } else originalTablePage.value = structuredClone(nextContent)
 }
 async function load() {
   try {
-    const nextDetail = await api.sourceDetail(sourceId, versionId)
-    detail.value = nextDetail
-    review.value = await api.sourceReview(versionId, nextDetail.chunk_sets?.review_target_id || '')
-    if (focusedChunkId.value) {
-      const focused = (review.value?.chunks || []).find(item => item.id === focusedChunkId.value)
-      if (focused) selectedSourceAnchor.value = focused.anchor || { precision: 'unavailable' }
+    const next = await api.sourceDetail(sourceId, versionId)
+    if (!active) return
+    detail.value = next
+    if (next.parsed_document) {
+      clearInterval(pollTimer); pollTimer = null
+      await loadParsedContent()
+    } else if (['pending', 'queued', 'running'].includes(next.source?.version?.parse_status || next.parse_job?.status)) {
+      if (!pollTimer) pollTimer = setInterval(load, 2000)
     }
-    schedulePolling()
-  } catch (e) { error.value = e.message; clearInterval(pollTimer); pollTimer = null }
+  } catch (value) { error.value = value.message; clearInterval(pollTimer); pollTimer = null }
 }
-async function run(action) { busy.value = true; error.value = ''; try { await action(); await load() } catch (e) { error.value = e.message } finally { busy.value = false } }
-function focusChunk(chunk) { focusedChunkId.value = chunk.id; selectedSourceAnchor.value = chunk.anchor || { precision: 'unavailable' } }
-function selectChunk(chunk, checked) { selectedIds.value = checked ? [...new Set([...selectedIds.value, chunk.id])] : selectedIds.value.filter(id => id !== chunk.id) }
-function startEdit(chunk) { editingId.value = chunk.id; editContent.value = chunk.content; focusChunk(chunk) }
-async function saveChunk(chunk) { await run(() => api.updateSourceChunk(chunk.id, { content: editContent.value, expected_revision_no: chunk.revision_no })); editingId.value = '' }
-function openSplit(chunk) { splitTarget.value = chunk; showSplit.value = true }
-async function confirmSplit(parts) { const chunk = splitTarget.value; showSplit.value = false; splitTarget.value = null; await run(() => api.splitSourceChunk(chunk.id, { parts, expected_revision_no: chunk.revision_no })) }
-async function removeChunk(chunk) { if (confirm('删除该文档块？审核修订仍会保留。')) await run(() => api.deleteSourceChunk(chunk.id, chunk.revision_no)) }
-async function reviewChunk(chunk, status) { await run(() => api.reviewSourceChunk(chunk.id, { status, expected_revision_no: chunk.revision_no })) }
-async function reopenChunk(chunk) { await run(() => api.reopenSourceChunk(chunk.id)) }
-async function mergeSelected() { const values = selectedChunks.value; await run(() => api.mergeSourceChunks({ chunk_ids: values.map(item => item.id), expected_revisions: Object.fromEntries(values.map(item => [item.id, item.revision_no])) })); selectedIds.value = [] }
-async function batch(action) { const values = selectedChunks.value; await run(() => api.batchReviewSourceChunks(versionId, { chunk_ids: values.map(item => item.id), action, expected_revisions: Object.fromEntries(values.map(item => [item.id, item.revision_no])) })); selectedIds.value = [] }
-function toggleSelectAll(checked) { selectedIds.value = checked ? reviewableChunks.value.map(item => item.id) : [] }
-async function approveAll() { const values = reviewableChunks.value; if (!values.length) return; await run(() => api.batchReviewSourceChunks(versionId, { chunk_ids: values.map(item => item.id), action: 'approve', expected_revisions: Object.fromEntries(values.map(item => [item.id, item.revision_no])) })) }
-async function completeReview() { await run(() => api.approveSourceReview(versionId)) }
-async function retryPreparation() { await run(() => api.retrySourcePreparation(versionId)) }
-async function openRechunk() { try { latestChunker.value = await api.sourcePreparationChunker(); showRechunk.value = true } catch (e) { error.value = e.message } }
-async function rechunk(executionSnapshotId) { showRechunk.value = false; await run(() => api.rechunkSourceVersion(versionId, executionSnapshotId)) }
-function closeMetaDetails() { if (metaDetails.value) metaDetails.value.open = false }
+async function retryParse() {
+  busy.value = true; error.value = ''
+  try { await api.retryParseJob(versionId); await load() } catch (value) { error.value = value.message } finally { busy.value = false }
+}
+async function selectSheet(index) { if (dirty.value && !confirm('当前页有未提交校订，切换 Sheet 将丢失这些修改。确定继续吗？')) return; sheetIndex.value = index; rowOffset.value = 0; await loadParsedContent() }
+async function changePage(delta) { if (dirty.value && !confirm('当前页有未提交校订，翻页将丢失这些修改。确定继续吗？')) return; rowOffset.value = Math.max(0, rowOffset.value + delta * 200); await loadParsedContent() }
+function gridUpdates() {
+  const original = new Map((originalTablePage.value?.rows || []).flatMap(row => (row.cells || []).map(cell => [`${row.row_index}:${cell.column_index}`, cell])))
+  return (content.value?.rows || []).flatMap(row => (row.cells || []).flatMap(cell => {
+    const before = original.get(`${row.row_index}:${cell.column_index}`)
+    if (before && before.value === cell.value && before.value_type === cell.value_type) return []
+    let value = cell.value
+    if (cell.value_type === 'empty') value = null
+    else if (cell.value_type === 'number') { value = Number(value); if (!Number.isFinite(value)) throw new Error(`行 ${row.row_index} 列 ${cell.column_index} 不是有效数字`) }
+    else if (cell.value_type === 'boolean') value = value === true || value === 'true'
+    else value = value == null ? '' : String(value)
+    return [{ sheet_index: sheetIndex.value, row_index: row.row_index, column_index: cell.column_index, value, value_type: cell.value_type }]
+  }))
+}
+async function approveParsedDocument() {
+  if (!parsed.value || reviewBusy.value) return
+  reviewBusy.value = true; error.value = ''; notice.value = ''
+  try {
+    const body = {
+      expected_content_digest: parsed.value.content_digest,
+      expected_anchor_map_digest: parsed.value.anchor_map_digest,
+      ...(parsed.value.kind === 'textual' ? { markdown: markdownDraft.value } : { cell_updates: gridUpdates() }),
+    }
+    const result = await api.reviewParsedDocument(parsed.value.id, body)
+    const started = (result.dispatches || []).filter(item => item.knowledge_job_id).length
+    const blocked = (result.dispatches || []).filter(item => ['blocked', 'failed'].includes(item.status)).length
+    notice.value = `解析内容已通过审阅，启动 ${started} 个模板任务${blocked ? `，${blocked} 个绑定被阻塞` : ''}。`
+    await load()
+  } catch (value) { error.value = value.message } finally { reviewBusy.value = false }
+}
+function warnUnsaved(event) { if (!dirty.value) return; event.preventDefault(); event.returnValue = '' }
 
-onMounted(load)
-onBeforeUnmount(() => clearInterval(pollTimer))
+onMounted(() => { load(); window.addEventListener('beforeunload', warnUnsaved) })
+onBeforeRouteLeave(() => !dirty.value || confirm('当前解析校订尚未通过审阅，确定离开吗？'))
+onBeforeUnmount(() => { active = false; clearInterval(pollTimer); window.removeEventListener('beforeunload', warnUnsaved) })
 </script>
 
 <template>
-  <section class="document-review-page">
-    <header class="review-header"><button class="back-button" @click="router.push(`/business/documents/${libraryId}`)">← 返回文档库</button><div class="review-identity"><h2 :title="detail?.source?.original_filename || '文档审核'">{{ detail?.source?.original_filename || '文档审核' }}</h2><span class="badge blue">{{ review?.review_status || prep.status || '加载中' }} · {{ review?.counts?.total || 0 }} Chunk</span></div><details ref="metaDetails" class="review-meta" @keydown.esc.stop="closeMetaDetails"><summary>分块信息 · r{{ detail?.chunker?.revision || '—' }} · {{ compactChunkSet }}</summary><div class="review-meta-panel"><div><b>Source Preparation r{{ detail?.chunker?.revision || '—' }}</b><span>{{ detail?.chunker?.params?.chunk_size || '—' }} 字符 · Overlap {{ detail?.chunker?.params?.overlap_percent ?? '—' }}% · {{ detail?.chunker?.params?.preserve_page_boundary ? '不跨页' : '允许跨页' }}</span></div><div v-if="detail?.chunk_sets?.active"><b>当前生效</b><span>{{ detail.chunk_sets.active.chunk_count }} Chunk · {{ detail.chunk_sets.active.status }}</span></div><div v-if="detail?.chunk_sets?.candidate"><b>候选</b><span>{{ detail.chunk_sets.candidate.chunk_count }} Chunk · {{ detail.chunk_sets.candidate.status }}</span></div></div></details><div class="review-actions"><button v-if="prep.status === 'failed'" class="primary" @click="retryPreparation">重试解析与分块</button><button @click="openRechunk">重新分块</button></div></header>
-    <p v-if="prep.status === 'queued' || prep.status === 'running'" class="notice">{{ prep.current_node ? `正在执行 ${prep.current_node}` : 'Source Preparation 正在运行' }} · {{ prep.completed_nodes || 0 }}/{{ prep.total_nodes || 0 }}</p>
-    <div class="workbench">
-      <SourcePreviewPane :source="detail?.source" :version="detail?.source?.version" :document-ir="detail?.document_ir" :selected-anchor="selectedSourceAnchor" />
-      <section class="chunk-pane"><div class="chunk-toolbar"><header><div><h3>Chunk 审核</h3><span>待审 {{ review?.counts?.pending_review || 0 }} · 通过 {{ review?.counts?.approved || 0 }} · 拒绝 {{ review?.counts?.rejected || 0 }}</span></div><div class="filters"><input v-model="keyword" placeholder="搜索 Chunk"><select v-model="filter"><option value="all">全部</option><option value="pending_review">待审</option><option value="approved">通过</option><option value="rejected">拒绝</option></select></div></header><div class="bulk"><label class="select-all"><input type="checkbox" :checked="allSelected" :indeterminate.prop="someSelected" @change="toggleSelectAll($event.target.checked)"> 全选</label><span>已选 {{ selectedIds.length }}</span><button :disabled="selectedIds.length < 1 || busy" @click="batch('approve')">批量通过</button><button :disabled="selectedIds.length < 1 || busy" @click="batch('reject')">批量拒绝</button><button :disabled="selectedIds.length < 2 || busy" @click="mergeSelected">合并连续 Chunk</button><button class="primary" :disabled="busy || reviewableChunks.length < 1" @click="approveAll">一键通过全部</button></div></div><ChunkCard v-for="chunk in chunks" :key="chunk.id" :chunk="chunk" :focused="focusedChunkId === chunk.id" :checked="selectedIds.includes(chunk.id)" :editing="editingId === chunk.id" :edit-content="editContent" :busy="busy" @select="selectChunk" @focus="focusChunk" @edit="startEdit" @update:edit-content="editContent=$event" @save="saveChunk" @cancel="editingId=''" @split="openSplit" @remove="removeChunk" @review="reviewChunk" @reopen="reopenChunk" /><p v-if="!chunks.length" class="empty">{{ prep.status === 'failed' ? '解析失败，尚无候选 Chunk。' : '当前筛选没有 Chunk。' }}</p><footer class="complete"><button class="primary" :disabled="busy || !canComplete" @click="completeReview">完成审核</button></footer></section>
-    </div>
-    <RechunkDialog v-if="showRechunk" :current="detail?.chunker" :latest="latestChunker" :busy="busy" @close="showRechunk=false" @submit="rechunk" />
-    <SplitChunkDialog v-if="showSplit" :chunk="splitTarget" :busy="busy" @close="showSplit=false; splitTarget=null" @submit="confirmSplit" />
+  <section class="parsed-document-page">
+    <header class="parsed-header">
+      <button @click="router.push(`/business/documents/${libraryId}`)">← 返回文档库</button>
+      <div><h2>{{ source.original_filename || source.version?.original_filename || '文档解析结果' }}</h2><p>校订当前解析内容并通过审阅后，系统会自动运行全部绑定模板。</p></div>
+      <span :class="['badge', parsed?.review_status === 'approved' ? 'green' : parseLabel() === '解析失败' ? 'red' : 'amber']">{{ parsed?.review_status === 'approved' ? '审阅已通过' : parseLabel() }}</span>
+      <button v-if="parsed" class="primary" :disabled="reviewBusy" @click="approveParsedDocument">{{ reviewBusy ? '提交中…' : parsed.review_status === 'approved' ? '保存新校订并重新运行' : '通过审阅并运行' }}</button>
+      <button v-if="parseLabel() === '解析失败'" class="primary" :disabled="busy" @click="retryParse">{{ busy ? '重试中…' : '重试解析' }}</button>
+    </header>
+
+    <p v-if="parseLabel() === '解析中' || parseLabel() === '待解析'" class="notice">ParseJob {{ parseJob?.attempt_no || 1 }} 正在处理；上传不会自动执行分块或知识流程。</p>
+    <p v-if="notice" class="notice" role="status">{{ notice }}</p>
     <p v-if="error" class="error">{{ error }}</p>
+
+    <section v-if="parsed" class="parsed-meta panel">
+      <div><small>内容契约</small><b>{{ parsed.kind }} · {{ parsed.content_format }}</b></div>
+      <div><small>Parser Revision</small><b>{{ parsed.parser_adapter }} · {{ parsed.parser_revision }}</b></div>
+      <div><small>内容摘要</small><code>{{ parsed.content_digest }}</code></div>
+      <div><small>Anchor 摘要</small><code>{{ parsed.anchor_map_digest }}</code></div>
+    </section>
+
+    <div v-if="parsed?.kind === 'textual'" class="textual-layout">
+      <PdfSourcePreview v-if="isPdf" :url="api.sourcePreviewUrl(sourceId, versionId)" :anchor="selectedAnchor" />
+      <section v-else class="source-info panel"><h3>原文件信息</h3><dl><div><dt>文件</dt><dd>{{ source.version?.original_filename }}</dd></div><div><dt>类型</dt><dd>{{ source.version?.media_type || '—' }}</dd></div><div><dt>大小</dt><dd>{{ source.version?.size_bytes || 0 }} bytes</dd></div></dl><p>DOCX、HTML、MD 与 TXT 的结构定位由右侧 Markdown range 与 paragraph/table Anchor 联动。</p></section>
+      <section class="markdown-pane panel"><header><div><h3>规范化 Markdown</h3><p>可修正 OCR/解析结果；批准后会创建新的不可变修订。</p></div><span v-if="dirty" class="badge amber">未提交校订</span></header><textarea v-model="markdownDraft" aria-label="Markdown 校订内容" spellcheck="false"></textarea></section>
+      <aside class="anchor-pane panel"><h3>SourceAnchor</h3><button v-for="(item, index) in anchorItems" :key="item.id || index" :class="{ active: selectedAnchor === sourceAnchor(item) }" @click="selectedAnchor=sourceAnchor(item)">{{ anchorName(item, index) }}</button><p v-if="!anchorItems.length">当前解析器未返回可交互 Anchor。</p></aside>
+    </div>
+
+    <section v-else-if="parsed?.kind === 'tabular'" class="table-layout panel">
+      <header><div><h3>Table Grid</h3><p>保留原始 row/column index、空单元格和值类型；不会拼接成 Markdown。</p></div><div class="actions"><button v-for="index in content?.sheet_count || 0" :key="index" :class="{ primary: sheetIndex === index - 1 }" @click="selectSheet(index - 1)">Sheet {{ index }}</button></div></header>
+      <div class="table-scroll"><table><thead><tr><th>row</th><th v-for="column in tableColumns" :key="column">c{{ column }}</th></tr></thead><tbody><tr v-for="row in tableRows" :key="row.row_index"><th>{{ row.row_index }}</th><td v-for="cell in row.cells || []" :key="cell.column_index" :class="{ empty: cell.value_type === 'empty' }" @click="selectedAnchor={ sheet_index: sheetIndex, sheet: content?.sheet?.name, row_index: row.row_index, column_index: cell.column_index }"><select v-model="cell.value_type" :aria-label="`行 ${row.row_index} 列 ${cell.column_index} 类型`"><option value="empty">empty</option><option value="string">string</option><option value="number">number</option><option value="boolean">boolean</option></select><select v-if="cell.value_type === 'boolean'" v-model="cell.value"><option :value="true">true</option><option :value="false">false</option></select><input v-else v-model="cell.value" :disabled="cell.value_type === 'empty'" :aria-label="`行 ${row.row_index} 列 ${cell.column_index} 值`"></td></tr></tbody></table></div>
+      <footer><button :disabled="rowOffset === 0" @click="changePage(-1)">上一页</button><span>{{ rowOffset + 1 }}–{{ Math.min(rowOffset + 200, content?.total || 0) }} / {{ content?.total || 0 }}</span><button :disabled="rowOffset + 200 >= (content?.total || 0)" @click="changePage(1)">下一页</button></footer>
+    </section>
   </section>
 </template>
 
 <style scoped>
-.document-review-page{display:flex;min-height:0;flex-direction:column}.review-header{position:relative;z-index:8;display:grid;min-height:46px;flex:none;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:10px}.review-identity{display:flex;min-width:0;align-items:center;gap:9px}.review-identity h2{min-width:0;overflow:hidden;margin:0;font-size:20px;text-overflow:ellipsis;white-space:nowrap}.review-identity .badge{flex:none}.review-meta{position:relative}.review-meta summary{min-height:38px;padding:9px 12px;border:1px solid var(--border);border-radius:8px;color:#405069;background:#fff;font-size:var(--font-assist);font-weight:750;cursor:pointer;white-space:nowrap}.review-meta-panel{position:absolute;top:calc(100% + 8px);right:0;z-index:20;display:flex;width:min(560px,calc(100vw - 40px));gap:20px;flex-wrap:wrap;padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:0 16px 42px rgba(30,51,82,.18)}.review-meta-panel div{display:grid;gap:3px}.review-meta-panel span,.chunk-toolbar header span{color:var(--muted);font-size:var(--font-assist)}.review-actions{display:flex;align-items:center;gap:8px}.notice{flex:none;padding:10px 12px;border:1px solid #bad0f5;border-radius:8px;background:var(--blue-soft);color:#405069}.workbench{display:grid;min-height:0;flex:1;grid-template-columns:minmax(0,1fr) minmax(440px,1fr);grid-template-rows:minmax(0,1fr);gap:16px;overflow:hidden;margin-top:10px}.chunk-pane{height:100%;min-width:0;min-height:0;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--border);border-radius:12px;background:#f7f9fc}.chunk-toolbar{position:sticky;top:0;z-index:3;background:#fff;box-shadow:0 1px 0 var(--border)}.chunk-toolbar>header{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--border);background:#fff}.chunk-pane h3{margin:0}.filters,.bulk{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.bulk{padding:10px 12px;background:#fff}.select-all{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}.empty{padding:40px;text-align:center;color:var(--muted)}.complete{position:sticky;bottom:0;z-index:2;display:flex;justify-content:flex-end;padding:12px;border-top:1px solid var(--border);background:#fff}
-@media(min-width:901px){.document-review-page{height:100%;overflow:hidden}}
+  .parsed-document-page{display:grid;min-height:0;gap:14px}.parsed-header{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto auto;align-items:center;gap:12px}.parsed-header h2,.parsed-header p{margin:0}.parsed-header p{margin-top:4px;color:var(--muted)}.notice{padding:10px 12px;border:1px solid #bad0f5;border-radius:8px;background:var(--blue-soft)}.parsed-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.parsed-meta div{display:grid;gap:5px}.parsed-meta small{color:var(--muted)}.parsed-meta code{overflow:hidden;text-overflow:ellipsis}.textual-layout{display:grid;min-height:620px;grid-template-columns:minmax(300px,1fr) minmax(380px,1.15fr) 220px;gap:14px}.source-info dl div{display:grid;grid-template-columns:90px 1fr;padding:10px 0;border-bottom:1px solid var(--border)}.source-info dt{color:var(--muted)}.source-info dd{margin:0}.markdown-pane,.anchor-pane{min-height:0;overflow:auto}.markdown-pane textarea{box-sizing:border-box;width:100%;min-height:540px;padding:14px;border:1px solid var(--border);border-radius:8px;resize:vertical;background:#fbfcfe;font:13px/1.75 ui-monospace,SFMono-Regular,Consolas,monospace}.anchor-pane{display:flex;flex-direction:column;gap:7px}.anchor-pane button{text-align:left}.anchor-pane button.active{border-color:var(--blue);color:var(--blue);background:var(--blue-soft)}.table-layout header,.table-layout footer{display:flex;align-items:center;justify-content:space-between;gap:12px}.table-layout h3,.table-layout p{margin:0}.table-scroll{overflow:auto;margin:14px 0;max-height:650px}.table-scroll th{position:sticky;top:0;background:#f3f6fa}.table-scroll td,.table-scroll th{min-width:110px}.table-scroll td select,.table-scroll td input{box-sizing:border-box;width:100%;margin:2px 0}.table-scroll td.empty{background:#f7f8fa;color:#a5adba}.table-layout footer{justify-content:flex-end}@media(max-width:1100px){.textual-layout{grid-template-columns:1fr}.parsed-meta{grid-template-columns:1fr 1fr}}@media(max-width:720px){.parsed-header,.parsed-meta{grid-template-columns:1fr}.textual-layout{min-height:0}}
 </style>

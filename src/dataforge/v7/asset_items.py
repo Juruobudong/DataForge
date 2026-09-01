@@ -6,26 +6,26 @@ import uuid
 
 from sqlalchemy import select
 
-from .models import KnowledgeAssetItem, KnowledgeItemSource, SourceVersion, Source
+from .models import KnowledgeAssetItem, KnowledgeEvidence, SourceVersion, Source
 
 
 def freeze_asset_items(session, asset, items):
     session.flush()
     for item in items:
         evidence = []
-        rows = session.execute(select(KnowledgeItemSource, SourceVersion, Source).join(
-            SourceVersion, SourceVersion.id == KnowledgeItemSource.source_version_id,
+        rows = session.execute(select(KnowledgeEvidence, SourceVersion, Source).join(
+            SourceVersion, SourceVersion.id == KnowledgeEvidence.source_version_id,
         ).join(Source, Source.id == SourceVersion.source_id).where(
-            KnowledgeItemSource.knowledge_item_id == item.id,
-        ).order_by(KnowledgeItemSource.id)).all()
+            KnowledgeEvidence.knowledge_item_id == item.id,
+        ).order_by(KnowledgeEvidence.id)).all()
         for link, version, source in rows:
             evidence.append({
                 "source_id": source.id, "source_name": source.name,
                 "original_filename": version.original_filename, "relative_path": source.relative_path,
                 "source_version_id": version.id, "source_version_no": version.version_no,
-                "source_chunk_id": link.source_chunk_id,
-                "source_chunk_revision_id": link.source_chunk_revision_id,
-                "source_review_snapshot_id": link.source_review_snapshot_id,
+                "flow_chunk_id": link.flow_chunk_id,
+                "flow_chunk_revision_id": link.flow_chunk_revision_id,
+                "flow_chunk_review_snapshot_id": link.flow_chunk_review_snapshot_id,
                 "source_anchor": link.source_anchor, "anchor": deepcopy(link.anchor_json),
                 "evidence_text": link.evidence_text, "is_primary": link.is_primary,
             })

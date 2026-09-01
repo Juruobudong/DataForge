@@ -12,6 +12,8 @@ const library = ref(null), items = ref([]), changes = ref([]), vector = ref(null
 const reviewSummary = ref(null), selectedIds = ref([]), reviewBusy = ref(false), publishBusy = ref(false)
 const deletion = ref(null), deletionJobs = ref([]), tab = ref('content'), error = ref(''), loading = ref(false)
 const schemaFacets = ref(null), schemaFacetsLoading = ref(false)
+const inputJobs = ref([]), selectedInputJobId = ref(''), inputPreparations = ref([]), inputReviewLoading = ref(false), inputActionBusy = ref(false)
+const activeFlowReview = ref(null), selectedFlowChunkIds = ref([])
 const qaListing = ref({ items: [], total: 0, page: 1, page_size: 50 })
 const qaSearch = ref(''), qaSearchDraft = ref(''), qaStatus = ref('active'), qaPage = ref(1)
 const qaLoading = ref(false), qaError = ref('')
@@ -33,6 +35,7 @@ const allSelected = computed(() => selectableItems.value.length > 0 && selectabl
 const someSelected = computed(() => !allSelected.value && selectableItems.value.some(item => selectedIds.value.includes(item.id)))
 const qaPages = computed(() => qaPageCount(qaListing.value.total, qaListing.value.page_size || 50))
 const qaHasFilters = computed(() => Boolean(qaSearch.value) || qaStatus.value !== 'active')
+const selectedInputJob = computed(() => inputJobs.value.find(item => item.id === selectedInputJobId.value) || null)
 
 function syncQaFiltersFromRoute() {
   const filters = normalizeQaFilters(route.query)
@@ -94,6 +97,8 @@ async function load() {
     deletion.value = null
     sources.value = []
     schemaFacets.value = null; schemaFacetsLoading.value = false
+    inputJobs.value = []; selectedInputJobId.value = ''; inputPreparations.value = []
+    activeFlowReview.value = null; selectedFlowChunkIds.value = []
     selectedIds.value = []
   } catch (err) {
     error.value = err.message
@@ -160,6 +165,49 @@ function closeDrawer(restoreFocus = true) {
   lastFocusedElement = null
   if (restoreFocus && focusTarget?.focus) nextTick(() => focusTarget.focus())
 }
+
+async function loadInputReview() {
+  if (inputReviewLoading.value) return
+  inputReviewLoading.value = true; error.value = ''
+  try {
+    const jobs = await api.knowledgeJobs()
+    inputJobs.value = jobs.filter(job => Object.values(job.sink_library_ids || job.output_library_ids || {}).includes(libraryId.value))
+    if (!inputJobs.value.some(job => job.id === selectedInputJobId.value)) selectedInputJobId.value = inputJobs.value[0]?.id || ''
+    inputPreparations.value = selectedInputJobId.value ? (await api.knowledgeJobInputPreparations(selectedInputJobId.value)).inputs : []
+  } catch (err) { error.value = err.message }
+  finally { inputReviewLoading.value = false }
+}
+async function chooseInputJob() { inputPreparations.value = selectedInputJobId.value ? (await api.knowledgeJobInputPreparations(selectedInputJobId.value)).inputs : [] }
+async function runInputAction(kind) {
+  const job = selectedInputJob.value
+  if (!job || inputActionBusy.value) return
+  const reprepare = kind === 'reprepare'
+  const message = reprepare
+    ? '重新准备输入会强制创建新的 FlowChunkSet，并要求重新审核；不会复用当前冻结快照。确认继续？'
+    : '重新生成知识会复用所选冻结 Snapshot，只执行 Gate 下游，不会重新调用 Chunker。确认继续？'
+  if (!window.confirm(message)) return
+  inputActionBusy.value = true; error.value = ''
+  try {
+    await (reprepare ? api.reprepareKnowledgeJobInput(job.id) : api.regenerateKnowledgeJob(job.id))
+    await loadInputReview()
+  } catch (err) { error.value = err.message }
+  finally { inputActionBusy.value = false }
+}
+async function retryFailedUnits() {
+  if (!selectedInputJob.value || inputActionBusy.value) return
+  inputActionBusy.value = true; error.value = ''
+  try { await api.retryFailedGenerationUnits(selectedInputJob.value.id); await loadInputReview() }
+  catch (err) { error.value = err.message }
+  finally { inputActionBusy.value = false }
+}
+async function openFlowReview(setId) { activeFlowReview.value = await api.flowChunkSetReview(setId); selectedFlowChunkIds.value = [] }
+async function refreshFlowReview() { if (activeFlowReview.value?.flow_chunk_set?.id) await openFlowReview(activeFlowReview.value.flow_chunk_set.id) }
+async function reviewFlowChunk(chunk, status) { await api.reviewFlowChunk(chunk.id, { status, expected_revision_no: chunk.revision_no }); await refreshFlowReview() }
+async function editFlowChunk(chunk) { const content = window.prompt('修改 FlowChunk 内容', chunk.content); if (content == null || content === chunk.content) return; await api.updateFlowChunk(chunk.id, { content, expected_revision_no: chunk.revision_no }); await refreshFlowReview() }
+async function splitFlowChunk(chunk) { const value = window.prompt('用空行分隔拆分后的片段', chunk.content); const parts = String(value || '').split(/\n\s*\n/).map(item => item.trim()).filter(Boolean); if (parts.length < 2) return; await api.splitFlowChunk(chunk.id, { parts, expected_revision_no: chunk.revision_no }); await refreshFlowReview() }
+async function mergeSelectedFlowChunks() { const chunks = activeFlowReview.value.chunks.filter(item => selectedFlowChunkIds.value.includes(item.id)); if (chunks.length < 2) return; await api.mergeFlowChunks({ chunk_ids: chunks.map(item => item.id), expected_revisions: Object.fromEntries(chunks.map(item => [item.id, item.revision_no])) }); await refreshFlowReview() }
+async function batchReviewFlowChunks(status) { const chunks = activeFlowReview.value.chunks.filter(item => selectedFlowChunkIds.value.includes(item.id)); if (!chunks.length) return; await api.batchReviewFlowChunks({ chunk_ids: chunks.map(item => item.id), action: status, expected_revisions: Object.fromEntries(chunks.map(item => [item.id, item.revision_no])) }); await refreshFlowReview() }
+async function freezeActiveFlowSet() { await api.freezeFlowChunkSet(activeFlowReview.value.flow_chunk_set.id); activeFlowReview.value = null; await loadInputReview() }
 
 function toggleSelectAll(checked) { selectedIds.value = checked ? selectableItems.value.map(item => item.id) : [] }
 async function refreshKnowledgeState() {
@@ -267,7 +315,7 @@ function sourceAnchor(source) {
 }
 
 watch(libraryId, load, { immediate: true })
-watch(tab, value => { if (value === 'schema') loadSchemaFacets() })
+watch(tab, value => { if (value === 'schema') loadSchemaFacets(); if (value === 'input-review') loadInputReview() })
 watch(
   () => [route.query.q, route.query.status, route.query.page],
   async () => {
@@ -312,6 +360,7 @@ watch(
       </details>
       <nav class="tabs">
         <button :class="{ active: tab === 'content' }" @click="tab = 'content'">知识内容</button>
+        <button :class="{ active: tab === 'input-review' }" @click="tab = 'input-review'">Flow 输入快照</button>
         <button :class="{ active: tab === 'diff' }" @click="tab = 'diff'">Knowledge Diff</button>
         <button :class="{ active: tab === 'vector' }" @click="tab = 'vector'">向量状态</button>
         <button v-if="!isQa" :class="{ active: tab === 'sources' }" @click="tab = 'sources'">来源追踪</button>
@@ -389,6 +438,12 @@ watch(
           <table><thead><tr><th v-if="isText"><input type="checkbox" :checked="allSelected" :indeterminate.prop="someSelected" aria-label="全选文本知识" @change="toggleSelectAll($event.target.checked)"></th><th>内容</th><th>来源</th><th>{{ isText ? '审核状态' : '状态' }}</th><th></th></tr></thead><tbody><tr v-for="item in items" :key="item.id"><td v-if="isText"><input v-model="selectedIds" type="checkbox" :value="item.id" :aria-label="`选择知识 ${item.source_knowledge_id}`"></td><td>{{ item.canonical_content }}</td><td>{{ item.source_count || item.source_version_ids?.length || 0 }}</td><td><span v-if="isText" :class="['badge', reviewStatusClass(item.review_status)]">{{ reviewStatusLabel(item.review_status) }}</span><span v-else>{{ item.status }}</span></td><td><button v-if="isText" @click="openQaDrawer(item, $event)">编辑审核</button><button v-else @click="trace(item)">查看来源</button></td></tr><tr v-if="!items.length"><td :colspan="isText ? 5 : 4" class="empty-cell">暂无知识内容。</td></tr></tbody></table>
         </div>
       </template>
+      <section v-else-if="tab === 'input-review'" class="panel input-review-panel">
+        <div class="panel-head"><div><h3>Flow 输入快照</h3><p>解析内容人工审阅后，系统按 Flow Revision 自动切分并冻结不可变 Snapshot；Multi 结果库共享同一快照。</p></div><button :disabled="inputReviewLoading" @click="loadInputReview">刷新</button></div>
+        <label>Knowledge Job<select v-model="selectedInputJobId" :disabled="inputReviewLoading" @change="chooseInputJob"><option value="">暂无关联任务</option><option v-for="job in inputJobs" :key="job.id" :value="job.id">{{ job.template?.name || job.knowledge_flow_template_id }} · {{ job.id }} · {{ job.status }}</option></select></label>
+        <div v-if="selectedInputJob" class="input-actions"><button class="primary" :disabled="inputActionBusy || !inputPreparations.some(item => item.flow_chunk_review_snapshot_id)" @click="runInputAction('regenerate')">重新生成知识</button><button :disabled="inputActionBusy" @click="runInputAction('reprepare')">重新准备输入</button><button :disabled="inputActionBusy || !selectedInputJob.failed_chunk_count" @click="retryFailedUnits">重试失败分支</button></div>
+        <div class="input-cards"><article v-for="item in inputPreparations" :key="item.id"><header><b>{{ item.parsed_document?.metadata?.filename || item.parsed_document?.id }}</b><span :class="['badge', item.status === 'ready' ? 'green' : 'amber']">{{ item.status }}</span></header><dl><div><dt>Flow Revision</dt><dd><code>{{ selectedInputJob?.knowledge_flow_template_revision_id }}</code></dd></div><div><dt>Approved ParsedDocument</dt><dd><code>{{ item.parsed_document?.id }}</code></dd></div><div><dt>FlowChunkSet</dt><dd><code>{{ item.flow_chunk_set?.id || '整文直连，无需分块' }}</code></dd></div><div><dt>自动冻结 Snapshot</dt><dd><code>{{ item.flow_chunk_review_snapshot_id || '系统正在准备输入' }}</code></dd></div></dl></article><p v-if="!inputPreparations.length">当前知识库还没有可展示的 Flow 输入任务。</p></div>
+      </section>
       <div v-else-if="tab === 'diff'" class="change-list"><article v-for="change in changes" :key="change.id"><b>{{ change.change_type }}</b><p>{{ change.before?.content || change.before_hash || '—' }} → {{ change.after?.content || change.after_hash || '—' }}</p></article><p v-if="!changes.length" class="empty-group">暂无变更记录。</p></div>
       <div v-else-if="tab === 'vector'" class="panel"><p>Vector Ready：<b>{{ vector?.ready ? '已就绪' : '未就绪' }}</b></p><pre>{{ JSON.stringify(vector?.record_states || {}, null, 2) }}</pre></div>
       <div v-else-if="tab === 'sources'">
@@ -477,7 +532,9 @@ watch(
 <style scoped>
 .back-link{margin-bottom:18px;border:0;color:var(--blue);background:transparent;padding:0;font-size:14px}.detail-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.detail-head h2{margin:6px 0 0;font-size:26px}.detail-type{color:var(--blue);font-size:14px;font-weight:800}.technical-id{min-height:0;margin-top:8px;padding:0;border:0;color:var(--muted);background:transparent;font-size:12px;font-weight:600}.detail-metrics{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:18px 0;color:var(--muted);font-size:14px}.detail-metrics b{color:var(--text);font-size:18px}.library-technical-details{margin:0 0 18px;padding:10px 14px;border:1px solid var(--border);border-radius:9px;background:var(--panel-muted)}.library-technical-details summary{cursor:pointer;color:var(--muted);font-weight:700}.library-technical-details dl{display:grid;gap:8px;margin:12px 0 0}.library-technical-details dl div{display:grid;grid-template-columns:180px minmax(0,1fr);gap:12px}.library-technical-details dd{display:grid;gap:4px;margin:0;overflow-wrap:anywhere}.change-list,.source-list{display:grid;gap:10px}.change-list article,.source-list article,.deletion-panel{padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}.change-list p,.source-list p{margin:8px 0 0;line-height:1.65}.source-list b,.source-list small{display:block}.source-list small{margin-top:5px;color:var(--muted);font-size:13px}.deletion-panel{margin-top:18px}.deletion-panel h3{margin:0;font-size:16px}.deletion-panel pre{max-height:240px;margin:12px 0}.deletion-job{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}.deletion-job small{overflow:hidden;color:var(--muted);text-overflow:ellipsis;white-space:nowrap}.empty-cell,.loading{color:var(--muted);text-align:center}.schema-panel h3{margin:0;font-size:16px}.schema-panel h4{margin:16px 0 6px;font-size:14px}.schema-panel ul{list-style:none;margin:0;padding:0}.schema-panel li{display:flex;align-items:center;gap:8px;padding:7px 0;border-top:1px solid var(--border)}.schema-panel li b{margin-right:8px}.schema-panel code{font-size:12px;color:var(--muted)}.schema-panel .schema-sub{margin:10px 0 4px;color:var(--muted);font-size:12px;font-weight:700}.schema-panel .schema-count{margin-left:auto;color:var(--muted);font-size:12px}
 .knowledge-review-toolbar{display:grid;gap:10px;margin:0 0 16px;padding:14px 16px;border:1px solid var(--border);border-radius:12px;background:var(--panel)}.review-counts,.review-actions{display:flex;align-items:center;flex-wrap:wrap;gap:12px}.review-counts span{color:var(--muted)}.review-counts b{color:var(--text)}.review-actions{justify-content:flex-end}.review-issues{margin:0;color:#a16207;font-size:13px}.drawer-review-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}.qa-full-content label,.drawer-section>label{display:grid;gap:6px;margin-bottom:12px;color:var(--muted);font-size:13px;font-weight:700}.qa-full-content input,.qa-full-content textarea,.drawer-section>label textarea{width:100%;resize:vertical}.qa-full-content small{display:block;margin-top:10px;color:var(--muted);line-height:1.5}.qa-select-col{width:42px}
+.input-review-panel{display:grid;gap:14px}.input-review-panel>label{display:grid;max-width:720px;gap:6px;color:var(--muted);font-size:13px;font-weight:700}.input-actions{display:flex;flex-wrap:wrap;gap:8px}.input-cards{display:grid;gap:10px}.input-cards article{padding:14px;border:1px solid var(--border);border-radius:10px;background:var(--panel-muted)}.input-cards header{display:flex;align-items:center;justify-content:space-between;gap:12px}.input-cards dl{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.input-cards dt{color:var(--muted);font-size:12px}.input-cards dd{min-width:0;margin:5px 0 0}.input-cards code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.flow-review-workbench{display:grid;gap:10px;padding:14px;border:1px solid #b8cdf0;border-radius:12px;background:#fff}.flow-review-workbench>header{display:flex;align-items:flex-start;justify-content:space-between}.flow-review-workbench h4,.flow-review-workbench header p{margin:0}.flow-review-workbench header p{margin-top:4px;color:var(--muted)}.flow-chunk-row{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:start;gap:12px;padding:12px;border:1px solid var(--border);border-radius:9px}.flow-chunk-row p{margin:6px 0;line-height:1.65;white-space:pre-wrap}.flow-chunk-row small{color:var(--muted)}
 .qa-content{display:grid;gap:12px}.qa-toolbar{display:flex;align-items:flex-end;justify-content:space-between;gap:20px}.qa-toolbar h3{margin:0;color:var(--text);font-size:20px}.qa-toolbar h3 span{color:var(--blue)}.qa-toolbar p{margin:5px 0 0;color:var(--muted);font-size:13px}.qa-filters{display:grid;grid-template-columns:minmax(280px,420px) 130px auto;align-items:center;margin:0}.qa-filters input,.qa-filters select{width:100%;min-width:0}.qa-table-wrap{border-radius:12px}.qa-table{min-width:920px;table-layout:fixed}.qa-question-col{width:33%}.qa-answer-col{width:41%}.qa-status-col{width:8%}.qa-time-col{width:11%}.qa-action-col{width:7%}.qa-table th{height:38px;padding:0 10px;white-space:nowrap}.qa-table td{height:42px;min-height:42px;padding:0 10px}.qa-row{cursor:pointer}.qa-row:hover td,.qa-row:focus td{background:#f6f9ff}.qa-row:focus{outline:0}.qa-row:focus-visible td:first-child{box-shadow:inset 3px 0 var(--blue)}.qa-cell{overflow:hidden;color:var(--text);font-weight:700;text-overflow:ellipsis;white-space:nowrap}.qa-cell.qa-answer{color:#59677a;font-weight:500}.qa-time{color:var(--muted);font-size:12px;white-space:nowrap}.qa-table td:last-child button{min-height:30px;padding:0 9px;white-space:nowrap}.qa-pagination{display:flex;align-items:center;justify-content:space-between;color:var(--muted);font-size:13px}.qa-pagination>div{display:flex;gap:7px}.qa-pagination button{min-height:34px}
 .drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.qa-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(560px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.qa-drawer.text-review-drawer{width:min(1040px,100%)}.qa-drawer>header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 22px;border-bottom:1px solid var(--border)}.qa-drawer>header small{color:var(--blue);font-weight:800}.qa-drawer>header h3{margin:4px 0 0;font-size:20px}.drawer-body{display:grid;align-content:start;gap:14px;overflow-y:auto;padding:18px 22px 28px;background:var(--bg)}.text-review-layout{grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:'evidence editor' 'evidence management' 'evidence review';align-items:start}.text-review-layout .evidence-section{grid-area:evidence;position:sticky;top:0;max-height:calc(100vh - 120px);overflow:auto}.text-review-layout .editor-section{grid-area:editor}.text-review-layout .management-section{grid-area:management}.text-review-layout .review-section{grid-area:review}.drawer-section{padding:17px;border:1px solid var(--border);border-radius:12px;background:#fff}.drawer-section h4{margin:0 0 12px;font-size:15px}.qa-full-content span{display:block;color:var(--blue);font-size:12px;font-weight:850}.qa-full-content p{margin:6px 0 18px;color:var(--text);font-size:15px;line-height:1.75;white-space:pre-wrap}.qa-full-content p:last-child{margin-bottom:0}.drawer-section dl{display:grid;gap:9px;margin:0}.drawer-section dl>div{display:grid;grid-template-columns:90px minmax(0,1fr);gap:10px;padding-top:9px;border-top:1px solid #edf0f4}.drawer-section dl>div:first-child{padding-top:0;border-top:0}.drawer-section dt{color:var(--muted);font-size:13px}.drawer-section dd{min-width:0;margin:0;color:#46546a;font-size:13px}.drawer-section code{display:block;overflow-wrap:anywhere;font-size:12px}.drawer-source-list{display:grid;gap:10px}.drawer-source-list article{padding:12px;border:1px solid #e5eaf1;border-radius:9px;background:var(--panel-muted)}.drawer-source-list article>div{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.drawer-source-list b{color:var(--text)}.drawer-source-list span{flex:0 0 auto;color:var(--muted);font-size:12px}.drawer-source-list p{margin:9px 0 0;color:#59677a;font-size:13px;line-height:1.65}.drawer-section .error{margin:0}
-@media(max-width:1100px){.qa-toolbar{align-items:stretch;flex-direction:column}.qa-filters{grid-template-columns:minmax(240px,1fr) 130px auto}.text-review-layout{grid-template-columns:1fr;grid-template-areas:'editor' 'review' 'evidence' 'management'}.text-review-layout .evidence-section{position:static;max-height:none}}@media(max-width:900px){.detail-head{display:grid}.detail-metrics{align-items:flex-start}}
+@media(max-width:1100px){.qa-toolbar{align-items:stretch;flex-direction:column}.qa-filters{grid-template-columns:minmax(240px,1fr) 130px auto}.text-review-layout{grid-template-columns:1fr;grid-template-areas:'editor' 'review' 'evidence' 'management'}.text-review-layout .evidence-section{position:static;max-height:none}.input-cards dl{grid-template-columns:1fr 1fr}}@media(max-width:900px){.detail-head{display:grid}.detail-metrics{align-items:flex-start}}
 </style>

@@ -4,7 +4,7 @@ import MilvusTargetRegistryView from '../../views/business/MilvusTargetRegistryV
 import { api } from '../../api/platform'
 
 vi.mock('../../api/platform', () => ({ api: Object.fromEntries([
-  'instance', 'milvusTargets', 'sharedDeployments', 'createMilvusTarget', 'patchMilvusTarget',
+  'instance', 'milvusTargets', 'instanceReleaseTarget', 'createMilvusTarget', 'patchMilvusTarget',
   'verifyMilvusTarget', 'checkMilvusTargetHealth', 'checkMilvusTargetCollections', 'putAuthoringMilvusTarget',
 ].map(name => [name, vi.fn()])) }))
 
@@ -27,7 +27,7 @@ beforeEach(() => {
   vi.resetAllMocks()
   api.instance.mockResolvedValue({ instance_mode: 'central', authoring_milvus_target: null })
   api.milvusTargets.mockResolvedValue([target()])
-  api.sharedDeployments.mockResolvedValue([])
+  api.instanceReleaseTarget.mockRejectedValue(new Error('not bound'))
   api.checkMilvusTargetHealth.mockResolvedValue(target({
     current_revision: { health_status: 'unavailable', health_error: 'connection refused' },
   }))
@@ -39,6 +39,17 @@ beforeEach(() => {
 })
 
 describe('Milvus registry live health', () => {
+  it('provides an explicit return to project publishing', async () => {
+    const push = vi.fn()
+    const wrapper = mount(MilvusTargetRegistryView, { global: { mocks: { $router: { push } } } })
+    await flushPromises()
+    const back = wrapper.findAll('button').find(button => button.text() === '← 返回项目发布')
+    expect(back).toBeTruthy()
+    await back.trigger('click')
+    expect(push).toHaveBeenCalledWith('/business/authorization')
+    wrapper.unmount()
+  })
+
   it('labels the authoring role as the default knowledge write target, not an environment', async () => {
     api.instance.mockResolvedValue({ instance_mode: 'central', authoring_milvus_target: target() })
     const wrapper = mount(MilvusTargetRegistryView)

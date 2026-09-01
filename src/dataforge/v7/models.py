@@ -75,13 +75,9 @@ class SourceVersion(Timestamped, Base):
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
-    extraction_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
-    extraction_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    preparation_status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
-    review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
-    current_review_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    active_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    candidate_chunk_set_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    parse_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    parse_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_parsed_document_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 @event.listens_for(SourceVersion, "before_update")
@@ -94,36 +90,91 @@ def _protect_source_version_content(_mapper, _connection, target: SourceVersion)
         raise ValueError(f"SourceVersion 内容字段不可修改：{', '.join(changed)}")
 
 
-class DocumentIR(Timestamped, Base):
-    """A persisted parser result for a concrete source version and flow run."""
-    __tablename__ = "document_irs"
-    __table_args__ = (UniqueConstraint("source_version_id", "flow_run_id", name="uq_document_ir_version_run"),)
+class ParseJob(Timestamped, Base):
+    """Retryable conversion from an immutable SourceVersion to a ParsedDocument."""
+    __tablename__ = "parse_jobs"
+    __table_args__ = (UniqueConstraint("source_version_id", "attempt_no", name="uq_parse_job_attempt"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    flow_run_id: Mapped[str] = mapped_column(ForeignKey("flow_runs.id"), nullable=False, index=True)
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    parser_revision: Mapped[str] = mapped_column(String(120), nullable=False)
     parser_adapter: Mapped[str] = mapped_column(String(120), nullable=False)
-    parser_profile: Mapped[str] = mapped_column(String(32), default="auto", nullable=False)
-    text: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class SourceChunk(Timestamped, Base):
-    """A formal source chunk retained independently from execution artifacts."""
-    __tablename__ = "source_chunks"
-    __table_args__ = (UniqueConstraint("chunk_set_id", "source_chunk_id", name="uq_source_chunk_set_logical_id"),)
+class ParsedDocument(Timestamped, Base):
+    """Immutable parser or administrator-reviewed document revision exposed to Flows."""
+    __tablename__ = "parsed_documents"
+    __table_args__ = (
+        UniqueConstraint("source_version_id", "revision_no", name="uq_parsed_document_revision"),
+        UniqueConstraint("parent_parsed_document_id", "content_digest", "anchor_map_digest",
+                         name="uq_parsed_document_review_result"),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    chunk_set_id: Mapped[str] = mapped_column(ForeignKey("source_chunk_sets.id"), nullable=False, index=True)
+    parse_job_id: Mapped[str | None] = mapped_column(ForeignKey("parse_jobs.id"), nullable=True, unique=True, index=True)
+    parent_parsed_document_id: Mapped[str | None] = mapped_column(
+        ForeignKey("parsed_documents.id"), nullable=True, index=True
+    )
+    revision_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    origin: Mapped[str] = mapped_column(String(32), default="parser", nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    content_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_ref: Mapped[str] = mapped_column(String(1024), nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    anchor_map_ref: Mapped[str] = mapped_column(String(1024), nullable=False)
+    anchor_map_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    parser_revision: Mapped[str] = mapped_column(String(120), nullable=False)
+    parser_adapter: Mapped[str] = mapped_column(String(120), nullable=False)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="completed", nullable=False, index=True)
+    review_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False, index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FlowChunkSet(Timestamped, Base):
+    """One Flow-owned chunking result for a ParsedDocument and stable input node."""
+    __tablename__ = "flow_chunk_sets"
+    __table_args__ = (
+        UniqueConstraint("flow_revision_id", "parsed_document_id", "input_node_key", "attempt_no",
+                         name="uq_flow_chunk_set_attempt"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_revision_id: Mapped[str] = mapped_column(ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True)
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    input_node_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    chunker_operator_id: Mapped[str] = mapped_column(String(120), default="document-chunker", nullable=False)
+    chunker_operator_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_config_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    chunk_config_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    pre_chunk_transform_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
-    origin_flow_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    source_chunk_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="candidate", nullable=False, index=True)
+    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class FlowChunk(Timestamped, Base):
+    __tablename__ = "flow_chunks"
+    __table_args__ = (UniqueConstraint("flow_chunk_set_id", "ordinal", name="uq_flow_chunk_set_ordinal"),)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_chunk_set_id: Mapped[str] = mapped_column(ForeignKey("flow_chunk_sets.id"), nullable=False, index=True)
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     current_revision_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     lifecycle_status: Mapped[str] = mapped_column(String(32), default="active", nullable=False, index=True)
     review_status: Mapped[str] = mapped_column(String(32), default="pending_review", nullable=False, index=True)
@@ -131,107 +182,58 @@ class SourceChunk(Timestamped, Base):
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class SourceChunkRevision(Timestamped, Base):
-    """Immutable human-review revision for one logical SourceChunk."""
-    __tablename__ = "source_chunk_revisions"
-    __table_args__ = (UniqueConstraint("source_chunk_id", "revision_no", name="uq_source_chunk_revision"),)
+class FlowChunkRevision(Timestamped, Base):
+    __tablename__ = "flow_chunk_revisions"
+    __table_args__ = (UniqueConstraint("flow_chunk_id", "revision_no", name="uq_flow_chunk_revision"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("source_chunks.id"), nullable=False, index=True)
+    flow_chunk_id: Mapped[str] = mapped_column(ForeignKey("flow_chunks.id"), nullable=False, index=True)
     revision_no: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     operation: Mapped[str] = mapped_column(String(32), default="prepared", nullable=False, index=True)
     parent_chunk_ids: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     actor: Mapped[str] = mapped_column(String(255), default="system", nullable=False)
 
 
-class SourceReviewSnapshot(Timestamped, Base):
-    """Immutable, ordered approval boundary for one SourceVersion."""
-    __tablename__ = "source_review_snapshots"
+class FlowChunkReviewSnapshot(Timestamped, Base):
+    """Immutable, ordered approval boundary consumed by a KnowledgeJob."""
+    __tablename__ = "flow_chunk_review_snapshots"
     __table_args__ = (
-        UniqueConstraint("source_version_id", "review_no", name="uq_source_review_number"),
-        UniqueConstraint("chunk_set_id", "content_digest", name="uq_source_review_chunk_set_digest"),
+        UniqueConstraint("flow_chunk_set_id", "snapshot_digest", name="uq_flow_chunk_review_digest"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    flow_chunk_set_id: Mapped[str] = mapped_column(ForeignKey("flow_chunk_sets.id"), nullable=False, index=True)
+    flow_revision_id: Mapped[str] = mapped_column(ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True)
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    chunk_set_id: Mapped[str] = mapped_column(ForeignKey("source_chunk_sets.id"), nullable=False, index=True)
-    review_no: Mapped[int] = mapped_column(Integer, nullable=False)
-    content_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    reviewed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    approved_by: Mapped[str] = mapped_column(String(255), nullable=False)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="approved", nullable=False, index=True)
+    approval_source: Mapped[str] = mapped_column(
+        String(64), default="parsed_document_review", nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="frozen", nullable=False, index=True)
 
 
-class SourceReviewSnapshotChunk(Timestamped, Base):
-    __tablename__ = "source_review_snapshot_chunks"
+class FlowChunkReviewSnapshotItem(Timestamped, Base):
+    __tablename__ = "flow_chunk_review_snapshot_items"
     __table_args__ = (
-        UniqueConstraint("source_review_snapshot_id", "ordinal", name="uq_source_review_chunk_ordinal"),
-        UniqueConstraint("source_review_snapshot_id", "source_chunk_revision_id", name="uq_source_review_chunk_revision"),
+        UniqueConstraint("flow_chunk_review_snapshot_id", "ordinal", name="uq_flow_chunk_review_ordinal"),
+        UniqueConstraint("flow_chunk_review_snapshot_id", "flow_chunk_revision_id", name="uq_flow_chunk_review_revision"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_review_snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    flow_chunk_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("flow_chunk_review_snapshots.id"), nullable=False, index=True
     )
-    source_chunk_id: Mapped[str] = mapped_column(ForeignKey("source_chunks.id"), nullable=False, index=True)
-    source_chunk_revision_id: Mapped[str] = mapped_column(
-        ForeignKey("source_chunk_revisions.id"), nullable=False, index=True
+    flow_chunk_id: Mapped[str] = mapped_column(ForeignKey("flow_chunks.id"), nullable=False, index=True)
+    flow_chunk_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("flow_chunk_revisions.id"), nullable=False, index=True
     )
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-
-
-class SourcePreparationJob(Timestamped, Base):
-    __tablename__ = "source_preparation_jobs"
-    __table_args__ = (UniqueConstraint("source_version_id", "preparation_revision", name="uq_source_preparation_revision"),)
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    preparation_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
-    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
-class SourceChunkSet(Timestamped, Base):
-    """One immutable preparation result that can be reviewed and promoted."""
-    __tablename__ = "source_chunk_sets"
-    __table_args__ = (
-        UniqueConstraint("source_version_id", "preparation_revision", name="uq_source_chunk_set_preparation"),
-        UniqueConstraint("source_preparation_job_id", name="uq_source_chunk_set_job"),
-    )
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    source_preparation_job_id: Mapped[str | None] = mapped_column(
-        ForeignKey("source_preparation_jobs.id"), nullable=True, index=True
-    )
-    flow_run_id: Mapped[str | None] = mapped_column(ForeignKey("flow_runs.id"), nullable=True, index=True)
-    execution_snapshot_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    preparation_revision: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="candidate", nullable=False, index=True)
-    content_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    metrics_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class KnowledgeDispatch(Timestamped, Base):
-    __tablename__ = "knowledge_dispatches"
-    __table_args__ = (UniqueConstraint(
-        "source_review_snapshot_id", "activation_no", name="uq_knowledge_dispatch_snapshot_activation"
-    ),)
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    source_review_snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
-    )
-    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
-    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class DocumentLibraryMember(Timestamped, Base):
@@ -270,14 +272,14 @@ class DocumentLibraryProcessingRecord(Timestamped, Base):
     __tablename__ = "document_library_processing_records"
     __table_args__ = (UniqueConstraint(
         "document_library_template_binding_id", "source_version_id", "knowledge_flow_template_revision_id",
-        "source_review_snapshot_id", "activation_no", name="uq_doc_processing_review_activation",
+        "flow_chunk_review_snapshot_id", "activation_no", name="uq_doc_processing_review_activation",
     ),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     document_library_template_binding_id: Mapped[str] = mapped_column(ForeignKey("document_library_template_bindings.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
     knowledge_flow_template_revision_id: Mapped[str] = mapped_column(ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True)
-    source_review_snapshot_id: Mapped[str | None] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=True, index=True
+    flow_chunk_review_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("flow_chunk_review_snapshots.id"), nullable=True, index=True
     )
     activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
@@ -303,6 +305,31 @@ class DocumentLibraryProcessingBaseline(Timestamped, Base):
     origin_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     imported_release_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     last_success_status: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
+
+
+class DocumentLibraryDispatch(Timestamped, Base):
+    """Idempotent approved-document dispatch for one binding and published Flow revision."""
+    __tablename__ = "document_library_dispatches"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_library_template_binding_id", "source_version_id", "parsed_document_id",
+            "knowledge_flow_template_revision_id", "activation_no", name="uq_document_library_dispatch",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    document_library_template_binding_id: Mapped[str] = mapped_column(
+        ForeignKey("document_library_template_bindings.id"), nullable=False, index=True
+    )
+    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
+    knowledge_flow_template_revision_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_flow_template_revisions.id"), nullable=False, index=True
+    )
+    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    knowledge_job_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=True, index=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class KnowledgeType(Timestamped, Base):
@@ -395,22 +422,35 @@ class KnowledgeItem(Timestamped, Base):
     review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class KnowledgeItemSource(Timestamped, Base):
-    __tablename__ = "knowledge_item_sources"
-    __table_args__ = (UniqueConstraint("knowledge_item_id", "source_version_id", "source_chunk_id", name="uq_item_source_version_chunk"),)
+class KnowledgeEvidence(Timestamped, Base):
+    __tablename__ = "knowledge_evidence"
+    __table_args__ = (
+        UniqueConstraint("knowledge_item_id", "input_kind", "input_ref", name="uq_knowledge_evidence_input"),
+        CheckConstraint(
+            "(flow_chunk_id IS NOT NULL AND flow_chunk_revision_id IS NOT NULL "
+            "AND flow_chunk_review_snapshot_id IS NOT NULL) OR "
+            "(flow_chunk_id IS NULL AND flow_chunk_revision_id IS NULL "
+            "AND flow_chunk_review_snapshot_id IS NULL)",
+            name="ck_knowledge_evidence_input_kind",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_item_id: Mapped[str] = mapped_column(ForeignKey("knowledge_items.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    source_chunk_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
-    source_chunk_revision_id: Mapped[str | None] = mapped_column(
-        ForeignKey("source_chunk_revisions.id"), nullable=True, index=True
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
+    input_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    input_ref: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    flow_chunk_id: Mapped[str | None] = mapped_column(ForeignKey("flow_chunks.id"), nullable=True, index=True)
+    flow_chunk_revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("flow_chunk_revisions.id"), nullable=True, index=True
     )
-    source_review_snapshot_id: Mapped[str | None] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=True, index=True
+    flow_chunk_review_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("flow_chunk_review_snapshots.id"), nullable=True, index=True
     )
     source_anchor: Mapped[str] = mapped_column(String(1024), default="", nullable=False)
     anchor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     evidence_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
@@ -446,17 +486,23 @@ class KnowledgeJob(Timestamped, Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-class KnowledgeJobReviewInput(Timestamped, Base):
-    __tablename__ = "knowledge_job_review_inputs"
-    __table_args__ = (UniqueConstraint("knowledge_job_id", "source_version_id", name="uq_job_review_source_version"),)
+class KnowledgeJobFlowInput(Timestamped, Base):
+    __tablename__ = "knowledge_job_flow_inputs"
+    __table_args__ = (
+        UniqueConstraint("knowledge_job_id", "parsed_document_id", "input_node_key", name="uq_job_flow_document_input"),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    source_review_snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    parsed_document_id: Mapped[str] = mapped_column(ForeignKey("parsed_documents.id"), nullable=False, index=True)
+    input_node_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    flow_chunk_set_id: Mapped[str | None] = mapped_column(ForeignKey("flow_chunk_sets.id"), nullable=True, index=True)
+    flow_chunk_review_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("flow_chunk_review_snapshots.id"), nullable=True, index=True
     )
-    review_digest: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    snapshot_digest: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending_preparation", nullable=False, index=True)
 
 
 class KnowledgeLibraryWorkLease(Timestamped, Base):
@@ -509,26 +555,23 @@ class ComponentCheckResult(Timestamped, Base):
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class KnowledgeChunkGeneration(Timestamped, Base):
-    """Latest generation result for one output type and formal source chunk.
-
-    This is deliberately separate from execution Artifacts.  It is the durable
-    retry and partial-publication boundary: an LLM failure must not make the
-    successful neighbouring chunks lose their published knowledge.
-    """
-    __tablename__ = "knowledge_chunk_generations"
+class KnowledgeGeneration(Timestamped, Base):
+    """Latest retry/replace result for one output branch and immutable input."""
+    __tablename__ = "knowledge_generations"
     __table_args__ = (
         UniqueConstraint(
-            "knowledge_job_id", "knowledge_type", "source_version_id", "source_chunk_id",
-            name="uq_job_type_source_chunk_generation",
+            "knowledge_job_id", "output_key", "branch_node_id", "input_kind", "input_ref",
+            name="uq_job_output_branch_input_generation",
         ),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_job_id: Mapped[str] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=False, index=True)
-    knowledge_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    source_chunk_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    output_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    branch_node_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    input_kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    input_ref: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    generation_unit: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     candidate_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -780,7 +823,7 @@ class DebugRunInputSnapshot(Timestamped, Base):
     output_types_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     reusable_node_map_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     sink_library_bindings_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
-    input_source: Mapped[str] = mapped_column(String(32), default="source_review_snapshot", nullable=False, index=True)
+    input_source: Mapped[str] = mapped_column(String(32), default="flow_chunk_review_snapshot", nullable=False, index=True)
     input_descriptor_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     resolved_chunks_json: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     input_digest: Mapped[str] = mapped_column(String(64), default="", nullable=False, index=True)
@@ -800,8 +843,8 @@ class DebugRunReviewInput(Timestamped, Base):
         ForeignKey("debug_run_input_snapshots.id"), nullable=False, index=True
     )
     source_version_id: Mapped[str] = mapped_column(ForeignKey("source_versions.id"), nullable=False, index=True)
-    source_review_snapshot_id: Mapped[str] = mapped_column(
-        ForeignKey("source_review_snapshots.id"), nullable=False, index=True
+    flow_chunk_review_snapshot_id: Mapped[str] = mapped_column(
+        ForeignKey("flow_chunk_review_snapshots.id"), nullable=False, index=True
     )
     activation_no: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     review_digest: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -825,17 +868,13 @@ class FlowRun(Timestamped, Base):
     __table_args__ = (
         UniqueConstraint("parent_flow_run_id", "idempotency_key", name="uq_derived_run_request"),
         CheckConstraint(
-            "(knowledge_job_id IS NOT NULL AND source_preparation_job_id IS NULL AND debug_input_snapshot_id IS NULL) OR "
-            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NOT NULL AND debug_input_snapshot_id IS NULL) OR "
-            "(knowledge_job_id IS NULL AND source_preparation_job_id IS NULL AND debug_input_snapshot_id IS NOT NULL)",
+            "(knowledge_job_id IS NOT NULL AND debug_input_snapshot_id IS NULL) OR "
+            "(knowledge_job_id IS NULL AND debug_input_snapshot_id IS NOT NULL)",
             name="ck_flow_run_single_owner",
         ),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     knowledge_job_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_jobs.id"), nullable=True, index=True)
-    source_preparation_job_id: Mapped[str | None] = mapped_column(
-        ForeignKey("source_preparation_jobs.id"), nullable=True, index=True
-    )
     debug_input_snapshot_id: Mapped[str | None] = mapped_column(
         ForeignKey("debug_run_input_snapshots.id"), nullable=True, index=True
     )
@@ -958,6 +997,8 @@ class ModelServing(Timestamped, Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
     max_retries: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     max_tokens: Mapped[int] = mapped_column(Integer, default=16384, nullable=False)
+    context_window_tokens: Mapped[int] = mapped_column(Integer, default=8192, nullable=False)
+    tokenizer_name: Mapped[str] = mapped_column(String(255), default="Qwen/Qwen3-32B", nullable=False)
     disable_thinking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
@@ -1321,22 +1362,24 @@ class Deployment(Timestamped, Base):
     institution_code_locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class DeploymentTarget(Timestamped, Base):
-    __tablename__ = "deployment_targets"
+class InstanceReleaseTarget(Timestamped, Base):
+    __tablename__ = "instance_release_targets"
     __table_args__ = (
-        UniqueConstraint("deployment_id", "release_stage", "target_kind", name="uq_deployment_stage_target"),
+        UniqueConstraint("dataforge_instance_id", "release_stage", name="uq_instance_release_stage_target"),
         ForeignKeyConstraint(
             ["milvus_target_revision_id", "milvus_target_id"],
             ["milvus_target_revisions.id", "milvus_target_revisions.milvus_target_id"],
-            name="fk_deployment_target_revision_identity",
+            name="fk_instance_release_target_revision_identity",
         ),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    deployment_id: Mapped[str] = mapped_column(ForeignKey("deployments.id"), nullable=False, index=True)
+    dataforge_instance_id: Mapped[str] = mapped_column(
+        ForeignKey("dataforge_instances.id"), nullable=False, index=True
+    )
     release_stage: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
-    target_kind: Mapped[str] = mapped_column(String(32), default="milvus", nullable=False)
     milvus_target_id: Mapped[str] = mapped_column(ForeignKey("milvus_targets.id"), nullable=False, index=True)
     milvus_target_revision_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    connection_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
 
 
 class ProjectDeployment(Timestamped, Base):
@@ -1363,11 +1406,11 @@ class DataForgeInstance(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
-class ProjectDeploymentTask(Timestamped, Base):
-    __tablename__ = "project_deployment_tasks"
-    __table_args__ = (UniqueConstraint("project_deployment_id", "project_task_id", name="uq_deployment_project_task"),)
+class ProjectReleaseTask(Timestamped, Base):
+    __tablename__ = "project_release_tasks"
+    __table_args__ = (UniqueConstraint("project_task_id", name="uq_project_release_task"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    project_deployment_id: Mapped[str] = mapped_column(ForeignKey("project_deployments.id"), nullable=False, index=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     project_task_id: Mapped[str] = mapped_column(ForeignKey("project_tasks.id"), nullable=False, index=True)
     index_profile_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_index_profiles.id"), nullable=True, index=True)
     qa_embedding_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -1379,9 +1422,11 @@ class ProjectDeploymentTask(Timestamped, Base):
 
 class ProjectOrgRoute(Timestamped, Base):
     __tablename__ = "project_org_routes"
-    __table_args__ = (UniqueConstraint("project_deployment_task_id", "org_code", name="uq_deploy_task_org_route"),)
+    __table_args__ = (UniqueConstraint("project_release_task_id", "org_code", name="uq_release_task_org_route"),)
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    project_deployment_task_id: Mapped[str] = mapped_column(ForeignKey("project_deployment_tasks.id"), nullable=False, index=True)
+    project_release_task_id: Mapped[str] = mapped_column(
+        ForeignKey("project_release_tasks.id"), nullable=False, index=True
+    )
     org_code: Mapped[str] = mapped_column(String(120), nullable=False)
     org_name: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, index=True)
@@ -1401,12 +1446,10 @@ class ProjectOrgRouteLibrary(Timestamped, Base):
 class ProjectRouteVersion(Base):
     __tablename__ = "project_route_versions"
     __table_args__ = (
-        UniqueConstraint("project_deployment_id", "release_stage", "version_no", name="uq_deploy_stage_route_version"),
+        UniqueConstraint("project_id", "version_no", name="uq_project_route_version"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
-    project_deployment_id: Mapped[str] = mapped_column(ForeignKey("project_deployments.id"), nullable=False, index=True)
-    release_stage: Mapped[str] = mapped_column(String(16), default="test", nullable=False, index=True)
     version_no: Mapped[int] = mapped_column(Integer, nullable=False)
     origin: Mapped[str] = mapped_column(String(32), default="central", nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
@@ -1415,6 +1458,31 @@ class ProjectRouteVersion(Base):
     object_key: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProjectPublication(Base):
+    __tablename__ = "project_publications"
+    __table_args__ = (
+        UniqueConstraint("project_id", "release_stage", "publication_no", name="uq_project_stage_publication"),
+    )
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    project_route_version_id: Mapped[str] = mapped_column(
+        ForeignKey("project_route_versions.id"), nullable=False, index=True
+    )
+    release_stage: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    publication_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_kind: Mapped[str] = mapped_column(String(32), default="registry", nullable=False)
+    target_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_revision_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_connection_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    origin: Mapped[str] = mapped_column(String(32), default="central", nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="published", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    published_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class ProjectRouteVersionAsset(Base):

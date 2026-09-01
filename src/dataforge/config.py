@@ -4,9 +4,12 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ORG_CODE_PRESETS_ENV = "DATAFORGE_ORG_CODE_PRESETS"
+DEFAULT_RELEASE_STAGE_ENV = "DATAFORGE_DEFAULT_RELEASE_STAGE"
+LOCAL_MILVUS_URI_ENV = "DATAFORGE_LOCAL_MILVUS_URI"
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,27 @@ def _org_code_presets_environment() -> tuple[OrgCodePreset, ...]:
     return tuple(presets)
 
 
+def _default_release_stage_environment() -> str:
+    value = os.getenv(DEFAULT_RELEASE_STAGE_ENV, "test").strip().lower()
+    if value not in {"test", "production"}:
+        raise ValueError(f"{DEFAULT_RELEASE_STAGE_ENV} 只允许 test 或 production")
+    return value
+
+
+def _local_milvus_uri_environment() -> str:
+    value = os.getenv(LOCAL_MILVUS_URI_ENV, "http://dataforge-milvus:19530").strip()
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.path not in {"", "/"}:
+        raise ValueError(f"{LOCAL_MILVUS_URI_ENV} 必须是合法的 http(s) Milvus URI")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{LOCAL_MILVUS_URI_ENV} 端口无效") from exc
+    if port is None:
+        raise ValueError(f"{LOCAL_MILVUS_URI_ENV} 必须显式包含端口")
+    return value.rstrip("/")
+
+
 @dataclass(frozen=True)
 class Settings:
     project_root: Path
@@ -96,7 +120,7 @@ class Settings:
     runner_timeout_seconds: float = 1860.0
     knowledge_job_concurrency: int = 3
     vector_sync_concurrency: int = 2
-    source_preparation_concurrency: int = 2
+    parse_concurrency: int = 2
     derived_runs_enabled: bool = False
     derived_run_commit_enabled: bool = False
     instance_mode: str = "central"
@@ -106,6 +130,8 @@ class Settings:
     migration_signing_key_id: str = "central-default"
     config_encryption_key: str | None = None
     org_code_presets: tuple[OrgCodePreset, ...] = DEFAULT_ORG_CODE_PRESETS
+    default_release_stage: str = "test"
+    local_milvus_default_uri: str = "http://dataforge-milvus:19530"
 
     @classmethod
     def load(
@@ -137,7 +163,7 @@ class Settings:
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
             knowledge_job_concurrency=_positive_int_environment("DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY", 3),
             vector_sync_concurrency=_positive_int_environment("DATAFORGE_VECTOR_SYNC_CONCURRENCY", 2),
-            source_preparation_concurrency=_positive_int_environment("DATAFORGE_SOURCE_PREPARATION_CONCURRENCY", 2),
+            parse_concurrency=_positive_int_environment("DATAFORGE_PARSE_CONCURRENCY", 2),
             derived_runs_enabled=os.getenv("DATAFORGE_DERIVED_RUNS_ENABLED", "0") == "1",
             derived_run_commit_enabled=os.getenv("DATAFORGE_DERIVED_RUN_COMMIT_ENABLED", "0") == "1",
             instance_mode=os.getenv("DATAFORGE_INSTANCE_MODE", "central").strip().lower(),
@@ -147,6 +173,8 @@ class Settings:
             migration_signing_key_id=os.getenv("DATAFORGE_MIGRATION_SIGNING_KEY_ID", "central-default").strip(),
             config_encryption_key=_read_secret("DATAFORGE_CONFIG_ENCRYPTION_KEY"),
             org_code_presets=_org_code_presets_environment(),
+            default_release_stage=_default_release_stage_environment(),
+            local_milvus_default_uri=_local_milvus_uri_environment(),
         )
 
     @property

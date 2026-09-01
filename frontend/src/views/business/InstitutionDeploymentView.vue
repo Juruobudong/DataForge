@@ -10,7 +10,8 @@ const releases = ref([]), jobs = ref([]), frozenRoutes = ref([])
 const deploymentId = ref(''), packageKind = ref('deployment_seed'), selectedStage = ref('test'), selectedRoutes = ref([]), selectedLibraries = ref([])
 const extraAssetVersionIds = ref([]), assetOptions = ref({ collections: [] })
 const includeFullDocuments = ref(false)
-const overrideUri = ref(''), overrideReason = ref('')
+const newInstitutionName = ref(''), newInstitutionCode = ref(''), newInstitutionProjectIds = ref([])
+const boundProjectIds = ref([])
 const step = ref(1), draft = ref(null), plan = ref(null), release = ref(null), upload = ref(null)
 const inspected = ref(null), resolutions = ref({}), error = ref(''), busy = ref(false)
 const local = computed(() => instance.value?.instance_mode === 'local')
@@ -35,11 +36,10 @@ async function loadFrozenRoutes() {
   frozenRoutes.value = []
   selectedRoutes.value = []
   if (!deploymentId.value || local.value) return
-  const bindings = projects.value.flatMap(project => (project.deployments || [])
-    .filter(binding => binding.deployment_id === deploymentId.value)
-    .map(binding => ({ project, binding })))
-  const rows = await Promise.all(bindings.map(async ({ project, binding }) => ({
-    project, binding, versions: await api.routeVersions(binding.id, selectedStage.value),
+  const bindings = await api.deploymentProjects(deploymentId.value)
+  boundProjectIds.value = bindings.map(item => item.project.id)
+  const rows = await Promise.all(bindings.map(async binding => ({
+    project: binding.project, binding, versions: await api.routeVersions(binding.project.id, selectedStage.value),
   })))
   frozenRoutes.value = rows.flatMap(row => frozenRoutesForStage(row.versions, selectedStage.value)
     .map(version => ({ ...version, project: row.project, binding: row.binding })))
@@ -48,6 +48,9 @@ async function load() {
   try {
     error.value = ''
     instance.value = await api.instance()
+    if (!route.params.draftId && !route.params.releaseId) {
+      selectedStage.value = instance.value?.default_release_stage === 'production' ? 'production' : 'test'
+    }
     if (local.value) {
       jobs.value = await api.migrations('import')
     } else {
@@ -66,8 +69,6 @@ async function load() {
       selectedLibraries.value = draft.value.selection?.knowledge_library_ids || []
       extraAssetVersionIds.value = draft.value.selection?.extra_asset_version_ids || []
       includeFullDocuments.value = Boolean(draft.value.selection?.include_full_document_library)
-      overrideUri.value = draft.value.milvus_override?.uri || ''
-      overrideReason.value = draft.value.milvus_override_reason || ''
       await loadFrozenRoutes()
       selectedRoutes.value = draft.value.selection?.route_version_ids || []
       await refreshPlan()
@@ -90,16 +91,6 @@ async function createDraft() {
       extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
       include_full_document_library: includeFullDocuments.value,
     })
-    if (overrideUri.value) {
-      draft.value = await api.updateInstitutionReleaseDraft(draft.value.id, {
-        route_version_ids: updateOnly.value ? [] : selectedRoutes.value,
-        release_stage: selectedStage.value,
-        knowledge_library_ids: updateOnly.value ? selectedLibraries.value : [],
-        extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
-        base_release_id: null, include_full_document_library: includeFullDocuments.value,
-        milvus_override: { uri: overrideUri.value }, milvus_override_reason: overrideReason.value,
-      })
-    }
     await router.push(`/institution-deployments/drafts/${draft.value.id}`)
     await refreshPlan(); step.value = 2
   } catch (e) { error.value = e.message } finally { busy.value = false }
@@ -115,8 +106,6 @@ async function saveDraft() {
       extra_asset_version_ids: updateOnly.value ? [] : extraAssetVersionIds.value,
       base_release_id: draft.value.base_release_id,
       include_full_document_library: includeFullDocuments.value,
-      milvus_override: overrideUri.value ? { uri: overrideUri.value } : null,
-      milvus_override_reason: overrideReason.value || null,
     })
     await refreshPlan()
   } catch (e) { error.value = e.message } finally { busy.value = false }
@@ -141,6 +130,22 @@ async function buildRelease() {
   try { busy.value = true; await api.buildInstitutionRelease(release.value.id); await load() }
   catch (e) { error.value = e.message } finally { busy.value = false }
 }
+async function createInstitutionDeployment() {
+  try {
+    busy.value = true; error.value = ''
+    const created = await api.createSharedDeployment({
+      institution_name: newInstitutionName.value.trim(),
+      institution_code: newInstitutionCode.value.trim(),
+      project_ids: newInstitutionProjectIds.value,
+    })
+    newInstitutionName.value = ''; newInstitutionCode.value = ''; newInstitutionProjectIds.value = []
+    await load(); deploymentId.value = created.id; await loadFrozenRoutes()
+  } catch (e) { error.value = e.message } finally { busy.value = false }
+}
+async function saveInstitutionProjects() {
+  try { busy.value = true; await api.replaceDeploymentProjects(deploymentId.value, boundProjectIds.value); await loadFrozenRoutes() }
+  catch (e) { error.value = e.message } finally { busy.value = false }
+}
 async function inspectPackage() {
   try {
     const form = new FormData(); form.append('file', upload.value.files[0])
@@ -156,9 +161,9 @@ async function startImport() {
 watch(deploymentId, loadFrozenRoutes)
 watch(selectedStage, loadFrozenRoutes)
 watch(packageKind, () => { selectedRoutes.value = []; selectedLibraries.value = []; extraAssetVersionIds.value = []; includeFullDocuments.value = false; plan.value = null; assetOptions.value = { collections: [] } })
-watch([selectedRoutes, selectedLibraries, extraAssetVersionIds, includeFullDocuments, overrideUri, overrideReason], () => {
+watch([selectedRoutes, selectedLibraries, extraAssetVersionIds, includeFullDocuments], () => {
   if (!draft.value || release.value || (!updateOnly.value && !selectedRoutes.value.length) ||
-      (updateOnly.value && !selectedLibraries.value.length) || (overrideUri.value && !overrideReason.value.trim())) return
+      (updateOnly.value && !selectedLibraries.value.length)) return
   clearTimeout(saveTimer)
   saveTimer = setTimeout(saveDraft, 600)
 }, { deep: true })
@@ -171,6 +176,20 @@ onMounted(load)
     <div class="page-head"><div><h2>机构发布部署</h2><p>{{ local ? '导入共享资产、验证候选 Partition，并逐项目激活路由。' : '冻结多个项目版本，去重共享资产，生成机构离线发布包。' }}</p></div><span class="badge blue">{{ instance?.display_name || 'DataForge' }}</span></div>
 
     <template v-if="!local">
+      <section class="panel stack">
+        <div class="panel-head"><div><h3>机构 Deployment 管理</h3><p>机构 Deployment 只表达机构身份及项目归属；机构 Milvus 由 local 初始化配置。</p></div></div>
+        <form class="grid2" @submit.prevent="createInstitutionDeployment">
+          <label>机构名称<input v-model="newInstitutionName" required></label>
+          <label>机构代码<input v-model="newInstitutionCode" required></label>
+          <label>绑定项目<select v-model="newInstitutionProjectIds" multiple required><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
+          <button class="primary" :disabled="busy||!newInstitutionProjectIds.length">创建机构 Deployment</button>
+        </form>
+        <form v-if="selectedDeployment" class="grid2" @submit.prevent="saveInstitutionProjects">
+          <label>当前机构<input :value="`${selectedDeployment.institution_name} · ${selectedDeployment.institution_code}`" readonly></label>
+          <label>已绑定项目<select v-model="boundProjectIds" multiple><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
+          <button :disabled="busy">保存项目绑定</button>
+        </form>
+      </section>
       <nav class="tabs"><button v-for="value in [1,2,3,4,5]" :key="value" :class="{active:step===value}" :disabled="value>1&&!draft" @click="step=value">{{ value }}. {{ ['发布范围','知识资产','判重与就绪','资产差异','冻结与构建'][value-1] }}</button></nav>
       <section v-if="step===1" class="panel stack">
         <div class="panel-head"><div><h3>发布范围</h3><p>发布工作台不会修改任何项目授权；项目授权必须先在“项目发布”中冻结。</p></div><span class="badge amber">自动保存草稿</span></div>
@@ -185,9 +204,8 @@ onMounted(load)
         </div>
         <label v-else>知识库（完整当前快照）<select v-model="selectedLibraries" multiple><option v-for="library in libraries" :key="library.id" :value="library.id">{{ library.name }} · {{ library.knowledge_type }}</option></select></label>
         <label v-if="updateOnly"><input v-model="includeFullDocuments" type="checkbox"> 同时携带完整关联文档库与模板运行闭包</label>
-        <div class="grid2"><label>机构 Milvus 默认预设<input :value="selectedDeployment?.stage_targets?.[selectedStage]?.revision?.milvus_url||'未配置'" readonly></label><label>本次临时覆盖（可选）<input v-model="overrideUri" placeholder="不回写机构默认预设"></label></div>
-        <label v-if="overrideUri">临时覆盖原因<textarea v-model="overrideReason" required rows="2"></textarea></label>
-        <div class="actions"><button class="primary" :disabled="busy||!targetInstitutionCode||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)||(overrideUri&&!overrideReason.trim())" @click="createDraft">创建并检查草稿</button></div>
+        <p class="notice">中心不保存或连接机构 Milvus；发布包导入后，由机构 local 的 verified Current Target 承接向量资产。</p>
+        <div class="actions"><button class="primary" :disabled="busy||!targetInstitutionCode||(!updateOnly&&!selectedRoutes.length)||(updateOnly&&!selectedLibraries.length)" @click="createDraft">创建并检查草稿</button></div>
       </section>
 
       <section v-else-if="step===2" class="panel">

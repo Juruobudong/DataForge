@@ -1,8 +1,10 @@
 # DataForge V7 能力矩阵
 
-更新日期：2026-08-31
+更新日期：2026-09-01
 
-DataFlow 质量信号扩充（2026-08-31）：Catalog 登记26个唯一精选，新增通用评分、语义重复标记、句子/符号过滤和安全重复标点清理；GeneralFilter v2 显式消费上游信号。代码与受控本地链路已实施，Standard DAG 不变。语义CPU依赖独立安装，但真实权重下载/TLS受阻，模型资源Profile及Runner资源层构建仍未完成验收；不是26项全部Ready。详见[026实施状态](specs/026-dataflow-quality-signals/summary.md)和[来源基线](wiki/sources/dataflow-quality-signals-2026-08-31.md)。
+ParsedDocument 校订审阅与模板自动执行（2026-09-01）：`LOCAL`。ParseJob 生成 pending 原始修订；Markdown/Grid 校订批准创建不可变 approved 修订，当前页可逐文件批量通过。批准、新绑定、新 Flow 修订和 approved 历史版本重新启用通过 dispatch 台账自动创建任务；正式 Gate 系统冻结 Flow 输入 Snapshot，不再人工二审。当前空库 Baseline、定向后端、前端合同/build 已验证；真实 MySQL/MinIO/MinerU/DataFlow/模型/PDF-Grid 浏览器 E2E 仍为 `CONNECT`。来源：[实施基线](wiki/sources/parsed-document-review-auto-dispatch-2026-09-01.md)。
+
+DataFlow 质量信号扩充（2026-08-31）：Catalog 登记26个唯一精选，新增通用评分、语义重复标记、句子/符号过滤和安全重复标点清理；GeneralFilter v2 显式消费上游信号。代码与受控本地链路已实施，Standard DAG 不变。固定多语言模型11个文件已按锁定revision下载、校验、离线导入并登记本地资源Profile，真实模型门禁1 passed；约485MB资源目录不入Git，仍须额外同步到`.34`后复验Runner镜像构建，不能把本地通过描述为远程验收。详见[026实施状态](specs/026-dataflow-quality-signals/summary.md)和[来源基线](wiki/sources/dataflow-quality-signals-2026-08-31.md)。
 
 问答 Provider 分离（2026-08-28）：默认原生 `qa-extractor v1`，Advanced 另选上游 `Text2QAGenerator v8`；提示词、业务参数与 Provider 分离，共用结构约束、有限恢复和诊断。本地完整 Debug 调用 `.34` 真实 Qwen3-32B：原生三轮共15块、DataFlow一轮5块均成功；未部署新版容器。见[实施记录](wiki/sources/qa-provider-separation-2026-08-28.md)。
 
@@ -49,7 +51,7 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 | 范围 | 页面或操作 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | 业务工作区 | 工作台：文档、任务、知识库、Vector Ready、项目统计 | `DONE` | 使用现有列表接口汇总。 |
-| 业务工作区 | 文档管理：目录树、递归上传、SourceChunk 人工审核 Gate、模板绑定与安全删除 | `DONE` | 上传/替换自动 Parse/Clean/Chunk 后停在待审核；双栏工作区支持 PDF.js 多页 bbox、DOCX 结构块证据定位，以及修改、拆分、连续合并、删除、通过/拒绝/重开，文档批准后自动调度已绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
+| 业务工作区 | 文档管理：目录树、递归上传、ParsedDocument 校订审阅、模板绑定与安全删除 | `LOCAL` | 上传/替换只排队 ParseJob；列表显示解析/审阅双状态并支持当前页批量通过。详情支持 Markdown OCR 校订与 table-v1 Grid cell 校订；批准后自动运行绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
 | 业务工作区 | 处理任务：监控、停止、重试、删除、日志 | `DONE` | 任务只从文档库模板绑定发起；模板和目标知识库名称优先于技术 ID，`completed_with_warnings` 显示失败分块数与日志明细，重试仅执行失败组合；删除不会物理删除已形成的正式知识。 |
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
 | 业务工作区 | KnowledgeItem 二次审核与手动全量向量发布 | `LOCAL` | Text/QA 支持编辑、单条/批量 CAS 审核，pending 清零后只冻结 approved；Graph/扩展不逐条审核但手动 all_active 入库。任务不再自动向量化，失败候选不影响旧 Ready/Routing；真实 `.34` Milvus/浏览器验收待执行。 |
@@ -58,14 +60,14 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 | 业务工作区 | Milvus Connection Contract 与启动健康复核 | `LOCAL` | 中心 Target 使用不可变 URI/加密 Token Revision、CAS `list_collections` 验证和实例级 Authoring 绑定；central 正式数据库 API 启动 30 秒后并行复核内置测试/生产 current，健康失败不撤销 verified Revision 或绑定，页面也可人工复核。Seed 不绑定，机构 Milvus 不进中心，由 local URI/Token Candidate 使用相同 CAS。真实 `.34` 启动检查与双绑定仍为 `CONNECT`。 |
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
-| 业务工作区 | 项目发布：发布目标/双环境、任务、知识范围、Ready AssetVersion、RouteVersion 冻结与在线发布 | `DONE` | test/production 显式隔离；知识范围按 `(Task, org_code)` 多范围保存。API 环境变量提供有序 org 建议项，默认 `KMDSRMYY/XMSZ`，选择只填充名称/编码，仍可自定义且不关联机构码。 |
-| 业务工作区 | 项目发布：检索调试 | `LOCAL` | Draft/Published/Historical 七阶段只读检索、临时实验、冻结正文/Evidence、重排失败停止；不做聊天、不改消费端。真实推理及浏览器视觉验收未完成。见[实施记录](wiki/sources/reranker-retrieval-debug-2026-08-28.md)。 |
+| 业务工作区 | 项目发布工作台：配置、验证、发布、版本记录 | `LOCAL` | 固定上下文为 Project/环境/全项目共用 Milvus Target；无中心 Deployment。项目级任务与 org 授权冻结为独立 RouteVersion，再由 ProjectPublication 绑定环境和精确 Target Revision。`DATAFORGE_DEFAULT_RELEASE_STAGE` 仅控制默认环境；真实 `.34` 发布和浏览器视觉验收未完成。 |
+| 业务工作区 | 项目发布三级验证 | `LOCAL` | 检索效果支持 Draft/Published/Historical 与临时实验；公共接口只测 Published Public v1；链路调试展示同次真实七阶段。管理员包装不改变正式 DTO、不持久化 Trace。真实 Bearer/推理/Milvus 验收未完成。见[实施记录](wiki/sources/project-publishing-workbench-2026-08-31.md)。 |
 | 业务工作区 | Public Retrieval v1 与统一检索测试台 | `LOCAL` | Published-only contract/query、独立 Retrieval Token、白名单业务 DTO、管理员公共测试与技术双模式已实现；qa_agent/kg 尚未迁移，`.34` 真实 Bearer/Milvus/浏览器验收为 `CONNECT`。见[实施记录](wiki/sources/public-retrieval-gateway-2026-08-29.md)。 |
 | 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | 草稿显式校验 Deployment ID 与 `institution_code`，`.dfm` v2 和 local 导入复验机构目标；项目资产锁定、额外 AssetVersion、结构化冲突、模板闭包、waiting、Prepare fingerprint 与逐项目激活已实现，`.34` 仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
 | 流程开发区 | 模型服务 | `DONE` | LLM/Embedding/Reranker 独立持久化、Secret 脱敏、真实测试接口、默认/启停/引用管理；Reranker 使用 bge-reranker-large，真实 `.34` 推理仍为 `CONNECT`。 |
-| 流程开发区 | 文档预处理 | `DONE` | Parser/Cleaner 只读、Chunker 可配置；内置 Markdown 或已有 DocumentIR 可做无副作用分块 Preview。 |
+| 流程开发区 | 文档预处理 | `REMOVE` | 固定 Source Preparation 产品链已删除；解析属于文档库 ParseJob，分块属于知识 Flow 的 document-chunker + execution_gate。 |
 | 流程开发区 | 知识流程 / 开发者资源 | `DONE` | 五固定模板只保留真实执行节点；Text/QA 直接接 Sink，Graph 保留独立校验。QA v6 支持冻结的多行提取要求，合法无匹配为成功零产出；失败保留旧知识。Standard/Advanced/Multi 共用参数与执行链；旧版本不改写。真实 `.34` 模型验收为 `CONNECT`。 |
 | 流程开发区 | 五类 Standard 透明算子与精选 DataFlow / Custom | `LOCAL` | Standard 输出由目录强制推导，Multi 规范 graph:triple/默认实体；技术视图区分真实算子与 Sink 平台治理。DataFlow/Custom 的有界脱敏双流日志贯通正式/Debug/派生节点与事件。保留版本目录、候选、真实精选算子及可信插件；实际包 + stub 模型本地验证，`.34` 容器与真实模型效果待验收。 |
 | 流程开发区 | 运行调试 Execution Sandbox | `DONE` | Draft/Published Revision 可使用内置审核 Sample + 虚拟空库 Diff，或同库多审核输入 + 真实 Sink Diff；Runtime DAG 只读，真实 `.34` E2E 为 `CONNECT`。 |
@@ -80,11 +82,11 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 | --- | --- | --- |
 | 知识库 `delete-check`、删除任务、重试 | `DONE` | 删除状态为 `active → deleting → deleted`；失败保持 `deleting`。 |
 | 知识库/项目自动编码与请求拒绝 | `DONE` | 知识库由服务端生成 `KL-YYYYMMDD-UUID4`，项目生成 `PRJ-YYYYMMDD-UUID4`；客户端提交 `code` 被拒绝。 |
-| 文档库模板绑定与自动结果库 | `DONE` | 一个文档库可绑定多个已发布模板；每个输出类型固定一个结果库，首次全量、后续增量、模板新修订全量。 |
+| 文档库模板绑定与自动结果库 | `LOCAL` | 一个文档库可绑定多个已发布模板；approved 文档在批准、新绑定、新修订和历史重新启用时按文档/模板幂等调度，每个输出类型固定结果库。 |
 | Source 内容身份 / CAS Blob / 历史重新启用 | `LOCAL` | `(source_id, sha256)` 唯一、全局 `blob://<sha256>` 共享、当前内容幂等、历史内容二次确认、activation-scoped Dispatch/Job/Sink Gate 与引用安全删除已完成本地实现；真实 MySQL/MinIO 验收待 `.34`。 |
-| Source Preparation / Review Snapshot / Knowledge Dispatch | `DONE` | Preparation 与 Knowledge Flow 分离；只有全部活动 Chunk approved 才冻结不可变 Snapshot 并幂等 Dispatch，未审核的整库、选中文件、直接 Job 均服务端拒绝。 |
-| SourceChunkSet / Rechunk / SourceAnchor 精确审核工作台 | `LOCAL` | Candidate/Active/Superseded/Failed 生命周期、Snapshot 参数化结构分块、Retry/Rechunk、批量审核、原子 Promote，以及九类格式的页/bbox、行、sheet/row、结构块、字符范围和 JSON Pointer 定位已完成本地实现；真实 `.34` E2E 待验收。 |
-| Reviewed Flow 与下游多层 Gate | `DONE` | 知识模板唯一根为 Reviewed SourceChunk Input；Job/Runner/Sink/Evidence/AssetVersion/Vector/Ready/Routing 逐层复验 Snapshot 或 digest，Milvus 写入位于 LLM/Operator、Knowledge Sink 与 Embedding 之后。 |
+| ParseJob / ParsedDocument | `LOCAL` | 上传只解析；Markdown/table-v1 与 Anchor Map 写对象存储并校验 digest，SourceVersion 只保存解析状态和当前指针。真实 Parser/MinIO 验收待 `.34`。 |
+| FlowChunkSet / execution_gate / Input Snapshot | `LOCAL` | 正式绑定任务从 approved ParsedDocument 生成 Set并由系统批准有效 Chunk、冻结 Snapshot；fingerprint 复用和强制 reprepare 保持。 |
+| Approved Flow 与下游多层 Gate | `LOCAL` | 五模板显式 document-input/document-chunker/execution_gate；Job/Runner/Sink 复验当前 approved 修订与 Snapshot/digest。表格通用分块 fail closed。 |
 | `knowledge_item_sources`、Evidence、结构化锚点 | `DONE` | 返回文档、SourceVersion、锚点、Evidence 与 primary 标识。 |
 | Knowledge Diff 和向量状态 | `DONE` | 新变更有可读 before/after；旧记录兼容 hash。 |
 | 受控模板修订 CRUD、默认、校验、发布、样例运行 | `DONE` | 生产任务固定引用已发布修订。 |

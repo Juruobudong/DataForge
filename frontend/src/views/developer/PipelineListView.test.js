@@ -4,10 +4,10 @@ import test from 'node:test'
 
 const view = readFileSync(new URL('./PipelineListView.vue', import.meta.url), 'utf8')
 
-test('source preparation chunker saves immutable revisions from a dedicated drawer', () => {
-  assert.match(view, /sourcePreparationChunker/)
-  assert.match(view, /createSourcePreparationChunkerRevision/)
-  assert.match(view, /base_revision: chunker\.value\.revision/)
-  assert.match(view, /保存为新 Revision/)
-  assert.doesNotMatch(view, /NodeInspector/)
+test('preprocessing workspace separates parse, Flow chunking and knowledge generation', () => {
+  assert.match(view, /ParseJob → 不可变 ParsedDocument/)
+  assert.match(view, /document-input → document-chunker → execution_gate/)
+  assert.match(view, /FlowChunkReviewSnapshot/)
+  assert.match(view, /TABULAR_CHUNKING_UNSUPPORTED/)
+  assert.doesNotMatch(view, /sourcePreparationChunker|previewSourcePreparation/)
 })

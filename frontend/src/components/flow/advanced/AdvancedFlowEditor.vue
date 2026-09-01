@@ -122,13 +122,19 @@ function dragStart(event, item, kind) {
 function addDefinition(raw, position) {
   if (raw.kind === 'subflow') {
     const item = resolveSubflow(raw, props.subflows)
-    if (!item || item.revision_status !== 'published' || item.status !== 'active' || (props.purpose === 'knowledge' && item.usage === 'source_preparation')) { emit('error', '该子流程尚未发布或仅适用于文档预处理'); return }
+    if (!item || item.revision_status !== 'published' || item.status !== 'active') { emit('error', '该子流程尚未发布或不可用'); return }
     raw = { ...raw, subflow_revision_id: item.revision_id || item.latest_revision_id }
   }
   beforeChange()
   const definition = { ...raw, id: uniqueId(raw.kind === 'subflow' ? raw.ref : raw.ref || 'node') }
   const node = makeCanvasNode(definition, { x: position.x - 135, y: position.y - 70 }, props.catalog, props.subflows)
   nodes.value.push(node)
+  if (definition.kind === 'operator' && definition.ref === 'document-chunker') {
+    const gateDefinition = { id: uniqueId('input-review-gate'), kind: 'execution_gate', locked: true }
+    const gate = makeCanvasNode(gateDefinition, { x: position.x + 210, y: position.y - 70 }, props.catalog, props.subflows)
+    nodes.value.push(gate)
+    edges.value.push({ id: uniqueId('edge'), type: 'dataforge', source: node.id, sourceHandle: 'output', target: gate.id, targetHandle: 'input', data: { status: 'idle' } })
+  }
   return node
 }
 function addItem(item, kind) {
@@ -234,7 +240,7 @@ function changeOperatorVersion(version) {
 function replaceOperator(item) {
   const old = selectedNode.value
   if (!old || old.data.meta.nodeRole !== 'operator' || old.data.definition.kind !== 'operator' || !item) return
-  if (item.node_role === 'flow_input' || item.code === 'reviewed-source-chunk-input' || !operatorAvailable(item, props.purpose, props.outputTypes)) return
+  if (item.node_role === 'flow_input' || item.code === 'document-input' || !operatorAvailable(item, props.purpose, props.outputTypes)) return
   if (old.data.definition.ref === item.code && old.data.definition.operator_version === item.version) return
   const definition = { id: old.id, kind: 'operator', node_role: 'operator', ref: item.code,
     operator_version: item.version, params: keepCompatibleParams(old.data.definition.params, item.parameter_schema) }

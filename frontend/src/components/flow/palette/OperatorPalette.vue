@@ -88,7 +88,7 @@ const versions = ref({})
 const matchingSubflows = computed(() => props.subflows.filter(item => !unavailable(item) && [item.name, item.display_name_zh, item.code, item.description].join(' ').toLowerCase().includes(query.value.trim().toLowerCase()) && connects({ kind: 'subflow', ref: item.code, subflow_revision_id: selected(item)?.revision_id || selected(item)?.latest_revision_id })))
 const published = item => (item.revisions || [item]).filter(version => version.revision_status === 'published')
 const selected = item => published(item).find(version => (version.revision_id || version.latest_revision_id) === versions.value[item.id]) || published(item)[0]
-const unavailable = item => !selected(item) || item.status !== 'active' || (props.purpose === 'knowledge' && item.usage === 'source_preparation')
+const unavailable = item => !selected(item) || item.status !== 'active'
 function addOperator(item) { if (insertable(item)) emit('add-item', item, 'operator') }
 function dragOperator(event, item) { if (!insertable(item)) event.preventDefault(); else { help.value?.close(); emit('drag-start', event, item, 'operator') } }
 function addSubflow(item) { if (!unavailable(item)) emit('add-item', selected(item), 'subflow') }
@@ -130,7 +130,7 @@ function toggle(key) {
         <div v-for="item in matchingSubflows" :key="item.id" class="palette-entry subflow-item" :draggable="!unavailable(item)" role="button" :tabindex="unavailable(item) ? -1 : 0" :aria-disabled="unavailable(item)" title="拖入画布添加；也可双击或按 Enter / 空格添加" @dragstart="dragSubflow($event, item)" @dblclick="addSubflow(item)" @keydown.enter.self.prevent="addSubflow(item)" @keydown.space.self.prevent="addSubflow(item)">
           <b>{{ subflowPrimaryName(item) }}</b><small>{{ subflowSubtitle(selected(item) || item, true) }}</small>
           <select v-if="published(item).length" :aria-label="`${subflowPrimaryName(item)}版本`" :value="versions[item.id] || selected(item)?.revision_id || selected(item)?.latest_revision_id" @change="versions[item.id] = $event.target.value" @dblclick.stop><option v-for="version in published(item)" :key="version.revision_id" :value="version.revision_id || version.latest_revision_id">r{{ version.revision }}</option></select>
-          <small v-if="item.usage === 'source_preparation'">审核前 · 文档预处理</small><small v-else-if="!selected(item)">尚未发布</small>
+          <small v-if="!selected(item)">尚未发布</small>
         </div>
         <p v-if="!matchingSubflows.length">暂无匹配的子流程</p>
       </section>

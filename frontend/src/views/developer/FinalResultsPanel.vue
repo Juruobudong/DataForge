@@ -47,7 +47,7 @@ async function loadPage() {
 }
 function changePage(delta) { pages.value = { ...pages.value, [selectedId.value]: Math.max(0, (page.value?.offset || 0) + delta * RESULT_PAGE_SIZE) } }
 function selectOutput(id) { outputChosen = true; selectedId.value = id }
-function sourceLabel(item) { return item.source_anchor || item.anchor_json?.label || item.source_chunk_id || '来源未记录' }
+function sourceLabel(item) { return item.source_anchor || item.anchor_json?.label || item.flow_chunk_id || item.parsed_document_id || '来源未记录' }
 function recorded(value) {
   if (Array.isArray(value)) return value.length ? value.join('、') : '未记录'
   return value === undefined || value === null || value === '' ? '未记录' : String(value)
@@ -78,11 +78,11 @@ function auditSummary(item) {
     const version = context.sample_version ? ` · v${context.sample_version}` : ''
     return `内置审核示例${version} · 已审核`
   }
-  return item.source_review_snapshot_id ? '业务审核快照' : '未记录'
+  return item.flow_chunk_review_snapshot_id ? 'Flow 输入快照' : item.parsed_document_id ? 'ParsedDocument' : '未记录'
 }
 function lineageValue(item, key) {
   if (item[key]) return recorded(item[key])
-  return isBuiltinSample() && ['source_chunk_revision_id', 'source_review_snapshot_id'].includes(key)
+  return isBuiltinSample() && ['flow_chunk_revision_id', 'flow_chunk_review_snapshot_id'].includes(key)
     ? '不适用（内置审核示例）' : '未记录'
 }
 function pretty(value) { return JSON.stringify(value ?? {}, null, 2) }
@@ -156,10 +156,10 @@ function semanticDetails(data) {
                   <dt>来源文件</dt><dd>{{ sourceFile(item) }}</dd>
                   <dt>切片位置</dt><dd>{{ chunkPosition(item) }}</dd>
                   <dt>来源版本</dt><dd>{{ recorded(item.source_version_ids) }}</dd>
-                  <dt>切片标识</dt><dd>{{ recorded(item.source_chunk_id) }}</dd>
-                  <dt>切片修订</dt><dd>{{ lineageValue(item, 'source_chunk_revision_id') }}</dd>
+                  <dt>FlowChunk</dt><dd>{{ recorded(item.flow_chunk_id) }}</dd>
+                  <dt>切片修订</dt><dd>{{ lineageValue(item, 'flow_chunk_revision_id') }}</dd>
                   <dt>审核信息</dt><dd>{{ auditSummary(item) }}</dd>
-                  <dt>审核快照</dt><dd>{{ lineageValue(item, 'source_review_snapshot_id') }}</dd>
+                  <dt>审核快照</dt><dd>{{ lineageValue(item, 'flow_chunk_review_snapshot_id') }}</dd>
                 </dl>
                 <h4>原文证据</h4><p>{{ item.evidence_text || '原文证据未记录' }}</p>
                 <h4>来源锚点</h4><pre>{{ pretty(item.anchor_json) }}</pre>

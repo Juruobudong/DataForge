@@ -9,9 +9,9 @@ from ..models import (
     DocumentLibrary,
     DocumentLibraryMember,
     KnowledgeItem,
-    KnowledgeItemSource,
+    KnowledgeEvidence,
     Source,
-    SourceChunk,
+    FlowChunk,
     SourceVersion,
 )
 
@@ -21,14 +21,14 @@ class DependencyScope:
     document_library_ids: tuple[str, ...]
     source_ids: tuple[str, ...]
     source_version_ids: tuple[str, ...]
-    source_chunk_ids: tuple[str, ...]
+    flow_chunk_ids: tuple[str, ...]
 
 
 def resolve_dependencies(session, library_ids: list[str], *, include_full_document_library: bool = False) -> DependencyScope:
     item_ids = list(session.scalars(select(KnowledgeItem.id).where(
         KnowledgeItem.knowledge_library_id.in_(library_ids), KnowledgeItem.status == "active",
     )))
-    links = list(session.scalars(select(KnowledgeItemSource).where(KnowledgeItemSource.knowledge_item_id.in_(item_ids)))) if item_ids else []
+    links = list(session.scalars(select(KnowledgeEvidence).where(KnowledgeEvidence.knowledge_item_id.in_(item_ids)))) if item_ids else []
     version_ids = {link.source_version_id for link in links}
     versions = list(session.scalars(select(SourceVersion).where(
         SourceVersion.id.in_(version_ids), SourceVersion.status != "deleted",
@@ -54,12 +54,12 @@ def resolve_dependencies(session, library_ids: list[str], *, include_full_docume
         )))
         version_ids = {version.id for version in versions}
 
-    chunks: list[SourceChunk] = []
+    chunks: list[FlowChunk] = []
     if version_ids:
-        chunk_keys = {(link.source_version_id, link.source_chunk_id) for link in links if link.source_chunk_id}
-        candidates = list(session.scalars(select(SourceChunk).where(SourceChunk.source_version_id.in_(version_ids))))
+        chunk_keys = {(link.source_version_id, link.flow_chunk_id) for link in links if link.flow_chunk_id}
+        candidates = list(session.scalars(select(FlowChunk).where(FlowChunk.source_version_id.in_(version_ids))))
         chunks = candidates if include_full_document_library else [
-            chunk for chunk in candidates if (chunk.source_version_id, chunk.source_chunk_id) in chunk_keys
+            chunk for chunk in candidates if (chunk.source_version_id, chunk.id) in chunk_keys
         ]
     if library_ids_set:
         # Fail closed when a referenced container has disappeared.

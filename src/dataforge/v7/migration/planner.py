@@ -19,7 +19,7 @@ from ..models import (
     Project,
     Deployment,
     ProjectDeployment,
-    ProjectDeploymentTask,
+    ProjectReleaseTask,
     ProjectOrgRoute,
     ProjectOrgRouteLibrary,
     ProjectRouteVersion,
@@ -54,16 +54,16 @@ class MigrationPlanner:
             if not deployment or not project: raise ValueError("Deployment 或 Project 不存在")
             if deployment.scope != "institution":
                 raise ValueError("迁移包目标 Deployment 必须是手动配置的目标机构，不能使用 DataForge 中心环境")
-            deployment_tasks = list(session.scalars(select(ProjectDeploymentTask).where(
-                ProjectDeploymentTask.project_deployment_id == project_deployment.id,
-                ProjectDeploymentTask.enabled.is_(True),
+            deployment_tasks = list(session.scalars(select(ProjectReleaseTask).where(
+                ProjectReleaseTask.project_id == project.id,
+                ProjectReleaseTask.enabled.is_(True),
             )))
             task_by_id = {task.id: task for task in deployment_tasks}
             project_tasks = {task.id: task for task in session.scalars(select(ProjectTask).where(
                 ProjectTask.id.in_([item.project_task_id for item in deployment_tasks])
             ))}
             routes = list(session.scalars(select(ProjectOrgRoute).where(
-                ProjectOrgRoute.project_deployment_task_id.in_(task_by_id), ProjectOrgRoute.enabled.is_(True)
+                ProjectOrgRoute.project_release_task_id.in_(task_by_id), ProjectOrgRoute.enabled.is_(True)
             ))) if task_by_id else []
             route_by_id = {route.id: route for route in routes}
             links = list(session.scalars(select(ProjectOrgRouteLibrary).where(
@@ -77,7 +77,7 @@ class MigrationPlanner:
             if {library.id for library in libraries} != selected_ids:
                 raise ValueError("迁移范围包含不存在的知识库")
 
-            by_type: dict[str, list[ProjectDeploymentTask]] = defaultdict(list)
+            by_type: dict[str, list[ProjectReleaseTask]] = defaultdict(list)
             for dt in deployment_tasks:
                 task = project_tasks.get(dt.project_task_id)
                 if task and dt.index_profile_id: by_type[task.knowledge_type].append(dt)
@@ -107,9 +107,8 @@ class MigrationPlanner:
                 mapping[library.id] = item
             dependencies = resolve_dependencies(session, sorted(selected_ids), include_full_document_library=include_full_document_library)
             latest_route = session.scalar(select(ProjectRouteVersion).where(
-                ProjectRouteVersion.project_deployment_id == project_deployment.id,
-                ProjectRouteVersion.release_stage == release_stage,
-                ProjectRouteVersion.status == "published",
+                ProjectRouteVersion.project_id == project.id,
+                ProjectRouteVersion.status == "frozen",
             ).order_by(ProjectRouteVersion.version_no.desc()))
             if package_kind == "deployment_seed" and not latest_route:
                 raise ValueError("deployment_seed 要求已发布的 Routing baseline")
@@ -134,7 +133,7 @@ class MigrationPlanner:
                     "document_library_ids": list(dependencies.document_library_ids),
                     "source_ids": list(dependencies.source_ids),
                     "source_version_ids": list(dependencies.source_version_ids),
-                    "source_chunk_ids": list(dependencies.source_chunk_ids),
+                    "flow_chunk_ids": list(dependencies.flow_chunk_ids),
                 },
                 "counts": {
                     "knowledge_libraries": len(selected_ids),
@@ -170,7 +169,6 @@ class InstitutionReleasePlanner:
                 InstitutionReleaseDraftProject.institution_release_draft_id == draft.id,
             ).order_by(InstitutionReleaseDraftProject.created_at)))
             projects: list[dict[str, Any]] = []
-            route_stages: set[str] = set()
             asset_ids: set[str] = set()
             required_by_projects: dict[str, list[dict[str, str]]] = defaultdict(list)
             project_required_refs = 0
@@ -184,9 +182,8 @@ class InstitutionReleasePlanner:
                     project = session.get(Project, binding.project_id) if binding else None
                     if not binding or binding.deployment_id != deployment.id or not project:
                         raise ValueError("机构发布项目不属于目标机构")
-                    if not route or route.status != "frozen" or route.project_deployment_id != binding.id:
+                    if not route or route.status != "frozen" or route.project_id != binding.project_id:
                         raise ValueError("机构发布只能引用当前机构的 frozen RouteVersion")
-                    route_stages.add(route.release_stage)
                     route_assets = list(session.scalars(select(ProjectRouteVersionAsset).where(
                         ProjectRouteVersionAsset.project_route_version_id == route.id,
                     )))
@@ -221,14 +218,10 @@ class InstitutionReleasePlanner:
                         raise ValueError(f"知识库 {library_id} 没有 Ready AssetVersion")
                     asset_ids.update(item.id for item in latest_by_profile.values())
 
-            if len(route_stages) > 1:
-                raise ValueError("机构发布不能混合测试环境和生产环境的项目版本")
             selected_stage = (draft.selection_json or {}).get("release_stage")
-            release_stage = str(selected_stage or (next(iter(route_stages)) if route_stages else ""))
+            release_stage = str(selected_stage or "")
             if release_stage not in {"test", "production"}:
                 raise ValueError("release_stage 只允许 test 或 production")
-            if route_stages and route_stages != {release_stage}:
-                raise ValueError("机构发布环境与所选 frozen RouteVersion 不一致")
 
             assets = list(session.scalars(select(KnowledgeAssetVersion).where(
                 KnowledgeAssetVersion.id.in_(asset_ids),
@@ -461,7 +454,7 @@ class InstitutionReleasePlanner:
                     "document_library_ids": list(dependencies.document_library_ids),
                     "source_ids": list(dependencies.source_ids),
                     "source_version_ids": list(dependencies.source_version_ids),
-                    "source_chunk_ids": list(dependencies.source_chunk_ids),
+                    "flow_chunk_ids": list(dependencies.flow_chunk_ids),
                 },
                 "runtime_closure": {
                     "binding_ids": sorted(closure_binding_ids),

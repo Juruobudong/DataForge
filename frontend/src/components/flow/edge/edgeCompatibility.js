@@ -22,7 +22,8 @@ function roleOf(node) {
   if (meta.nodeRole) return meta.nodeRole
   if (definition.node_role) return definition.node_role
   if (definition.kind === 'knowledge_sink') return 'knowledge_output'
-  if (definition.kind === 'operator' && definition.ref === 'reviewed-source-chunk-input') return 'flow_input'
+  if (definition.kind === 'execution_gate') return 'execution_gate'
+  if (definition.kind === 'operator' && definition.ref === 'document-input') return 'flow_input'
   return 'operator'
 }
 

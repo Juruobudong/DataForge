@@ -179,28 +179,21 @@ def _run_knowledge_job(store: V7Store, resolved: Settings, job_id: str, owner: s
             release("knowledge", job_id, owner)
 
 
-def _run_source_preparation_job(store: V7Store, resolved: Settings, job_id: str, owner: str) -> int:
+def _run_parse_job(store: V7Store, resolved: Settings, job_id: str, owner: str) -> int:
     try:
         if not resolved.runner_url:
-            store.finish_source_preparation(job_id, "DATAFORGE_RUNNER_URL 未配置")
+            store.finish_parse_job(job_id, error="DATAFORGE_RUNNER_URL 未配置")
             return 0
         headers = {"Authorization": f"Bearer {resolved.runner_service_token}"} if resolved.runner_service_token else {}
         response = httpx.post(
             f"{resolved.runner_url.rstrip('/')}/internal/jobs",
-            json={"source_preparation_job_id": job_id, "lease_owner": owner}, headers=headers,
+            json={"parse_job_id": job_id, "lease_owner": owner}, headers=headers,
             timeout=resolved.runner_timeout_seconds,
         )
         response.raise_for_status(); return 1
     except Exception as exc:
-        LOGGER.exception("Source Preparation 任务失败：%s", exc)
-        store.finish_source_preparation(job_id, str(exc)); return 0
-
-
-def _run_knowledge_dispatch(store: V7Store, dispatch_id: str) -> int:
-    try:
-        store.process_knowledge_dispatch(dispatch_id); return 1
-    except Exception as exc:
-        LOGGER.exception("知识自动调度失败：%s", exc); return 0
+        LOGGER.exception("ParseJob 失败：%s", exc)
+        store.finish_parse_job(job_id, error=str(exc)); return 0
 
 
 def _run_vector_sync_job(store: V7Store, job_id: str, owner: str) -> int:
@@ -289,14 +282,9 @@ def run_once(settings: Settings | None = None, *, check_schema: bool = True) -> 
     result = _run_derived_once(store, resolved, owner)
     if result is not None:
         return result
-    claim_dispatch = getattr(store, "claim_knowledge_dispatch", None)
-    dispatch = claim_dispatch(owner) if claim_dispatch else None
-    if dispatch:
-        return _run_knowledge_dispatch(store, dispatch.id)
-    claim_preparation = getattr(store, "claim_source_preparation_job", None)
-    preparation = claim_preparation(owner) if claim_preparation else None
-    if preparation:
-        return _run_source_preparation_job(store, resolved, preparation.id, owner)
+    parse_job = store.claim_parse_job(owner)
+    if parse_job:
+        return _run_parse_job(store, resolved, parse_job.id, owner)
     job = store.claim_job(owner)
     if job:
         return _run_knowledge_job(store, resolved, job.id, owner)
@@ -331,7 +319,7 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
                 details={"active_job_ids": current, "active_count": len(current),
                          "knowledge_concurrency": getattr(resolved, "knowledge_job_concurrency", 3),
                          "vector_concurrency": getattr(resolved, "vector_sync_concurrency", 2),
-                         "source_preparation_concurrency": getattr(resolved, "source_preparation_concurrency", 2)},
+                         "parse_concurrency": getattr(resolved, "parse_concurrency", 2)},
             )
         except Exception:
             LOGGER.exception("Worker 心跳写入失败")
@@ -347,9 +335,8 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
     draining = False
     knowledge_concurrency = getattr(resolved, "knowledge_job_concurrency", 3)
     vector_concurrency = getattr(resolved, "vector_sync_concurrency", 2)
-    preparation_concurrency = getattr(resolved, "source_preparation_concurrency", 2)
-    claim_preparation = getattr(store, "claim_source_preparation_job", lambda _owner: None)
-    with ThreadPoolExecutor(max_workers=preparation_concurrency, thread_name_prefix="source-preparation") as preparation_pool, \
+    parse_concurrency = getattr(resolved, "parse_concurrency", 2)
+    with ThreadPoolExecutor(max_workers=parse_concurrency, thread_name_prefix="document-parse") as parse_pool, \
             ThreadPoolExecutor(max_workers=knowledge_concurrency, thread_name_prefix="knowledge") as knowledge_pool, \
             ThreadPoolExecutor(max_workers=vector_concurrency, thread_name_prefix="vector") as vector_pool:
         while stop_event is None or not stop_event.is_set():
@@ -364,8 +351,8 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
                         LOGGER.exception("并发任务未捕获异常：%s", work.work_id)
                     continue
                 if now >= work.next_renew_at:
-                    renewed = (store.renew_source_preparation_lease(work.work_id, work.owner)
-                               if work.kind == "source_preparation"
+                    renewed = (store.renew_parse_lease(work.work_id, work.owner)
+                               if work.kind == "parse"
                                else store.renew_work_lease(work.kind, work.work_id, work.owner))
                     if not renewed:
                         LOGGER.error("任务租约续期失败：%s %s", work.kind, work.work_id)
@@ -383,21 +370,15 @@ def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, 
                 time.sleep(interval)
                 continue
 
-            dispatch_owner = _owner_token("knowledge-dispatch")
-            claim_dispatch = getattr(store, "claim_knowledge_dispatch", None)
-            dispatch = claim_dispatch(dispatch_owner) if claim_dispatch else None
-            if dispatch:
-                _run_knowledge_dispatch(store, dispatch.id)
-
             knowledge_active = sum(item.kind == "knowledge" for item in active)
-            preparation_active = sum(item.kind == "source_preparation" for item in active)
-            while preparation_active < preparation_concurrency:
-                owner = _owner_token("source-preparation")
-                job = claim_preparation(owner)
+            parse_active = sum(item.kind == "parse" for item in active)
+            while parse_active < parse_concurrency:
+                owner = _owner_token("parse")
+                job = store.claim_parse_job(owner)
                 if not job: break
-                future = preparation_pool.submit(_run_source_preparation_job, store, resolved, job.id, owner)
-                active.append(ActiveWork("source_preparation", job.id, owner, future, now + LEASE_RENEW_SECONDS))
-                preparation_active += 1
+                future = parse_pool.submit(_run_parse_job, store, resolved, job.id, owner)
+                active.append(ActiveWork("parse", job.id, owner, future, now + LEASE_RENEW_SECONDS))
+                parse_active += 1
 
             while knowledge_active < knowledge_concurrency:
                 owner = _owner_token("knowledge")

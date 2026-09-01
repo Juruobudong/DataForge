@@ -27,7 +27,7 @@ from .models import (
     KnowledgeIndexProfileRevision,
     ModelServing,
     RerankerServing,
-    ProjectDeploymentTask,
+    ProjectReleaseTask,
     ProjectRouteVersion,
     utc_now,
 )
@@ -88,6 +88,8 @@ class LLMServingConfig:
     timeout_seconds: float
     max_retries: int
     max_tokens: int
+    context_window_tokens: int
+    tokenizer_name: str
     disable_thinking: bool
 
 
@@ -167,6 +169,8 @@ class ServingManager:
         }
         if isinstance(value, ModelServing):
             result.update({"serving_type": value.serving_type, "max_tokens": value.max_tokens,
+                           "context_window_tokens": value.context_window_tokens,
+                           "tokenizer_name": value.tokenizer_name,
                            "disable_thinking": value.disable_thinking})
         elif isinstance(value, RerankerServing):
             result.update({"provider_type": value.provider_type, "max_batch_size": value.max_batch_size,
@@ -214,6 +218,8 @@ class ServingManager:
             }
             if isinstance(value, ModelServing):
                 payload.update({"serving_type": value.serving_type, "max_tokens": value.max_tokens,
+                                "context_window_tokens": value.context_window_tokens,
+                                "tokenizer_name": value.tokenizer_name,
                                 "disable_thinking": value.disable_thinking})
                 if include_credentials:
                     payload["credential_digest"] = hashlib.sha256(str(value.credential_ciphertext or "").encode("utf-8")).hexdigest()
@@ -237,8 +243,14 @@ class ServingManager:
                      "reranker": SUPPORTED_RERANKER_TYPES}[kind]
         if provider_type not in supported:
             raise ValueError("Serving 协议不受支持")
-        if kind == "model" and int(payload.get("max_tokens", 0)) <= 0:
-            raise ValueError("max_tokens 必须为正整数")
+        if kind == "model":
+            payload = {**payload,
+                       "context_window_tokens": int(payload.get("context_window_tokens") or 8192),
+                       "tokenizer_name": str(payload.get("tokenizer_name") or payload.get("model_name") or "").strip()}
+        if kind == "model" and (int(payload.get("max_tokens", 0)) <= 0
+                                or int(payload.get("context_window_tokens", 0)) <= 0
+                                or not str(payload.get("tokenizer_name") or "").strip()):
+            raise ValueError("max_tokens、context_window_tokens 和 tokenizer_name 必须有效")
         if kind == "embedding" and (int(payload.get("dimension", 0)) <= 0 or int(payload.get("batch_size", 0)) <= 0):
             raise ValueError("dimension 和 batch_size 必须为正整数")
         base_url = self._validate_base_url(payload.get("base_url"))
@@ -257,6 +269,8 @@ class ServingManager:
             }
             if kind == "model":
                 values.update({"serving_type": provider_type, "max_tokens": int(payload["max_tokens"]),
+                               "context_window_tokens": int(payload["context_window_tokens"]),
+                               "tokenizer_name": str(payload["tokenizer_name"]).strip(),
                                "disable_thinking": bool(payload.get("disable_thinking", True))})
             elif kind == "reranker":
                 values.update({"provider_type": provider_type, "max_batch_size": int(payload["max_batch_size"]),
@@ -301,13 +315,14 @@ class ServingManager:
                 if published or asset:
                     raise ValueError("Embedding Serving 已被正式 Profile 或 Asset 引用，不能原地修改协议、模型或维度")
             connection_fields = {"base_url", "model_name", "serving_type", "provider_type", "dimension",
-                                 "timeout_seconds", "max_retries", "max_tokens", "disable_thinking", "batch_size",
+                                 "timeout_seconds", "max_retries", "max_tokens", "context_window_tokens",
+                                 "tokenizer_name", "disable_thinking", "batch_size",
                                  "max_batch_size", "max_concurrency"}
             changed_connection = bool(connection_fields & set(changes)) or bool(api_key) or clear_credential
             for key, raw in changes.items():
                 if key == "base_url":
                     raw = self._validate_base_url(raw)
-                if key in {"timeout_seconds", "max_tokens", "dimension", "batch_size"} and int(raw) <= 0:
+                if key in {"timeout_seconds", "max_tokens", "context_window_tokens", "dimension", "batch_size"} and int(raw) <= 0:
                     raise ValueError(f"{key} 必须为正整数")
                 if key == "max_retries" and int(raw) < 0:
                     raise ValueError("max_retries 必须为非负整数")
@@ -358,8 +373,8 @@ class ServingManager:
                              if _contains_llm_serving(item.compiled_definition_json, value.serving_code)]
                 result = {"templates": templates, "revisions": revisions, "snapshots": snapshots}
             elif kind == "reranker":
-                result = {"tasks": list(session.scalars(select(ProjectDeploymentTask.id).where(
-                    ProjectDeploymentTask.reranker_serving_code == value.serving_code))),
+                result = {"tasks": list(session.scalars(select(ProjectReleaseTask.id).where(
+                    ProjectReleaseTask.reranker_serving_code == value.serving_code))),
                     "route_versions": self._reranker_versions(session, value.serving_code)}
             else:
                 profiles = list(session.scalars(select(KnowledgeIndexProfile.id).where(
@@ -526,12 +541,14 @@ class DatabaseLLMServingRegistry:
     def require(self, serving_id: str | None = None) -> LLMServingConfig:
         value, _ = self.manager.resolved("model", serving_id, require_configured=False)
         return LLMServingConfig(value.serving_code, value.serving_type, value.model_name, value.base_url,
-                                value.timeout_seconds, value.max_retries, value.max_tokens, value.disable_thinking)
+                                value.timeout_seconds, value.max_retries, value.max_tokens,
+                                value.context_window_tokens, value.tokenizer_name, value.disable_thinking)
 
     def require_healthy(self, serving_id: str | None = None) -> LLMServingConfig:
         value, _ = self.manager.resolved("model", serving_id, require_healthy=True)
         return LLMServingConfig(value.serving_code, value.serving_type, value.model_name, value.base_url,
-                                value.timeout_seconds, value.max_retries, value.max_tokens, value.disable_thinking)
+                                value.timeout_seconds, value.max_retries, value.max_tokens,
+                                value.context_window_tokens, value.tokenizer_name, value.disable_thinking)
 
     def fingerprint(self, serving_id: str | None = None, *, include_credentials: bool = True) -> str:
         value = self.require(serving_id)
@@ -540,7 +557,8 @@ class DatabaseLLMServingRegistry:
     def client(self, serving_id: str | None = None) -> tuple[LLMServingConfig, Any]:
         value, credential = self.manager.resolved("model", serving_id)
         config = LLMServingConfig(value.serving_code, value.serving_type, value.model_name, value.base_url,
-                                  value.timeout_seconds, value.max_retries, value.max_tokens, value.disable_thinking)
+                                  value.timeout_seconds, value.max_retries, value.max_tokens,
+                                  value.context_window_tokens, value.tokenizer_name, value.disable_thinking)
         fingerprint = hashlib.sha256(json.dumps({
             "url": value.base_url, "model": value.model_name, "credential": value.credential_ciphertext,
             "timeout": value.timeout_seconds, "retries": value.max_retries,

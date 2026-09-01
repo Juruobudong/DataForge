@@ -45,7 +45,9 @@ conda activate sun
 uv run --extra web dataforge-runner
 ```
 
-运行前需要按 [`compose.yaml`](compose.yaml) 中同名环境变量配置数据库、对象存储、Runner、Embedding、Model Serving、Milvus、Routing 与迁移目录。机构 local 保存 Milvus 密码或 Token 时，必须设置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）。
+运行前需要按 [`compose.example.yaml`](compose.example.yaml) 中同名环境变量配置数据库、对象存储、Runner、Embedding、Model Serving、Milvus、Routing 与迁移目录。该文件是脱敏模板，不含任何内网地址；部署时先 `cp compose.example.yaml compose.yaml`，再把真实地址写入 `.env.docker`（`compose.yaml` 与 `.env.docker` 均不入库）。机构 local 保存 Milvus 密码或 Token 时，必须设置 32 字节 `DATAFORGE_CONFIG_ENCRYPTION_KEY`（Base64 或 64 位十六进制）。`DATAFORGE_LOCAL_MILVUS_URI` 默认 `http://dataforge-milvus:19530`，仅预填 local Candidate 表单，不自动保存、验证或启用。
+
+项目发布页默认进入测试环境；需要默认进入生产环境时设置 `DATAFORGE_DEFAULT_RELEASE_STAGE=production`。中心 test/production Milvus 通过实例级 Target 首次绑定并由所有项目共用；页面不再创建或选择中心 Deployment。
 
 ## 启动前端
 

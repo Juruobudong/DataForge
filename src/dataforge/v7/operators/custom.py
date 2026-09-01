@@ -6,16 +6,16 @@ from .runtime import OperatorRuntime
 from .diagnostics import capture_operator_diagnostics
 from ..operator_runtime_contract import validate_runtime_requirements
 
-PROTECTED = ("source_id", "source_version_id", "source_version_ids", "source_chunk_id", "source_chunk_revision_id",
-             "source_review_snapshot_id", "source_anchor", "anchor", "anchor_json", "evidence_text", "source_knowledge_id")
+PROTECTED = ("source_id", "source_version_id", "source_version_ids", "flow_chunk_id", "flow_chunk_revision_id",
+             "flow_chunk_review_snapshot_id", "source_anchor", "anchor", "anchor_json", "evidence_text", "source_knowledge_id")
 
 
 def validate_records(records, artifact_type):
     if not isinstance(records, list) or any(not isinstance(row, dict) for row in records):
         raise ValueError("输出必须为记录对象数组")
     for row in records:
-        if artifact_type == "source_chunk_set" and not isinstance(row.get("content"), str):
-            raise ValueError("source_chunk_set 缺少正文")
+        if artifact_type == "flow_chunk_review_snapshot" and not isinstance(row.get("content"), str):
+            raise ValueError("flow_chunk_review_snapshot 缺少正文")
         if artifact_type == "entity_candidate_set" and not isinstance(row.get("entities"), list):
             raise ValueError("entity_candidate_set 缺少 entities 数组")
         if artifact_type == "entity_candidate_set" and any(not isinstance(entity, dict) or not isinstance(entity.get("name"), str) or not entity["name"].strip() for entity in row["entities"]):
@@ -57,9 +57,9 @@ class CustomOperatorExecutor:
         validate_records(inputs, self.definition["input_ports"]["input"]["artifact_type"])
         records = []
         for index, row in enumerate(inputs):
-            if not row.get("source_chunk_id") or not (row.get("source_version_id") or row.get("source_version_ids")):
+            if not row.get("flow_chunk_id") or not (row.get("source_version_id") or row.get("source_version_ids")):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 自定义算子输入缺少审核来源")
-            if not row.get("source_chunk_revision_id") or not row.get("source_review_snapshot_id") or not isinstance(row.get("anchor_json", row.get("anchor")), dict):
+            if not row.get("flow_chunk_revision_id") or not row.get("flow_chunk_review_snapshot_id") or not isinstance(row.get("anchor_json", row.get("anchor")), dict):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 自定义算子必须保留审核修订和完整 Anchor")
             record = deepcopy(row) if self.spec["executor"] == "custom-native" else {
                 target: deepcopy(row[source]) for source, target in self.spec.get("input_mapping", {}).items()}

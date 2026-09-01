@@ -6,69 +6,93 @@ const props = defineProps({
   deploymentId: String, releaseStage: String, institution: Boolean,
   projectCode: String, deploymentCode: String,
 })
-const viewMode = ref('public'), routeMode = ref('draft'), version = ref(''), publicStage = ref(props.releaseStage || 'test')
+
+const viewMode = ref('effect'), routeMode = ref('draft'), version = ref('')
 const taskCode = ref(''), orgCode = ref(''), query = ref('')
-const options = ref({ tasks: [], versions: [], rerankers: [] }), result = ref(null), error = ref('')
-const busy = ref(false), loading = ref(false), publicUnavailable = ref('')
-const experiment = ref(false), topK = ref(10), finalTopK = ref(5), reranker = ref(null), filters = ref([]), copyNotice = ref('')
+const options = ref({ tasks: [], versions: [], rerankers: [] })
+const effectResult = ref(null), publicEnvelope = ref(null), traceResult = ref(null)
+const error = ref(''), busy = ref(false), loading = ref(false), unavailable = ref('')
+const experiment = ref(false), topK = ref(10), finalTopK = ref(5), reranker = ref(null)
+const filters = ref([]), copyNotice = ref('')
 let optionsEpoch = 0, runEpoch = 0
 
 const task = computed(() => options.value.tasks.find(item => item.task_code === taskCode.value))
 const orgs = computed(() => task.value?.org_routes || [])
 const fields = computed(() => task.value?.filter_fields || {})
-const activeStage = computed(() => viewMode.value === 'public' ? publicStage.value : props.releaseStage)
-const publicPath = computed(() => {
-  if (!props.projectCode || !props.deploymentCode || !taskCode.value) return ''
-  return `/api/runtime/retrieval/v1/${encodeURIComponent(props.projectCode)}/${encodeURIComponent(props.deploymentCode)}/${publicStage.value}/${encodeURIComponent(taskCode.value)}/query`
-})
+const publicBody = computed(() => publicEnvelope.value?.response?.body || null)
+const publicPath = computed(() => publicEnvelope.value?.request?.path || (
+  props.projectCode && props.deploymentCode && taskCode.value
+    ? `/api/runtime/retrieval/v1/${encodeURIComponent(props.projectCode)}/${encodeURIComponent(props.deploymentCode)}/${props.releaseStage}/${encodeURIComponent(taskCode.value)}/query`
+    : ''
+))
 const curlText = computed(() => publicPath.value ? [
   `curl -X POST "${globalThis.location?.origin || '<DATAFORGE_URL>'}${publicPath.value}"`,
   '-H "Authorization: Bearer <DATAFORGE_RETRIEVAL_TOKEN>"',
   '-H "Content-Type: application/json"',
   `-d '${JSON.stringify({ org_code: orgCode.value, query: query.value || '<QUERY>' })}'`,
 ].join(' \\\n+  ') : '')
-const stageNames = { routing: '① Routing Resolution', embedding: '② Query Embedding', recall: '③ Vector Recall', reranker: '④ Reranker', final: '⑤ Final Results', context: '⑥ Context Preview', evidence: '⑦ Citation / Evidence' }
+const stageNames = {
+  routing: '路由与授权', embedding: 'Query Embedding', recall: 'Vector Search 与候选合并',
+  reranker: 'Rerank', final: 'Final Results', context: 'Context Preview', evidence: 'Citation / Evidence',
+}
 const statusNames = { completed: '完成', failed: '失败', skipped: '跳过', blocked: '待本地执行' }
+const traceStages = computed(() => traceResult.value?.stages || [])
 
-function invalidate() { runEpoch++; result.value = null; busy.value = false; error.value = ''; copyNotice.value = '' }
+function clearResults({ keepTrace = false } = {}) {
+  runEpoch += 1; effectResult.value = null; publicEnvelope.value = null
+  if (!keepTrace) traceResult.value = null
+  busy.value = false; error.value = ''; copyNotice.value = ''
+}
+
 async function loadOptions() {
   const epoch = ++optionsEpoch
-  invalidate(); loading.value = true; publicUnavailable.value = ''
+  clearResults({ keepTrace: viewMode.value === 'trace' && !!traceResult.value })
+  loading.value = true; unavailable.value = ''
   const priorVersions = options.value.versions
   options.value = { tasks: [], versions: priorVersions, rerankers: [] }
   taskCode.value = ''; orgCode.value = ''; filters.value = []; experiment.value = false
-  if (!props.deploymentId || viewMode.value === 'technical' && routeMode.value === 'historical' && !version.value) { loading.value = false; return }
+  if (!props.deploymentId || viewMode.value !== 'public' && routeMode.value === 'historical' && !version.value) {
+    loading.value = false; return
+  }
   try {
     const params = {
-      release_stage: activeStage.value,
+      release_stage: props.releaseStage,
       route_mode: viewMode.value === 'public' ? 'published' : routeMode.value,
     }
-    if (viewMode.value === 'technical' && routeMode.value === 'historical') params.version_no = version.value
+    if (viewMode.value !== 'public' && routeMode.value === 'historical') params.version_no = version.value
     const response = await api.retrievalDebugOptions(props.deploymentId, params)
     if (epoch !== optionsEpoch) return
     options.value = response
     taskCode.value = response.tasks[0]?.task_code || ''
-    if (viewMode.value === 'public' && !response.tasks.length) publicUnavailable.value = '该环境的当前发布版本没有可检索任务或机构授权。'
+    if (!response.tasks.length) unavailable.value = viewMode.value === 'public'
+      ? '当前环境没有可测试的已发布任务或组织授权。'
+      : '所选配置没有可测试的任务或组织授权。'
   } catch (e) {
     if (epoch !== optionsEpoch) return
-    if (viewMode.value === 'public') publicUnavailable.value = '该环境尚无可用的已发布检索版本。'
-    else error.value = e.message
+    unavailable.value = viewMode.value === 'public' ? '当前环境尚无可用的已发布检索版本。' : ''
+    if (!unavailable.value) error.value = e.message
   } finally { if (epoch === optionsEpoch) loading.value = false }
 }
 
 watch(() => [props.deploymentId, props.releaseStage, props.projectCode, props.deploymentCode], () => {
-  publicStage.value = props.releaseStage || 'test'; routeMode.value = 'draft'; version.value = ''
-  options.value = { tasks: [], versions: [], rerankers: [] }; loadOptions()
+  routeMode.value = 'draft'; version.value = ''; options.value = { tasks: [], versions: [], rerankers: [] }
+  clearResults(); loadOptions()
 }, { immediate: true })
-watch([viewMode, routeMode, version, publicStage], loadOptions)
-watch(task, value => {
-  invalidate(); filters.value = []; experiment.value = false
-  orgCode.value = value?.org_routes?.[0]?.org_code || ''
-  topK.value = value?.top_k ?? 10; finalTopK.value = value?.final_top_k ?? 5; reranker.value = value?.reranker_serving_code ?? null
+watch(viewMode, value => {
+  if (value === 'trace' && traceResult.value) return
+  loadOptions()
 })
-watch([orgCode, query, experiment, topK, finalTopK, reranker], invalidate)
-watch(filters, invalidate, { deep: true })
-onBeforeUnmount(() => { optionsEpoch++; runEpoch++ })
+watch([routeMode, version], () => { if (viewMode.value !== 'public') loadOptions() })
+watch(task, value => {
+  clearResults({ keepTrace: viewMode.value === 'trace' })
+  filters.value = []; experiment.value = false
+  orgCode.value = value?.org_routes?.[0]?.org_code || ''
+  topK.value = value?.top_k ?? 10; finalTopK.value = value?.final_top_k ?? 5
+  reranker.value = value?.reranker_serving_code ?? null
+})
+watch([orgCode, query, experiment, topK, finalTopK, reranker], () => clearResults())
+watch(filters, () => clearResults(), { deep: true })
+onBeforeUnmount(() => { optionsEpoch += 1; runEpoch += 1 })
 
 function addFilter() { filters.value.push({ field: Object.keys(fields.value)[0] || '', op: 'eq', value: '' }) }
 function filterPayload(item) {
@@ -79,26 +103,51 @@ function filterPayload(item) {
   }
   return { field: item.field, op: item.op, value }
 }
-async function run() {
+function debugPayload() {
+  const body = {
+    release_stage: props.releaseStage, route_mode: routeMode.value,
+    task_code: taskCode.value, org_code: orgCode.value, query: query.value,
+    filters: filters.value.map(filterPayload),
+  }
+  if (routeMode.value === 'historical') body.version_no = Number(version.value)
+  if (experiment.value) body.overrides = {
+    top_k: topK.value, final_top_k: finalTopK.value, reranker_serving_code: reranker.value,
+  }
+  return body
+}
+async function runEffect(openTrace = false) {
   const epoch = ++runEpoch
-  error.value = ''; result.value = null; busy.value = true
+  error.value = ''; effectResult.value = null; busy.value = true
   try {
-    let response
-    if (viewMode.value === 'public') {
-      response = await api.retrievalPublicTest(props.deploymentId, {
-        release_stage: publicStage.value, task_code: taskCode.value,
-        org_code: orgCode.value, query: query.value,
-      })
-    } else {
-      const body = { release_stage: props.releaseStage, route_mode: routeMode.value, task_code: taskCode.value, org_code: orgCode.value, query: query.value, filters: filters.value.map(filterPayload) }
-      if (routeMode.value === 'historical') body.version_no = Number(version.value)
-      if (experiment.value) body.overrides = { top_k: topK.value, final_top_k: finalTopK.value, reranker_serving_code: reranker.value }
-      response = await api.retrievalDebug(props.deploymentId, body)
-    }
-    if (epoch === runEpoch) result.value = response
+    const response = await api.retrievalDebug(props.deploymentId, debugPayload())
+    if (epoch !== runEpoch) return
+    effectResult.value = response; traceResult.value = response
+    if (openTrace) viewMode.value = 'trace'
   } catch (e) { if (epoch === runEpoch) error.value = e.message }
   finally { if (epoch === runEpoch) busy.value = false }
 }
+async function runPublic() {
+  const epoch = ++runEpoch
+  error.value = ''; publicEnvelope.value = null; busy.value = true
+  try {
+    const envelope = await api.retrievalPublicTest(props.deploymentId, {
+      release_stage: props.releaseStage, task_code: taskCode.value,
+      org_code: orgCode.value, query: query.value,
+    })
+    if (epoch !== runEpoch) return
+    publicEnvelope.value = envelope; traceResult.value = envelope.trace
+  } catch (e) {
+    if (epoch !== runEpoch) return
+    if (e.problem?.trace) {
+      publicEnvelope.value = e.problem; traceResult.value = e.problem.trace
+    }
+    error.value = e.detail || e.message
+  } finally { if (epoch === runEpoch) busy.value = false }
+}
+function openTrace() { if (traceResult.value) viewMode.value = 'trace' }
+function clearTrace() { traceResult.value = null; loadOptions() }
+function stage(key, result = effectResult.value) { return result?.stages?.find(item => item.key === key) || null }
+function candidates(value) { return value?.data?.candidates || value?.data?.results || [] }
 async function copyValue(value, success) {
   try { await navigator.clipboard.writeText(value); copyNotice.value = success }
   catch { copyNotice.value = '无法访问剪贴板，请手动选择并复制。' }
@@ -106,81 +155,79 @@ async function copyValue(value, success) {
 </script>
 
 <template>
-  <section class="retrieval-debug stack">
-    <header><h3>检索测试</h3><p>公共模式验证业务消费契约；技术模式用于定位 DataForge 内部检索阶段。</p></header>
-    <nav class="view-switch" aria-label="检索测试模式">
-      <button type="button" :aria-pressed="viewMode==='public'" :class="{active:viewMode==='public'}" @click="viewMode='public'">公共接口测试</button>
-      <button type="button" :aria-pressed="viewMode==='technical'" :class="{active:viewMode==='technical'}" @click="viewMode='technical'">技术链路调试</button>
+  <section class="retrieval-validation stack">
+    <header><h3>验证</h3><p>检索效果看结果，公共接口看业务契约，链路调试看内部执行。</p></header>
+    <nav class="validation-tabs" aria-label="验证工具">
+      <button type="button" :class="{active:viewMode==='effect'}" @click="viewMode='effect'">检索效果</button>
+      <button type="button" :class="{active:viewMode==='public'}" @click="viewMode='public'">公共接口</button>
+      <button type="button" :class="{active:viewMode==='trace'}" @click="viewMode='trace'">链路调试</button>
     </nav>
 
-    <template v-if="viewMode==='public'">
-      <p class="notice">浏览器使用管理员测试端点并返回与正式 API 相同的业务 DTO；外部 Bearer Token 请使用下方 curl 单独验收。</p>
-      <form class="panel stack public-form" @submit.prevent="run">
+    <template v-if="viewMode==='effect'">
+      <form class="panel stack" @submit.prevent="runEffect(false)">
         <div class="controls">
-          <label>Project<input :value="projectCode || '—'" readonly></label>
-          <label>Deployment<input :value="deploymentCode || '—'" readonly></label>
-          <label>环境<select v-model="publicStage"><option value="test">测试环境 · test</option><option value="production">生产环境 · production</option></select></label>
-          <label>任务<select v-model="taskCode" required :disabled="loading || !options.tasks.length"><option value="">选择已发布任务</option><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name || item.task_code }} · {{ item.task_code }}</option></select></label>
-          <label>机构<select v-model="orgCode" required :disabled="!orgs.length"><option value="">选择已发布授权</option><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_name || item.org_code }} · {{ item.org_code }}</option></select></label>
+          <label>测试对象<select v-model="routeMode"><option value="draft">当前配置</option><option value="published">当前已发布</option><option value="historical">历史版本</option></select></label>
+          <label v-if="routeMode==='historical'">历史版本<select v-model="version" required><option value="">选择版本</option><option v-for="item in options.versions.filter(v=>['published','frozen'].includes(v.status))" :key="item.id" :value="item.version_no">V{{ item.version_no }}</option></select></label>
+          <label>检索任务<select v-model="taskCode" required :disabled="loading"><option value="">选择任务</option><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name || item.task_code }}</option></select></label>
+          <label>组织授权<select v-model="orgCode" required><option value="">选择 org_code</option><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_name || item.org_code }} · {{ item.org_code }}</option></select></label>
         </div>
-        <p v-if="publicUnavailable" role="status" class="notice amber">{{ publicUnavailable }}</p>
-        <section v-if="publicPath" class="endpoint-box">
-          <small>正式公共接口</small><code>{{ publicPath }}</code>
-          <div class="actions"><button type="button" @click="copyValue(publicPath,'公共接口 URL 已复制。')">复制 URL</button><button type="button" @click="copyValue(curlText,'curl 示例已复制，Token 保持占位符。')">复制 curl</button></div>
-        </section>
-        <label>Query<textarea v-model="query" rows="3" maxlength="8192" required placeholder="输入业务系统要检索的问题"></textarea></label>
-        <button class="primary" :disabled="busy || loading || !!publicUnavailable || !taskCode || !orgCode || !query.trim()">{{ busy ? '检索中…' : '执行公共接口测试' }}</button>
-        <p role="status" class="copy-notice">{{ copyNotice }}</p>
+        <label>Query<textarea v-model="query" rows="3" maxlength="8192" required placeholder="输入要验证检索效果的问题"></textarea></label>
+        <details class="advanced-box"><summary>高级参数与本次实验</summary>
+          <div v-for="(item,index) in filters" :key="index" class="controls">
+            <label>过滤字段<select v-model="item.field"><option v-for="(dtype,name) in fields" :key="name" :value="name">{{ name }} · {{ dtype }}</option></select></label>
+            <label>条件<select v-model="item.op"><option value="eq">等于</option><option value="in">属于集合</option><option value="gt">大于</option><option value="gte">大于等于</option><option value="lt">小于</option><option value="lte">小于等于</option></select></label>
+            <label>值<input v-model="item.value" required></label><button type="button" @click="filters.splice(index,1)">移除</button>
+          </div>
+          <button type="button" :disabled="!Object.keys(fields).length || filters.length>=32" @click="addFilter">添加过滤条件</button>
+          <label><input v-model="experiment" type="checkbox"> 临时覆盖检索策略，不保存</label>
+          <div v-if="experiment" class="controls experiment"><label>召回候选数<input v-model.number="topK" type="number" min="1" max="200"></label><label>最终返回数<input v-model.number="finalTopK" type="number" min="1" :max="topK"></label><label>Reranker<select v-model="reranker"><option :value="null">关闭重排</option><option v-for="item in options.rerankers" :key="item.id" :value="item.serving_code" :disabled="!item.is_enabled">{{ item.name }}</option></select></label></div>
+        </details>
+        <p v-if="unavailable" class="notice amber">{{ unavailable }}</p>
+        <button class="primary" :disabled="busy||loading||!!unavailable||!taskCode||!orgCode||!query.trim()">{{ busy?'检索中…':'执行检索效果测试' }}</button>
       </form>
       <p v-if="error" role="alert" class="error">{{ error }}</p>
-      <section v-if="result" class="public-result stack">
-        <article class="panel"><div class="panel-head"><div><h4>公共检索完成</h4><p>{{ result.route.project_code }} / {{ result.route.deployment_code }} / {{ result.route.release_stage }} / {{ result.route.task_code }}</p></div><span class="badge green">V{{ result.route.route_version }} · {{ result.latency_ms }} ms</span></div><p>召回 {{ result.policy.top_k }} · 最终 {{ result.policy.final_top_k }} · {{ result.policy.reranker_enabled ? '已启用重排' : '未启用重排' }}</p></article>
-        <article class="panel stack"><h4>检索结果 · {{ result.results.length }} 条</h4><p v-if="!result.results.length">没有匹配结果。</p><div v-else class="public-items"><section v-for="item in result.results" :key="item.citation_id"><header><b>[{{ item.citation_id }}] {{ item.source_knowledge_id }}</b><span>{{ item.score.kind }} · {{ item.score.value }}</span></header><p class="content">{{ item.content }}</p><details v-if="item.evidence.length"><summary>引用依据 · {{ item.evidence.length }} 条</summary><div v-for="source in item.evidence" :key="`${source.source_version_id}:${source.source_chunk_id}`"><b>{{ source.source_name }}</b><p class="content">{{ source.evidence_text }}</p></div></details></section></div></article>
-        <article class="panel stack"><h4>Context</h4><p v-if="result.context.truncated">已截断，原文 {{ result.context.total_characters }} 字符。</p><button type="button" @click="copyValue(result.context.text,'上下文已复制。')">复制 Context</button><pre>{{ result.context.text }}</pre></article>
-      </section>
+      <template v-if="effectResult">
+        <article class="panel result-summary"><div><b>{{ effectResult.experimental?'本次实验':'版本配置' }} · {{ statusNames[effectResult.status] }}</b><p>{{ effectResult.route_mode }} · {{ effectResult.version_no==null?'未发布配置':`V${effectResult.version_no}` }}</p></div><span>{{ effectResult.latency_ms }} ms</span></article>
+        <div class="result-grid">
+          <article v-for="key in ['recall','reranker','final']" :key="key" class="panel stack"><h4>{{ stageNames[key] }}</h4><p>{{ statusNames[stage(key)?.status] }} · {{ stage(key)?.latency_ms || 0 }} ms</p><p v-if="stage(key)?.error" class="error">{{ stage(key).error }}</p><p v-if="!candidates(stage(key)).length">{{ stage(key)?.data?.reason || '没有匹配结果。' }}</p><ol v-else><li v-for="item in candidates(stage(key))" :key="`${item.asset_version_id}:${item.source_knowledge_id}`"><b>{{ item.citation_id || item.source_knowledge_id }}</b><span>{{ item.content }}</span><small>Vector {{ item.vector_score }}<template v-if="item.rerank_score!=null"> · Rerank {{ item.rerank_score }}</template></small></li></ol></article>
+        </div>
+        <button type="button" @click="openTrace">查看本次链路</button>
+      </template>
+    </template>
+
+    <template v-else-if="viewMode==='public'">
+      <p class="notice">只测试当前环境已发布的 Public Retrieval v1；管理员测试不会把业务 Token 交给浏览器。</p>
+      <form class="panel stack" @submit.prevent="runPublic">
+        <div class="controls"><label>项目<input :value="projectCode||'—'" readonly></label><label>Deployment<input :value="deploymentCode||'—'" readonly></label><label>检索任务<select v-model="taskCode" required><option value="">选择已发布任务</option><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name || item.task_code }}</option></select></label><label>组织授权<select v-model="orgCode" required><option value="">选择 org_code</option><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_name || item.org_code }}</option></select></label></div>
+        <label>Query<textarea v-model="query" rows="3" maxlength="8192" required placeholder="输入业务系统要检索的问题"></textarea></label>
+        <p v-if="unavailable" class="notice amber">{{ unavailable }}</p>
+        <button class="primary" :disabled="busy||loading||!!unavailable||!taskCode||!orgCode||!query.trim()">{{ busy?'请求中…':'发送公共接口请求' }}</button>
+      </form>
+      <p v-if="error" role="alert" class="error">{{ error }}</p>
+      <template v-if="publicEnvelope">
+        <article class="panel api-summary"><div><b>HTTP {{ publicEnvelope.response.status_code }}</b><p>request_id · <code>{{ publicEnvelope.response.request_id }}</code></p></div><div><b>{{ publicBody?.results?.length || 0 }} 条</b><p>{{ publicBody?.latency_ms || traceResult?.latency_ms || 0 }} ms · V{{ publicBody?.route?.route_version || '—' }}</p></div></article>
+        <article v-if="publicBody?.results" class="panel stack"><h4>响应结果</h4><p v-if="!publicBody.results.length">没有匹配结果。</p><div v-else class="public-items"><section v-for="item in publicBody.results" :key="item.citation_id"><header><b>[{{ item.citation_id }}] {{ item.source_knowledge_id }}</b><span>{{ item.score.kind }} · {{ item.score.value }}</span></header><p class="content">{{ item.content }}</p><details v-if="item.evidence.length"><summary>引用依据 · {{ item.evidence.length }} 条</summary><p v-for="source in item.evidence" :key="source.source_chunk_id" class="content">{{ source.source_name }} · {{ source.evidence_text }}</p></details></section></div></article>
+        <details class="panel raw-contract"><summary>原始 Request / Response / cURL</summary><h4>Request</h4><pre>{{ JSON.stringify(publicEnvelope.request,null,2) }}</pre><h4>Response</h4><pre>{{ JSON.stringify(publicEnvelope.response.body,null,2) }}</pre><div class="actions"><button type="button" @click="copyValue(publicPath,'接口 URL 已复制。')">复制 URL</button><button type="button" @click="copyValue(curlText,'cURL 已复制，Token 保持占位符。')">复制 cURL</button></div><p>{{ copyNotice }}</p></details>
+        <button v-if="traceResult" type="button" class="primary" @click="openTrace">查看本次链路</button>
+      </template>
     </template>
 
     <template v-else>
-      <p v-if="institution" class="notice">中心不连接机构现场 Milvus；此处只解析 Routing，完整检索需在机构本地执行。</p>
-      <form class="panel stack" @submit.prevent="run">
-        <div class="controls">
-          <label>Routing 版本<select v-model="routeMode"><option value="draft">Draft candidate（已保存草稿）</option><option value="published">Published current（当前发布）</option><option value="historical">Historical（历史版本）</option></select></label>
-          <label v-if="routeMode==='historical'">历史版本<select v-model="version" required><option value="">选择版本</option><option v-for="item in options.versions.filter(v=>['published','frozen'].includes(v.status))" :key="item.id" :value="item.version_no">V{{ item.version_no }} · {{ item.status }}</option></select></label>
-          <label>任务<select v-model="taskCode" required><option value="">选择任务</option><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name || item.task_code }}</option></select></label>
-          <label>机构 org_code<select v-model="orgCode" required><option value="">选择机构</option><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_name || item.org_code }} · {{ item.org_code }}</option></select></label>
-        </div>
-        <label>Query<textarea v-model="query" rows="3" maxlength="8192" required placeholder="输入要检查召回行为的查询"></textarea></label>
-        <div v-for="(item,index) in filters" :key="index" class="controls">
-          <label>过滤字段<select v-model="item.field"><option v-for="(dtype,name) in fields" :key="name" :value="name">{{ name }} · {{ dtype }}</option></select></label>
-          <label>条件<select v-model="item.op"><option value="eq">等于</option><option value="in">属于集合</option><template v-if="!['VARCHAR','BOOL'].includes(fields[item.field])"><option value="gt">大于</option><option value="gte">大于等于</option><option value="lt">小于</option><option value="lte">小于等于</option></template></select></label>
-          <label>值<input v-model="item.value" required placeholder='集合使用 JSON 数组，如 ["A","B"]'></label><button type="button" @click="filters.splice(index,1)">移除条件</button>
-        </div>
-        <button type="button" :disabled="!Object.keys(fields).length || filters.length>=32" @click="addFilter">添加过滤条件（AND）</button>
-        <label><input v-model="experiment" type="checkbox">本次实验：临时覆盖检索参数，不保存配置</label>
-        <div v-if="experiment" class="controls experiment"><label>召回候选数<input v-model.number="topK" type="number" min="1" max="200" required></label><label>最终 TopK<input v-model.number="finalTopK" type="number" min="1" :max="topK" required></label><label>Reranker<select v-model="reranker"><option :value="null">关闭重排</option><option v-for="item in options.rerankers" :key="item.id" :disabled="!item.is_enabled" :value="item.serving_code">{{ item.name }} · {{ item.model_name }}</option></select></label></div>
-        <p v-else-if="task">版本配置：召回 {{ task.top_k }} · 最终 {{ task.final_top_k }} · {{ task.reranker_serving_code || '未启用重排' }}</p>
-        <button class="primary" :disabled="busy || loading || !taskCode || !orgCode || !query.trim()">{{ busy ? '检索中…' : '执行技术链路调试' }}</button>
+      <p v-if="institution" class="notice">中心不连接机构现场 Milvus；链路将在 Routing 后标记待本地执行。</p>
+      <form v-if="!traceResult" class="panel stack" @submit.prevent="runEffect(true)">
+        <p>尚无可查看的 Trace。可先从“检索效果”或“公共接口”进入，也可以直接执行一次技术调试。</p>
+        <div class="controls"><label>对象<select v-model="routeMode"><option value="draft">当前配置</option><option value="published">当前已发布</option><option value="historical">历史版本</option></select></label><label v-if="routeMode==='historical'">版本<select v-model="version"><option value="">选择版本</option><option v-for="item in options.versions" :key="item.id" :value="item.version_no">V{{ item.version_no }}</option></select></label><label>任务<select v-model="taskCode"><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name }}</option></select></label><label>org_code<select v-model="orgCode"><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_code }}</option></select></label></div><label>Query<textarea v-model="query" rows="3" required></textarea></label><button class="primary" :disabled="busy||!taskCode||!orgCode||!query.trim()">执行链路调试</button>
       </form>
-      <p v-if="error" role="alert" class="error">{{ error }}</p>
-      <template v-if="result">
-        <div class="panel" role="status"><b>{{ result.experimental ? '本次实验' : '版本配置验证' }} · {{ statusNames[result.status] }}</b><p>{{ releaseStage }} · {{ result.route_mode }} · {{ result.version_no == null ? '未发布草稿' : `V${result.version_no}` }} · {{ result.latency_ms }} ms</p><code>{{ result.checksum }}</code><p>{{ result.notice }}</p></div>
-        <article v-for="stage in result.stages" :key="stage.key" class="panel stack" :class="stage.status">
-          <header class="stage-head"><h4>{{ stageNames[stage.key] }}</h4><span>{{ statusNames[stage.status] }} · {{ stage.latency_ms }} ms</span></header>
-          <p v-if="stage.error" role="alert" class="error">{{ stage.error }}</p><p v-if="stage.data.reason">{{ stage.data.reason }}</p>
-          <template v-if="stage.key==='routing'&&stage.data.libraries"><p>{{ stage.data.project.name }} → {{ stage.data.deployment.name }} → {{ stage.data.org_code }} → {{ stage.data.task_code }} · {{ stage.data.libraries.length }} 个知识库</p><details class="technical-details"><summary>技术详情</summary><p>Milvus：<code>{{ stage.data.milvus_target?.milvus_url }}</code></p><div v-for="library in stage.data.libraries" :key="library.knowledge_library_id"><code>{{ library.knowledge_library_id }}</code> → AssetVersion V{{ library.asset_version_no }} → <code>{{ library.partition_name }}</code></div></details></template>
-          <details v-if="stage.key==='embedding'&&stage.data.serving_code" class="technical-details"><summary>技术详情</summary><p>Serving：{{ stage.data.serving_code }} · {{ stage.data.model_name }} · 配置 {{ stage.data.expected_dimension }} / 实际 {{ stage.data.observed_dimension }} 维</p></details>
-          <details v-if="stage.key==='recall'&&stage.data.metric_type" class="technical-details"><summary>技术详情</summary><p>{{ stage.data.metric_type }} · {{ stage.data.score_direction==='ascending'?'分数越小越靠前':'分数越大越靠前' }}</p></details>
-          <p v-if="stage.key==='reranker'&&stage.data.model_name">{{ stage.data.model_name }} · {{ stage.data.batch_count }} 批</p>
-          <p v-if="stage.key==='final'&&stage.status==='completed'">TopK = {{ stage.data.top_k }} · 实际 {{ stage.data.count }} 条</p>
-          <template v-if="['recall','reranker','final'].includes(stage.key)&&stage.status==='completed'"><p v-if="!(stage.data.candidates || stage.data.results || []).length">没有匹配结果。</p><div v-else class="table-wrap"><table><thead><tr><th>候选 / 引用</th><th>排名变化</th><th>Vector score</th><th>Rerank score</th><th>正文与来源</th></tr></thead><tbody><tr v-for="item in (stage.data.candidates || stage.data.results || [])" :key="`${item.asset_version_id}:${item.source_knowledge_id}`"><td>{{ item.citation_id || item.source_knowledge_id }}</td><td>{{ item.vector_rank }}<template v-if="item.rerank_rank"> → {{ item.rerank_rank }}</template></td><td>{{ item.vector_score }}</td><td>{{ item.rerank_score ?? '—' }}</td><td><details><summary>{{ item.content.slice(0,100) }}</summary><p class="content">{{ item.content }}</p><details class="technical-details"><summary>技术详情</summary><code>{{ item.knowledge_library_id }} · V{{ item.asset_version_no }} · {{ item.partition_name }}</code></details></details></td></tr></tbody></table></div></template>
-          <template v-if="stage.key==='context'&&stage.status==='completed'"><p v-if="stage.data.truncated">预览已截断为 32,000 字符，原文 {{ stage.data.total_characters }} 字符。</p><button type="button" @click="copyValue(stage.data.text,'上下文已复制。')">复制上下文</button><pre>{{ stage.data.text }}</pre></template>
-          <template v-if="stage.key==='evidence'&&stage.status==='completed'"><div v-for="citation in stage.data.citations" :key="citation.citation_id"><h5>[{{ citation.citation_id }}] {{ citation.source_knowledge_id }}</h5><div v-for="(source,index) in citation.sources" :key="index"><p>{{ source.source_name }} · 源版本 V{{ source.source_version_no }}</p><p class="content">{{ source.evidence_text }}</p><details class="technical-details"><summary>技术详情</summary><pre>{{ source }}</pre></details></div></div></template>
-        </article>
+      <template v-else>
+        <article class="panel trace-summary"><div><b>请求 {{ traceResult.request_id || '管理员调试' }}</b><p>{{ traceResult.route_mode }} · {{ traceResult.version_no==null?'当前配置':`V${traceResult.version_no}` }}</p></div><span :class="['badge',traceResult.status==='completed'?'green':'red']">{{ statusNames[traceResult.status] }} · {{ traceResult.latency_ms }} ms</span></article>
+        <div class="trace-list"><details v-for="(item,index) in traceStages" :key="item.key" class="trace-step" :open="item.status==='failed'"><summary><span :class="['trace-dot',item.status]"></span><b>{{ index+1 }}. {{ stageNames[item.key] }}</b><span>{{ statusNames[item.status] }} · {{ item.latency_ms }} ms</span></summary><p v-if="item.error" class="error">{{ item.error }}</p><template v-if="item.key==='routing'&&item.data.project"><p>{{ item.data.project.name }} → {{ item.data.deployment.name }} → {{ item.data.task_code }} → {{ item.data.org_code }}</p><p>授权知识库 {{ item.data.libraries?.length || 0 }} 个</p></template><template v-if="item.key==='recall'"><p>{{ item.data.metric_type || '—' }} · 候选 {{ item.data.candidates?.length || 0 }} 条</p><div v-for="candidate in item.data.candidates || []" :key="candidate.source_knowledge_id"><code>{{ candidate.knowledge_library_id }} · Asset V{{ candidate.asset_version_no }} · {{ candidate.partition_name }}</code></div></template><p v-if="item.data.reason">{{ item.data.reason }}</p><details class="technical-details"><summary>原始阶段数据</summary><pre>{{ JSON.stringify(item.data,null,2) }}</pre></details></details></div>
+        <button type="button" @click="clearTrace">清除 Trace</button>
       </template>
+      <p v-if="error" role="alert" class="error">{{ error }}</p>
     </template>
   </section>
 </template>
 
 <style scoped>
-.retrieval-debug{display:grid;gap:16px}.view-switch{display:inline-flex;width:max-content;gap:3px;padding:3px;border:1px solid #dfe5ed;border-radius:9px;background:#eef2f7}.view-switch button{border:0;background:transparent}.view-switch button.active{color:#2f6fed;background:#fff}.controls{display:flex;flex-wrap:wrap;gap:16px;align-items:end}.controls label{flex:1;min-width:160px}.public-form .controls label{min-width:190px}.endpoint-box{display:grid;gap:8px;padding:14px;border:1px solid #dbe3ef;border-radius:9px;background:#f7f9fc}.endpoint-box code{overflow-wrap:anywhere}.actions{display:flex;gap:8px}.stage-head,.public-items header{display:flex;justify-content:space-between;gap:14px;align-items:center}.stage-head h4{margin:0}.experiment{padding:16px;background:#fff8e6;border:1px solid #e7c979;border-radius:8px}.failed{border-color:#dc6464}.content,pre{white-space:pre-wrap;overflow-wrap:anywhere}pre{max-height:440px;overflow:auto}.table-wrap{overflow:auto}td{vertical-align:top}code{overflow-wrap:anywhere}.notice{color:#805c16}.notice.amber{padding:10px;border-radius:8px;background:#fff8e6}.technical-details{margin-top:8px}.technical-details>summary{cursor:pointer;color:#536177;font-weight:700}.public-items{display:grid;gap:12px}.public-items>section{padding:14px;border:1px solid #e0e6ee;border-radius:9px}.copy-notice{min-height:20px;color:#1d8c65}
+.retrieval-validation{display:grid;gap:16px}.validation-tabs{display:inline-flex;width:max-content;gap:3px;padding:3px;border:1px solid var(--border);border-radius:10px;background:#eef2f7}.validation-tabs button{border:0;background:transparent}.validation-tabs button.active{color:var(--blue);background:#fff}.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:end}.controls label{display:grid;flex:1;min-width:170px;gap:6px}.advanced-box,.raw-contract{padding:14px;border:1px solid var(--border);border-radius:9px;background:#fbfcfe}.experiment{margin-top:12px;padding:12px;background:var(--amber-soft)}.result-summary,.api-summary,.trace-summary{display:flex;justify-content:space-between;gap:16px;align-items:center}.result-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.result-grid ol{display:grid;gap:10px;margin:0;padding-left:20px}.result-grid li span,.result-grid li small{display:block;margin-top:4px}.public-items{display:grid;gap:12px}.public-items>section{padding:14px;border:1px solid var(--border);border-radius:9px}.public-items header{display:flex;justify-content:space-between;gap:12px}.trace-list{display:grid;gap:10px}.trace-step{padding:0 14px;border:1px solid var(--border);border-radius:10px;background:#fff}.trace-step>summary{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:14px 0;cursor:pointer}.trace-dot{width:10px;height:10px;border-radius:50%;background:#9aa6b6}.trace-dot.completed{background:var(--green)}.trace-dot.failed{background:var(--red)}.trace-dot.blocked{background:var(--amber)}.content,pre{white-space:pre-wrap;overflow-wrap:anywhere}.notice.amber{padding:10px;border-radius:8px;background:var(--amber-soft)}.technical-details{margin:10px 0}.actions{display:flex;gap:8px}@media(max-width:1100px){.result-grid{grid-template-columns:1fr}}
 </style>

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../../api/platform'
 
-const instance = ref(null), targets = ref([]), deployments = ref([])
+const instance = ref(null), targets = ref([]), releaseTargets = ref({})
 const name = ref(''), uri = ref(''), token = ref(''), editing = ref(null)
 const busy = ref(false), collectionCheckId = ref(''), collectionChecks = ref({}), error = ref(''), notice = ref('')
 const central = computed(() => instance.value?.instance_mode === 'central')
@@ -30,9 +30,9 @@ function healthDetails(revision, targetId) {
   return `${checkedAt}${revision.health_latency_ms == null ? '' : ` · ${revision.health_latency_ms} ms`}`
 }
 function references(targetId) {
-  const values = deployments.value.flatMap(deployment => Object.entries(deployment.stage_targets || {})
-    .filter(([, target]) => target.id === targetId)
-    .map(([stage]) => `${deployment.name} · ${stage === 'production' ? '生产' : '测试'}`))
+  const values = Object.entries(releaseTargets.value)
+    .filter(([, target]) => target?.milvus_target?.id === targetId)
+    .map(([stage]) => `中心${stage === 'production' ? '生产' : '测试'}发布 Target`)
   if (instance.value?.authoring_milvus_target?.id === targetId) values.unshift('默认知识写入目标')
   return values
 }
@@ -41,7 +41,9 @@ async function load() {
   try {
     instance.value = await api.instance()
     if (!central.value) return
-    ;[targets.value, deployments.value] = await Promise.all([api.milvusTargets(), api.sharedDeployments()])
+    const optionalTarget = async stage => { try { return await api.instanceReleaseTarget(stage) } catch { return null } }
+    const [values, test, production] = await Promise.all([api.milvusTargets(), optionalTarget('test'), optionalTarget('production')])
+    targets.value = values; releaseTargets.value = { test, production }
   } catch (e) { error.value = e.message }
 }
 async function createTarget() {
@@ -61,7 +63,7 @@ async function saveEdit() {
   const changedUri = editing.value.milvus_url.trim() !== (currentRevision(target)?.milvus_url || '')
   const needsVerification = changedUri || currentRevision(target)?.verification_status !== 'verified'
   const refs = references(editing.value.id)
-  if (changedUri && refs.length && !window.confirm(`以下中心环境仍会保持当前 Revision：\n${refs.join('\n')}\n\n新地址验证通过后不会自动切换，需在各环境分别重新绑定。`)) return
+  if (changedUri && refs.length && !window.confirm(`以下中心环境仍会保持当前 Revision：\n${refs.join('\n')}\n\n新地址验证通过后不会自动切换；本期环境 Target 不支持改绑。`)) return
   busy.value = true; error.value = ''; notice.value = ''
   try {
     const value = await api.patchMilvusTarget(editing.value.id, {
@@ -105,7 +107,7 @@ onMounted(load)
 
 <template>
   <section class="milvus-registry-page">
-    <div class="page-head"><div><h2>Milvus 服务</h2><p>API 启动 30 秒后只自动检查中心测试与生产服务的连接；Collection 名称和数量仅在管理员点击后读取。</p></div><span class="badge blue">中心控制面</span></div>
+    <div class="page-head"><div><h2>Milvus 服务</h2><p>API 启动 30 秒后只自动检查中心测试与生产服务的连接；Collection 名称和数量仅在管理员点击后读取。</p></div><div class="page-actions"><button type="button" @click="$router.push('/business/authorization')">← 返回项目发布</button><span class="badge blue">中心控制面</span></div></div>
     <p v-if="!central && instance" class="notice">只有智能中心可以管理 Milvus 服务注册表；机构 Milvus 请在“本地初始化”中配置。</p>
     <template v-else>
       <form class="panel registry-form" @submit.prevent="createTarget"><div><h3>新增服务</h3><p>连接失败时保留配置，但不能设为默认知识写入目标或绑定中心环境。</p></div><label>服务名称<input v-model="name" required maxlength="255"></label><label>Milvus URI<input v-model="uri" required placeholder="http://milvus:19531"></label><label>Token（可选）<input v-model="token" type="password" autocomplete="new-password"></label><button class="primary" :disabled="busy">{{ busy ? '正在连接验证…' : '注册并验证' }}</button></form>

@@ -30,7 +30,7 @@ def require_group_size(count, *, node_id=None, group=None):
 
 
 def input_preflight(definition, source_counts):
-    """Only a direct reviewed-input edge has an exact pre-execution count."""
+    """Only a direct frozen input-review Gate has an exact pre-execution count."""
     from collections import defaultdict
     by_id = {node["id"]: node for node in definition.get("nodes", [])}
     incoming = defaultdict(list)
@@ -42,7 +42,7 @@ def input_preflight(definition, source_counts):
         if node.get("kind") != "operator" or node.get("ref") != "SemDeduplicateFilter":
             continue
         parents = incoming[node["id"]]
-        if len(parents) != 1 or by_id.get(parents[0], {}).get("ref") != "reviewed-source-chunk-input":
+        if len(parents) != 1 or by_id.get(parents[0], {}).get("kind") != "execution_gate":
             issues.append({"code": "SEMANTIC_DEDUP_SIZE_DEFERRED", "severity": "warning", "node_id": node["id"],
                 "limit": MAX_GROUP_RECORDS, "message": "上游执行后的记录数尚未确定，将在语义节点启动前检查每组5000条上限"})
             continue

@@ -7,9 +7,9 @@ NATIVE_DERIVED_VERSIONS = {"text-knowledge-mapper": 4, "prompt-generator": 7, "s
 
 
 def source_key(source):
-    if not all(source.get(key) for key in ("source_id", "source_version_id", "source_chunk_id")):
+    if not all(source.get(key) for key in ("source_id", "source_version_id", "flow_chunk_id")):
         raise ValueError("SOURCE_LINEAGE_MISSING: 来源 Chunk 身份缺失")
-    return str(source["source_version_id"]), str(source["source_chunk_id"])
+    return str(source["source_version_id"]), str(source["flow_chunk_id"])
 
 
 def is_source(value):
@@ -57,7 +57,7 @@ def prepare_generation(values, kind, context):
             outcome["targeted"].append(deepcopy(source))
             outcome["successful"].append(deepcopy(source))
             if runtime.get("store") and runtime.get("job_id"):
-                runtime["store"].record_chunk_generation(runtime["job_id"], kind, source, status="completed", candidate_count=0)
+                runtime["store"].record_chunk_generation(runtime["job_id"], kind, source, status="success_empty", candidate_count=0)
         else:
             inputs.append({**deepcopy(source), "content": record["effective_text"]})
     return inputs, originals
@@ -67,20 +67,20 @@ def restore_evidence(outputs, originals, kind, context):
     result = []
     for output in outputs:
         versions = output.get("source_version_ids") or []
-        key = (str(versions[0]), str(output.get("source_chunk_id"))) if len(versions) == 1 else None
+        key = (str(versions[0]), str(output.get("flow_chunk_id"))) if len(versions) == 1 else None
         if key not in originals:
             raise ValueError("SOURCE_LINEAGE_MISMATCH: 生成结果改变来源")
         source = originals[key]
         value = deepcopy(output)
         value.update(evidence_text=source["content"], source_version_ids=[source["source_version_id"]],
-                     source_chunk_id=source["source_chunk_id"], source_chunk_revision_id=source.get("source_chunk_revision_id"),
-                     source_review_snapshot_id=source.get("source_review_snapshot_id"),
+                     flow_chunk_id=source["flow_chunk_id"], flow_chunk_revision_id=source.get("flow_chunk_revision_id"),
+                     flow_chunk_review_snapshot_id=source.get("flow_chunk_review_snapshot_id"),
                      anchor_json=deepcopy(source.get("anchor_json") or source.get("anchor") or {}))
         result.append(value)
     outcome = context.runtime.get("generation", {}).get(kind, {})
     for field in ("targeted", "successful", "failed"):
         for index, value in enumerate(outcome.get(field, [])):
-            source = originals.get((str(value.get("source_version_id")), str(value.get("source_chunk_id"))))
+            source = originals.get((str(value.get("source_version_id")), str(value.get("flow_chunk_id"))))
             if source:
                 outcome[field][index] = {**deepcopy(source), **({"error": value["error"]} if "error" in value else {})}
     return result

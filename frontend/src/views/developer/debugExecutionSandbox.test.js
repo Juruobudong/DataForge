@@ -16,7 +16,7 @@ const templates = readFileSync(new URL('./TemplateListView.vue', import.meta.url
 test('console node names reuse Catalog metadata while preserving distinct runtime IDs', () => {
   const catalog = [{ code: 'prompt-generator', name: 'Prompt Generator', display_name_zh: '提示词生成器' }]
   const graph = deserializeRuntimeDag({ nodes: [
-    { id: 'input-1', kind: 'operator', node_role: 'flow_input', ref: 'reviewed-source-chunk-input' },
+    { id: 'input-1', kind: 'operator', node_role: 'flow_input', ref: 'document-input' },
     { id: 'generate-a', kind: 'operator', ref: 'prompt-generator' },
     { id: 'child::generate-b', kind: 'operator', ref: 'prompt-generator' },
     { id: 'sink-1', kind: 'knowledge_sink', knowledge_type: 'text' },
@@ -25,7 +25,7 @@ test('console node names reuse Catalog metadata while preserving distinct runtim
   const labels = consoleNodeLabels(graph.nodes)
   assert.deepEqual(consoleNodePresentation('generate-a', labels), { label: '提示词生成器', technicalId: 'generate-a' })
   assert.deepEqual(consoleNodePresentation('child::generate-b', labels), { label: '提示词生成器', technicalId: 'child::generate-b' })
-  assert.equal(consoleNodePresentation('input-1', labels).label, '已审核文档块')
+  assert.equal(consoleNodePresentation('input-1', labels).label, '文档输入')
   assert.equal(consoleNodePresentation('sink-1', labels).label, '知识输出')
   for (const id of ['legacy-1', 'missing-node']) {
     assert.deepEqual(consoleNodePresentation(id, labels), { label: id, technicalId: '' })

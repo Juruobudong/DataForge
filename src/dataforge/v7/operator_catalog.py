@@ -91,7 +91,7 @@ def version_payload(definition, version):
         "adapter_code": version.adapter_code, "runtime_requirements": runtime,
         "driver": runtime["driver"], "executor": runtime["executor"],
         "uses_llm": bool(runtime.get("uses_llm")), "approved": runtime.get("approved", definition.exposure != "controlled"),
-        "node_role": "flow_input" if definition.code == "reviewed-source-chunk-input" else "operator",
+        "node_role": "flow_input" if definition.code == "document-input" else "operator",
         "input": (version.input_ports.get("input") or {}).get("artifact_type", ""),
         "output": (version.output_ports.get("output") or {}).get("artifact_type", ""),
         **{key: deepcopy(getattr(version, key)) for key in (

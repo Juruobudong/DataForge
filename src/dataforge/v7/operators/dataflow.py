@@ -100,10 +100,12 @@ class DataFlowOperatorExecutor:
                 session.remaining()
                 session.succeeded()
             return result.get("early_result", result["outputs"])
-        if self.adapter.startswith("governance-"):
+        if self.adapter == "parsed-document-to-flow-chunks-v1":
+            outputs = self._document_chunks(values, params, invoke)
+        elif self.adapter.startswith("governance-"):
             from .governance import execute_governance
             return execute_governance(self, values, params, context, invoke)
-        if self.adapter == "source-chunk-to-qa-v4":
+        elif self.adapter == "source-chunk-to-qa-v4":
             from .derived_text import prepare_generation, restore_evidence
             inputs, originals = prepare_generation(values, "qa", context)
             outputs = self._qa(inputs, params, context, invoke, allow_no_match=True) if inputs else []
@@ -125,6 +127,43 @@ class DataFlowOperatorExecutor:
             metrics["qa_recovery"] = dict(context.runtime.get("_qa_recovery", {}))
         return OperatorResult(outputs=outputs, metrics=metrics)
 
+    @staticmethod
+    def _document_chunks(values, params, invoke):
+        outputs = []
+        init = {key: params[key] for key in ("split_method", "chunk_size", "chunk_overlap", "tokenizer_name")
+                if key in params}
+        for document in values:
+            if document.get("kind") == "tabular":
+                raise ValueError("TABULAR_CHUNKING_UNSUPPORTED: 当前 Runtime 尚未实现表格切分")
+            text = document.get("markdown") if "markdown" in document else document.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("PARSED_DOCUMENT_CONTENT_INVALID: 文本 ParsedDocument 缺少 Markdown")
+            rows = invoke([{"text": text}], init=init,
+                          run_arguments={"input_key": "text", "output_key": "raw_chunk"})
+            try:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(str(params.get("tokenizer_name") or "Qwen/Qwen3-32B"),
+                                                           local_files_only=True)
+                count_tokens = lambda value: len(tokenizer.encode(value, add_special_tokens=False))
+            except Exception:
+                count_tokens = len
+            for ordinal, row in enumerate(rows):
+                content = row.get("raw_chunk") or row.get("text")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("DATAFLOW_CHUNK_OUTPUT_INVALID: KBCChunkGenerator 返回空正文")
+                start = text.find(content)
+                outputs.append({
+                    "parsed_document_id": document.get("parsed_document_id"),
+                    "source_version_id": document.get("source_version_id"),
+                    "content": content, "ordinal": ordinal,
+                    "token_count": count_tokens(content),
+                    "content_digest": __import__("hashlib").sha256(content.encode("utf-8")).hexdigest(),
+                    "anchor": {"markdown_start": start if start >= 0 else None,
+                               "markdown_end": start + len(content) if start >= 0 else None,
+                               "source_anchors": list(document.get("source_anchors") or [])},
+                })
+        return outputs
+
     def _filter_candidates(self, values, params, invoke):
         from ..operator_parameters import business_parameters
         business = business_parameters(self.parameter_schema, params)
@@ -141,12 +180,12 @@ class DataFlowOperatorExecutor:
         groups = defaultdict(list)
         deduplicate = self.adapter in {"candidate-ngram-deduplicate-v1", "candidate-simhash-deduplicate-v1"}
         for index, value in enumerate(values):
-            if not all(value.get(key) for key in ("source_knowledge_id", "source_chunk_id", "source_version_ids")):
+            if not all(value.get(key) for key in ("source_knowledge_id", "flow_chunk_id", "source_version_ids")):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 过滤候选缺少来源身份")
             content = value.get("canonical_content")
             if not isinstance(content, str) and not (self.code == "ContentNullFilter" and content is None):
                 raise ValueError("候选正文必须是字符串")
-            group = (tuple(value["source_version_ids"]), value["source_chunk_id"]) if deduplicate else ()
+            group = (tuple(value["source_version_ids"]), value["flow_chunk_id"]) if deduplicate else ()
             groups[group].append({"_df_row": index, "text": content})
         retained = set()
         for records in groups.values():
@@ -178,9 +217,9 @@ class DataFlowOperatorExecutor:
             if not value.get("source_knowledge_id"):
                 raise ValueError("候选缺少 source_knowledge_id")
             if method == "minhash":
-                if params.get("knowledge_type") not in {"text", "qa"} or not value.get("source_chunk_id"):
+                if params.get("knowledge_type") not in {"text", "qa"} or not value.get("flow_chunk_id"):
                     raise ValueError("MinHash 仅支持带来源 Chunk 的文本与问答")
-                group = (tuple(value.get("source_version_ids", [])), value["source_chunk_id"])
+                group = (tuple(value.get("source_version_ids", [])), value["flow_chunk_id"])
                 text = value.get("canonical_content")
                 if not isinstance(text, str) or not text:
                     raise ValueError("MinHash 候选正文不能为空")
@@ -213,7 +252,7 @@ class DataFlowOperatorExecutor:
             raise ValueError("修订必须使用已冻结 Prompt，且仅支持文本与问答")
         records, originals = [], {}
         for index, value in enumerate(values):
-            if not value.get("source_chunk_id") or not value.get("source_version_ids"):
+            if not value.get("flow_chunk_id") or not value.get("source_version_ids"):
                 raise ValueError("SOURCE_LINEAGE_MISSING: 修订候选缺少血缘")
             payload = {"canonical_content": value["canonical_content"]} if kind == "text" else {key: value["data_json"][key] for key in ("question", "answer")}
             records.append({"_df_row": index, "text": json.dumps(payload, ensure_ascii=False)})

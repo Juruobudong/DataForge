@@ -18,13 +18,13 @@ from ..models import (
     FlowExecutionSnapshot, FlowSubgraph, FlowSubgraphRevision, KnowledgeFlowTemplate,
     KnowledgeFlowTemplateRevision, KnowledgeIndexProfile, KnowledgeType,
     KnowledgeTypeIndexBinding, KnowledgeTypeModeRevision, KnowledgeTypeRevision,
-    KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeItemSource, KnowledgeLibrary,
+    KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeEvidence, KnowledgeLibrary,
     KnowledgeMigrationJob,
-    OperatorDefinition, OperatorVersion, PromptTemplate, PromptTemplateRevision,
+    OperatorDefinition, OperatorVersion, ParseJob, ParsedDocument, PromptTemplate, PromptTemplateRevision,
     QualityProfile, QualityProfileRevision,
-    Deployment, Project, ProjectDeployment, ProjectDeploymentTask, ProjectOrgRoute,
-    ProjectOrgRouteLibrary, ProjectTask, Source, SourceChunk, SourceChunkRevision,
-    SourceReviewSnapshot, SourceReviewSnapshotChunk, SourceVersion, StorageContract,
+    Deployment, Project, ProjectDeployment, ProjectReleaseTask, ProjectOrgRoute,
+    ProjectOrgRouteLibrary, ProjectTask, Source, FlowChunk, FlowChunkSet, FlowChunkRevision,
+    FlowChunkReviewSnapshot, FlowChunkReviewSnapshotItem, SourceVersion, StorageContract,
     StorageContractRevision,
     utc_now,
 )
@@ -38,12 +38,13 @@ from .package import extract_verified_entry, inspect_package
 
 METADATA_MODELS = {
     "document_libraries": DocumentLibrary, "sources": Source, "source_versions": SourceVersion,
-    "source_chunks": SourceChunk, "document_library_members": DocumentLibraryMember,
-    "source_chunk_revisions": SourceChunkRevision,
-    "source_review_snapshots": SourceReviewSnapshot,
-    "source_review_snapshot_chunks": SourceReviewSnapshotChunk,
+    "parse_jobs": ParseJob, "parsed_documents": ParsedDocument, "flow_chunk_sets": FlowChunkSet,
+    "flow_chunks": FlowChunk, "document_library_members": DocumentLibraryMember,
+    "flow_chunk_revisions": FlowChunkRevision,
+    "flow_chunk_review_snapshots": FlowChunkReviewSnapshot,
+    "flow_chunk_review_snapshot_items": FlowChunkReviewSnapshotItem,
     "knowledge_libraries": KnowledgeLibrary, "knowledge_items": KnowledgeItem,
-    "knowledge_item_sources": KnowledgeItemSource,
+    "knowledge_item_sources": KnowledgeEvidence,
     "knowledge_asset_items": KnowledgeAssetItem,
     "knowledge_types": KnowledgeType, "knowledge_type_revisions": KnowledgeTypeRevision,
     "knowledge_type_mode_revisions": KnowledgeTypeModeRevision,
@@ -432,16 +433,16 @@ class MigrationImporter:
         for value in cloned_document_ids: id_maps["document_libraries"][value] = new_id("doclib")
         for value in cloned_source_ids: id_maps["sources"][value] = new_id("src")
         for value in cloned_version_ids: id_maps["versions"][value] = new_id("srcv")
-        for chunk in metadata["source_chunks"]:
+        for chunk in metadata["flow_chunks"]:
             if chunk["source_version_id"] in cloned_version_ids: id_maps["chunks"][chunk["id"]] = new_id("chunk")
-        for revision in metadata.get("source_chunk_revisions", []):
-            if revision["source_chunk_id"] in id_maps["chunks"]:
+        for revision in metadata.get("flow_chunk_revisions", []):
+            if revision["flow_chunk_id"] in id_maps["chunks"]:
                 id_maps["chunk_revisions"][revision["id"]] = new_id("schrev")
-        for snapshot in metadata.get("source_review_snapshots", []):
+        for snapshot in metadata.get("flow_chunk_review_snapshots", []):
             if snapshot["source_version_id"] in cloned_version_ids:
                 id_maps["review_snapshots"][snapshot["id"]] = new_id("review")
-        for mapping in metadata.get("source_review_snapshot_chunks", []):
-            if mapping["source_review_snapshot_id"] in id_maps["review_snapshots"]:
+        for mapping in metadata.get("flow_chunk_review_snapshot_items", []):
+            if mapping["flow_chunk_review_snapshot_id"] in id_maps["review_snapshots"]:
                 id_maps["review_snapshot_chunks"][mapping["id"]] = new_id("reviewchunk")
         for member in metadata["document_library_members"]:
             if member["source_id"] in cloned_source_ids: id_maps["members"][member["id"]] = new_id("dlm")
@@ -506,10 +507,10 @@ class MigrationImporter:
                 deployment = _upsert(session, Deployment, deployment_payload)
                 # Legacy v1 may carry a Deployment, but institution Milvus is
                 # still resolved from local current_target and never written as
-                # a central DeploymentTarget.
+                # a central InstanceReleaseTarget.
                 project_deployment = _upsert(session, ProjectDeployment, control["project_deployment"])
                 for payload in control["tasks"]: _upsert(session, ProjectTask, payload)
-                for payload in control["deployment_tasks"]: _upsert(session, ProjectDeploymentTask, payload)
+                for payload in control["deployment_tasks"]: _upsert(session, ProjectReleaseTask, payload)
                 for payload in control["org_routes"]: _upsert(session, ProjectOrgRoute, payload)
                 for payload in control["route_libraries"]:
                     if payload["knowledge_library_id"] in selected: _upsert(session, ProjectOrgRouteLibrary, payload)
@@ -533,14 +534,16 @@ class MigrationImporter:
                     cloned["name"] = f'{payload["name"]}（中心新版副本）'
                     cloned.update(origin_type="local", origin_instance_id=None, origin_asset_id=None, origin_state=None)
                     _upsert(session, DocumentLibrary, cloned)
-            for name in ("sources", "source_versions", "source_chunks", "document_library_members"):
+            parsed_links: dict[str, str | None] = {}
+            for name in ("sources", "source_versions", "document_library_members"):
                 for payload in metadata[name]:
                     payload = dict(payload)
                     if name == "sources" and payload["id"] not in selected_source_ids: continue
-                    if name in {"source_versions", "source_chunks"} and payload["source_version_id" if name == "source_chunks" else "id"] not in selected_version_ids: continue
+                    if name == "source_versions" and payload["id"] not in selected_version_ids: continue
                     if name == "document_library_members" and payload["source_id"] not in selected_source_ids: continue
-                    if name == "source_chunks":
-                        payload["origin_flow_run_id"], payload["flow_run_id"] = payload.get("flow_run_id"), None
+                    if name == "source_versions":
+                        parsed_links[payload["id"]] = payload.get("current_parsed_document_id")
+                        payload["current_parsed_document_id"] = None
                     current = session.get(METADATA_MODELS[name], payload["id"])
                     if name == "sources" and current:
                         document = session.get(DocumentLibrary, payload["document_library_id"])
@@ -555,58 +558,67 @@ class MigrationImporter:
                     else:
                         _upsert(session, METADATA_MODELS[name], payload)
                     mapping_name = {"sources": "sources", "source_versions": "versions",
-                                    "source_chunks": "chunks", "document_library_members": "members"}[name]
+                                    "document_library_members": "members"}[name]
                     if payload["id"] in id_maps[mapping_name]:
                         cloned = dict(payload); cloned["id"] = id_maps[mapping_name][payload["id"]]
                         if name == "sources": cloned["document_library_id"] = id_maps["document_libraries"][payload["document_library_id"]]
                         elif name == "source_versions":
                             cloned["source_id"] = id_maps["sources"][payload["source_id"]]
-                            if cloned.get("current_review_snapshot_id"):
-                                cloned["current_review_snapshot_id"] = id_maps["review_snapshots"].get(
-                                    cloned["current_review_snapshot_id"], cloned["current_review_snapshot_id"],
-                                )
-                        elif name == "source_chunks":
-                            cloned["source_version_id"] = id_maps["versions"][payload["source_version_id"]]
-                            if cloned.get("current_revision_id"):
-                                cloned["current_revision_id"] = id_maps["chunk_revisions"].get(
-                                    cloned["current_revision_id"], cloned["current_revision_id"],
-                                )
                         else:
                             cloned["document_library_id"] = id_maps["document_libraries"][payload["document_library_id"]]
                             cloned["source_id"] = id_maps["sources"][payload["source_id"]]
                         _upsert(session, METADATA_MODELS[name], cloned)
-            selected_chunk_ids = {item["id"] for item in metadata["source_chunks"]
+            for payload in metadata.get("parse_jobs", []):
+                if payload["source_version_id"] in selected_version_ids: _upsert(session, ParseJob, payload)
+            for payload in sorted(metadata.get("parsed_documents", []),
+                                  key=lambda item: (item["source_version_id"], item.get("revision_no", 1), item["id"])):
+                if payload["source_version_id"] in selected_version_ids: _upsert(session, ParsedDocument, payload)
+            for version_id, parsed_id in parsed_links.items():
+                version = session.get(SourceVersion, version_id)
+                if version: version.current_parsed_document_id = parsed_id
+            for payload in metadata.get("flow_chunk_sets", []):
+                if payload["source_version_id"] in selected_version_ids: _upsert(session, FlowChunkSet, payload)
+            pending_chunk_revisions: dict[str, str | None] = {}
+            for payload in metadata.get("flow_chunks", []):
+                if payload["source_version_id"] not in selected_version_ids: continue
+                payload = dict(payload); pending_chunk_revisions[payload["id"]] = payload.get("current_revision_id")
+                payload["current_revision_id"] = None
+                _upsert(session, FlowChunk, payload)
+            selected_chunk_ids = {item["id"] for item in metadata["flow_chunks"]
                                   if item["source_version_id"] in selected_version_ids}
-            selected_snapshot_ids = {item["id"] for item in metadata.get("source_review_snapshots", [])
+            selected_snapshot_ids = {item["id"] for item in metadata.get("flow_chunk_review_snapshots", [])
                                      if item["source_version_id"] in selected_version_ids}
-            for payload in metadata.get("source_chunk_revisions", []):
-                if payload["source_chunk_id"] not in selected_chunk_ids: continue
+            for payload in metadata.get("flow_chunk_revisions", []):
+                if payload["flow_chunk_id"] not in selected_chunk_ids: continue
                 payload = dict(payload)
-                _upsert(session, SourceChunkRevision, payload)
+                _upsert(session, FlowChunkRevision, payload)
                 if payload["id"] in id_maps["chunk_revisions"]:
                     cloned = dict(payload)
                     cloned["id"] = id_maps["chunk_revisions"][payload["id"]]
-                    cloned["source_chunk_id"] = id_maps["chunks"][payload["source_chunk_id"]]
+                    cloned["flow_chunk_id"] = id_maps["chunks"][payload["flow_chunk_id"]]
                     cloned["parent_chunk_ids"] = [id_maps["chunks"].get(value, value) for value in cloned.get("parent_chunk_ids") or []]
-                    _upsert(session, SourceChunkRevision, cloned)
-            for payload in metadata.get("source_review_snapshots", []):
+                    _upsert(session, FlowChunkRevision, cloned)
+            for chunk_id, revision_id in pending_chunk_revisions.items():
+                chunk = session.get(FlowChunk, chunk_id)
+                if chunk: chunk.current_revision_id = revision_id
+            for payload in metadata.get("flow_chunk_review_snapshots", []):
                 if payload["id"] not in selected_snapshot_ids: continue
-                payload = dict(payload); _upsert(session, SourceReviewSnapshot, payload)
+                payload = dict(payload); _upsert(session, FlowChunkReviewSnapshot, payload)
                 if payload["id"] in id_maps["review_snapshots"]:
                     cloned = dict(payload)
                     cloned["id"] = id_maps["review_snapshots"][payload["id"]]
                     cloned["source_version_id"] = id_maps["versions"][payload["source_version_id"]]
-                    _upsert(session, SourceReviewSnapshot, cloned)
-            for payload in metadata.get("source_review_snapshot_chunks", []):
-                if payload["source_review_snapshot_id"] not in selected_snapshot_ids: continue
-                payload = dict(payload); _upsert(session, SourceReviewSnapshotChunk, payload)
+                    _upsert(session, FlowChunkReviewSnapshot, cloned)
+            for payload in metadata.get("flow_chunk_review_snapshot_items", []):
+                if payload["flow_chunk_review_snapshot_id"] not in selected_snapshot_ids: continue
+                payload = dict(payload); _upsert(session, FlowChunkReviewSnapshotItem, payload)
                 if payload["id"] in id_maps["review_snapshot_chunks"]:
                     cloned = dict(payload)
                     cloned["id"] = id_maps["review_snapshot_chunks"][payload["id"]]
-                    cloned["source_review_snapshot_id"] = id_maps["review_snapshots"][payload["source_review_snapshot_id"]]
-                    cloned["source_chunk_id"] = id_maps["chunks"][payload["source_chunk_id"]]
-                    cloned["source_chunk_revision_id"] = id_maps["chunk_revisions"][payload["source_chunk_revision_id"]]
-                    _upsert(session, SourceReviewSnapshotChunk, cloned)
+                    cloned["flow_chunk_review_snapshot_id"] = id_maps["review_snapshots"][payload["flow_chunk_review_snapshot_id"]]
+                    cloned["flow_chunk_id"] = id_maps["chunks"][payload["flow_chunk_id"]]
+                    cloned["flow_chunk_revision_id"] = id_maps["chunk_revisions"][payload["flow_chunk_revision_id"]]
+                    _upsert(session, FlowChunkReviewSnapshotItem, cloned)
             self._runtime_bindings_and_baselines(
                 session, metadata, selected_document_ids, selected_version_ids, id_maps,
             )
@@ -637,7 +649,7 @@ class MigrationImporter:
                     for key, value in _model_values(KnowledgeLibrary, payload).items():
                         if key not in {"id", "created_at"}: setattr(current, key, value)
                     old_items = list(session.scalars(select(KnowledgeItem.id).where(KnowledgeItem.knowledge_library_id == new_id_value)))
-                    if old_items: session.execute(delete(KnowledgeItemSource).where(KnowledgeItemSource.knowledge_item_id.in_(old_items)))
+                    if old_items: session.execute(delete(KnowledgeEvidence).where(KnowledgeEvidence.knowledge_item_id.in_(old_items)))
                     session.execute(delete(KnowledgeItem).where(KnowledgeItem.knowledge_library_id == new_id_value))
                 else: session.add(KnowledgeLibrary(**_model_values(KnowledgeLibrary, payload)))
             session.flush()
@@ -663,15 +675,15 @@ class MigrationImporter:
                 if old_item in id_maps["items"]:
                     payload["id"], payload["knowledge_item_id"] = new_id("kis"), id_maps["items"][old_item]
                     payload["source_version_id"] = id_maps["versions"].get(payload["source_version_id"], payload["source_version_id"])
-                    if payload.get("source_chunk_revision_id"):
-                        payload["source_chunk_revision_id"] = id_maps["chunk_revisions"].get(
-                            payload["source_chunk_revision_id"], payload["source_chunk_revision_id"],
+                    if payload.get("flow_chunk_revision_id"):
+                        payload["flow_chunk_revision_id"] = id_maps["chunk_revisions"].get(
+                            payload["flow_chunk_revision_id"], payload["flow_chunk_revision_id"],
                         )
-                    if payload.get("source_review_snapshot_id"):
-                        payload["source_review_snapshot_id"] = id_maps["review_snapshots"].get(
-                            payload["source_review_snapshot_id"], payload["source_review_snapshot_id"],
+                    if payload.get("flow_chunk_review_snapshot_id"):
+                        payload["flow_chunk_review_snapshot_id"] = id_maps["review_snapshots"].get(
+                            payload["flow_chunk_review_snapshot_id"], payload["flow_chunk_review_snapshot_id"],
                         )
-                session.add(KnowledgeItemSource(**_model_values(KnowledgeItemSource, payload)))
+                session.add(KnowledgeEvidence(**_model_values(KnowledgeEvidence, payload)))
 
     @staticmethod
     def _v2_project_boundaries(session, control: dict[str, Any], manifest: dict[str, Any]) -> None:
@@ -703,8 +715,8 @@ class MigrationImporter:
                 _upsert(session, ProjectTask, project_task_payload, immutable=("project_id", "code"))
                 profile = task.get("index_profile") or {}
                 deployment_task_payload = {
-                    "id": task["deployment_task_id"],
-                    "project_deployment_id": entry["project_deployment_id"],
+                    "id": task["release_task_id"],
+                    "project_id": project.id,
                     "project_task_id": task["task_id"],
                     "index_profile_id": profile.get("index_profile_id"),
                     "qa_embedding_mode": task.get("qa_embedding_mode"),
@@ -712,8 +724,8 @@ class MigrationImporter:
                     "final_top_k": int(task.get("final_top_k", min(5, int(task.get("top_k", 10))))),
                     "reranker_serving_code": task.get("reranker_serving_code"),
                 }
-                _upsert(session, ProjectDeploymentTask, deployment_task_payload,
-                        immutable=("project_deployment_id", "project_task_id", "index_profile_id"))
+                _upsert(session, ProjectReleaseTask, deployment_task_payload,
+                        immutable=("project_id", "project_task_id", "index_profile_id"))
 
     @staticmethod
     def _runtime_parents(session, metadata: dict[str, list[dict[str, Any]]],
@@ -1072,8 +1084,8 @@ class MigrationImporter:
                     payload["id"] = "kai_" + hashlib.sha256(f'{payload["asset_version_id"]}:{raw["source_knowledge_id"]}'.encode()).hexdigest()[:48]
                     for evidence in payload["evidence_json"]:
                         for field, mapping in (("source_id", "sources"), ("source_version_id", "versions"),
-                                               ("source_chunk_revision_id", "chunk_revisions"),
-                                               ("source_review_snapshot_id", "review_snapshots")):
+                                               ("flow_chunk_revision_id", "chunk_revisions"),
+                                               ("flow_chunk_review_snapshot_id", "review_snapshots")):
                             original = evidence.get(field)
                             evidence[field] = id_maps.get(mapping, {}).get(original, original)
                 _upsert(session, KnowledgeAssetItem, payload, immutable=(
@@ -1161,6 +1173,19 @@ class MigrationImporter:
                     int(version["size_bytes"]), version["media_type"])
                 if stored.sha256 != version["sha256"]:
                     raise ValueError(f"恢复对象 SHA-256 不匹配：{version['id']}")
+        for document in metadata.get("parsed_documents", []):
+            if document["source_version_id"] not in selected_version_ids: continue
+            for reference, digest_field, content_type in (
+                (document["content_ref"], "content_digest", "application/json" if document["content_format"] == "table-v1" else "text/markdown"),
+                (document["anchor_map_ref"], "anchor_map_digest", "application/json"),
+            ):
+                if not reference.startswith("object:///"):
+                    raise ValueError("ParsedDocument 只允许当前 object:/// 内容引用")
+                key = reference.removeprefix("object:///")
+                payload = archive.read(f"parsed-objects/{key}")
+                if hashlib.sha256(payload).hexdigest() != document[digest_field]:
+                    raise ValueError(f"ParsedDocument 对象摘要不匹配：{document['id']}")
+                self.objects.put_bytes(key, payload, content_type)
 
     def _apply_tombstones(self, manifest: dict[str, Any], selected: set[str]) -> None:
         source_instance_id = manifest["source_instance_id"]
@@ -1298,7 +1323,12 @@ class MigrationImporter:
         baseline = control.get("route_baseline") or {}
         release_stage = str(baseline.get("release_stage")
                             or control.get("deployment", {}).get("release_stage") or "test")
-        generated = self.store.routing_snapshot(project_deployment_id, release_stage)
+        with self.store.sessions() as session:
+            binding = session.get(ProjectDeployment, project_deployment_id)
+            if not binding:
+                raise ValueError("Seed 的机构项目绑定不存在")
+            project_id = binding.project_id
+        generated = self.store.routing_snapshot(project_id, release_stage)
         # Central and local Target identifiers may differ; the authorization/task payload must not.
         comparable_generated = json.loads(json.dumps(generated))
         comparable_baseline = json.loads(json.dumps(baseline))
@@ -1321,10 +1351,20 @@ class MigrationImporter:
                                 index.pop("partition_name", None)
         if comparable_generated.get("tasks") != comparable_baseline.get("tasks"):
             raise ValueError("Seed 导入后授权生成的 Routing 与 baseline 不一致")
-        version = self.store.create_route_version(project_deployment_id, generated, status="draft", origin="central_seed")
+        version = self.store.create_route_version(project_id, generated, status="frozen", origin="central_seed")
         project_code = control["project"]["code"]; deployment_code = control["deployment"]["code"]
         checksum, object_key = AtomicRoutingPublisher(self.routing_dir).publish(
-            project_code, deployment_code, version.version_no, version.snapshot_json,
-            release_stage=version.release_stage)
-        self.store.mark_route_published(version.id, checksum, object_key)
+            project_code, deployment_code, version.version_no, baseline or version.snapshot_json,
+            release_stage=release_stage)
+        published_snapshot = baseline or version.snapshot_json
+        target = dict(published_snapshot.get("milvus_target") or {})
+        self.store.create_project_publication(
+            project_id, version.id, release_stage,
+            target_kind="local",
+            target_id=str(target.get("target_id") or target.get("id") or f"local:{deployment_id}"),
+            target_revision_id=str(target.get("revision_id") or "verified-current"),
+            target_connection_fingerprint=str(target.get("connection_fingerprint") or "verified-current"),
+            snapshot=published_snapshot, checksum=checksum, object_key=object_key,
+            origin="central_seed",
+        )
         self.instance = self.instance.bind_seed(self.store, deployment_id, manifest["source_instance_id"])

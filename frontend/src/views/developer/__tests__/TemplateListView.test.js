@@ -509,7 +509,7 @@ describe('knowledge flow editing toolbar', () => {
     await button('＋ 新建知识流程').trigger('click')
     await wrapper.findAll('.goal-grid button')[1].trigger('click')
     await flushPromises()
-    expect(wrapper.findAll('.business-stage')).toHaveLength(3)
+    expect(wrapper.findAll('.business-stage')).toHaveLength(5)
     expect(wrapper.find('.serving-selector').exists()).toBe(true)
     expect(wrapper.get('.template-page-head .template-revisions').text()).toBe('最新草稿：无 · 已发布版本：未发布')
     expect(wrapper.get('.authoring-mode-actions').text()).not.toContain('转换为高级编排')

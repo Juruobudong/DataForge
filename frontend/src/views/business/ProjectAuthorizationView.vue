@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '../../api/platform'
 import PublishTargetPanel from '../../components/project-publishing/PublishTargetPanel.vue'
+import EnvironmentTabs from '../../components/project-publishing/EnvironmentTabs.vue'
 import ProjectTaskPanel from '../../components/project-publishing/ProjectTaskPanel.vue'
 import KnowledgeScopePanel from '../../components/project-publishing/KnowledgeScopePanel.vue'
 import RoutingPublishPanel from '../../components/project-publishing/RoutingPublishPanel.vue'
@@ -9,33 +10,27 @@ import RetrievalDebugPanel from '../../components/project-publishing/RetrievalDe
 import RetrievalTaskSettings from '../../components/project-publishing/RetrievalTaskSettings.vue'
 import RouteVersionTable from '../../components/project-publishing/RouteVersionTable.vue'
 import { statusLabel } from '../../constants/statusLabels'
-import { availableOrgCodePresets, compatibleProfilesForTask, movePriority, newOrgScopeDefaults, orgRoutesForTask, preferredDeployment, qaEmbeddingMode, resolveOrgCodePreset, routingPublishReadiness, routingValidationView } from './projectPublishingModel'
+import { availableOrgCodePresets, compatibleProfilesForTask, movePriority, newOrgScopeDefaults, normalizeDefaultReleaseStage, orgRoutesForTask, qaEmbeddingMode, resolveOrgCodePreset, routingPublishReadiness, routingValidationView } from './projectPublishingModel'
 
-const instance = ref(null), projects = ref([]), libraries = ref([]), sharedDeployments = ref([]), knowledgeTypes = ref([]), milvusTargets = ref([])
-const projectId = ref(''), deploymentId = ref(''), selectedStage = ref('test'), tab = ref('target')
+const instance = ref(null), projects = ref([]), libraries = ref([]), knowledgeTypes = ref([]), milvusTargets = ref([])
+const projectId = ref(''), selectedStage = ref('test'), tab = ref('config'), releaseTarget = ref(null)
 const deploymentTasks = ref([]), authorizations = ref([]), versions = ref([])
 const deploymentTaskId = ref(''), orgRouteId = ref(''), orgPresetCode = ref(''), orgCode = ref(''), orgName = ref(''), chosen = ref([])
-const institutionName = ref(''), institutionCode = ref(''), selectedMilvusTargetId = ref('')
-const newInstitutionName = ref(''), newInstitutionCode = ref(''), bindDeploymentId = ref('')
+const selectedMilvusTargetId = ref('')
 const showCreateProject = ref(false), newProjectName = ref('')
 const newTaskCode = ref(''), newTaskName = ref(''), newTaskKnowledgeType = ref(''), newTaskDescription = ref('')
 const newProjectTaskId = ref(''), newIndexProfileId = ref(''), newTopK = ref(10), newDeploymentTaskEnabled = ref(true)
-const result = ref(null), preview = ref(null), error = ref(''), notice = ref('')
+const result = ref(null), diffResult = ref(null), preview = ref(null), validatedContext = ref('')
+const expandedTaskId = ref(''), error = ref(''), notice = ref(''), releaseBusy = ref(false)
 
 const selectedProject = computed(() => projects.value.find(project => project.id === projectId.value))
-const deployments = computed(() => selectedProject.value?.deployments || [])
 const local = computed(() => instance.value?.instance_mode === 'local')
 const central = computed(() => instance.value?.instance_mode === 'central')
-const selectedDeployment = computed(() => deployments.value.find(item => item.id === deploymentId.value))
-const freezesForInstitution = computed(() => central.value && selectedDeployment.value?.scope === 'institution')
-const currentStageTarget = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.revision?.milvus_url || '')
-const currentStageTargetId = computed(() => selectedDeployment.value?.stage_targets?.[selectedStage.value]?.id || '')
+const freezesForInstitution = computed(() => false)
+const currentStageTarget = computed(() => releaseTarget.value?.milvus_target?.revision?.milvus_url || releaseTarget.value?.uri || '')
+const currentStageTargetId = computed(() => releaseTarget.value?.milvus_target?.id || '')
 const verifiedMilvusTargets = computed(() => milvusTargets.value.filter(item => item.current_revision?.verification_status === 'verified'))
 const isKgConsultation = computed(() => selectedProject.value?.code === 'kg-for-consultation')
-const unboundDeployments = computed(() => {
-  const bound = new Set(deployments.value.map(item => item.deployment_id))
-  return sharedDeployments.value.filter(item => !bound.has(item.id) && item.scope === 'institution')
-})
 const isQaAgent = computed(() => [selectedProject.value?.code, selectedProject.value?.name]
   .map(value => String(value || '').trim().toLowerCase().replaceAll('_', '-').replaceAll(' ', '-'))
   .some(value => value === 'qa-agent' || value.startsWith('qa-agent-')))
@@ -52,10 +47,12 @@ const selectedDeploymentTask = computed(() => deploymentTasks.value.find(item =>
 const taskAuthorizations = computed(() => orgRoutesForTask(authorizations.value, deploymentTaskId.value))
 const orgCodePresets = computed(() => availableOrgCodePresets(instance.value?.org_code_presets))
 const publishState = computed(() => routingPublishReadiness(
-  deploymentTasks.value, authorizations.value, freezesForInstitution.value ? 'deferred_to_local' : currentStageTarget.value,
+  deploymentTasks.value, authorizations.value, currentStageTarget.value,
 ))
 const validationView = computed(() => routingValidationView(result.value))
-const releaseActionLabel = computed(() => `${freezesForInstitution.value ? '冻结' : '发布'}${statusLabel(selectedStage.value)}版本`)
+const contextKey = computed(() => `${projectId.value}:${selectedStage.value}`)
+const releaseReady = computed(() => publishState.value.ready && validationView.value.valid && validatedContext.value === contextKey.value)
+const releaseActionLabel = computed(() => `冻结并发布${statusLabel(selectedStage.value)}版本`)
 const availableLibraries = computed(() => {
   const task = selectedDeploymentTask.value
   return libraries.value.filter(library => {
@@ -67,44 +64,67 @@ const availableLibraries = computed(() => {
     return true
   })
 })
+const selectedTaskRoutes = computed(() => orgRoutesForTask(authorizations.value, deploymentTaskId.value))
 
-function chooseBoundDeployment() {
-  if (deployments.value.some(item => item.id === deploymentId.value)) return
-  deploymentId.value = preferredDeployment(
-    deployments.value, local.value ? instance.value?.bound_deployment_id : null,
-  )?.id || ''
+function invalidateReleaseEvidence() {
+  result.value = null; diffResult.value = null; validatedContext.value = ''; releaseBusy.value = false
+}
+
+function configuredDefaultStage() {
+  return normalizeDefaultReleaseStage(instance.value?.default_release_stage)
+}
+
+async function loadReleaseTarget() {
+  releaseTarget.value = null
+  if (local.value) {
+    const configs = await api.localMilvusConfigurations()
+    const current = configs.find(item => item.slot === 'current_target' && item.status === 'verified')
+    releaseTarget.value = current ? { uri: current.uri } : null
+  } else {
+    try { releaseTarget.value = await api.instanceReleaseTarget(selectedStage.value) }
+    catch { releaseTarget.value = null }
+  }
+  selectedMilvusTargetId.value = currentStageTargetId.value
 }
 async function load() {
   try {
     error.value = ''
-    ;[instance.value, projects.value, libraries.value, sharedDeployments.value, knowledgeTypes.value] = await Promise.all([
-      api.instance(), api.projects(), api.knowledgeLibraries(), api.sharedDeployments(), api.knowledgeTypes(),
+    ;[instance.value, projects.value, libraries.value, knowledgeTypes.value] = await Promise.all([
+      api.instance(), api.projects(), api.knowledgeLibraries(), api.knowledgeTypes(),
     ])
     milvusTargets.value = instance.value?.instance_mode === 'central' ? await api.milvusTargets() : []
+    selectedStage.value = configuredDefaultStage()
     projectId.value ||= projects.value[0]?.id || ''
     newTaskKnowledgeType.value ||= activeKnowledgeTypes.value[0]?.code || ''
-    chooseBoundDeployment()
+    await loadReleaseTarget()
   } catch (e) { error.value = e.message }
 }
 async function loadDeployment(preferredOrgCode = '') {
-  result.value = null; preview.value = null
-  if (!deploymentId.value) { deploymentTasks.value = []; authorizations.value = []; versions.value = []; return }
+  invalidateReleaseEvidence(); preview.value = null
+  if (!projectId.value) { deploymentTasks.value = []; authorizations.value = []; versions.value = []; return }
   try {
-    institutionName.value = selectedDeployment.value?.institution_name || ''
-    institutionCode.value = selectedDeployment.value?.institution_code || ''
-    selectedMilvusTargetId.value = currentStageTargetId.value
     ;[deploymentTasks.value, authorizations.value, versions.value] = await Promise.all([
-      api.deploymentTasks(deploymentId.value), api.authorizations(deploymentId.value), api.routeVersions(deploymentId.value, selectedStage.value),
+      api.deploymentTasks(projectId.value), api.authorizations(projectId.value), api.routeVersions(projectId.value, selectedStage.value),
     ])
     if (!deploymentTasks.value.some(item => item.id === deploymentTaskId.value)) {
       deploymentTaskId.value = deploymentTasks.value.find(item => item.enabled)?.id || ''
+    }
+    if (!deploymentTasks.value.some(item => item.id === expandedTaskId.value)) {
+      expandedTaskId.value = deploymentTaskId.value
     }
     selectDefaultOrgRoute(typeof preferredOrgCode === 'string' ? preferredOrgCode : '')
   } catch (e) { error.value = e.message }
 }
 function startNewOrgRoute() {
-  const defaults = newOrgScopeDefaults(selectedDeployment.value, taskAuthorizations.value)
+  const defaults = newOrgScopeDefaults(null, taskAuthorizations.value)
   orgRouteId.value = '__new__'; orgPresetCode.value = ''; orgCode.value = defaults.orgCode; orgName.value = defaults.orgName; chosen.value = []
+}
+function toggleTask(taskId) {
+  expandedTaskId.value = expandedTaskId.value === taskId ? '' : taskId
+  if (expandedTaskId.value) {
+    deploymentTaskId.value = taskId
+    selectDefaultOrgRoute()
+  }
 }
 function syncOrgScope() {
   const route = taskAuthorizations.value.find(item => item.id === orgRouteId.value)
@@ -139,8 +159,8 @@ async function createProject() {
   try {
     const created = await api.createProject({ name: newProjectName.value.trim() })
     newProjectName.value = ''; showCreateProject.value = false
-    await load(); projectId.value = created.id; chooseBoundDeployment(); await loadDeployment()
-    tab.value = 'tasks'; notice.value = `项目「${created.name}」已创建，并已绑定 DataForge 中心。`
+    await load(); projectId.value = created.id; await loadDeployment()
+    tab.value = 'config'; notice.value = `项目「${created.name}」已创建。`
   } catch (e) { error.value = e.message }
 }
 async function createProjectTask() {
@@ -152,7 +172,7 @@ async function createProjectTask() {
 }
 async function createDeploymentTask() {
   try {
-    await api.createDeploymentTask(deploymentId.value, { project_task_id: newProjectTaskId.value, index_profile_id: newIndexProfileId.value, qa_embedding_mode: selectedQaEmbeddingMode.value, top_k: Number(newTopK.value), enabled: newDeploymentTaskEnabled.value })
+    await api.createDeploymentTask(projectId.value, { project_task_id: newProjectTaskId.value, index_profile_id: newIndexProfileId.value, qa_embedding_mode: selectedQaEmbeddingMode.value, top_k: Number(newTopK.value), enabled: newDeploymentTaskEnabled.value })
     newProjectTaskId.value = ''; newIndexProfileId.value = ''; newTopK.value = 10; newDeploymentTaskEnabled.value = true
     await loadDeployment(); notice.value = '检索通道已创建。'
   } catch (e) { error.value = e.message }
@@ -165,66 +185,64 @@ async function saveRoute() {
   try {
     const normalizedOrgCode = orgCode.value.trim()
     if (!normalizedOrgCode) { error.value = 'org_code 不能为空'; return }
-    result.value = await api.putDeploymentRoute(deploymentId.value, deploymentTaskId.value, {
+    await api.putDeploymentRoute(projectId.value, deploymentTaskId.value, {
       org_code: normalizedOrgCode, org_name: orgName.value.trim(), knowledge_library_ids: chosen.value,
     })
     await loadDeployment(normalizedOrgCode); notice.value = '知识范围已保存，列表顺序即检索优先级。'
   } catch (e) { error.value = e.message }
-}
-async function saveInstitutionIdentity() {
-  try { await api.patchSharedDeployment(selectedDeployment.value.deployment_id, { institution_name: institutionName.value, institution_code: institutionCode.value }); await load(); await loadDeployment(); notice.value = '机构身份已保存。' }
-  catch (e) { error.value = e.message }
 }
 async function saveCentralTarget() {
   const target = verifiedMilvusTargets.value.find(item => item.id === selectedMilvusTargetId.value)
   if (!target) return
   const production = selectedStage.value === 'production'
   const revision = target.current_revision
-  if (production && !window.confirm(`确认切换中心生产环境 Milvus 服务？\nMilvus：${revision.milvus_url}`)) return
+  if (production && !window.confirm(`确认首次绑定中心生产环境 Milvus 服务？\nMilvus：${revision.milvus_url}\n绑定后本期不可切换。`)) return
   try {
-    await api.putDeploymentTarget(selectedDeployment.value.deployment_id, selectedStage.value, { milvus_target_id: target.id, milvus_target_revision_id: revision.id, confirm_production: production, expected_target_uri: production ? revision.milvus_url : null })
-    await load(); await loadDeployment(); notice.value = `${statusLabel(selectedStage.value)} Milvus 服务已切换。`
+    await api.putInstanceReleaseTarget(selectedStage.value, { milvus_target_id: target.id, milvus_target_revision_id: revision.id, confirm_production: production, expected_target_uri: production ? revision.milvus_url : null })
+    await loadReleaseTarget(); await loadDeployment(); notice.value = `${statusLabel(selectedStage.value)} Milvus 服务已绑定。`
   } catch (e) { error.value = e.message }
 }
-async function createInstitutionDeployment() {
+async function preflight() {
+  const key = contextKey.value
+  releaseBusy.value = true; error.value = ''; preview.value = null; invalidateReleaseEvidence()
   try {
-    const created = await api.createSharedDeployment({ institution_name: newInstitutionName.value.trim(), institution_code: newInstitutionCode.value.trim() })
-    const binding = await api.bindDeploymentProject(created.id, projectId.value)
-    newInstitutionName.value = ''; newInstitutionCode.value = ''; await load(); deploymentId.value = binding.id; await loadDeployment(); notice.value = `发布目标「${created.name}」已创建。`
-  } catch (e) { error.value = e.message }
+    const [validation, changes] = await Promise.all([
+      api.validateRouting(projectId.value, selectedStage.value),
+      api.routingDiff(projectId.value, selectedStage.value),
+    ])
+    if (key !== contextKey.value) return
+    result.value = validation; diffResult.value = changes; validatedContext.value = key
+  } catch (e) { if (key === contextKey.value) error.value = e.message }
+  finally { if (key === contextKey.value) releaseBusy.value = false }
 }
-async function bindExistingDeployment() {
-  if (!bindDeploymentId.value) return
-  try { const binding = await api.bindDeploymentProject(bindDeploymentId.value, projectId.value); bindDeploymentId.value = ''; await load(); deploymentId.value = binding.id; await loadDeployment() }
-  catch (e) { error.value = e.message }
-}
-async function diff() { try { result.value = await api.routingDiff(deploymentId.value, selectedStage.value); preview.value = null } catch (e) { error.value = e.message } }
-async function validate() { try { result.value = await api.validateRouting(deploymentId.value, selectedStage.value); preview.value = null } catch (e) { error.value = e.message } }
 function releaseBody(production = false) { return { release_stage: selectedStage.value, expected_target_uri: currentStageTarget.value, confirm_production: production } }
+async function freezeCurrentProject() {
+  try {
+    const frozen = await api.freezeRouting(projectId.value, selectedStage.value)
+    await loadDeployment(); notice.value = `项目版本 v${frozen.version_no} 已冻结，可用于中心发布或机构 Release。`
+    return frozen
+  } catch (e) { error.value = e.message; return null }
+}
 async function releaseCurrentStage() {
-  if (!publishState.value.ready) { error.value = publishState.value.problems.join('；'); return }
+  if (!releaseReady.value) { error.value = '请先完成并通过当前环境的发布检查。'; return }
   if (isKgConsultation.value && selectedStage.value !== 'test') { error.value = 'kg_for_consultation 第一阶段只允许发布测试环境'; return }
-  if (freezesForInstitution.value) {
-    try { result.value = await api.freezeRouting(deploymentId.value, selectedStage.value); await loadDeployment(); tab.value = 'history'; notice.value = `${statusLabel(selectedStage.value)}项目版本已冻结；请到“机构发布部署”继续生成机构 Release。` }
-    catch (e) { error.value = e.message }
-    return
-  }
   const production = selectedStage.value === 'production'
-  if (production && !window.confirm(`确认发布生产环境？\n发布目标：${selectedDeployment.value?.name}\nMilvus：${currentStageTarget.value}\n发布后中心生产 Runtime 将立即使用新版本。`)) return
-  try { result.value = await api.publishRouting(deploymentId.value, releaseBody(production)); await loadDeployment(); tab.value = 'history' }
+  if (production && !window.confirm(`确认发布生产环境？\nMilvus：${currentStageTarget.value}\n发布后中心生产 Runtime 将立即使用新版本。`)) return
+  const frozen = await freezeCurrentProject()
+  if (!frozen) return
+  try { await api.publishRouting(projectId.value, { ...releaseBody(production), route_version_id: frozen.id }); await loadDeployment(); tab.value = 'history' }
   catch (e) { error.value = e.message }
 }
-async function showVersion(version) { try { preview.value = await api.routeVersion(deploymentId.value, version, selectedStage.value); result.value = null; tab.value = 'routing' } catch (e) { error.value = e.message } }
+async function showVersion(version) { try { preview.value = await api.routeVersion(projectId.value, version, selectedStage.value); tab.value = 'history' } catch (e) { error.value = e.message } }
 async function rollback(version) {
   const production = selectedStage.value === 'production'
   const message = production ? `确认回滚生产环境到 v${version} 的配置并发布新版本？\nMilvus：${currentStageTarget.value}` : `恢复测试环境 v${version} 的配置并发布新版本？`
   if (!window.confirm(message)) return
-  try { await api.rollbackRouting(deploymentId.value, version, releaseBody(production)); await loadDeployment() } catch (e) { error.value = e.message }
+  try { await api.rollbackRouting(projectId.value, version, releaseBody(production)); await loadDeployment() } catch (e) { error.value = e.message }
 }
 
-watch(projectId, () => { selectedStage.value = 'test'; deploymentId.value = ''; chooseBoundDeployment(); newProjectTaskId.value = ''; newIndexProfileId.value = '' })
-watch(deploymentId, () => { selectedStage.value = 'test'; loadDeployment() })
-watch(selectedStage, async () => { result.value = null; preview.value = null; selectedMilvusTargetId.value = currentStageTargetId.value; if (deploymentId.value) versions.value = await api.routeVersions(deploymentId.value, selectedStage.value) })
+watch(projectId, () => { selectedStage.value = configuredDefaultStage(); newProjectTaskId.value = ''; newIndexProfileId.value = ''; tab.value = 'config'; loadDeployment() })
+watch(selectedStage, async () => { invalidateReleaseEvidence(); preview.value = null; await loadReleaseTarget(); if (projectId.value) versions.value = await api.routeVersions(projectId.value, selectedStage.value) })
 watch(deploymentTaskId, () => selectDefaultOrgRoute())
 watch(orgRouteId, syncOrgScope)
 watch(newProjectTaskId, () => { newIndexProfileId.value = compatibleProfiles.value[0]?.id || '' })
@@ -232,23 +250,34 @@ onMounted(load)
 </script>
 
 <template>
-  <section>
-    <div class="page-head"><div><h2>项目发布</h2><p>选择发布目标和环境，配置检索通道、知识范围并生成独立发布版本。</p></div><div class="page-actions"><span class="badge blue">{{ local ? '机构本地' : '中心控制面' }}</span><button v-if="central" class="primary" @click="showCreateProject=!showCreateProject">{{ showCreateProject?'取消新增':'新增项目' }}</button></div></div>
+  <section class="publishing-workbench">
+    <div class="page-head"><div><h2>项目发布</h2><p>按项目配置检索任务，并发布到当前环境全项目共用的 Milvus。</p></div><div class="page-actions"><span class="badge blue">{{ local ? '机构本地' : '中心控制面' }}</span><button v-if="central" class="primary" @click="showCreateProject=!showCreateProject">{{ showCreateProject?'取消新增':'新增项目' }}</button></div></div>
     <form v-if="showCreateProject" class="panel stack" @submit.prevent="createProject"><h3>新增项目</h3><label>项目名称<input v-model="newProjectName" required maxlength="255"></label><button class="primary">创建项目</button></form>
-    <section class="panel"><div class="panel-head"><div><h3>{{ selectedProject?.name || '暂无项目' }}</h3><p>项目创建后自动绑定 DataForge 中心。</p></div><div class="page-actions"><select v-model="projectId"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select><select v-if="!local" v-model="deploymentId"><option v-for="deployment in deployments" :key="deployment.id" :value="deployment.id">{{ deployment.name }} · {{ deployment.code }}</option></select></div></div></section>
-    <nav class="tabs"><button :class="{active:tab==='target'}" @click="tab='target'">发布目标</button><button :class="{active:tab==='tasks'}" @click="tab='tasks'">任务配置</button><button :class="{active:tab==='scope'}" @click="tab='scope'">知识范围</button><button :class="{active:tab==='routing'}" @click="tab='routing'">发布配置</button><button :class="{active:tab==='retrieval'}" @click="tab='retrieval'">检索调试</button><button :class="{active:tab==='history'}" @click="tab='history'">发布记录</button></nav>
-    <PublishTargetPanel v-if="tab==='target'" :deployment="selectedDeployment" :selected-stage="selectedStage" :target-uri="currentStageTarget" @update:selected-stage="selectedStage=$event">
-      <form v-if="selectedDeployment?.scope==='institution'" class="stack" @submit.prevent="saveInstitutionIdentity"><label>机构名称<input v-model="institutionName" required></label><label>机构代码<input v-model="institutionCode" required :readonly="selectedDeployment.institution_code_locked"></label><button>保存机构身份</button></form>
-      <p v-if="selectedDeployment?.scope==='institution'&&!local" class="notice">机构 Milvus 不在中心保存；私有化部署后由机构在“本地初始化”中注册并验证。</p>
-      <form v-if="selectedDeployment?.scope==='central'&&central" class="stack" @submit.prevent="saveCentralTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务<select v-model="selectedMilvusTargetId" required><option value="">选择已验证服务</option><option v-for="target in verifiedMilvusTargets" :key="target.id" :value="target.id">{{ target.name }} · {{ target.current_revision.milvus_url }}</option></select></label><button>保存 Milvus 服务</button><RouterLink to="/business/milvus-targets">管理 Milvus 服务注册表</RouterLink></form>
-      <form v-if="!local" class="stack" @submit.prevent="createInstitutionDeployment"><h4>新增机构发布目标</h4><label>机构名称<input v-model="newInstitutionName" required></label><label>机构代码<input v-model="newInstitutionCode" required></label><button>创建并绑定当前项目</button></form>
-      <form v-if="!local&&unboundDeployments.length" class="stack" @submit.prevent="bindExistingDeployment"><h4>绑定已有发布目标</h4><select v-model="bindDeploymentId" required><option value="">选择发布目标</option><option v-for="item in unboundDeployments" :key="item.id" :value="item.id">{{ item.name }} · {{ item.institution_code }}</option></select><button>绑定当前项目</button></form>
-    </PublishTargetPanel>
-    <ProjectTaskPanel v-else-if="tab==='tasks'" :count="deploymentTasks.length"><div class="grid2"><form class="stack" @submit.prevent="createProjectTask"><h4>1. 新增业务任务</h4><label>任务编码<input v-model="newTaskCode" required></label><label>任务名称<input v-model="newTaskName" required></label><label>知识类型<select v-model="newTaskKnowledgeType" required><option v-for="item in activeKnowledgeTypes" :key="item.id" :value="item.code">{{ item.name }}</option></select></label><label>任务说明<textarea v-model="newTaskDescription" rows="3"></textarea></label><button class="primary">创建业务任务</button></form><form class="stack" @submit.prevent="createDeploymentTask"><h4>2. 配置检索通道</h4><label>业务任务<select v-model="newProjectTaskId" required><option value="">选择业务任务</option><option v-for="task in unboundProjectTasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label><label>索引配置<select v-model="newIndexProfileId" required><option value="">选择索引配置</option><option v-for="profile in compatibleProfiles" :key="profile.id" :value="profile.id">{{ profile.code }}</option></select></label><label v-if="selectedQaEmbeddingMode">QA 向量化方式<input :value="selectedQaEmbeddingMode==='question'?'问题文本':'问题与答案全文'" readonly></label><label>候选数量 Top K<input v-model.number="newTopK" type="number" min="1" required></label><label><input v-model="newDeploymentTaskEnabled" type="checkbox"> 启用</label><button class="primary">保存检索通道</button></form></div><table><thead><tr><th>业务任务</th><th>知识类型</th><th>索引配置</th><th>召回候选数</th><th>最终 TopK</th><th>Reranker</th><th>状态</th></tr></thead><tbody><tr v-for="task in deploymentTasks" :key="task.id"><td>{{ task.task?.name }}</td><td>{{ task.task?.knowledge_type }}</td><td>{{ task.index_profile?.code }}</td><td>{{ task.top_k }}</td><td>{{ task.final_top_k }}</td><td>{{ task.reranker_serving_code || '关闭重排' }}</td><td>{{ task.enabled?'启用':'未启用' }}</td></tr></tbody></table><RetrievalTaskSettings :key="deploymentId" :deployment-id="deploymentId" :tasks="deploymentTasks" @saved="loadDeployment" /></ProjectTaskPanel>
-    <section v-else-if="tab==='scope'" class="panel stack"><div class="panel-head"><div><h3>知识范围</h3><p>{{ selectedDeployment?.name }} · 检索通道与 org_code 共同确定授权范围</p></div><button type="button" @click="startNewOrgRoute">新增 org_code 范围</button></div><label>检索通道<select v-model="deploymentTaskId" required><option value="">选择检索通道</option><option v-for="task in deploymentTasks.filter(item=>item.enabled)" :key="task.id" :value="task.id">{{ task.task?.name }}</option></select></label><label>已有知识范围<select v-model="orgRouteId" :disabled="!deploymentTaskId"><option value="__new__">新增 org_code 范围</option><option v-for="route in taskAuthorizations" :key="route.id" :value="route.id">{{ route.org_name || route.org_code }} · {{ route.org_code }}</option></select></label><label v-if="orgRouteId==='__new__'&&orgCodePresets.length">预配置机构<select v-model="orgPresetCode" @change="applyOrgPreset"><option value="">自定义 org_code</option><option v-for="preset in orgCodePresets" :key="preset.org_code" :value="preset.org_code">{{ preset.name }} · {{ preset.org_code }}</option></select></label><div class="grid2"><label>组织范围编码（org_code）<input v-model="orgCode" required maxlength="120" :readonly="orgRouteId!=='__new__'" @input="markCustomOrgCode"></label><label>范围名称（org_name）<input v-model="orgName" maxlength="255"></label></div><p class="muted">预配置只用于快速填充；可继续自定义。机构发布目标使用 institution_code，这里的 org_code 可与其相同，也可独立配置。</p><KnowledgeScopePanel :libraries="availableLibraries" :chosen="chosen" @toggle="toggleLibrary" @move="moveLibrary" /><button class="primary" :disabled="!deploymentTaskId||!orgCode.trim()||!chosen.length" @click="saveRoute">保存知识范围</button></section>
-    <RoutingPublishPanel v-else-if="tab==='routing'" :validation="validationView" :result="result" :preview="preview" :institution="freezesForInstitution" :ready="publishState.ready" :problems="publishState.problems" :action-label="releaseActionLabel" @diff="diff" @validate="validate" @release="releaseCurrentStage" />
-    <RetrievalDebugPanel v-else-if="tab==='retrieval'" :key="projectId" :deployment-id="deploymentId" :release-stage="selectedStage" :institution="freezesForInstitution" :project-code="selectedProject?.code" :deployment-code="selectedDeployment?.code" />
-    <section v-else class="panel"><div class="panel-head"><div><h3>{{ statusLabel(selectedStage) }}发布记录</h3><p>测试与生产版本独立编号、独立回滚。</p></div></div><RouteVersionTable :versions="versions" :allow-rollback="!freezesForInstitution" @preview="showVersion" @rollback="rollback" /></section>
+    <section class="panel publishing-context"><div><small>项目</small><select v-model="projectId"><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></div><div><small>环境</small><EnvironmentTabs :model-value="selectedStage" :target-uri="currentStageTarget" @update:model-value="selectedStage=$event" /></div><div><small>中心发布 Milvus</small><strong>{{ currentStageTarget || '尚未绑定' }}</strong></div></section>
+    <nav class="tabs primary-tabs"><button :class="{active:tab==='config'}" @click="tab='config'">配置</button><button :class="{active:tab==='validation'}" @click="tab='validation'">验证</button><button :class="{active:tab==='release'}" @click="tab='release'">发布</button><button :class="{active:tab==='history'}" @click="tab='history'">版本记录</button></nav>
+
+    <section v-if="tab==='config'" class="stack workbench-section">
+      <PublishTargetPanel :target="releaseTarget" :selected-stage="selectedStage" :target-uri="currentStageTarget" :show-environment="false">
+        <details class="configuration-details"><summary>管理发布目标</summary>
+          <form v-if="central&&!releaseTarget" class="stack" @submit.prevent="saveCentralTarget"><label>{{ statusLabel(selectedStage) }} Milvus 服务<select v-model="selectedMilvusTargetId" required><option value="">选择已验证服务</option><option v-for="target in verifiedMilvusTargets" :key="target.id" :value="target.id">{{ target.name }} · {{ target.current_revision.milvus_url }}</option></select></label><p class="notice">该环境的 Target 首次绑定后本期不可切换，且由所有项目共用。</p><button>绑定 Milvus 服务</button></form>
+          <p v-else-if="releaseTarget" class="notice">当前环境 Target 已固定；Registry 新 Revision 不会自动改绑。</p>
+          <RouterLink to="/business/milvus-targets">管理 Milvus 服务注册表</RouterLink>
+          <button type="button" :disabled="!projectId" @click="freezeCurrentProject">仅冻结项目版本</button>
+        </details>
+      </PublishTargetPanel>
+      <ProjectTaskPanel :count="deploymentTasks.length">
+        <details class="configuration-details"><summary>新增检索任务</summary><div class="grid2"><form class="stack" @submit.prevent="createProjectTask"><h4>1. 定义业务任务</h4><label>任务标识<input v-model="newTaskCode" required></label><label>任务名称<input v-model="newTaskName" required></label><label>知识类型<select v-model="newTaskKnowledgeType" required><option v-for="item in activeKnowledgeTypes" :key="item.id" :value="item.code">{{ item.name }}</option></select></label><label>任务说明<textarea v-model="newTaskDescription" rows="3"></textarea></label><button class="primary">创建业务任务</button></form><form class="stack" @submit.prevent="createDeploymentTask"><h4>2. 建立运行任务</h4><label>业务任务<select v-model="newProjectTaskId" required><option value="">选择业务任务</option><option v-for="task in unboundProjectTasks" :key="task.id" :value="task.id">{{ task.name }}</option></select></label><label>索引配置<select v-model="newIndexProfileId" required><option value="">选择索引配置</option><option v-for="profile in compatibleProfiles" :key="profile.id" :value="profile.id">{{ profile.code }}</option></select></label><label v-if="selectedQaEmbeddingMode">QA 向量化方式<input :value="selectedQaEmbeddingMode==='question'?'问题文本':'问题与答案全文'" readonly></label><label>候选召回数<input v-model.number="newTopK" type="number" min="1" required></label><label><input v-model="newDeploymentTaskEnabled" type="checkbox"> 启用任务</label><button class="primary">保存运行任务</button></form></div></details>
+        <div class="task-list"><article v-for="task in deploymentTasks" :key="task.id" class="task-card"><header><div><h4>{{ task.task?.name }}</h4><p><code>{{ task.task?.code }}</code> · {{ task.task?.knowledge_type }} · {{ task.index_profile?.code }}</p></div><div class="task-summary"><span class="badge" :class="task.enabled?'green':'amber'">{{ task.enabled?'已启用':'未启用' }}</span><span>{{ orgRoutesForTask(authorizations,task.id).length }} 个授权</span><span>召回 {{ task.top_k }} / 最终 {{ task.final_top_k }}</span><button type="button" @click="toggleTask(task.id)">{{ expandedTaskId===task.id?'收起':'配置任务' }}</button></div></header><div v-if="expandedTaskId===task.id" class="task-editor"><section class="task-contract"><h4>基本信息</h4><p>任务标识 <code>{{ task.task?.code }}</code></p><p>知识类型 {{ task.task?.knowledge_type }}</p><p>索引配置 {{ task.index_profile?.code }}</p></section><RetrievalTaskSettings :deployment-id="projectId" :task="task" @saved="loadDeployment" /><section class="authorization-editor stack"><div class="panel-head"><div><h4>知识授权</h4><p>当前任务按 org_code 隔离可访问知识库。</p></div><button type="button" @click="startNewOrgRoute">新增授权范围</button></div><label>授权范围<select v-model="orgRouteId"><option value="__new__">新增 org_code 范围</option><option v-for="route in selectedTaskRoutes" :key="route.id" :value="route.id">{{ route.org_name || route.org_code }} · {{ route.org_code }}</option></select></label><label v-if="orgRouteId==='__new__'&&orgCodePresets.length">预配置机构<select v-model="orgPresetCode" @change="applyOrgPreset"><option value="">自定义 org_code</option><option v-for="preset in orgCodePresets" :key="preset.org_code" :value="preset.org_code">{{ preset.name }} · {{ preset.org_code }}</option></select></label><div class="grid2"><label>组织授权编码<input v-model="orgCode" required maxlength="120" :readonly="orgRouteId!=='__new__'" @input="markCustomOrgCode"></label><label>授权范围名称<input v-model="orgName" maxlength="255"></label></div><p class="muted">org_code 可与 institution_code 相同，也可独立配置。</p><KnowledgeScopePanel :libraries="availableLibraries" :chosen="chosen" @toggle="toggleLibrary" @move="moveLibrary" /><button class="primary" :disabled="!orgCode.trim()||!chosen.length" @click="saveRoute">保存知识授权</button></section></div></article><p v-if="!deploymentTasks.length" class="muted">当前项目还没有检索任务。</p></div>
+      </ProjectTaskPanel>
+    </section>
+
+    <RetrievalDebugPanel v-else-if="tab==='validation'" :key="`${projectId}:${selectedStage}`" :deployment-id="projectId" :release-stage="selectedStage" :institution="false" :project-code="selectedProject?.code" deployment-code="dataforge-central" />
+    <RoutingPublishPanel v-else-if="tab==='release'" :validation="validationView" :result="result" :diff="diffResult" :institution="freezesForInstitution" :ready="releaseReady" :busy="releaseBusy" :problems="publishState.problems" :action-label="releaseActionLabel" :libraries="libraries" @validate="preflight" @release="releaseCurrentStage" />
+    <section v-else class="stack"><section class="panel"><div class="panel-head"><div><h3>{{ statusLabel(selectedStage) }}版本记录</h3><p>测试与生产版本独立编号、独立回滚；机构中心侧只记录冻结版本。</p></div></div><RouteVersionTable :versions="versions" :allow-rollback="!freezesForInstitution" @preview="showVersion" @rollback="rollback" /></section><section v-if="preview" class="panel stack version-detail"><div class="panel-head"><div><h3>版本 V{{ preview.version_no }}</h3><p>{{ preview.status }} · 相对 V{{ preview.previous_version_no || 0 }} 共 {{ preview.change_summary?.total || 0 }} 项变化</p></div><button type="button" @click="preview=null">关闭</button></div><div class="stats"><article class="stat-card"><small>任务</small><b>{{ preview.snapshot?.tasks?.length || 0 }}</b></article><article class="stat-card"><small>授权范围</small><b>{{ preview.snapshot?.routes?.length || 0 }}</b></article><article class="stat-card"><small>资产</small><b>{{ preview.assets?.length || 0 }}</b></article></div><article v-for="task in preview.snapshot?.tasks || []" :key="task.task_code" class="version-task"><h4>{{ task.task_name }} · <code>{{ task.task_code }}</code></h4><p>召回 {{ task.top_k }} · 最终 {{ task.final_top_k }} · {{ task.reranker_serving_code || '关闭重排' }}</p><p v-for="route in task.org_routes" :key="route.org_code">{{ route.org_name || route.org_code }} · {{ route.knowledge_library_ids.length }} 个知识库</p></article><details><summary>变更明细</summary><pre>{{ JSON.stringify(preview.changes,null,2) }}</pre></details><details><summary>RoutingSnapshot JSON</summary><pre>{{ JSON.stringify(preview.snapshot,null,2) }}</pre></details></section></section>
     <p v-if="notice" class="notice">{{ notice }}</p><p v-if="error" class="error">{{ error }}</p>
   </section>
 </template>
+
+<style scoped>
+.publishing-workbench{display:grid;gap:16px}.publishing-context{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,1fr) minmax(300px,1.4fr);gap:18px;align-items:start}.publishing-context>div{display:grid;gap:7px}.publishing-context small{color:var(--muted);font-weight:750}.primary-tabs{margin:0}.workbench-section{gap:16px}.configuration-details{padding-top:8px;border-top:1px solid var(--border)}.configuration-details>summary{padding:8px 0;color:var(--blue);font-weight:750;cursor:pointer}.task-list{display:grid;gap:14px;margin-top:16px}.task-card{border:1px solid var(--border);border-radius:12px;background:#fbfcfe}.task-card>header{display:flex;justify-content:space-between;gap:18px;align-items:center;padding:16px}.task-card h4{margin:0 0 5px}.task-summary{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.task-editor{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(260px,1fr) minmax(320px,1.3fr);gap:16px;padding:16px;border-top:1px solid var(--border);background:#fff}.task-contract,.authorization-editor{padding:14px;border:1px solid var(--border);border-radius:10px}.version-detail{margin-top:0}.version-task{padding:14px;border:1px solid var(--border);border-radius:10px}@media(max-width:1200px){.publishing-context,.task-editor{grid-template-columns:1fr}.task-card>header{align-items:flex-start;flex-direction:column}}
+</style>

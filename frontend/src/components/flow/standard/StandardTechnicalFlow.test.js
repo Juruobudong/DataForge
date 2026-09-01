@@ -4,9 +4,13 @@ import StandardTechnicalFlow from './StandardTechnicalFlow.vue'
 import { nativeQaOperator } from '../__tests__/flowFixtures'
 
 function projection(outputs) {
-  const nodes = [{ node_id: 'input', code: 'reviewed-source-chunk-input', kind: 'operator', display_name_zh: '已审核文档块' }], edges = []
+  const nodes = [
+    { node_id: 'input', code: 'document-input', kind: 'operator', display_name_zh: '文档输入' },
+    { node_id: 'chunker', code: 'document-chunker', kind: 'operator', display_name_zh: '文档切分' },
+    { node_id: 'gate', code: 'execution-gate', kind: 'execution_gate', display_name_zh: '自动冻结输入' },
+  ], edges = [{ source: 'input', target: 'chunker' }, { source: 'chunker', target: 'gate' }]
   for (const output of outputs) {
-    let previous = 'input'
+    let previous = 'gate'
     for (const code of ['generator', ...(output.startsWith('graph:') ? ['schema-validator', 'graph-quality-validator'] : []), 'knowledge-sink']) {
       const id = `${output}-${code}`
       nodes.push({ node_id: id, code, kind: code === 'knowledge-sink' ? 'knowledge_sink' : 'operator', display_name_zh: code, output_key: output, name: code, version: 1, source: 'dataforge', catalog_group: 'dataforge', driver: code === 'knowledge-sink' ? null : 'builtin', executor: code === 'knowledge-sink' ? null : 'dataforge-native' })

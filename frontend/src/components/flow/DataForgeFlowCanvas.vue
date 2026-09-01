@@ -9,6 +9,7 @@ import OperatorNode from './nodes/OperatorNode.vue'
 import FlowInputNode from './nodes/FlowInputNode.vue'
 import SubflowNode from './nodes/SubflowNode.vue'
 import KnowledgeSinkNode from './nodes/KnowledgeSinkNode.vue'
+import ExecutionGateNode from './nodes/ExecutionGateNode.vue'
 import FlowEdge from './edges/FlowEdge.vue'
 import ConnectionLine from './edges/ConnectionLine.vue'
 import { removeElements } from './flowModel'
@@ -227,6 +228,7 @@ defineExpose({ autoLayout, deleteEdge, focusElement, fit, screenToFlowCoordinate
       <template #node-flow-input="nodeProps"><FlowInputNode v-bind="nodeProps" /></template>
       <template #node-subflow="nodeProps"><SubflowNode v-bind="nodeProps" :show-technical-code="showTechnicalCode" /></template>
       <template #node-knowledge-sink="nodeProps"><KnowledgeSinkNode v-bind="nodeProps" /></template>
+      <template #node-execution-gate="nodeProps"><ExecutionGateNode v-bind="nodeProps" /></template>
       <template #edge-dataforge="edgeProps"><FlowEdge v-bind="edgeProps" /></template>
       <template #connection-line="lineProps"><ConnectionLine v-bind="lineProps" /></template>
       <div v-if="!compact" class="canvas-chip" :class="{ connecting: interaction.mode !== 'idle' }">{{ interactionLabel }}</div>

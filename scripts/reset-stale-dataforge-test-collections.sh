@@ -8,6 +8,11 @@ cd "$PROJECT_ROOT"
 COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}"
 ENV_FILE="${ENV_FILE:-.env.docker}"
 
+# compose.yaml 含内网地址、不入库；全新 clone 回退到脱敏模板。
+if [[ ! -f "$COMPOSE_FILE" && -f compose.example.yaml ]]; then
+  COMPOSE_FILE="compose.example.yaml"
+fi
+
 if [[ "$#" -ne 0 ]]; then
   echo "该固定测试清理脚本不接受参数；直接运行脚本即执行 dry-run、删除和 Provision。" >&2
   exit 2

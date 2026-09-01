@@ -1,7 +1,9 @@
 # ADR-007：SourceAnchorV2 与证据视图分离
 
-**状态**：Accepted  
+**状态**：Superseded by [ADR-011](ADR-011-parsed-document-flow-owned-chunking.md)
 **日期**：2026-08-25
+
+> 本文保留历史决策。当前 ParseJob 在 ParsedDocument Anchor Map 建立来源定位，FlowChunkRevision 只冻结所消费的范围；不存在 Source Preparation Anchor 所有权。
 
 ## 决策
 
@@ -23,4 +25,3 @@ Workbench 左侧按来源类型选择证据视图：PDF 使用本地 PDF.js Canv
 - 旧 Chunk 仍可页级定位；重新分块后获得 v2 精确血缘，不做历史 bbox 回填。
 - Source Detail 的 DocumentIR 增加 `source_type/blocks`，Review Chunk 的 `anchor` 明确返回版本和精度。
 - Routing、Knowledge Flow、ReviewSnapshot 和数据库 schema 均不变化；真实 MinerU/PDF/DOCX 仍需在 `.34` 验收。
-

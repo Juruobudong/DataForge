@@ -85,7 +85,7 @@ class SampleDataService:
             chunks.append({
                 "source_id": f"sample-source:{code}",
                 "source_version_id": f"sample-version:{code}:{value['version']}",
-                "source_chunk_id": str(raw.get("chunk_key") or f"sample-{index + 1:03d}"),
+                "flow_chunk_id": str(raw.get("chunk_key") or f"sample-{index + 1:03d}"),
                 "filename": value.get("source_filename") or value["name"],
                 "content": content,
                 "text": content,

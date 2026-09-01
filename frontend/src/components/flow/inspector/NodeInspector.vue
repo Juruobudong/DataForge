@@ -5,7 +5,7 @@ import OperatorParameterForm from './OperatorParameterForm.vue'
 const props = defineProps({ node: Object, issue: Object, sampleResult: Object, purpose: { type: String, default: 'knowledge' }, outputTypes: { type: Array, default: () => [] }, entityTypes: { type: Array, default: () => [] }, evaluationNodes: { type: Array, default: () => [] }, deduplicationNodes: { type: Array, default: () => [] }, subflows: { type: Array, default: () => [] }, catalog: { type: Array, default: () => [] } })
 const emit = defineEmits(['apply-parameters', 'open-subflow', 'change-subflow-revision', 'change-operator-version', 'replace-operator', 'open-graph-config'])
 const replacing = ref(false), replacementCode = ref('')
-const replacements = computed(() => props.catalog.filter(item => item.node_role !== 'flow_input' && item.code !== 'reviewed-source-chunk-input' && operatorAvailable(item, props.purpose, props.outputTypes)))
+const replacements = computed(() => props.catalog.filter(item => item.node_role !== 'flow_input' && item.code !== 'document-input' && operatorAvailable(item, props.purpose, props.outputTypes)))
 function replace() { const item = replacements.value.find(item => item.code === replacementCode.value); if (item) emit('replace-operator', item); replacing.value = false; replacementCode.value = '' }
 const operatorVersions = computed(() => props.catalog.find(item => item.code === props.node?.data.definition.ref)?.versions || [])
 const availableRevisions = computed(() => subflowRevisions(props.subflows).filter(item => item.code === props.node?.data.definition.ref && item.revision_status === 'published'))

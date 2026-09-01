@@ -2,7 +2,7 @@
 
 ## 额外的多语言语义资源
 
-Runner现在还要求独立目录 `semantic-multilingual-v1/`，按 `../semantic-model-v1.lock.json` 放置11个固定文件（包含 `1_Pooling/config.json` 子目录）。此目录不入Git，必须额外同步；当前本机未能下载真实模型文件，不能直接宣称新Runner镜像构建已可验收。准备命令见[运行环境说明](../README.md)。
+Runner要求独立目录 `semantic-multilingual-v1/`，按 `../semantic-model-v1.lock.json` 放置11个固定文件（包含 `1_Pooling/config.json` 子目录）。本机现已准备484,798,061 bytes并通过离线导入、摘要、真实模型加载和双语推理校验。此目录不入Git，必须额外同步；本地资源通过不代表Runner镜像或`.34`已验收。准备命令见[运行环境说明](../README.md)。
 
 该模型仅用于当前Artifact内的相似标记，不读取现有向量库；不会复用或修改下面的英文PII资源。
 

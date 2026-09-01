@@ -4,6 +4,10 @@ export function qaEmbeddingMode(profile) {
   return null
 }
 
+export function normalizeDefaultReleaseStage(value) {
+  return value === 'production' ? 'production' : 'test'
+}
+
 export function compatibleProfilesForTask(task, knowledgeTypes, qaAgent = false) {
   if (!task?.knowledge_type) return []
   const type = knowledgeTypes.find(item => item.status === 'active' && item.code === task.knowledge_type)
@@ -37,7 +41,7 @@ export function movePriority(ids, id, offset) {
 }
 
 export function orgRoutesForTask(authorizations, deploymentTaskId) {
-  return (authorizations || []).filter(route => route.project_deployment_task_id === deploymentTaskId)
+  return (authorizations || []).filter(route => route.project_release_task_id === deploymentTaskId)
 }
 
 export function newOrgScopeDefaults(deployment, existingRoutes = []) {

@@ -7,6 +7,7 @@ import {
   compatibleProfilesForTask,
   movePriority,
   newOrgScopeDefaults,
+  normalizeDefaultReleaseStage,
   orgRoutesForTask,
   preferredDeployment,
   qaEmbeddingMode,
@@ -39,6 +40,12 @@ test('QA Profile 自动映射 embedding 模式', () => {
   assert.equal(qaEmbeddingMode({ code: 'text-default' }), null)
 })
 
+test('默认发布环境只接受生产值，其余安全回退测试环境', () => {
+  assert.equal(normalizeDefaultReleaseStage('production'), 'production')
+  assert.equal(normalizeDefaultReleaseStage('test'), 'test')
+  assert.equal(normalizeDefaultReleaseStage(undefined), 'test')
+})
+
 test('发布门禁要求任务、授权和当前阶段 Target', () => {
   assert.deepEqual(routingPublishReadiness([], [], '').problems, [
     '请先配置并启用检索通道',
@@ -68,9 +75,9 @@ test('知识范围优先级按上下移动后的显式顺序提交', () => {
 
 test('知识范围按 Task 与 org_code 组合隔离', () => {
   const routes = [
-    { id: 'a-1', project_deployment_task_id: 'task-a', org_code: 'ORG-1' },
-    { id: 'a-2', project_deployment_task_id: 'task-a', org_code: 'ORG-2' },
-    { id: 'b-1', project_deployment_task_id: 'task-b', org_code: 'ORG-1' },
+    { id: 'a-1', project_release_task_id: 'task-a', org_code: 'ORG-1' },
+    { id: 'a-2', project_release_task_id: 'task-a', org_code: 'ORG-2' },
+    { id: 'b-1', project_release_task_id: 'task-b', org_code: 'ORG-1' },
   ]
   assert.deepEqual(orgRoutesForTask(routes, 'task-a').map(item => item.id), ['a-1', 'a-2'])
   assert.deepEqual(orgRoutesForTask(routes, 'task-b').map(item => item.id), ['b-1'])
@@ -107,6 +114,22 @@ test('项目发布预设选择自动填充且手工改码回到自定义', () =>
   assert.match(publishing, /@input="markCustomOrgCode"/)
   assert.match(publishing, /resolvedPreset\.existingRoute/)
   assert.match(publishing, /orgName\.value = resolvedPreset\.preset\.name/)
+})
+
+test('项目发布工作台使用固定上下文和四个一级入口', () => {
+  const publishing = fs.readFileSync(new URL('./ProjectAuthorizationView.vue', import.meta.url), 'utf8')
+  assert.match(publishing, /class="panel publishing-context"/)
+  assert.match(publishing, />配置<\/button>/)
+  assert.match(publishing, />验证<\/button>/)
+  assert.match(publishing, />发布<\/button>/)
+  assert.match(publishing, />版本记录<\/button>/)
+  assert.doesNotMatch(publishing, /tab==='target'/)
+  assert.doesNotMatch(publishing, /tab==='scope'/)
+  assert.match(publishing, /<RetrievalTaskSettings[^>]+:task="task"/)
+  assert.match(publishing, /<KnowledgeScopePanel[^>]+:libraries="availableLibraries"/)
+  assert.match(publishing, /@validate="preflight"/)
+  assert.match(publishing, /selectedStage\.value = configuredDefaultStage\(\)/)
+  assert.match(publishing, /instance\.value\?\.default_release_stage/)
 })
 
 test('Routing 校验分项保留 blocked、Expected/Observed 与 deferred 语义', () => {

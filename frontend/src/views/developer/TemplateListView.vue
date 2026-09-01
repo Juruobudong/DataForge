@@ -6,6 +6,7 @@ import StandardFlowEditor from '../../components/flow/standard/StandardFlowEdito
 import AdvancedFlowEditor from '../../components/flow/advanced/AdvancedFlowEditor.vue'
 import UnsavedNavigationDialog from '../../components/flow/UnsavedNavigationDialog.vue'
 import FieldHelp from '../../components/common/FieldHelp.vue'
+import OutputTypeConfiguration from '../../components/governance/OutputTypeConfiguration.vue'
 import { groupFlowTemplates, templateOutputSummary, templateRevisionSummary } from './templatePresentation'
 
 const templates = ref([]), catalog = ref([]), subflows = ref([]), types = ref([]), managedTemplates = ref([])
@@ -27,6 +28,7 @@ let publishNoticeTimer
 let saveTimer, savePromise, editGeneration = 0, editorSession = 0
 const router = useRouter()
 const route = useRoute()
+const activePage = computed(() => route.query.tab === 'output-types' ? 'output-types' : 'flows')
 const advancedConversionHelp = '基于当前标准配置展开完整执行 DAG，先在当前页面预览和编辑。首次保存或运行前保存时才创建独立的自定义高级流程，直接退出不会创建草稿。原标准流程不会被修改。'
 
 const typeOptions = computed(() => {
@@ -150,6 +152,12 @@ function onEditorDirty() { markDirty(); sampleResult.value = null }
 function onEditorError(message) { if (message) error.value = message }
 async function refreshSubflows() {
   try { subflows.value = await api.flowSubgraphs() } catch (e) { onEditorError(e.message) }
+}
+function switchPage(page) {
+  if (page === activePage.value) return
+  if (editing.value && dirty.value && !window.confirm('当前画布有未保存修改，确定离开知识流程编辑吗？')) return
+  if (editing.value) { clearDraft(); editing.value = false }
+  router.push({ path: '/developer/flow-templates', query: page === 'output-types' ? { tab: 'output-types' } : {} })
 }
 function navigateSubflow(item) {
   pendingSubflow.value = null
@@ -367,11 +375,14 @@ onMounted(async () => {
     </Transition>
     <UnsavedNavigationDialog v-if="pendingSubflow" :pending="navigationSaving" :error="error" @cancel="pendingSubflow=null" @discard="navigateSubflow(pendingSubflow)" @save="saveThenNavigate" />
     <header class="template-page-head">
-      <div><div class="title-row"><h2>知识流程</h2></div><p>通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。</p><p v-if="editing" class="template-revisions">{{ templateRevisionSummary(selected) }}</p></div>
-      <div class="header-actions"><template v-if="editing"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前流程</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
+      <div><div class="title-row"><h2>知识流程</h2></div><p>{{ activePage === 'flows' ? '通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。' : '定义 Text、QA、Graph 与扩展类型的正式输出语义。' }}</p><p v-if="editing && activePage === 'flows'" class="template-revisions">{{ templateRevisionSummary(selected) }}</p></div>
+      <div class="header-actions"><template v-if="editing && activePage === 'flows'"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前流程</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
     </header>
-    <p v-if="pendingConversion" class="conversion-notice">当前为转换预览，尚未创建草稿。首次保存或运行前保存后才创建独立流程，直接退出不会保留。</p>
-    <template v-if="!editing">
+    <nav class="page-tabs" aria-label="知识流程页面"><button :class="{active:activePage==='flows'}" @click="switchPage('flows')">知识流程</button><button :class="{active:activePage==='output-types'}" @click="switchPage('output-types')">输出类型配置</button></nav>
+    <OutputTypeConfiguration v-if="activePage === 'output-types'" />
+    <template v-else>
+      <p v-if="pendingConversion" class="conversion-notice">当前为转换预览，尚未创建草稿。首次保存或运行前保存后才创建独立流程，直接退出不会保留。</p>
+      <template v-if="!editing">
         <section class="template-strip">
           <button class="new-template" @click="wizardOpen=true">＋ 新建知识流程</button>
           <div class="template-groups">
@@ -401,8 +412,8 @@ onMounted(async () => {
             </section>
           </div>
         </section>
-    </template>
-    <template v-else>
+      </template>
+      <template v-else>
         <form v-if="settingsOpen" class="template-settings" novalidate @submit.prevent="save">
           <label>模板编码
             <input id="template-code" ref="codeInput" v-model="code" :disabled="!!selected" required placeholder="template-code" :aria-invalid="!code.trim() ? 'true' : undefined" :aria-describedby="!code.trim() ? 'template-code-error' : undefined" @input="markDirty">
@@ -422,12 +433,13 @@ onMounted(async () => {
         </div>
         <StandardFlowEditor v-if="authoringMode === 'standard'" :template="selected" :managed-template-code="stageDefinition?.template_code || selected?.managed_template_code || ''" :definition="stageDefinition" :managed-templates="managedTemplates" :output-types="outputTypes" @update:definition="onStageDefinition" />
         <AdvancedFlowEditor v-else ref="advancedEditor" :catalog="catalog" :subflows="subflows" :output-types="outputTypes" :sample-result="sampleResult" @dirty="onEditorDirty" @error="onEditorError" @open-subflow="requestSubflow" @subflow-created="refreshSubflows" />
+      </template>
+      <div v-if="wizardOpen" class="wizard-backdrop" @click.self="wizardOpen=false"><section class="wizard"><header><div><h3>选择知识生产目标</h3><p>普通路径只选择业务目标，不需要理解 Node、Edge 或 Port。</p></div><button @click="wizardOpen=false">关闭</button></header><div class="goal-grid"><button v-for="item in managedTemplates" :key="item.code" @click="startNew(item.code)"><b>{{ item.name }}</b><small>{{ (item.output_types || []).join(' + ') }}</small></button></div><div class="advanced-choice"><span>高级</span><button @click="startNew('')"><b>空白高级流程</b><small>从 Authoring DAG 开始</small></button></div></section></div>
+      <section v-if="error || result" ref="actionConsole" class="action-console" aria-label="Console">
+        <header><b>Console</b></header>
+        <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
+      </section>
     </template>
-    <div v-if="wizardOpen" class="wizard-backdrop" @click.self="wizardOpen=false"><section class="wizard"><header><div><h3>选择知识生产目标</h3><p>普通路径只选择业务目标，不需要理解 Node、Edge 或 Port。</p></div><button @click="wizardOpen=false">关闭</button></header><div class="goal-grid"><button v-for="item in managedTemplates" :key="item.code" @click="startNew(item.code)"><b>{{ item.name }}</b><small>{{ (item.output_types || []).join(' + ') }}</small></button></div><div class="advanced-choice"><span>高级</span><button @click="startNew('')"><b>空白高级流程</b><small>从 Authoring DAG 开始</small></button></div></section></div>
-    <section v-if="error || result" ref="actionConsole" class="action-console" aria-label="Console">
-      <header><b>Console</b></header>
-      <p v-if="error" class="error page-error">{{ error }}</p><pre v-if="result" class="action-result">{{ JSON.stringify(result,null,2) }}</pre>
-    </section>
   </section>
 </template>
 

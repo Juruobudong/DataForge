@@ -24,7 +24,7 @@ class DocumentDeletionService:
 
     def run(self, job: DocumentDeletionJob) -> dict[str, Any]:
         try:
-            for object_key in job.object_keys:
+            for object_key in self.store.unreferenced_parsed_object_keys(job.id):
                 self.objects.delete_key(object_key)
             self.store.delete_unreferenced_blobs(job.id, self.objects.delete_blob)
             return self.store.finish_document_deletion(job.id)

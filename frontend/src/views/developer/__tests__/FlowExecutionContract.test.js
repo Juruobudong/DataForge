@@ -14,11 +14,11 @@ vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => ({ query
 vi.mock('../../../api/platform', () => ({ api: Object.fromEntries(['operatorCandidates', 'flowTemplates', 'operatorCatalog', 'flowSubgraphs', 'knowledgeTypes', 'managedFlowTemplates', 'updateFlowTemplate', 'createFlowTemplate', 'modelServings', 'promptTemplates', 'qualityProfiles', 'publishFlowTemplate', 'previewFlowToAdvanced', 'resolveStandardFlow', 'graphEntityTypes'].map(name => [name, vi.fn()])) }))
 const operator = (code, input = 'candidate:*', output = 'candidate:*', properties = {}) => ({ code, name: code, display_name_zh: code, version: 1, version_status: 'published', source: 'dataforge', catalog_group: 'dataforge', category: 'content-processing', exposure: 'public', enabled: true, approved: true, node_role: 'operator', surfaces: ['advanced-canvas'], knowledge_types: ['text'], input_ports: { input: { artifact_type: input, binding: 'edge', required: true } }, output_ports: { output: { artifact_type: output } }, parameter_schema: { type: 'object', properties, additionalProperties: false } })
 const catalog = [
-  { ...operator('reviewed-source-chunk-input', 'approved_source_chunks', 'source_chunk_set'), node_role: 'flow_input', input_ports: { input: { artifact_type: 'approved_source_chunks', binding: 'runtime_input' } } },
-  operator('mapper', 'source_chunk_set', 'candidate:text'),
+  { ...operator('document-input', 'parsed_document', 'parsed_document'), node_role: 'flow_input', input_ports: { input: { artifact_type: 'parsed_document', binding: 'runtime_input' } } },
+  operator('mapper', 'parsed_document', 'candidate:text'),
   operator('old-filter', 'candidate:*', 'candidate:*', { threshold: { type: 'number', default: 0.5 } }),
   operator('new-filter', 'candidate:*', 'candidate:*', { threshold: { type: 'number', maximum: 1, default: 0.4 } }),
-  operator('generator', 'source_chunk_set', 'candidate:text'),
+  operator('generator', 'parsed_document', 'candidate:text'),
 ]
 
 it('drops native QA instructions when switching to DataFlow v8', () => {
@@ -28,7 +28,7 @@ it('drops native QA instructions when switching to DataFlow v8', () => {
   expect(params).toEqual({ llm_serving: 'model', questions_per_chunk: 2 })
 })
 const definition = () => ({ schema_version: 3, nodes: [
-  { id: 'input', kind: 'operator', ref: 'reviewed-source-chunk-input', operator_version: 1 },
+  { id: 'input', kind: 'operator', ref: 'document-input', operator_version: 1 },
   { id: 'map', kind: 'operator', ref: 'mapper', operator_version: 1 },
   { id: 'filter', kind: 'operator', ref: 'old-filter', operator_version: 1, params: { threshold: 0.7, knowledge_type: 'text' } },
   { id: 'sink', kind: 'knowledge_sink', knowledge_type: 'text', output_key: 'text' },
@@ -69,7 +69,8 @@ if (process.env.DATAFORGE_DAG_EDITOR_INPUT) {
       expect(active.vm.validate()).toBe(true)
       const serialized = active.vm.serialize()
       expect(serialized.nodes).toEqual(fixture.preview.definition.nodes.map(node => ({ ...node,
-        node_role: node.node_role || (node.kind === 'knowledge_sink' ? 'knowledge_output' : 'operator') })))
+        node_role: node.node_role || (node.kind === 'knowledge_sink' ? 'knowledge_output'
+          : node.kind === 'execution_gate' ? 'execution_gate' : 'operator') })))
       expect(serialized.edges).toEqual(fixture.preview.definition.edges)
       await button(action).trigger('click'); await flushPromises()
       expect(api.createFlowTemplate).toHaveBeenCalledTimes(1)

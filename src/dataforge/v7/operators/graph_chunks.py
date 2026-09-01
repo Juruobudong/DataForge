@@ -90,7 +90,7 @@ def chunk_identity(value):
         if not isinstance(versions, list) or len(versions) != 1 or not versions[0] or (version and version != versions[0]):
             raise ValueError("SOURCE_LINEAGE_MISMATCH: 三元组分块必须对应唯一来源版本")
         version = versions[0]
-    chunk = value.get("source_chunk_id")
+    chunk = value.get("flow_chunk_id")
     if not isinstance(version, str) or not version.strip() or not isinstance(chunk, str) or not chunk.strip():
         raise ValueError("SOURCE_LINEAGE_MISSING: 三元组分块缺少来源版本或分块身份")
     return version, chunk
@@ -114,7 +114,7 @@ class GraphChunkStage:
             return False
         self.repair_attempted.add(key)
         self.diagnostics.append("stdout", self.diagnostics.error(
-            f"GRAPH_RELATION_REPAIR_ATTEMPT: {error} [node={self.node_id}, source_version_id={key[0]}, source_chunk_id={key[1]}, attempt=1]") + "\n")
+            f"GRAPH_RELATION_REPAIR_ATTEMPT: {error} [node={self.node_id}, source_version_id={key[0]}, flow_chunk_id={key[1]}, attempt=1]") + "\n")
         return True
 
     def record_relation_result(self, key, records, outputs):
@@ -123,7 +123,7 @@ class GraphChunkStage:
         entity_count = sum(len([entity for entity in value.get("entities", []) if entity.get("object_kind") != "literal"]) for value in records)
         zero_reason = "no_entities" if not entity_count else "no_legal_relations"
         self.diagnostics.append("stdout", self.diagnostics.error(
-            f"GRAPH_RELATION_RESULT: source_version_id={key[0]} source_chunk_id={key[1]} entities={entity_count} relations={count} "
+            f"GRAPH_RELATION_RESULT: source_version_id={key[0]} flow_chunk_id={key[1]} entities={entity_count} relations={count} "
             f"repair_attempts={int(key in self.repair_attempted)} zero_reason={zero_reason if not count else 'none'}") + "\n")
 
     @property
@@ -157,13 +157,16 @@ class GraphChunkStage:
                 continue
             self.attempted.add(key)
             first = records[0]
-            chunk = targeted.get(key) or {"source_version_id": key[0], "source_chunk_id": key[1],
-                "chunk_index": int(first.get("chunk_index", (first.get("anchor_json") or {}).get("chunk_index", 0)))}
+            chunk = targeted.get(key) or {
+                **first,
+                "source_version_id": key[0], "flow_chunk_id": key[1],
+                "chunk_index": int(first.get("chunk_index", (first.get("anchor_json") or {}).get("chunk_index", 0))),
+            }
             targeted[key] = chunk
             try:
                 outputs = process(records)
             except GraphChunkError as exc:
-                message = self.diagnostics.error(f"{exc} [node={self.node_id}, source_version_id={key[0]}, source_chunk_id={key[1]}]")
+                message = self.diagnostics.error(f"{exc} [node={self.node_id}, source_version_id={key[0]}, flow_chunk_id={key[1]}]")
                 successful.pop(key, None)
                 failed[key] = {**chunk, "error": message}
                 self.failed.add(key)
@@ -177,7 +180,7 @@ class GraphChunkStage:
                     self.record_relation_result(key, records, outputs)
                 result.extend(outputs)
                 if store and job_id:
-                    store.record_chunk_generation(job_id, self.output_key, chunk, status="completed", candidate_count=len(outputs))
+                    store.record_chunk_generation(job_id, self.output_key, chunk, status="success" if outputs else "success_empty", candidate_count=len(outputs))
             finally:
                 outcome.update(targeted=list(targeted.values()), successful=list(successful.values()), failed=list(failed.values()))
         if self.attempted and self.failed == self.attempted:

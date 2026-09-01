@@ -8,7 +8,7 @@ API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中�
 
 固定模型为 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`，commit `e8f8c211226b894fcb81acc59f3b34ba3efd5f42`。`semantic-model-v1.lock.json` 固定11个文件及大小、Git blob或LFS SHA256；模型权重本身约471MB。运行按128-token窗口覆盖全部正文，以attention mask池化；语义重复只标记，不删除。
 
-当前实际权重尚未下载成功：主站连接超时，镜像文件下载元数据缺失/TLS断流。资源Profile未登记，`SemDeduplicateFilter`返回`OPERATOR_RESOURCE_MISSING`。真实模型验收和Runner资源层构建仍未完成，不能把受控向量测试作为模型效果验收。
+当前固定权重已从官方源取得并通过11项大小/摘要校验、真实模型加载、双语推理及并发回放门禁；本地semantic-v1资源Profile已登记，`SemDeduplicateFilter`真实模型门禁1 passed。Docker所需的扁平离线目录为`runtime/dataflow/vendor-resources/semantic-multilingual-v1/`，共11个文件、484,798,061 bytes；该目录不入Git，必须额外同步到构建服务器。尚未复验`.34` Runner镜像，不把本地通过冒充远程验收。
 
 先激活 `sun`，新环境安装（已存在环境不要再次运行）：
 
@@ -101,7 +101,8 @@ python scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads
 python-base
 ├─ app-common → app / runner
 └─ operator-deps → operator-expanded-deps → operator-governance-deps
-   → operator-governance-resources → operator-runtime → 复制到 runner
+   → operator-governance-resources → operator-semantic-deps
+   → operator-semantic-resources → operator-runtime → 复制到 runner
 ```
 
 - `operator-deps` 只复制 `upstream.lock` 和 `requirements.lock`，复用 pip/uv 缓存。当前依赖锁已有 26 个固定版本及 SHA-256，不需要在构建时重新生成；上游依然单独锁定，不能解析它的完整依赖集合。

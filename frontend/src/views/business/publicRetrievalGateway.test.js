@@ -17,7 +17,7 @@ test('ordinary knowledge list hides physical vector storage columns', () => {
 
 test('project publishing passes logical public retrieval codes into the shared console', () => {
   assert.match(publishing, /:project-code="selectedProject\?\.code"/)
-  assert.match(publishing, /:deployment-code="selectedDeployment\?\.code"/)
+  assert.match(publishing, /deployment-code="dataforge-central"/)
   assert.match(publishing, /project\.name \}\} · \{\{ project\.code/)
-  assert.match(publishing, /deployment\.name \}\} · \{\{ deployment\.code/)
+  assert.doesNotMatch(publishing, /v-model="deploymentId"/)
 })

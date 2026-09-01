@@ -18,17 +18,25 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import Settings
 from .auth import SESSION_COOKIE, verify_admin_password
-from .models import AdminSession, Deployment, utc_now
+from .models import AdminSession, Deployment, ProjectDeployment, utc_now
 from .observability import COMPONENTS, ComponentCheckService, components_snapshot
 from .runner import preview_template_definition
-from .sample_data import SampleDataService, preview_preprocessing_document
+from .sample_data import SampleDataService
 from .routing import AtomicRoutingPublisher
 from .routing_delivery import RoutingDeliveryService
 from .storage import LocalObjectStore, MinioObjectStore
+from .parsed_document import (
+    apply_table_cell_updates,
+    persist_content,
+    read_anchors,
+    read_content,
+    reviewed_text_anchors,
+)
 from .instance import InstanceContext
 from .local_config import LocalMilvusConfigurationService
 from .milvus_targets import (
@@ -92,67 +100,66 @@ class SelectedDocumentSourcesRequest(BaseModel):
     source_ids: list[str] = Field(min_length=1)
 
 
-class DocumentSourceReviewTarget(BaseModel):
+class ParsedDocumentCellUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source_id: str = Field(min_length=1)
-    source_version_id: str | None = Field(min_length=1)
-    activation_no: int | None = Field(ge=1)
-    chunk_set_id: str | None = Field(min_length=1)
+    sheet_index: int = Field(ge=0)
+    row_index: int = Field(ge=0)
+    column_index: int = Field(ge=0)
+    value: str | int | float | bool | None = None
+    value_type: Literal["empty", "string", "number", "boolean"]
 
 
-class DocumentSourcesBatchReviewRequest(BaseModel):
+class ParsedDocumentReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    items: list[DocumentSourceReviewTarget] = Field(min_length=1, max_length=50)
+    expected_content_digest: str = Field(min_length=64, max_length=64)
+    expected_anchor_map_digest: str = Field(min_length=64, max_length=64)
+    markdown: str | None = None
+    cell_updates: list[ParsedDocumentCellUpdate] = Field(default_factory=list, max_length=10000)
 
 
-class SourceChunkUpdateRequest(BaseModel):
+class ParsedDocumentBatchReviewItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_id: str
+    source_version_id: str
+    parsed_document_id: str
+    expected_content_digest: str = Field(min_length=64, max_length=64)
+    expected_anchor_map_digest: str = Field(min_length=64, max_length=64)
+
+
+class ParsedDocumentBatchReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    items: list[ParsedDocumentBatchReviewItem] = Field(min_length=1, max_length=200)
+
+
+class FlowChunkUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     content: str
     expected_revision_no: int = Field(ge=1)
 
 
-class SourceChunkSplitRequest(BaseModel):
+class FlowChunkSplitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     parts: list[str] = Field(min_length=2)
     expected_revision_no: int = Field(ge=1)
 
 
-class SourceChunkMergeRequest(BaseModel):
+class FlowChunkMergeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chunk_ids: list[str] = Field(min_length=2)
     expected_revisions: dict[str, int]
 
 
-class SourceChunkReviewRequest(BaseModel):
+class FlowChunkReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status: Literal["approved", "rejected"]
+    status: Literal["approved", "excluded"]
     expected_revision_no: int = Field(ge=1)
 
 
-class SourceChunkBatchReviewRequest(BaseModel):
+class FlowChunkBatchReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     chunk_ids: list[str] = Field(min_length=1)
-    action: Literal["approve", "reject"]
+    action: Literal["approved", "excluded"]
     expected_revisions: dict[str, int]
-
-
-class SourceRechunkRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    execution_snapshot_id: str | None = None
-
-
-class SourcePreparationChunkerRevisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    base_revision: int = Field(ge=1)
-    params: dict
-
-
-class SourcePreparationPreviewRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    input_source: Literal["builtin_sample", "source_version"] = "builtin_sample"
-    sample_code: str = "preprocessing-document-v1"
-    source_version_id: str | None = None
-    configuration: dict = Field(default_factory=dict)
 
 
 class DocumentTemplateBatchBindingRequest(BaseModel):
@@ -198,7 +205,7 @@ class KnowledgeVectorPublishRequest(BaseModel):
 
 
 class KnowledgeJobRequest(BaseModel):
-    input_source: str = "source_review_snapshot"
+    input_source: str = "parsed_document"
     source_version_ids: list[str] = Field(min_length=1)
     output_library_ids: dict[str, str] = Field(min_length=1)
     knowledge_flow_template_id: str
@@ -280,9 +287,9 @@ class DebugRunConfigRequest(BaseModel):
     template_id: str
     revision_id: str
     expected_compiled_checksum: str
-    input_source: Literal["builtin_sample", "source_review_snapshot"] = "source_review_snapshot"
+    input_source: Literal["builtin_sample", "flow_chunk_review_snapshot"] = "flow_chunk_review_snapshot"
     sample_code: str | None = None
-    source_review_snapshot_ids: list[str] = Field(default_factory=list)
+    flow_chunk_review_snapshot_ids: list[str] = Field(default_factory=list)
     sink_library_bindings: dict[str, str] = Field(default_factory=dict)
     idempotency_key: str | None = None
 
@@ -347,16 +354,22 @@ class ProjectRequest(BaseModel):
     name: str
 
 
-class KnowledgeTypeRequest(BaseModel):
+class KnowledgeTypeSemanticRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
-    code: str
-    name: str
-    icon: str = "知"
     type_schema: dict = Field(alias="schema")
     canonical_field: str
     identity_fields: list[str] = Field(min_length=1)
     source_policy: Literal["single", "multiple"]
-    quality_profile_revision_id: str
+
+
+class CreateKnowledgeTypeRequest(KnowledgeTypeSemanticRequest):
+    code: str
+    name: str
+    icon: str = "知"
+
+
+class KnowledgeTypeStorageBindingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     index_profile_ids: list[str] = Field(default_factory=list)
     managed_collection_name: str = ""
     reuse_managed_collection_id: str | None = None
@@ -419,6 +432,7 @@ class DeploymentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     institution_name: str
     institution_code: str
+    project_ids: list[str] = Field(default_factory=list)
 
 
 class DeploymentPatch(BaseModel):
@@ -428,7 +442,7 @@ class DeploymentPatch(BaseModel):
     status: Literal["active", "disabled"] | None = None
 
 
-class DeploymentTargetRequest(BaseModel):
+class InstanceReleaseTargetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     milvus_target_id: str
     milvus_target_revision_id: str
@@ -441,11 +455,17 @@ class DeploymentProjectRequest(BaseModel):
     project_id: str
 
 
+class DeploymentProjectsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    project_ids: list[str] = Field(default_factory=list)
+
+
 class RoutingActionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     release_stage: Literal["test", "production"]
     expected_target_uri: str | None = None
     confirm_production: bool = False
+    route_version_id: str | None = None
 
 
 class PublicRetrievalAdminRequest(BaseModel):
@@ -545,6 +565,8 @@ class ModelServingRequest(BaseModel):
     timeout_seconds: int = 120
     max_retries: int = 2
     max_tokens: int = 16384
+    context_window_tokens: int = 8192
+    tokenizer_name: str = "Qwen/Qwen3-32B"
     disable_thinking: bool = True
     is_enabled: bool = True
 
@@ -560,6 +582,8 @@ class ModelServingPatch(BaseModel):
     timeout_seconds: int | None = None
     max_retries: int | None = None
     max_tokens: int | None = None
+    context_window_tokens: int | None = None
+    tokenizer_name: str | None = None
     disable_thinking: bool | None = None
     is_enabled: bool | None = None
 
@@ -628,6 +652,59 @@ def _objects(settings: Settings):
     if settings.minio_endpoint and settings.minio_access_key and settings.minio_secret_key:
         return MinioObjectStore(settings.minio_endpoint, settings.minio_access_key, settings.minio_secret_key, settings.minio_bucket)
     return LocalObjectStore(settings.state_dir / "v7-objects")
+
+
+def _review_parsed_document(store: V7Store, objects, parsed_document_id: str,
+                            payload: ParsedDocumentReviewRequest) -> dict:
+    parent = store.parsed_document(parsed_document_id)
+    content, anchors = read_content(objects, parent), read_anchors(objects, parent)
+    if parent.kind == "textual":
+        if payload.cell_updates:
+            raise ValueError("文本 ParsedDocument 不接受单元格修改")
+        if payload.markdown is None or not payload.markdown.strip():
+            raise ValueError("Markdown 校订内容不能为空")
+        reviewed_content = payload.markdown
+        reviewed_anchors = reviewed_text_anchors(
+            anchors, content_changed=reviewed_content != content,
+            parent_parsed_document_id=parent.id,
+        )
+    elif parent.kind == "tabular":
+        if payload.markdown is not None:
+            raise ValueError("表格 ParsedDocument 不接受 Markdown 内容")
+        reviewed_content, reviewed_anchors = apply_table_cell_updates(
+            content, anchors, [item.model_dump() for item in payload.cell_updates],
+            parent_parsed_document_id=parent.id,
+        )
+    else:
+        raise ValueError("未知 ParsedDocument 类型")
+    reviewed_id = new_id("parsed")
+    persisted = persist_content(
+        objects, reviewed_id, kind=parent.kind, content=reviewed_content,
+        anchors=reviewed_anchors,
+    )
+    object_keys = list(persisted.pop("object_keys", []))
+    try:
+        result = store.approve_parsed_document_revision(
+            parent.id, reviewed_document_id=reviewed_id,
+            expected_content_digest=payload.expected_content_digest,
+            expected_anchor_map_digest=payload.expected_anchor_map_digest,
+            content_ref=persisted["content_ref"], content_digest=persisted["content_digest"],
+            anchor_map_ref=persisted["anchor_map_ref"], anchor_map_digest=persisted["anchor_map_digest"],
+        )
+    except Exception:
+        for key in object_keys:
+            try:
+                objects.delete_key(key)
+            except Exception:
+                logger.exception("清理失败的 ParsedDocument 校订对象：%s", key)
+        raise
+    if result.get("idempotent") and result["parsed_document"]["id"] != reviewed_id:
+        for key in object_keys:
+            try:
+                objects.delete_key(key)
+            except Exception:
+                logger.exception("清理幂等 ParsedDocument 校订对象：%s", key)
+    return result
 
 
 def _error(exc: ValueError) -> HTTPException:
@@ -857,6 +934,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             {"name": item.name, "org_code": item.org_code}
             for item in resolved.org_code_presets
         ]
+        payload["default_release_stage"] = resolved.default_release_stage
         try:
             payload["authoring_milvus_target"] = store.authoring_milvus_target(app.state.instance.id)
         except ValueError:
@@ -867,6 +945,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         payload["display_name"] = "智能中心"
         if app.state.instance.mode == "local":
             payload["display_name"] = "机构本地"
+            payload["local_milvus_default_uri"] = resolved.local_milvus_default_uri
             if app.state.instance.bound_deployment_id:
                 with store.sessions() as session:
                     deployment = session.get(Deployment, app.state.instance.bound_deployment_id)
@@ -1045,13 +1124,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def document_tree(library_id: str):
         try: return store.document_tree(library_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/document-libraries/{library_id}/sources/review/approve-batch")
-    def approve_document_sources_batch(library_id: str, payload: DocumentSourcesBatchReviewRequest):
-        try:
-            return store.approve_document_sources_batch(library_id, [item.model_dump() for item in payload.items])
-        except ValueError as exc:
-            raise _error(exc) from exc
 
     @app.get("/api/document-libraries/{library_id}/template-bindings")
     def document_library_template_bindings(library_id: str):
@@ -1245,70 +1317,131 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.source_detail(source_id, version_id, flow_run_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.get("/api/source-versions/{source_version_id}/review")
-    def source_review(source_version_id: str, chunk_set_id: str | None = None):
-        try: return store.source_review_detail(source_version_id, chunk_set_id)
+    @app.post("/api/source-versions/{source_version_id}/parse/retry", status_code=202)
+    def retry_parse_job(source_version_id: str):
+        try: return store.retry_parse_job(source_version_id)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/parsed-documents/{parsed_document_id}")
+    def parsed_document_metadata(parsed_document_id: str):
+        try: return store._parsed_document_payload(store.parsed_document(parsed_document_id))
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/source-versions/{source_version_id}/review/approve")
-    def approve_source_review(source_version_id: str):
-        try: return store.approve_source_version(source_version_id, approve_pending=False)
+    @app.post("/api/parsed-documents/{parsed_document_id}/review")
+    def review_parsed_document(parsed_document_id: str, payload: ParsedDocumentReviewRequest):
+        try: return _review_parsed_document(store, objects, parsed_document_id, payload)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/source-versions/{source_version_id}/preparation/retry", status_code=202)
-    def retry_source_preparation(source_version_id: str):
-        try: return store.retry_source_preparation(source_version_id)
-        except ValueError as exc: raise _error(exc) from exc
+    @app.post("/api/document-libraries/{library_id}/parsed-documents/review-batch")
+    def review_parsed_documents_batch(library_id: str, payload: ParsedDocumentBatchReviewRequest):
+        result: dict[str, list] = {
+            "approved": [], "already_approved": [], "skipped": [], "failed": [], "dispatches": [],
+        }
+        for item in payload.items:
+            identity = None
+            try:
+                identity = store.parsed_document_review_identity(item.parsed_document_id)
+                if (identity["document_library_id"] != library_id
+                        or identity["source_id"] != item.source_id
+                        or identity["source_version_id"] != item.source_version_id):
+                    result["skipped"].append({"parsed_document_id": item.parsed_document_id,
+                                              "reason": "所选文件与解析修订不匹配"})
+                    continue
+                if (identity["current_source_version_id"] != item.source_version_id
+                        or identity["current_parsed_document_id"] != item.parsed_document_id):
+                    result["skipped"].append({"parsed_document_id": item.parsed_document_id,
+                                              "reason": "文件或解析修订已变化"})
+                    continue
+                if identity["review_status"] == "approved":
+                    result["already_approved"].append({"parsed_document_id": item.parsed_document_id})
+                    continue
+                parent = store.parsed_document(item.parsed_document_id)
+                current_content = read_content(objects, parent)
+                review = _review_parsed_document(store, objects, item.parsed_document_id,
+                    ParsedDocumentReviewRequest(
+                        expected_content_digest=item.expected_content_digest,
+                        expected_anchor_map_digest=item.expected_anchor_map_digest,
+                        markdown=current_content if parent.kind == "textual" else None,
+                        cell_updates=[],
+                    ))
+                result["approved"].append({
+                    "source_id": item.source_id,
+                    "parsed_document": review["parsed_document"],
+                })
+                result["dispatches"].extend(review.get("dispatches") or [])
+            except ReviewGateError as exc:
+                result["skipped"].append({"parsed_document_id": item.parsed_document_id,
+                                          "reason": exc.message, "code": exc.code})
+            except ValueError as exc:
+                result["failed"].append({"parsed_document_id": item.parsed_document_id,
+                                         "reason": str(exc)})
+        return result
 
-    @app.post("/api/source-versions/{source_version_id}/preparation/rechunk", status_code=202)
-    def rechunk_source_version(source_version_id: str, payload: SourceRechunkRequest):
-        try: return store.rechunk_source_version(source_version_id, payload.execution_snapshot_id)
-        except ReviewGateError as exc: raise _review_error(exc) from exc
-        except ValueError as exc: raise _error(exc) from exc
-
-    @app.post("/api/source-versions/{source_version_id}/review/batch")
-    def batch_review_source_chunks(source_version_id: str, payload: SourceChunkBatchReviewRequest):
+    @app.get("/api/parsed-documents/{parsed_document_id}/content")
+    def parsed_document_content(parsed_document_id: str, sheet: int = 0, offset: int = 0,
+                                limit: int = Query(200, ge=1, le=1000)):
         try:
-            return store.batch_review_source_chunks(
-                source_version_id, payload.chunk_ids, payload.action, payload.expected_revisions,
-            )
+            item = store.parsed_document(parsed_document_id); content = read_content(objects, item)
+            if item.kind == "textual":
+                return {"kind": item.kind, "content_format": item.content_format, "markdown": content}
+            sheets = list(content.get("sheets") or [])
+            if sheet < 0 or sheet >= len(sheets): raise ValueError("Sheet 不存在")
+            selected = dict(sheets[sheet]); rows = list(selected.pop("rows", []))
+            return {"kind": item.kind, "content_format": item.content_format,
+                    "sheet_count": len(sheets), "sheet": selected, "rows": rows[offset:offset + limit],
+                    "offset": offset, "limit": limit, "total": len(rows)}
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/parsed-documents/{parsed_document_id}/anchors")
+    def parsed_document_anchors(parsed_document_id: str):
+        try: return read_anchors(objects, store.parsed_document(parsed_document_id))
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.get("/api/flow-chunk-sets/{flow_chunk_set_id}/review")
+    def flow_chunk_set_review(flow_chunk_set_id: str):
+        try: return store.flow_chunk_set_review(flow_chunk_set_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/flow-chunk-sets/{flow_chunk_set_id}/freeze")
+    def freeze_flow_chunk_set(flow_chunk_set_id: str):
+        try: return store.freeze_flow_chunk_set(flow_chunk_set_id)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.patch("/api/source-chunks/{chunk_id}")
-    def update_source_chunk(chunk_id: str, payload: SourceChunkUpdateRequest):
-        try: return store.update_source_chunk(chunk_id, payload.content, payload.expected_revision_no)
+    @app.patch("/api/flow-chunks/{chunk_id}")
+    def update_flow_chunk(chunk_id: str, payload: FlowChunkUpdateRequest):
+        try: return store.update_flow_chunk(chunk_id, payload.content, payload.expected_revision_no)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/source-chunks/{chunk_id}/split")
-    def split_source_chunk(chunk_id: str, payload: SourceChunkSplitRequest):
-        try: return store.split_source_chunk(chunk_id, payload.parts, payload.expected_revision_no)
+    @app.post("/api/flow-chunks/{chunk_id}/split")
+    def split_flow_chunk(chunk_id: str, payload: FlowChunkSplitRequest):
+        try: return store.split_flow_chunk(chunk_id, payload.parts, payload.expected_revision_no)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/source-chunks/merge")
-    def merge_source_chunks(payload: SourceChunkMergeRequest):
-        try: return store.merge_source_chunks(payload.chunk_ids, payload.expected_revisions)
+    @app.post("/api/flow-chunks/merge")
+    def merge_flow_chunks(payload: FlowChunkMergeRequest):
+        try: return store.merge_flow_chunks(payload.chunk_ids, payload.expected_revisions)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.delete("/api/source-chunks/{chunk_id}")
-    def delete_source_chunk(chunk_id: str, expected_revision_no: int = Query(ge=1)):
-        try: return store.delete_source_chunk(chunk_id, expected_revision_no)
+    @app.delete("/api/flow-chunks/{chunk_id}")
+    def delete_flow_chunk(chunk_id: str, expected_revision_no: int = Query(ge=1)):
+        try: return store.delete_flow_chunk(chunk_id, expected_revision_no)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/source-chunks/{chunk_id}/review")
-    def review_source_chunk(chunk_id: str, payload: SourceChunkReviewRequest):
-        try: return store.review_source_chunk(chunk_id, payload.status, payload.expected_revision_no)
+    @app.post("/api/flow-chunks/{chunk_id}/review")
+    def review_flow_chunk(chunk_id: str, payload: FlowChunkReviewRequest):
+        try: return store.review_flow_chunk(chunk_id, payload.status, payload.expected_revision_no)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/source-chunks/{chunk_id}/reopen")
-    def reopen_source_chunk(chunk_id: str):
-        try: return store.reopen_source_chunk(chunk_id)
+    @app.post("/api/flow-chunks/{chunk_id}/reopen")
+    def reopen_flow_chunk(chunk_id: str):
+        try: return store.reopen_flow_chunk(chunk_id)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
@@ -1325,7 +1458,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: version = store.source_version_for_download(source_id, version_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         if version.media_type != "application/pdf" or not version.original_filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=415, detail="原文件内联预览仅支持 PDF；其他格式请使用 DocumentIR")
+            raise HTTPException(status_code=415, detail="原文件内联预览仅支持 PDF；其他格式请使用 ParsedDocument")
         return Response(content=objects.get_blob(version.blob_uri), media_type="application/pdf", headers={
             "Content-Disposition": _content_disposition("inline", version.original_filename),
             "X-Content-Type-Options": "nosniff",
@@ -1397,6 +1530,12 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 item_id, data=payload.data, canonical_content=payload.canonical_content,
                 expected_review_revision=payload.expected_review_revision,
             )
+        except ReviewGateError as exc: raise _review_error(exc) from exc
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/flow-chunks/review-batch")
+    def batch_review_flow_chunks(payload: FlowChunkBatchReviewRequest):
+        try: return store.batch_review_flow_chunks(payload.chunk_ids, payload.action, payload.expected_revisions)
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
 
@@ -1520,7 +1659,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/api/knowledge-jobs", status_code=202)
     def create_knowledge_job(payload: KnowledgeJobRequest):
         try:
-            if payload.input_source != "source_review_snapshot":
+            if payload.input_source != "flow_chunk_review_snapshot":
                 raise ReviewGateError("BUILTIN_SAMPLE_NOT_ALLOWED", "正式 KnowledgeJob 只能使用真实审核快照")
             return store.create_knowledge_job(payload.source_version_ids, payload.output_library_ids, payload.knowledge_flow_template_id)
         except ReviewGateError as exc: raise _review_error(exc) from exc
@@ -1541,24 +1680,55 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return store.job_generation_results(job_id, failed_only=failed_only)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/knowledge-jobs/{job_id}/input-preparations")
+    def knowledge_job_input_preparations(job_id: str):
+        try: return store.job_input_preparations(job_id)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/knowledge-jobs/{job_id}/regenerate", status_code=202)
+    def regenerate_knowledge_job(job_id: str):
+        try: return store.regenerate_knowledge_job(job_id, reprepare=False)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge-jobs/{job_id}/reprepare-input", status_code=202)
+    def reprepare_knowledge_job_input(job_id: str):
+        try: return store.regenerate_knowledge_job(job_id, reprepare=True)
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/knowledge-jobs/{job_id}/retry-failed", status_code=202)
+    def retry_failed_generation_units(job_id: str):
+        try: return store.manage_jobs([job_id], "retry")[0]
+        except ValueError as exc: raise _error(exc) from exc
+
     @app.get("/api/developer/knowledge-types")
     def knowledge_types():
         return store.list_knowledge_type_definitions()
 
     @app.post("/api/developer/knowledge-types", status_code=201)
-    def create_knowledge_type(payload: KnowledgeTypeRequest):
-        try: return store.create_knowledge_type(payload.code, payload.name, payload.icon, payload.type_schema, payload.canonical_field,
-                                                 payload.identity_fields, payload.source_policy, payload.quality_profile_revision_id,
-                                                 payload.index_profile_ids, managed_collection_name=payload.managed_collection_name,
-                                                 reuse_managed_collection_id=payload.reuse_managed_collection_id)
+    def create_knowledge_type(payload: CreateKnowledgeTypeRequest):
+        try: return store.create_knowledge_type_semantic(
+            payload.code, payload.name, payload.icon, payload.type_schema, payload.canonical_field,
+            payload.identity_fields, payload.source_policy,
+        )
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-types/{type_id}/revisions", status_code=201)
-    def revise_knowledge_type(type_id: str, payload: KnowledgeTypeRequest):
-        try: return store.revise_knowledge_type(type_id, payload.type_schema, payload.canonical_field, payload.identity_fields,
-                                                payload.source_policy, payload.quality_profile_revision_id, payload.index_profile_ids,
-                                                managed_collection_name=payload.managed_collection_name,
-                                                reuse_managed_collection_id=payload.reuse_managed_collection_id)
+    def revise_knowledge_type(type_id: str, payload: KnowledgeTypeSemanticRequest):
+        try: return store.revise_knowledge_type_semantic(
+            type_id, payload.type_schema, payload.canonical_field, payload.identity_fields, payload.source_policy,
+        )
+        except ValueError as exc: raise _error(exc) from exc
+
+    @app.post("/api/developer/knowledge-types/{type_id}/storage-bindings", status_code=201)
+    def revise_knowledge_type_storage_bindings(type_id: str, payload: KnowledgeTypeStorageBindingsRequest):
+        try:
+            if payload.managed_collection_name.strip() and payload.reuse_managed_collection_id:
+                raise ValueError("新 Collection 名与复用受管 Collection 不能同时设置")
+            return store.revise_knowledge_type_storage_bindings(
+                type_id, payload.index_profile_ids,
+                managed_collection_name=payload.managed_collection_name,
+                reuse_managed_collection_id=payload.reuse_managed_collection_id,
+            )
         except ValueError as exc: raise _error(exc) from exc
 
     @app.post("/api/developer/knowledge-types/{type_id}/validate")
@@ -1587,20 +1757,9 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.get("/api/developer/standard-pipelines")
     def standard_pipelines():
         return [{"code": "common", "steps": [
-            "Source Preparation", "SourceChunk 人工审核 Gate", "Knowledge Flow",
+            "ParseJob / ParsedDocument", "Document Chunker", "FlowChunk 人工审核 Gate", "Knowledge Flow",
             "Knowledge Sink", "Embedding", "Milvus", "Ready / Routing",
         ]}]
-
-    @app.get("/api/developer/source-preparation/chunker")
-    def source_preparation_chunker():
-        try: return store.source_preparation_chunker()
-        except ValueError as exc: raise _error(exc) from exc
-
-    @app.post("/api/developer/source-preparation/chunker/revisions")
-    def create_source_preparation_chunker_revision(payload: SourcePreparationChunkerRevisionRequest):
-        try: return store.create_source_preparation_chunker_revision(payload.base_revision, payload.params)
-        except ReviewGateError as exc: raise _review_error(exc) from exc
-        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/samples")
     def developer_samples(purpose: str = ""):
@@ -1610,22 +1769,6 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def developer_sample(sample_code: str):
         try: return samples.get(sample_code)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    @app.post("/api/developer/source-preparation/preview")
-    def preview_source_preparation(payload: SourcePreparationPreviewRequest):
-        try:
-            if payload.input_source == "builtin_sample":
-                sample = samples.get(payload.sample_code)
-                if sample["purpose"] != "preprocessing":
-                    raise ValueError("示例用途不是文档预处理")
-                document = {"type": "builtin_sample", "name": sample["name"],
-                            "filename": sample["filename"], "text": sample["content"]}
-            else:
-                if not payload.source_version_id:
-                    raise ValueError("业务文档预览必须指定 source_version_id")
-                document = store.source_preparation_preview_document(payload.source_version_id)
-            return preview_preprocessing_document(document, payload.configuration)
-        except ValueError as exc: raise _error(exc) from exc
 
     @app.get("/api/developer/operator-catalog")
     def operator_catalog(q: str = "", category: str = "", knowledge_type: str = "", exposure: str = "", status: str = "",
@@ -1858,7 +2001,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return store.debug_run_preflight(
                 template_id=payload.template_id, revision_id=payload.revision_id,
                 expected_compiled_checksum=payload.expected_compiled_checksum,
-                source_review_snapshot_ids=payload.source_review_snapshot_ids,
+                flow_chunk_review_snapshot_ids=payload.flow_chunk_review_snapshot_ids,
                 sink_library_bindings=payload.sink_library_bindings,
                 input_source=payload.input_source, sample_code=payload.sample_code,
             )
@@ -1871,7 +2014,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return store.create_debug_run(
                 template_id=payload.template_id, revision_id=payload.revision_id,
                 expected_compiled_checksum=payload.expected_compiled_checksum,
-                source_review_snapshot_ids=payload.source_review_snapshot_ids,
+                flow_chunk_review_snapshot_ids=payload.flow_chunk_review_snapshot_ids,
                 sink_library_bindings=payload.sink_library_bindings,
                 idempotency_key=payload.idempotency_key or str(uuid.uuid4()),
                 input_source=payload.input_source, sample_code=payload.sample_code,
@@ -2273,124 +2416,155 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         if app.state.instance.mode != "central":
             raise HTTPException(status_code=403, detail="Local 实例不能管理共享 Deployment")
 
-    def _assert_deployment_idle(deployment_id: str) -> None:
-        binding_ids = {item["project_deployment_id"] for item in store.list_deployment_projects(deployment_id)}
-        with app.state.routing_publications_lock:
-            if binding_ids & app.state.routing_publications:
-                raise ValueError("Routing 发布或回滚运行期间禁止切换环境 Target")
-
-    @app.get("/api/deployments")
-    def shared_deployments():
+    @app.get("/api/institution-deployments")
+    def institution_deployments():
         return store.list_shared_deployments(
             allowed_deployment_id=app.state.instance.bound_deployment_id
             if app.state.instance.mode == "local" else None
         )
 
-    @app.post("/api/deployments", status_code=201)
-    def create_shared_deployment(payload: DeploymentRequest):
+    @app.post("/api/institution-deployments", status_code=201)
+    def create_institution_deployment(payload: DeploymentRequest):
         _require_central_deployment_admin()
         try:
             return store.create_shared_deployment(
                 institution_name=payload.institution_name,
                 institution_code=payload.institution_code,
+                project_ids=payload.project_ids,
             )
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.patch("/api/deployments/{deployment_id}")
-    def patch_shared_deployment(deployment_id: str, payload: DeploymentPatch):
+    @app.patch("/api/institution-deployments/{deployment_id}")
+    def patch_institution_deployment(deployment_id: str, payload: DeploymentPatch):
         _require_central_deployment_admin()
         try:
             return store.patch_shared_deployment(deployment_id, **payload.model_dump())
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.put("/api/deployments/{deployment_id}/targets/{release_stage}")
-    def put_shared_deployment_target(deployment_id: str, release_stage: Literal["test", "production"],
-                                     payload: DeploymentTargetRequest):
+    @app.get("/api/instance/release-targets/{release_stage}")
+    def get_instance_release_target(release_stage: Literal["test", "production"]):
+        if app.state.instance.mode != "central":
+            raise HTTPException(status_code=403, detail="只有中心实例可以读取发布 Target")
+        try: return store.instance_release_target(app.state.instance.id, release_stage)
+        except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/instance/release-targets/{release_stage}")
+    def put_instance_release_target(release_stage: Literal["test", "production"],
+                                    payload: InstanceReleaseTargetRequest):
         _require_central_deployment_admin()
         try:
-            _assert_deployment_idle(deployment_id)
-            return store.put_deployment_target(
-                deployment_id, release_stage, payload.milvus_target_id,
+            return store.put_instance_release_target(
+                app.state.instance.id, release_stage, payload.milvus_target_id,
                 payload.milvus_target_revision_id,
                 confirm_production=payload.confirm_production,
                 expected_target_uri=payload.expected_target_uri,
             )
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.get("/api/deployments/{deployment_id}/projects")
-    def shared_deployment_projects(deployment_id: str):
+    @app.get("/api/institution-deployments/{deployment_id}/projects")
+    def institution_deployment_projects(deployment_id: str):
         try: return store.list_deployment_projects(deployment_id)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/deployments/{deployment_id}/projects", status_code=201)
-    def bind_shared_deployment_project(deployment_id: str, payload: DeploymentProjectRequest):
+    @app.put("/api/institution-deployments/{deployment_id}/projects")
+    def replace_institution_deployment_projects(deployment_id: str, payload: DeploymentProjectsRequest):
         _require_central_deployment_admin()
-        try: return store.bind_project_deployment(deployment_id, payload.project_id)
+        try: return store.replace_deployment_projects(deployment_id, payload.project_ids)
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.get("/api/projects/{project_id}/deployments")
-    def deployments(project_id: str):
-        values = store.list_deployments(project_id, allowed_deployment_id=app.state.instance.bound_deployment_id if app.state.instance.mode == "local" else None)
-        if app.state.instance.mode == "local" and not values: raise HTTPException(status_code=404, detail="Deployment 不存在")
-        return values
-
-    @app.get("/api/project-deployments/{deployment_id}/tasks")
-    def deployment_tasks(deployment_id: str):
-        try: app.state.instance.require_deployment(store, deployment_id); return store.list_deployment_tasks(deployment_id)
-        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
+    @app.get("/api/projects/{project_id}/release-tasks")
+    def release_tasks(project_id: str):
+        try: return store.list_release_tasks(project_id)
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/project-deployments/{deployment_id}/tasks", status_code=201)
-    def create_deployment_task(deployment_id: str, payload: DeploymentTaskRequest):
+    @app.post("/api/projects/{project_id}/release-tasks", status_code=201)
+    def create_release_task(project_id: str, payload: DeploymentTaskRequest):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
-            return store.create_deployment_task(deployment_id, payload.project_task_id, payload.index_profile_id,
+            return store.create_release_task(project_id, payload.project_task_id, payload.index_profile_id,
                 qa_embedding_mode=payload.qa_embedding_mode, top_k=payload.top_k, enabled=payload.enabled,
                 final_top_k=payload.final_top_k, reranker_serving_code=payload.reranker_serving_code)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.patch("/api/project-deployments/{deployment_id}/tasks/{task_id}")
-    def patch_deployment_task(deployment_id: str, task_id: str, payload: DeploymentTaskPatch):
+    @app.patch("/api/projects/{project_id}/release-tasks/{task_id}")
+    def patch_release_task(project_id: str, task_id: str, payload: DeploymentTaskPatch):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
-            return store.patch_deployment_task(deployment_id, task_id, payload.model_dump(exclude_unset=True))
+            return store.patch_release_task(project_id, task_id, payload.model_dump(exclude_unset=True))
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.get("/api/project-deployments/{deployment_id}/retrieval-debug/options")
-    def retrieval_debug_options(deployment_id: str, release_stage: Literal["test", "production"],
+    @app.get("/api/projects/{project_id}/retrieval-debug/options")
+    def retrieval_debug_options(project_id: str, release_stage: Literal["test", "production"],
                                 route_mode: Literal["draft", "published", "historical"] = "draft",
                                 version_no: int | None = None):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
-            return app.state.retrieval_debug.options(deployment_id, release_stage, route_mode, version_no)
+            return app.state.retrieval_debug.options(project_id, release_stage, route_mode, version_no)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/project-deployments/{deployment_id}/retrieval-debug")
-    def retrieval_debug(deployment_id: str, payload: RetrievalDebugRequest):
+    @app.post("/api/projects/{project_id}/retrieval-debug")
+    def retrieval_debug(project_id: str, payload: RetrievalDebugRequest):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
-            return app.state.retrieval_debug.run(deployment_id, payload, instance_mode=app.state.instance.mode)
+            snapshot, identity = app.state.retrieval_debug.snapshot(
+                project_id, payload.release_stage, payload.route_mode, payload.version_no,
+            )
+            if not snapshot.get("milvus_target"):
+                connection = milvus_resolver.stage(project_id, payload.release_stage)
+                snapshot["milvus_target"] = {
+                    "id": connection.target_id, "name": "当前环境 Milvus",
+                    "milvus_url": connection.uri, "revision_id": connection.revision_id,
+                    "connection_fingerprint": connection.fingerprint,
+                    "token_configured": bool(connection.token),
+                }
+            return app.state.retrieval_debug.run_resolved(
+                snapshot, identity, payload, instance_mode=app.state.instance.mode,
+            )
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.post("/api/project-deployments/{deployment_id}/retrieval-public-test")
-    def retrieval_public_test(deployment_id: str, payload: PublicRetrievalAdminRequest,
+    @app.post("/api/projects/{project_id}/retrieval-public-test")
+    def retrieval_public_test(project_id: str, payload: PublicRetrievalAdminRequest,
                               request: Request):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
             snapshot, _identity = app.state.retrieval_debug.snapshot(
-                deployment_id, payload.release_stage, "published",
+                project_id, payload.release_stage, "published",
             )
             public_request = PublicRetrievalRequest(org_code=payload.org_code, query=payload.query)
-            content = app.state.public_retrieval.query(
+            content, trace, failure = app.state.public_retrieval.query_with_trace(
                 snapshot["project"]["code"], snapshot["deployment"]["code"],
                 payload.release_stage, payload.task_code, public_request,
                 request_id=request.state.request_id, instance_mode=app.state.instance.mode,
             )
-            return JSONResponse(content=content, headers={"Cache-Control": "no-store"})
+            public_path = (
+                f"/api/runtime/retrieval/v1/{snapshot['project']['code']}/"
+                f"{snapshot['deployment']['code']}/{payload.release_stage}/"
+                f"{payload.task_code}/query"
+            )
+            response_body = content if content is not None else {
+                "error": {"code": failure.code, "message": failure.message},
+                "request_id": request.state.request_id,
+            }
+            envelope = {
+                "request": {
+                    "method": "POST", "path": public_path,
+                    "headers": {
+                        "Authorization": "Bearer <DATAFORGE_RETRIEVAL_TOKEN>",
+                        "Content-Type": "application/json",
+                    },
+                    "body": public_request.model_dump(),
+                },
+                "response": {
+                    "status_code": failure.status_code if failure else 200,
+                    "request_id": request.state.request_id,
+                    "body": response_body,
+                },
+                "trace": trace,
+            }
+            return JSONResponse(
+                status_code=failure.status_code if failure else 200,
+                content=envelope,
+                headers={"Cache-Control": "no-store"},
+            )
         except LookupError:
             return public_retrieval_error(
                 PublicRetrievalError("route_not_found", "公共检索路由不存在", 404), request,
@@ -2402,165 +2576,173 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         except PublicRetrievalError as exc:
             return public_retrieval_error(exc, request)
 
-    @app.get("/api/project-deployments/{deployment_id}/authorizations")
-    def deployment_authorizations(deployment_id: str):
-        try: app.state.instance.require_deployment(store, deployment_id); return store.list_authorizations(deployment_id)
+    @app.get("/api/projects/{project_id}/authorizations")
+    def project_authorizations(project_id: str):
+        try: return store.list_authorizations(project_id)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.put("/api/project-deployments/{deployment_id}/tasks/{deployment_task_id}/org-routes")
-    def put_deployment_route(deployment_id: str, deployment_task_id: str, payload: RouteRequest):
+    @app.put("/api/projects/{project_id}/release-tasks/{release_task_id}/org-routes")
+    def put_release_route(project_id: str, release_task_id: str, payload: RouteRequest):
         try:
-            app.state.instance.require_deployment(store, deployment_id)
-            tasks = {item["id"] for item in store.list_deployment_tasks(deployment_id)}
-            if deployment_task_id not in tasks: raise LookupError("DeploymentTask 不存在")
-            return store.put_deployment_route(deployment_task_id, payload.org_code, payload.org_name, payload.knowledge_library_ids)
+            tasks = {item["id"] for item in store.list_release_tasks(project_id)}
+            if release_task_id not in tasks: raise LookupError("ProjectReleaseTask 不存在")
+            return store.put_release_route(release_task_id, payload.org_code, payload.org_name, payload.knowledge_library_ids)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
 
-    def _deployment_boundary(deployment_id: str) -> None:
-        try:
-            app.state.instance.require_deployment(store, deployment_id)
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    def _project_boundary(project_id: str) -> None:
+        if not any(item["id"] == project_id for item in store.list_projects(
+                allowed_deployment_id=(app.state.instance.bound_deployment_id
+                                       if app.state.instance.mode == "local" else None))):
+            raise HTTPException(status_code=404, detail="Project 不存在")
 
-    def _begin_routing_action(deployment_id: str) -> None:
+    def _begin_routing_action(project_id: str) -> None:
         with app.state.routing_publications_lock:
-            if deployment_id in app.state.routing_publications:
-                raise HTTPException(status_code=409, detail="该 Deployment 已有 Routing 发布或回滚正在运行")
-            app.state.routing_publications.add(deployment_id)
+            if project_id in app.state.routing_publications:
+                raise HTTPException(status_code=409, detail="该 Project 已有 Routing 发布或回滚正在运行")
+            app.state.routing_publications.add(project_id)
 
-    def _end_routing_action(deployment_id: str) -> None:
+    def _end_routing_action(project_id: str) -> None:
         with app.state.routing_publications_lock:
-            app.state.routing_publications.discard(deployment_id)
+            app.state.routing_publications.discard(project_id)
 
-    def _validate_target_routing(deployment_id: str, release_stage: Literal["test", "production"]):
-        project_deployment = app.state.instance.require_deployment(store, deployment_id)
-        payload = next((item for item in store.list_deployments(
-            project_deployment.project_id,
-            allowed_deployment_id=(app.state.instance.bound_deployment_id
-                                   if app.state.instance.mode == "local" else None),
-        ) if item["id"] == deployment_id), None)
-        if not payload:
-            raise ValueError("ProjectDeployment 不存在")
-        should_connect = app.state.instance.mode == "local" or payload.get("scope") == "central"
-        connection = None
-        if should_connect:
-            try:
-                connection = milvus_resolver.stage(deployment_id, release_stage)
-            except ValueError as exc:
-                raise HTTPException(status_code=503, detail=str(exc)) from exc
-        if should_connect:
-            result = store.validate_routing(
-                deployment_id, release_stage, V7Milvus(connection.uri, connection.token) if connection else None,
-                target_validation_mode="live",
-                target_reason=(None if connection else
-                               "当前 Deployment 需要目标验证，但未配置有效的目标 Milvus URI"),
-            )
-            if app.state.instance.mode == "local" and connection and result.get("snapshot"):
-                result["snapshot"]["milvus_target"] = {
-                    "id": connection.target_id, "name": "机构本地 Milvus",
-                    "milvus_url": connection.uri,
-                    "revision_id": f"local:{connection.revision_id}",
-                    "connection_fingerprint": connection.fingerprint,
-                    "token_configured": bool(connection.token),
-                }
-            return result
-        return store.validate_routing(
-            deployment_id, release_stage, target_validation_mode="deferred_to_local",
-            target_reason=("中心不连接机构现场 Milvus，实体检查延后到机构本地 "
-                           "Prepare/Activation Preflight"),
+    def _stage_connection(project_id: str, release_stage: Literal["test", "production"]):
+        try: return milvus_resolver.stage(project_id, release_stage)
+        except ValueError as exc: raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def _publication_snapshot(project_id: str, core: dict, release_stage: str, connection) -> dict:
+        snapshot = dict(core)
+        snapshot["release_stage"] = release_stage
+        if app.state.instance.mode == "local" and app.state.instance.bound_deployment_id:
+            with store.sessions() as session:
+                deployment = session.get(Deployment, app.state.instance.bound_deployment_id)
+                binding = session.scalar(select(ProjectDeployment).where(
+                    ProjectDeployment.project_id == project_id,
+                    ProjectDeployment.deployment_id == app.state.instance.bound_deployment_id,
+                    ProjectDeployment.status == "active",
+                ))
+            if not deployment or not binding:
+                raise ValueError("机构本地 Project 未绑定当前 Deployment")
+            snapshot["deployment"] = store._shared_deployment_payload(deployment)
+            snapshot["project_deployment"] = {
+                "id": binding.id, "project_id": project_id,
+                "deployment_id": deployment.id, "status": binding.status,
+            }
+            revision_id = f"local:{connection.revision_id}"
+        else:
+            snapshot["deployment"] = {
+                "id": "central-runtime", "code": "dataforge-central",
+                "name": "DataForge 中心", "scope": "central",
+            }
+            snapshot["project_deployment"] = {
+                "id": f"central:{project_id}", "project_id": project_id,
+                "deployment_id": "central-runtime", "status": "active",
+            }
+            revision_id = connection.revision_id
+        snapshot["milvus_target"] = {
+            "id": connection.target_id, "name": "当前环境 Milvus",
+            "milvus_url": connection.uri, "revision_id": revision_id,
+            "connection_fingerprint": connection.fingerprint,
+            "token_configured": bool(connection.token),
+        }
+        return snapshot
+
+    def _validate_target_routing(project_id: str, release_stage: Literal["test", "production"]):
+        connection = _stage_connection(project_id, release_stage)
+        result = store.validate_routing(
+            project_id, release_stage, V7Milvus(connection.uri, connection.token),
+            target_validation_mode="live",
         )
+        if result.get("snapshot"):
+            result["snapshot"] = _publication_snapshot(
+                project_id, result["snapshot"], release_stage, connection,
+            )
+        return result
 
-    @app.post("/api/project-deployments/{deployment_id}/routing/validate")
-    def validate_deployment_routing(deployment_id: str,
+    @app.post("/api/projects/{project_id}/routing/validate")
+    def validate_project_routing(project_id: str,
                                     release_stage: Literal["test", "production"]):
-        _deployment_boundary(deployment_id)
-        try: return _validate_target_routing(deployment_id, release_stage)
+        _project_boundary(project_id)
+        try: return _validate_target_routing(project_id, release_stage)
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.get("/api/project-deployments/{deployment_id}/routing/diff")
-    def deployment_routing_diff(deployment_id: str, release_stage: Literal["test", "production"]):
-        _deployment_boundary(deployment_id)
-        try: return store.routing_diff(deployment_id, release_stage)
+    @app.get("/api/projects/{project_id}/routing/diff")
+    def project_routing_diff(project_id: str, release_stage: Literal["test", "production"]):
+        _project_boundary(project_id)
+        try: return store.routing_diff(project_id, release_stage)
         except ValueError as exc: raise _error(exc) from exc
 
-    @app.get("/api/project-deployments/{deployment_id}/routing/versions")
-    def deployment_routing_versions(deployment_id: str, release_stage: Literal["test", "production"]):
-        _deployment_boundary(deployment_id); return store.list_route_versions(deployment_id, release_stage)
+    @app.get("/api/projects/{project_id}/route-versions")
+    def project_route_versions(project_id: str, release_stage: Literal["test", "production"]):
+        _project_boundary(project_id); return store.list_route_versions(project_id, release_stage)
 
-    @app.get("/api/project-deployments/{deployment_id}/routing/versions/{version_no}")
-    def deployment_routing_version(deployment_id: str, version_no: int,
+    @app.get("/api/projects/{project_id}/route-versions/{version_no}")
+    def project_route_version(project_id: str, version_no: int,
                                    release_stage: Literal["test", "production"]):
-        _deployment_boundary(deployment_id)
-        try: return store.route_version_detail(deployment_id, version_no, release_stage)
+        _project_boundary(project_id)
+        try: return store.route_version_detail(project_id, version_no, release_stage)
         except ValueError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    @app.post("/api/project-deployments/{deployment_id}/routing/freeze", status_code=201)
-    def freeze_deployment_routing(deployment_id: str,
+    @app.post("/api/projects/{project_id}/route-versions", status_code=201)
+    def freeze_project_routing(project_id: str,
                                   release_stage: Literal["test", "production"]):
         if app.state.instance.mode != "central":
             raise HTTPException(status_code=403, detail="只有智能中心可以冻结机构离线路由")
-        _deployment_boundary(deployment_id)
+        _project_boundary(project_id)
         try:
-            return store.freeze_route_version(deployment_id, release_stage)
+            return store.freeze_route_version(project_id, release_stage)
         except ValueError as exc:
             raise _error(exc) from exc
 
-    @app.post("/api/project-deployments/{deployment_id}/routing/publish")
-    def publish_deployment_routing(deployment_id: str, payload: RoutingActionRequest):
-        _deployment_boundary(deployment_id)
-        _begin_routing_action(deployment_id)
+    @app.post("/api/projects/{project_id}/publications")
+    def publish_project_routing(project_id: str, payload: RoutingActionRequest):
+        _project_boundary(project_id)
+        _begin_routing_action(project_id)
         try:
-            project_deployment = app.state.instance.require_deployment(store, deployment_id)
-            deployment = next(item for item in store.list_deployments(project_deployment.project_id)
-                              if item["id"] == deployment_id)
-            if app.state.instance.mode == "central" and deployment["scope"] == "institution":
-                raise ValueError("机构发布目标在智能中心只能冻结项目版本，不能直接发布生效")
             stage = payload.release_stage
-            target = store.deployment_stage_target(deployment_id, stage)
-            expected_uri = target["milvus_target"]["revision"]["milvus_url"]
+            connection = _stage_connection(project_id, stage)
+            expected_uri = connection.uri
             if stage == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
                 raise ValueError("生产发布必须再次确认当前生产环境的完整 Milvus URI")
             if payload.expected_target_uri and payload.expected_target_uri != expected_uri:
                 raise ValueError("发布目标与 release_stage 不一致")
-            candidate_check = store.validate_routing(
-                deployment_id, stage, target_validation_mode="configuration_only",
-            )
-            if not candidate_check["valid"]:
-                raise ValueError("路由校验失败：" + "；".join(candidate_check["problems"]))
-            candidate = candidate_check["snapshot"]
-            if app.state.instance.mode == "central" and candidate.get("deployment", {}).get("scope") == "central":
+            versions = store.list_route_versions(project_id, stage)
+            version_id = payload.route_version_id or (versions[0]["id"] if versions else None)
+            version = next((item for item in versions if item["id"] == version_id), None)
+            if not version:
+                raise ValueError("请先冻结项目版本")
+            detail = store.route_version_detail(project_id, version["version_no"], stage)
+            candidate = _publication_snapshot(project_id, detail["snapshot"], stage, connection)
+            if app.state.instance.mode == "central":
                 RoutingDeliveryService(
                     store, resolved.routing_dir / "production-backups", resolver=milvus_resolver,
                 ).sync(candidate)
-            check = _validate_target_routing(deployment_id, stage)
-            if not check["valid"]: raise ValueError("路由校验失败：" + "；".join(check["problems"]))
-            snapshot = check["snapshot"]
             origin = "local" if app.state.instance.mode == "local" else "central"
-            version = store.create_route_version(deployment_id, snapshot, origin=origin)
             checksum, object_key = AtomicRoutingPublisher(resolved.routing_dir).publish(
-                snapshot["project"]["code"], snapshot["deployment"]["code"], version.version_no, snapshot,
-                release_stage=snapshot["release_stage"])
-            return store.mark_route_published(version.id, checksum, object_key)
+                candidate["project"]["code"], candidate["deployment"]["code"], version["version_no"], candidate,
+                release_stage=stage)
+            return store.create_project_publication(
+                project_id, version["id"], stage,
+                target_kind="local" if app.state.instance.mode == "local" else "registry",
+                target_id=str(connection.target_id or "local"),
+                target_revision_id=str(connection.revision_id),
+                target_connection_fingerprint=connection.fingerprint,
+                snapshot=candidate, checksum=checksum, object_key=object_key, origin=origin,
+            )
         except ValueError as exc: raise _error(exc) from exc
-        finally: _end_routing_action(deployment_id)
+        finally: _end_routing_action(project_id)
 
-    @app.post("/api/project-deployments/{deployment_id}/routing/rollback/{version_no}")
-    def rollback_deployment_routing(deployment_id: str, version_no: int,
+    @app.post("/api/projects/{project_id}/publications/rollback/{version_no}")
+    def rollback_project_routing(project_id: str, version_no: int,
                                     payload: RoutingActionRequest):
-        _deployment_boundary(deployment_id)
-        _begin_routing_action(deployment_id)
+        _project_boundary(project_id)
+        _begin_routing_action(project_id)
         try:
-            project_deployment = app.state.instance.require_deployment(store, deployment_id)
-            deployment = next(item for item in store.list_deployments(project_deployment.project_id)
-                              if item["id"] == deployment_id)
-            if app.state.instance.mode == "central" and deployment["scope"] == "institution":
-                raise ValueError("机构发布目标在智能中心不能执行在线回滚")
             stage = payload.release_stage
-            target = store.deployment_stage_target(deployment_id, stage)
-            expected_uri = target["milvus_target"]["revision"]["milvus_url"]
+            connection = _stage_connection(project_id, stage)
+            expected_uri = connection.uri
             if stage == "production" and (
                 not payload.confirm_production or payload.expected_target_uri != expected_uri
             ):
@@ -2568,20 +2750,30 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if payload.expected_target_uri and payload.expected_target_uri != expected_uri:
                 raise ValueError("回滚目标与 release_stage 不一致")
             previous = store.published_route_version(
-                deployment_id, version_no, release_stage=stage,
+                project_id, version_no, release_stage=stage,
             )
-            store.restore_authorizations(deployment_id, previous.snapshot_json)
-            check = _validate_target_routing(deployment_id, stage)
+            store.restore_authorizations(project_id, previous.snapshot_json)
+            check = _validate_target_routing(project_id, stage)
             if not check["valid"]: raise ValueError("回滚后的授权校验失败：" + "；".join(check["problems"]))
-            snapshot = check["snapshot"]
-            version = store.create_route_version(deployment_id, snapshot,
-                origin="local" if app.state.instance.mode == "local" else "central")
+            snapshot = _publication_snapshot(project_id, previous.snapshot_json, stage, connection)
+            if app.state.instance.mode == "central":
+                RoutingDeliveryService(
+                    store, resolved.routing_dir / "production-backups", resolver=milvus_resolver,
+                ).sync(snapshot)
             checksum, object_key = AtomicRoutingPublisher(resolved.routing_dir).publish(
-                snapshot["project"]["code"], snapshot["deployment"]["code"], version.version_no, snapshot,
-                release_stage=snapshot["release_stage"])
-            return store.mark_route_published(version.id, checksum, object_key)
+                snapshot["project"]["code"], snapshot["deployment"]["code"], previous.version_no, snapshot,
+                release_stage=stage)
+            return store.create_project_publication(
+                project_id, previous.id, stage,
+                target_kind="local" if app.state.instance.mode == "local" else "registry",
+                target_id=str(connection.target_id or "local"),
+                target_revision_id=str(connection.revision_id),
+                target_connection_fingerprint=connection.fingerprint,
+                snapshot=snapshot, checksum=checksum, object_key=object_key,
+                origin="local" if app.state.instance.mode == "local" else "central",
+            )
         except ValueError as exc: raise _error(exc) from exc
-        finally: _end_routing_action(deployment_id)
+        finally: _end_routing_action(project_id)
 
     @app.get("/api/imported-route-candidates")
     def imported_route_candidates(migration_job_id: str | None = None):

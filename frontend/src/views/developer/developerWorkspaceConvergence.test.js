@@ -9,12 +9,15 @@ const preprocessing = readFileSync(new URL('./PipelineListView.vue', import.meta
 const debug = readFileSync(new URL('./DataFlowDebugView.vue', import.meta.url), 'utf8')
 const templates = readFileSync(new URL('./TemplateListView.vue', import.meta.url), 'utf8')
 
-test('developer navigation exposes the fixed main flow and an always-visible resource group', () => {
+test('developer navigation exposes three fixed always-visible groups and defaults to knowledge flows', () => {
+  assert.match(menus, /流程开发/)
+  assert.match(menus, /能力配置/)
   assert.match(menus, /文档预处理/)
   assert.match(menus, /开发者资源/)
   assert.match(menus, /算子组件/)
   assert.match(menus, /可复用子流程/)
   assert.match(layout, /v-if="item\.group"/)
+  assert.match(layout, /'\/developer\/flow-templates'/)
   assert.doesNotMatch(layout, /<details[^>]*developer-resource/)
 })
 
@@ -29,9 +32,10 @@ test('standard authoring is business configuration while advanced and runtime DA
   assert.doesNotMatch(templates, /window\.confirm\('将基于当前标准配置展开完整执行 DAG/)
 })
 
-test('preprocessing and debug default to versioned builtin samples', () => {
-  assert.match(preprocessing, /preprocessing-document-v1/)
-  assert.match(preprocessing, /previewSourcePreparation/)
+test('preprocessing uses ParsedDocument and Flow-owned review while debug keeps versioned samples', () => {
+  assert.match(preprocessing, /ParsedDocument/)
+  assert.match(preprocessing, /document-chunker/)
+  assert.doesNotMatch(preprocessing, /previewSourcePreparation/)
   assert.match(debug, /reviewed-medical-v2/)
   assert.match(debug, /虚拟空库 Diff/)
 })

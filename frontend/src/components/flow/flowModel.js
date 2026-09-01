@@ -18,11 +18,11 @@ export function resolveCandidateType(type, definition = {}) {
 }
 
 const ARTIFACT_TYPE_LABELS = {
-  approved_source_chunks: '已审核文档块',
   source_file: '源文件',
-  document_ir: '文档解析结果',
+  parsed_document: 'ParsedDocument',
+  candidate_flow_chunk_set: '候选 FlowChunkSet',
+  flow_chunk_review_snapshot: '冻结 Flow 输入快照',
   chunk_set: '文档块',
-  source_chunk_set: '来源文档块',
   derived_text_set: '派生正文与处理回执',
   text_record_set: '来源正文或文本/问答候选',
   'candidate:*': '候选知识',
@@ -60,14 +60,15 @@ function normalizedPorts(raw, fallback) {
     artifact_type: typeof value === 'string' ? value : value?.artifact_type || '',
     cardinality: typeof value === 'string' ? (fallback === DEFAULT_INPUT ? 'one' : 'many') : value?.cardinality || (fallback === DEFAULT_INPUT ? 'one' : 'many'),
     required: typeof value === 'string' ? fallback === DEFAULT_INPUT : value?.required ?? (fallback === DEFAULT_INPUT),
-    binding: typeof value === 'string' ? 'edge' : value?.binding || (value?.artifact_type === 'source_file' ? 'system_injected' : value?.artifact_type === 'approved_source_chunks' ? 'runtime_input' : 'edge'),
+    binding: typeof value === 'string' ? 'edge' : value?.binding || (value?.artifact_type === 'parsed_document' ? 'runtime_input' : 'edge'),
   }]))
 }
 
 export function nodeRole(definition = {}) {
-  if (['flow_input', 'operator', 'knowledge_output'].includes(definition.node_role)) return definition.node_role
+  if (['flow_input', 'operator', 'execution_gate', 'knowledge_output'].includes(definition.node_role)) return definition.node_role
   if (definition.kind === 'knowledge_sink') return 'knowledge_output'
-  if (definition.kind === 'operator' && definition.ref === 'reviewed-source-chunk-input') return 'flow_input'
+  if (definition.kind === 'execution_gate') return 'execution_gate'
+  if (definition.kind === 'operator' && definition.ref === 'document-input') return 'flow_input'
   return 'operator'
 }
 
@@ -207,6 +208,15 @@ export function resolveNodeMetadata(definition, catalog = [], subflows = []) {
       inputExample: entryItem?.input_example || {}, outputExample: exitItem?.output_example || {},
     }
   }
+  if (definition.kind === 'execution_gate') {
+    return {
+      kind: 'execution_gate', nodeRole: 'execution_gate', name: '自动冻结输入快照', code: definition.id,
+      category: '执行控制', status, known: true, locked: true,
+      inputs: { input: { artifact_type: 'candidate_flow_chunk_set', cardinality: 'one', required: true, binding: 'edge' } },
+      outputs: { output: { artifact_type: 'flow_chunk_review_snapshot', cardinality: 'many', required: false, binding: 'edge' } },
+      parameterSchema: {}, inputExample: {}, outputExample: {},
+    }
+  }
   const catalogVersion = catalogItem(catalog, definition.ref, definition.operator_version)
   const item = definition.operator_spec || catalogVersion
   const role = nodeRole({ ...definition, node_role: definition.node_role || item?.node_role })
@@ -229,12 +239,14 @@ export function hasEditableParameters(node) {
 }
 
 export function makeCanvasNode(definition, position, catalog = [], subflows = []) {
-  const normalized = { ...cloneValue(definition), node_role: nodeRole(definition) }
+  const item = definition.kind === 'operator' ? catalogItem(catalog, definition.ref, definition.operator_version) : null
+  const normalized = { ...cloneValue(definition), node_role: nodeRole({ ...definition, node_role: definition.node_role || item?.node_role }) }
   const meta = resolveNodeMetadata(normalized, catalog, subflows)
   return {
     id: definition.id,
-    type: meta.nodeRole === 'flow_input' ? 'flow-input' : meta.kind === 'knowledge_sink' ? 'knowledge-sink' : meta.kind,
+    type: meta.nodeRole === 'flow_input' ? 'flow-input' : meta.kind === 'knowledge_sink' ? 'knowledge-sink' : meta.kind === 'execution_gate' ? 'execution-gate' : meta.kind,
     position: { x: Number(position?.x) || 0, y: Number(position?.y) || 0 },
+    draggable: definition.kind !== 'execution_gate', deletable: definition.kind !== 'execution_gate',
     data: { definition: normalized, meta },
   }
 }
@@ -351,7 +363,7 @@ export function validateSubflow(nodes, edges) {
   const exits = nodes.filter(node => !edges.some(edge => edge.source === node.id))
   const issues = validateFlow(nodes, edges).filter(issue => issue.code !== 'MISSING_SINK' && !(issue.code === 'REQUIRED_INPUT' && entries.some(node => node.id === issue.nodeId)))
   if (entries.length !== 1 || exits.length !== 1) issues.push({ code: 'SUBFLOW_BOUNDARY', message: '子流程必须连通、单入口、单出口' })
-  for (const node of nodes) if (node.data.meta.nodeRole !== 'operator' || node.data.definition.ref === 'reviewed-source-chunk-input') issues.push({ code: 'SUBFLOW_NODE_ROLE', nodeId: node.id, message: '子流程不能包含流程输入或知识输出' })
+  for (const node of nodes) if (node.data.meta.nodeRole !== 'operator' || node.data.definition.ref === 'document-input') issues.push({ code: 'SUBFLOW_NODE_ROLE', nodeId: node.id, message: '子流程不能包含流程输入、审核 Gate 或知识输出' })
   return issues
 }
 

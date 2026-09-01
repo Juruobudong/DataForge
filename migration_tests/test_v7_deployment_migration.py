@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -23,7 +24,7 @@ from dataforge.v7.migration.manifest import validate_manifest
 from dataforge.v7.migration.planner import InstitutionReleasePlanner, MigrationPlanner
 from dataforge.v7.migration.verifier import ActivationPreflightVerifier
 from dataforge.v7.migrations import upgrade
-from dataforge.v7.models import DataForgeInstance, Deployment, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeItem, KnowledgeItemSource, SourceReviewSnapshot, SourceVersion
+from dataforge.v7.models import DataForgeInstance, Deployment, FlowExecutionSnapshot, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeFlowTemplateRevision, KnowledgeItem, KnowledgeEvidence, ParsedDocument, FlowChunkReviewSnapshot, SourceVersion
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import V7Store
 from dataforge.v7.vector import V7Milvus
@@ -34,7 +35,6 @@ from dataforge.v7.web import create_app
 def seeded_qa_project(store: V7Store) -> dict:
     with store.sessions() as session:
         instance = session.scalar(select(DataForgeInstance))
-        central = session.scalar(select(Deployment).where(Deployment.scope == "central"))
     if instance and instance.instance_mode == "central":
         service = MilvusTargetService(store, None, lambda _uri, _token: SimpleNamespace(check_connection=lambda: "2.5.18"))
         for target_id in ("milvus_dataforge_central_test", "milvus_dataforge_central_production"):
@@ -44,13 +44,11 @@ def seeded_qa_project(store: V7Store) -> dict:
         test_target = store.get_milvus_target("milvus_dataforge_central_test")
         production_target = store.get_milvus_target("milvus_dataforge_central_production")
         store.bind_authoring_milvus_target(instance.id, test_target["id"])
-        if not central:
-            raise AssertionError("central deployment missing")
         for stage, target in (("test", test_target), ("production", production_target)):
-            current = store.list_shared_deployments(allowed_deployment_id=central.id)[0]["stage_targets"]
-            if stage not in current:
-                store.put_deployment_target(
-                    central.id, stage, target["id"], target["current_revision_id"],
+            try: store.instance_release_target(instance.id, stage)
+            except ValueError:
+                store.put_instance_release_target(
+                    instance.id, stage, target["id"], target["current_revision_id"],
                     confirm_production=stage == "production",
                     expected_target_uri=(target["current_revision"]["milvus_url"]
                                          if stage == "production" else None),
@@ -63,20 +61,57 @@ def bind_institution(store: V7Store, project_id: str, name: str, code: str) -> d
     return store.bind_project_deployment(shared["id"], project_id)
 
 
-def record_and_approve_source(store: V7Store, source: dict, content: str = "迁移测试来源") -> None:
-    preparation = store.claim_source_preparation_job(f"migration-{source['version']['id']}")
-    assert preparation and preparation.source_version_id == source["version"]["id"]
-    run = store.start_source_preparation_flow_run(preparation.id)
-    store.record_source_chunks(run["id"], [{
-        "source_version_id": source["version"]["id"],
-        "source_chunk_id": f"chunk-{source['version']['id']}",
-        "chunk_index": 0,
-        "content": content,
-        "anchor": {"chunk_index": 0},
-    }])
-    store.finish_flow_run(run["id"], status="completed")
-    store.finish_source_preparation(preparation.id)
-    store.approve_source_version(source["version"]["id"])
+def record_and_approve_source(store: V7Store, objects: LocalObjectStore, source: dict,
+                              content: str = "迁移测试来源") -> None:
+    version_id = source["version"]["id"]
+    parse_job = store.claim_parse_job(f"migration-{version_id}")
+    assert parse_job and parse_job.source_version_id == version_id
+    content_bytes = content.encode("utf-8")
+    anchor_bytes = b"{}"
+    content_object = objects.put_bytes(f"parsed/{version_id}/content.md", content_bytes, "text/markdown")
+    anchor_object = objects.put_bytes(f"parsed/{version_id}/anchors.json", anchor_bytes, "application/json")
+    store.finish_parse_job(parse_job.id, {
+        "id": f"parsed-{version_id}", "kind": "textual", "content_format": "markdown",
+        "content_ref": f"object:///{content_object.key}", "content_digest": hashlib.sha256(content_bytes).hexdigest(),
+        "anchor_map_ref": f"object:///{anchor_object.key}", "anchor_map_digest": hashlib.sha256(anchor_bytes).hexdigest(),
+        "metadata_json": {"filename": source["version"]["original_filename"]},
+    })
+    approved = store.approve_parsed_document_revision(
+        f"parsed-{version_id}", reviewed_document_id=f"reviewed-{version_id}",
+        expected_content_digest=hashlib.sha256(content_bytes).hexdigest(),
+        expected_anchor_map_digest=hashlib.sha256(anchor_bytes).hexdigest(),
+        content_ref=f"object:///{content_object.key}", content_digest=hashlib.sha256(content_bytes).hexdigest(),
+        anchor_map_ref=f"object:///{anchor_object.key}", anchor_map_digest=hashlib.sha256(anchor_bytes).hexdigest(),
+    )
+    parsed_document_id = approved["parsed_document"]["id"]
+    with store.sessions() as session:
+        revisions = list(session.scalars(select(KnowledgeFlowTemplateRevision).where(
+            KnowledgeFlowTemplateRevision.status == "published",
+            KnowledgeFlowTemplateRevision.execution_snapshot_id.is_not(None),
+        )))
+        definitions = [(revision, session.get(FlowExecutionSnapshot, revision.execution_snapshot_id).compiled_definition_json)
+                       for revision in revisions]
+    for revision, definition in definitions:
+        input_node = next((node for node in definition.get("nodes", []) if node.get("ref") == "document-input"), None)
+        chunker = next((node for node in definition.get("nodes", []) if node.get("ref") == "document-chunker"), None)
+        if not input_node or not chunker:
+            continue
+        chunk_set = store.create_flow_chunk_set(
+            flow_revision_id=revision.id, parsed_document_id=parsed_document_id,
+            input_node_key=str(input_node["id"]), operator_revision=int(chunker.get("operator_version") or 1),
+            params=dict(chunker.get("params") or {}),
+        )
+        if chunk_set["reused"]:
+            continue
+        chunk_set_id = chunk_set["flow_chunk_set_id"]
+        store.record_flow_chunks(chunk_set_id, [{
+            "parsed_document_id": parsed_document_id, "source_version_id": version_id,
+            "ordinal": 0, "content": content, "token_count": len(content),
+            "anchor": {"markdown_start": 0, "markdown_end": len(content)},
+        }])
+        chunk = store.flow_chunk_set_review(chunk_set_id)["chunks"][0]
+        store.review_flow_chunk(chunk["id"], "approved", chunk["revision_no"])
+        store.freeze_flow_chunk_set(chunk_set_id)
 
 
 def keys():
@@ -179,7 +214,7 @@ def test_local_instance_hides_other_deployment_and_rejects_second_seed(tmp_path:
         ),
     )
     routing_check = client.post(
-        f"/api/project-deployments/{bound['id']}/routing/validate?release_stage=test",
+        f"/api/projects/{project['id']}/routing/validate?release_stage=test",
     ).json()
     assert routing_check["target_validation"] == {
         "mode": "live", "attempted": True, "reachable": True, "reason": None,
@@ -187,9 +222,11 @@ def test_local_instance_hides_other_deployment_and_rejects_second_seed(tmp_path:
     with pytest.raises(ValueError, match="第二次 Seed"):
         context.bind_seed(store, bound["deployment_id"], "central-one")
     assert client.post("/api/projects", json={"name": "仍不允许的本地项目"}).status_code == 403
-    assert client.get(f'/api/project-deployments/{other["id"]}/tasks').status_code == 404
+    visible_deployments = client.get('/api/institution-deployments').json()
+    assert [item['id'] for item in visible_deployments] == [bound['deployment_id']]
     projects = client.get("/api/projects").json()
-    assert [item["id"] for item in projects[0]["deployments"]] == [bound["id"]]
+    assert [item["id"] for item in projects] == [project["id"]]
+    assert "deployments" not in projects[0]
 
 
 def test_central_deployment_routing_validation_uses_live_milvus_mode(tmp_path: Path, monkeypatch):
@@ -198,7 +235,6 @@ def test_central_deployment_routing_validation_uses_live_milvus_mode(tmp_path: P
     url = f"sqlite:///{tmp_path / 'central-routing-mode.sqlite3'}"; upgrade(url)
     store = V7Store(url); store.seed()
     project = seeded_qa_project(store)
-    deployment = next(item for item in project["deployments"] if item["scope"] == "central")
     calls = []
     monkeypatch.setattr(
         v7_web, "V7Milvus",
@@ -211,18 +247,20 @@ def test_central_deployment_routing_validation_uses_live_milvus_mode(tmp_path: P
         instance_mode="central", instance_code="dataforge-central",
     ), check_schema=True))
     result = client.post(
-        f"/api/project-deployments/{deployment['id']}/routing/validate?release_stage=test",
+        f"/api/projects/{project['id']}/routing/validate?release_stage=test",
     ).json()
     assert result["target_validation"] == {
         "mode": "live", "attempted": True, "reachable": True, "reason": None,
     }
     production = client.post(
-        f"/api/project-deployments/{deployment['id']}/routing/validate?release_stage=production",
+        f"/api/projects/{project['id']}/routing/validate?release_stage=production",
     ).json()
     assert production["snapshot"]["release_stage"] == "production"
+    with store.sessions() as session:
+        instance = session.scalar(select(DataForgeInstance))
     assert calls == [
-        deployment["stage_targets"]["test"]["revision"]["milvus_url"],
-        deployment["stage_targets"]["production"]["revision"]["milvus_url"],
+        store.instance_release_target(instance.id, "test")["milvus_target"]["revision"]["milvus_url"],
+        store.instance_release_target(instance.id, "production")["milvus_target"]["revision"]["milvus_url"],
     ]
 
 
@@ -230,9 +268,10 @@ def test_migration_planner_rejects_dataforge_central_as_target(tmp_path: Path):
     url = f"sqlite:///{tmp_path / 'central-target.sqlite3'}"; upgrade(url)
     store = V7Store(url); store.seed()
     project = seeded_qa_project(store)
-    central = next(item for item in project["deployments"] if item["scope"] == "central")
-    with pytest.raises(ValueError, match="目标机构.*DataForge 中心环境"):
-        MigrationPlanner(store).plan(central["id"], release_stage="test")
+    with store.sessions() as session:
+        assert session.scalar(select(Deployment).where(Deployment.scope == "central")) is None
+    with pytest.raises(ValueError, match="ProjectDeployment 不存在"):
+        MigrationPlanner(store).plan(project["id"], release_stage="test")
 
 
 def test_routing_snapshot_is_generated_from_deployment_authorization(tmp_path: Path, monkeypatch):
@@ -242,20 +281,16 @@ def test_routing_snapshot_is_generated_from_deployment_authorization(tmp_path: P
     library = store.create_knowledge_library("医院 FAQ", "qa")
     project = seeded_qa_project(store)
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
-    deployment = bind_institution(store, project["id"], "医院 A", "KM001")
-    profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
-    deployment_task = store.create_deployment_task(deployment["id"], task["id"], profile["id"])
-    store.put_deployment_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
-    snapshot = store.routing_snapshot(deployment["id"], "test")
-    assert snapshot["schema_version"] == 3
-    assert snapshot["deployment"]["id"] == deployment["deployment_id"]
-    assert snapshot["project_deployment"]["id"] == deployment["id"]
-    assert snapshot["milvus_target"] is None
+    deployment_task = store.list_release_tasks(project["id"])[0]
+    store.put_release_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
+    snapshot = store.routing_snapshot(project["id"], "test")
+    assert snapshot["schema_version"] == 4
+    assert snapshot["project"]["id"] == project["id"]
+    assert "deployment" not in snapshot and "milvus_target" not in snapshot
     assert snapshot["tasks"][0]["org_routes"][0]["knowledge_library_ids"] == [library["id"]]
-    first = store.create_route_version(deployment["id"], snapshot)
-    other = bind_institution(store, project["id"], "医院 B", "KM002")
-    other_version = store.create_route_version(other["id"], store.routing_snapshot(other["id"], "test"))
-    assert first.version_no == other_version.version_no == 1
+    first = store.create_route_version(project["id"], snapshot)
+    other_version = store.create_route_version(project["id"], store.routing_snapshot(project["id"], "test"))
+    assert (first.version_no, other_version.version_no) == (1, 2)
 
 
 def test_task_and_org_code_form_independent_knowledge_scopes(tmp_path: Path):
@@ -267,21 +302,21 @@ def test_task_and_org_code_form_independent_knowledge_scopes(tmp_path: Path):
     first_task = store.create_project_task(project["id"], "knowledge_qa", "主问答", "qa")
     deployment = bind_institution(store, project["id"], "机构 A", "INST-A")
     profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
-    first_channel = store.create_deployment_task(deployment["id"], first_task["id"], profile["id"])
+    first_channel = store.create_release_task(project["id"], first_task["id"], profile["id"])
     second_task = store.create_project_task(project["id"], "knowledge_qa_secondary", "辅助问答", "qa")
-    second_channel = store.create_deployment_task(deployment["id"], second_task["id"], profile["id"])
+    second_channel = store.create_release_task(project["id"], second_task["id"], profile["id"])
 
-    first_route = store.put_deployment_route(
+    first_route = store.put_release_route(
         first_channel["id"], "ORG-A", "范围 A", [first_library["id"]],
     )
-    store.put_deployment_route(first_channel["id"], "INST-A", "机构默认范围", [second_library["id"]])
-    store.put_deployment_route(second_channel["id"], "ORG-A", "辅助范围 A", [second_library["id"]])
-    updated = store.put_deployment_route(
+    store.put_release_route(first_channel["id"], "INST-A", "机构默认范围", [second_library["id"]])
+    store.put_release_route(second_channel["id"], "ORG-A", "辅助范围 A", [second_library["id"]])
+    updated = store.put_release_route(
         first_channel["id"], "ORG-A", "范围 A 更新", [second_library["id"], first_library["id"]],
     )
 
     assert updated["id"] == first_route["id"]
-    authorizations = store.list_authorizations(deployment["id"])
+    authorizations = store.list_authorizations(project["id"])
     assert len(authorizations) == 3
     assert {
         (item["task_code"], item["org_code"]): item["knowledge_library_ids"]
@@ -291,8 +326,8 @@ def test_task_and_org_code_form_independent_knowledge_scopes(tmp_path: Path):
         ("knowledge_qa", "ORG-A"): [second_library["id"], first_library["id"]],
         ("knowledge_qa_secondary", "ORG-A"): [second_library["id"]],
     }
-    snapshot = store.routing_snapshot(deployment["id"], "test")
-    assert snapshot["deployment"]["institution_code"] == "INST-A"
+    snapshot = store.routing_snapshot(project["id"], "test")
+    assert snapshot["project"]["id"] == project["id"]
     assert {(item["task_code"], item["org_code"]) for item in snapshot["routes"]} == {
         ("knowledge_qa", "INST-A"),
         ("knowledge_qa", "ORG-A"),
@@ -303,12 +338,13 @@ def test_task_and_org_code_form_independent_knowledge_scopes(tmp_path: Path):
 def test_institution_freeze_locks_institution_code_and_does_not_create_package(tmp_path: Path, monkeypatch):
     url = f"sqlite:///{tmp_path / 'freeze.sqlite3'}"; upgrade(url)
     store = V7Store(url); store.seed()
+    objects = LocalObjectStore(tmp_path / "freeze-objects")
     docs = store.create_document_library("冻结资料")
     source = store.create_source(
         library_id=docs["id"], name="FAQ", filename="faq.txt", blob_uri=f"blob://{'f' * 64}",
         sha256="f" * 64, size_bytes=10, media_type="text/plain",
     )
-    record_and_approve_source(store, source, "冻结 FAQ 来源")
+    record_and_approve_source(store, objects, source, "冻结 FAQ 来源")
     library = store.create_knowledge_library("冻结 FAQ", "qa")
     job = store.create_knowledge_job(
         [source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa",
@@ -330,14 +366,13 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     project = seeded_qa_project(store)
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
     deployment = bind_institution(store, project["id"], "冻结医院", "FREEZE001")
-    profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
-    deployment_task = store.create_deployment_task(deployment["id"], task["id"], profile["id"])
-    store.put_deployment_route(deployment_task["id"], "FREEZE-SCOPE", "冻结知识范围", [library["id"]])
-    frozen = store.freeze_route_version(deployment["id"], "test")
+    deployment_task = store.list_release_tasks(project["id"])[0]
+    store.put_release_route(deployment_task["id"], "FREEZE-SCOPE", "冻结知识范围", [library["id"]])
+    frozen = store.freeze_route_version(project["id"], "test")
     assert frozen["status"] == "frozen"
-    assert store.route_version_detail(deployment["id"], frozen["version_no"], "test")["assets"]
+    assert store.route_version_detail(project["id"], frozen["version_no"], "test")["assets"]
     assert store.list_migration_jobs() == []
-    production_frozen = store.freeze_route_version(deployment["id"], "production")
+    production_frozen = store.freeze_route_version(project["id"], "test")
     production_draft = store.create_institution_release_draft(
         deployment["deployment_id"], "institution_release", release_stage="production",
         target_institution_code=deployment["institution_code"],
@@ -346,7 +381,7 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     production_plan = InstitutionReleasePlanner(store).plan(production_draft["id"])
     assert production_plan["deployment"]["release_stage"] == "production"
     assert "milvus_preset" not in production_plan["deployment"]
-    with pytest.raises(ValueError, match="不能混合测试环境和生产环境"):
+    with pytest.raises(ValueError, match="同一 Project 只能选择一个 RouteVersion"):
         store.create_institution_release_draft(
             deployment["deployment_id"], "institution_release", release_stage="test",
             target_institution_code=deployment["institution_code"],
@@ -356,39 +391,39 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     monkeypatch.setenv("DATAFORGE_INSTANCE_CODE", "dataforge-central")
     monkeypatch.setattr(
         v7_web, "V7Milvus",
-        lambda *_args, **_kwargs: pytest.fail("中心 institution Routing 校验不得创建 Milvus 客户端"),
+        lambda uri, token=None: SimpleNamespace(uri=uri, token=token, list_collections=lambda: []),
     )
     client = TestClient(create_app(Settings(
         project_root=tmp_path, state_dir=tmp_path / "state", database_url=url,
         instance_mode="central", instance_code="dataforge-central",
     ), check_schema=True))
     validation = client.post(
-        f"/api/project-deployments/{deployment['id']}/routing/validate?release_stage=test",
+        f"/api/projects/{project['id']}/routing/validate?release_stage=test",
     ).json()
-    assert validation["valid"] is True
+    assert validation["valid"] is True, validation
     assert validation["target_validation"] == {
-        "mode": "deferred_to_local", "attempted": False, "reachable": None,
-        "reason": "中心不连接机构现场 Milvus，实体检查延后到机构本地 Prepare/Activation Preflight",
+        "mode": "live", "attempted": True, "reachable": True, "reason": None,
     }
     second_project = store.create_project("共享资产项目")
     second_task = store.create_project_task(
         second_project["id"], "knowledge_qa_shared", "共享问答", "qa",
     )
     second_binding = store.bind_project_deployment(deployment["deployment_id"], second_project["id"])
-    second_deployment_task = store.create_deployment_task(
-        second_binding["id"], second_task["id"], profile["id"],
+    profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
+    second_deployment_task = store.create_release_task(
+        second_project["id"], second_task["id"], profile["id"],
     )
-    store.put_deployment_route(
+    store.put_release_route(
         second_deployment_task["id"], "FREEZE-SCOPE", "共享冻结知识范围", [library["id"]],
     )
-    second_frozen = store.freeze_route_version(second_binding["id"], "test")
+    second_frozen = store.freeze_route_version(second_project["id"], "test")
     draft = store.create_institution_release_draft(
         deployment["deployment_id"], "deployment_seed", release_stage="test",
         target_institution_code=deployment["institution_code"],
         route_version_ids=[frozen["id"], second_frozen["id"]],
     )
     required_asset_id = store.route_version_detail(
-        deployment["id"], frozen["version_no"], "test",
+        project["id"], frozen["version_no"], "test",
     )["assets"][0]["knowledge_asset_version_id"]
     store.update_institution_release_draft(
         draft["id"], extra_asset_version_ids=[required_asset_id, required_asset_id],
@@ -584,10 +619,10 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         library_id=document["id"], name="闭包", filename="closure.txt", blob_uri=stored.blob_uri,
         sha256=stored.sha256, size_bytes=stored.size_bytes, media_type="text/plain",
     )
-    record_and_approve_source(central, source, "完整模板来源")
+    record_and_approve_source(central, central_objects, source, "完整模板来源")
     binding = central.bind_document_library_template(document["id"], "flow_standard-qa")
     library_id = binding["outputs"][0]["knowledge_library"]["id"]
-    processing_job = central.process_document_library(document["id"])[0]
+    processing_job = {"id": binding["dispatches"][0]["knowledge_job_id"]}
     central.apply_knowledge_output(processing_job["id"], "qa", [{
         "source_knowledge_id": "closure-faq", "canonical_content": "问题：闭包？答案：完整。",
         "data_json": {"question": "闭包？", "answer": "完整。"},
@@ -608,10 +643,13 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
     task = next(value for value in project["tasks"] if value["code"] == "knowledge_qa")
     deployment = bind_institution(central, project["id"], "医院 V2", "V2001")
     profile = next(value for value in central.list_index_profiles() if value["code"] == "qa-question")
-    deployment_task = central.create_deployment_task(deployment["id"], task["id"], profile["id"],
-        final_top_k=3, reranker_serving_code="bge_reranker_large")
-    central.put_deployment_route(deployment_task["id"], "V2001", "医院 V2", [library_id])
-    frozen = central.freeze_route_version(deployment["id"], "test")
+    deployment_task = next(item for item in central.list_release_tasks(project["id"])
+                           if item["project_task_id"] == task["id"])
+    deployment_task = central.patch_release_task(project["id"], deployment_task["id"], {
+        "final_top_k": 3, "reranker_serving_code": "bge_reranker_large",
+    })
+    central.put_release_route(deployment_task["id"], "V2001", "医院 V2", [library_id])
+    frozen = central.freeze_route_version(project["id"], "test")
     draft = central.create_institution_release_draft(
         deployment["deployment_id"], "deployment_seed", release_stage="test",
         target_institution_code=deployment["institution_code"], route_version_ids=[frozen["id"]],
@@ -682,7 +720,7 @@ def test_v2_seed_waits_for_milvus_then_imports_template_closure_and_candidate_ro
         restored_item = session.scalar(select(KnowledgeAssetItem))
         assert restored_item and restored_item.canonical_content == exported_asset_items[0]["canonical_content"]
         assert restored_item.evidence_json == exported_asset_items[0]["evidence_json"]
-    restored_task = local.list_deployment_tasks(deployment["id"])[0]
+    restored_task = local.list_release_tasks(project["id"])[0]
     assert restored_task["final_top_k"] == 3 and restored_task["reranker_serving_code"] == "bge_reranker_large"
     assert local.list_document_library_template_bindings(document["id"])[0]["pending_file_count"] == 0
 
@@ -944,7 +982,7 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     stored = central_objects.put_blob(b"hospital faq", "text/plain")
     source = central.create_source(library_id=docs["id"], name="FAQ", filename="faq.txt", blob_uri=stored.blob_uri,
         sha256=stored.sha256, size_bytes=stored.size_bytes, media_type="text/plain")
-    record_and_approve_source(central, source, "医院 FAQ 来源")
+    record_and_approve_source(central, central_objects, source, "医院 FAQ 来源")
     library = central.create_knowledge_library("医院 FAQ", "qa")
     knowledge_job = central.create_knowledge_job([source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa")
     central.apply_knowledge_output(knowledge_job["id"], "qa", [{"source_knowledge_id": "faq-1",
@@ -961,12 +999,13 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     task = next(item for item in project["tasks"] if item["code"] == "knowledge_qa")
     deployment = bind_institution(central, project["id"], "医院 A", "KM001")
     qa_question_profile = next(item for item in central.list_index_profiles() if item["code"] == "qa-question")
-    deployment_task = central.create_deployment_task(deployment["id"], task["id"], qa_question_profile["id"])
-    central.put_deployment_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
-    central.create_route_version(deployment["id"], central.routing_snapshot(deployment["id"], "test"), status="published")
+    deployment_task = next(item for item in central.list_release_tasks(project["id"])
+                           if item["project_task_id"] == task["id"])
+    central.put_release_route(deployment_task["id"], "KM001", "医院 A", [library["id"]])
+    central.create_route_version(project["id"], central.routing_snapshot(project["id"], "test"), status="frozen")
     other_deployment = bind_institution(central, project["id"], "医院 B", "KM002")
-    other_task = central.create_deployment_task(other_deployment["id"], task["id"], qa_question_profile["id"])
-    central.put_deployment_route(other_task["id"], "KM002", "医院 B", [library["id"]])
+    other_task = deployment_task
+    central.put_release_route(other_task["id"], "KM002", "医院 B", [library["id"]])
     plan = MigrationPlanner(central).plan(
         deployment["id"], [library["id"]], release_stage="test",
     )
@@ -1016,8 +1055,9 @@ def test_signed_seed_export_import_round_trip(tmp_path: Path, monkeypatch):
     with local.sessions() as session:
         imported_version = session.scalar(select(SourceVersion))
         imported_item = session.scalar(select(KnowledgeItem))
-        imported_evidence = session.scalar(select(KnowledgeItemSource))
-        assert imported_version and imported_version.review_status == "approved"
+        imported_evidence = session.scalar(select(KnowledgeEvidence))
+        assert imported_version and imported_version.parse_status == "completed"
+        assert session.get(ParsedDocument, imported_version.current_parsed_document_id)
         assert imported_item and imported_item.review_status == "approved" and imported_item.review_revision == 2
-        assert session.get(SourceReviewSnapshot, imported_version.current_review_snapshot_id)
-        assert imported_evidence and imported_evidence.source_chunk_revision_id and imported_evidence.source_review_snapshot_id
+        assert imported_evidence and imported_evidence.flow_chunk_revision_id
+        assert session.get(FlowChunkReviewSnapshot, imported_evidence.flow_chunk_review_snapshot_id).status == "frozen"

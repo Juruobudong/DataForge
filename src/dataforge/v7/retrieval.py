@@ -112,11 +112,11 @@ class RetrievalDebugService:
         self.milvus_factory = milvus_factory
         self.milvus_resolver = milvus_resolver
 
-    def snapshot(self, deployment_id, release_stage, route_mode, version_no=None):
+    def snapshot(self, project_id, release_stage, route_mode, version_no=None):
         if route_mode == "historical":
             if version_no is None:
                 raise RetrievalError("历史模式必须选择 version_no")
-            version = self.store.route_version_detail(deployment_id, version_no, release_stage)
+            version = self.store.route_version_detail(project_id, version_no, release_stage)
             if version["status"] not in {"frozen", "published"}:
                 raise RetrievalError("只允许选择冻结或发布的历史版本")
             snapshot, number = version["snapshot"], version["version_no"]
@@ -124,20 +124,20 @@ class RetrievalDebugService:
         elif route_mode == "published":
             if version_no is not None:
                 raise RetrievalError("当前发布模式不能指定历史版本号")
-            version = self.store.published_route_version(deployment_id, release_stage=release_stage)
-            snapshot, number, checksum = version.snapshot_json, version.version_no, version.checksum
+            publication = self.store.current_project_publication(project_id, release_stage)
+            snapshot, number, checksum = publication["snapshot"], publication["version_no"], publication["checksum"]
         else:
             if version_no is not None:
                 raise RetrievalError("Draft 模式没有版本号")
-            snapshot, number, checksum = self.store.routing_snapshot(deployment_id, release_stage), None, None
+            snapshot, number, checksum = self.store.routing_snapshot(project_id, release_stage), None, None
         snapshot = deepcopy(snapshot)
-        if snapshot.get("project_deployment", {}).get("id") != deployment_id or snapshot.get("release_stage") != release_stage:
-            raise RetrievalError("RoutingSnapshot 归属或环境不匹配")
+        if snapshot.get("project", {}).get("id") != project_id:
+            raise RetrievalError("RoutingSnapshot 归属不匹配")
         return snapshot, {"route_mode": route_mode, "version_no": number, "checksum": checksum or hashlib.sha256(
             json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
 
-    def options(self, deployment_id, release_stage, route_mode, version_no=None):
-        snapshot, identity = self.snapshot(deployment_id, release_stage, route_mode, version_no)
+    def options(self, project_id, release_stage, route_mode, version_no=None):
+        snapshot, identity = self.snapshot(project_id, release_stage, route_mode, version_no)
         tasks = []
         with self.store.sessions() as session:
             for task in snapshot.get("tasks", []):
@@ -149,13 +149,13 @@ class RetrievalDebugService:
                               "final_top_k": task.get("final_top_k", min(5, task["top_k"])),
                               "reranker_serving_code": task.get("reranker_serving_code"),
                               "filter_fields": filter_fields(contract.schema_json) if contract else {}})
-        return {**identity, "tasks": tasks, "versions": self.store.list_route_versions(deployment_id, release_stage),
+        return {**identity, "tasks": tasks, "versions": self.store.list_route_versions(project_id, release_stage),
                 "rerankers": self.manager.list("reranker")}
 
-    def run(self, deployment_id: str, request: RetrievalDebugRequest, *, instance_mode: str):
+    def run(self, project_id: str, request: RetrievalDebugRequest, *, instance_mode: str):
         if not request.query.strip():
             raise RetrievalError("query 不能为空")
-        snapshot, identity = self.snapshot(deployment_id, request.release_stage, request.route_mode, request.version_no)
+        snapshot, identity = self.snapshot(project_id, request.release_stage, request.route_mode, request.version_no)
         return self.run_resolved(snapshot, identity, request, instance_mode=instance_mode)
 
     def run_resolved(self, snapshot: dict[str, Any], identity: dict[str, Any],
@@ -433,18 +433,18 @@ class PublicRetrievalService:
             "relative_path": source.get("relative_path"),
             "source_version_id": source.get("source_version_id"),
             "source_version_no": source.get("source_version_no"),
-            "source_chunk_id": source.get("source_chunk_id"),
-            "source_chunk_revision_id": source.get("source_chunk_revision_id"),
-            "source_review_snapshot_id": source.get("source_review_snapshot_id"),
+            "flow_chunk_id": source.get("flow_chunk_id"),
+            "flow_chunk_revision_id": source.get("flow_chunk_revision_id"),
+            "flow_chunk_review_snapshot_id": source.get("flow_chunk_review_snapshot_id"),
             "source_anchor": source.get("source_anchor"),
             "anchor": deepcopy(source.get("anchor")),
             "evidence_text": source.get("evidence_text"),
             "is_primary": bool(source.get("is_primary")),
         }
 
-    def query(self, project_code: str, deployment_code: str, release_stage: str,
-              task_code: str, request: PublicRetrievalRequest, *, request_id: str,
-              instance_mode: str, allowed_deployment_id: str | None = None):
+    def _query_with_trace(self, project_code: str, deployment_code: str, release_stage: str,
+                          task_code: str, request: PublicRetrievalRequest, *, request_id: str,
+                          instance_mode: str, allowed_deployment_id: str | None = None):
         snapshot, task, _org, identity = self._published(
             project_code, deployment_code, release_stage, task_code, request.org_code,
             allowed_deployment_id=allowed_deployment_id,
@@ -456,14 +456,13 @@ class PublicRetrievalService:
         result = self.debug_service.run_resolved(
             snapshot, identity, debug_request, instance_mode=instance_mode,
         )
+        result["request_id"] = request_id
         if result["status"] == "blocked":
-            raise PublicRetrievalError(
-                "wrong_execution_site", "机构检索必须在对应机构本地 DataForge 执行", 409,
-            )
+            return None, result, PublicRetrievalError(
+                "wrong_execution_site", "机构检索必须在对应机构本地 DataForge 执行", 409)
         if result["status"] != "completed":
-            raise PublicRetrievalError(
-                "retrieval_unavailable", "公共检索依赖或冻结契约不可用", 503,
-            )
+            return None, result, PublicRetrievalError(
+                "retrieval_unavailable", "公共检索依赖或冻结契约不可用", 503)
         stages = {item["key"]: item for item in result["stages"]}
         final = stages["final"]["data"].get("results", [])
         citations = {item["citation_id"]: item for item in
@@ -490,7 +489,7 @@ class PublicRetrievalService:
                              for source in citation.get("sources", [])],
             })
         context = stages["context"]["data"]
-        return {
+        public = {
             "schema": "dataforge.retrieval-result.v1",
             "contract_version": self.CONTRACT_VERSION,
             "request_id": request_id,
@@ -504,3 +503,26 @@ class PublicRetrievalService:
             },
             "latency_ms": result["latency_ms"],
         }
+        return public, result, None
+
+    def query_with_trace(self, project_code: str, deployment_code: str, release_stage: str,
+                         task_code: str, request: PublicRetrievalRequest, *, request_id: str,
+                         instance_mode: str, allowed_deployment_id: str | None = None):
+        """Admin-only execution result; callers must not expose trace to retrieval tokens."""
+        return self._query_with_trace(
+            project_code, deployment_code, release_stage, task_code, request,
+            request_id=request_id, instance_mode=instance_mode,
+            allowed_deployment_id=allowed_deployment_id,
+        )
+
+    def query(self, project_code: str, deployment_code: str, release_stage: str,
+              task_code: str, request: PublicRetrievalRequest, *, request_id: str,
+              instance_mode: str, allowed_deployment_id: str | None = None):
+        public, _trace, error = self._query_with_trace(
+            project_code, deployment_code, release_stage, task_code, request,
+            request_id=request_id, instance_mode=instance_mode,
+            allowed_deployment_id=allowed_deployment_id,
+        )
+        if error:
+            raise error
+        return public

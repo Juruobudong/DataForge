@@ -70,7 +70,7 @@ def node_role(node: dict[str, Any]) -> str:
         return explicit
     if node.get("kind") == "knowledge_sink":
         return "knowledge_output"
-    if node.get("kind") == "operator" and node.get("ref") == "reviewed-source-chunk-input":
+    if node.get("kind") == "operator" and node.get("ref") == "document-input":
         return "flow_input"
     return "operator"
 
@@ -258,6 +258,12 @@ def _node_ports(node: dict[str, Any], *, direction: str,
         output_key = str(node.get("output_key") or (f"graph:{graph_mode}" if knowledge_type == "graph" and graph_mode else knowledge_type))
         return {"input": {"artifact_type": f"candidate:{output_key}", "cardinality": "one",
                           "required": True, "binding": "edge"}}
+    if node.get("kind") == "execution_gate":
+        artifact_type = "flow_chunk_review_snapshot" if direction == "output" else "candidate_flow_chunk_set"
+        return {"output" if direction == "output" else "input": {
+            "artifact_type": artifact_type, "cardinality": "many" if direction == "output" else "one",
+            "required": direction == "input", "binding": "edge",
+        }}
     if node.get("kind") == "operator":
         item = resolve_operator(catalog, node) or {}
         key = "output_ports" if direction == "output" else "input_ports"
@@ -421,10 +427,6 @@ class FlowCompiler:
             _reject_unknown_operators(child, self.catalog)
             validate_flow_edges(child, catalog=self.catalog, subflows=self.subflows)
             child_nodes, child_edges = self._expand(child, f"{prefix}{node_id}::", stack + (identity,))
-            if code == "knowledge-chunk" and node.get("params"):
-                for child_node in child_nodes:
-                    if child_node.get("ref") == "semantic-chunker":
-                        child_node["params"] = {**dict(child_node.get("params") or {}), **dict(node["params"])}
             entry, exit_node = child.get("entry_node"), child.get("exit_node")
             if not entry or not exit_node:
                 raise FlowValidationError(f"子图 {code} 缺少 entry_node 或 exit_node")
@@ -453,8 +455,8 @@ class FlowCompiler:
         validate_flow_edges(definition, catalog=self.catalog, subflows=self.subflows)
         schema_version = int(definition.get("schema_version", 2))
         purpose = str(definition.get("purpose") or "knowledge")
-        if purpose not in {"knowledge", "source_preparation"}:
-            raise FlowValidationError("Flow purpose 必须是 knowledge 或 source_preparation")
+        if purpose != "knowledge":
+            raise FlowValidationError("Flow purpose 当前必须是 knowledge")
         nodes, edges = self._expand(definition)
         # Recheck actual boundary ports, not just a subflow's declared interface.
         validate_flow_edges({**definition, "nodes": nodes, "edges": edges},
@@ -464,10 +466,12 @@ class FlowCompiler:
         outgoing: dict[str, list[str]] = defaultdict(list)
         for edge in edges:
             source_node, target_node = by_id[edge["source"]], by_id[edge["target"]]
-            if source_node.get("kind") != "operator" or node_role(source_node) == "knowledge_output":
+            if source_node.get("kind") not in {"operator", "execution_gate"} or node_role(source_node) == "knowledge_output":
                 raise FlowValidationError(f"节点 {edge['source']} 不能作为边的起点")
             source_item = resolve_operator(self.catalog, source_node) or {}
-            source_ports = source_item.get("output_ports") or {"output": {"artifact_type": source_item.get("output")}}
+            source_ports = (_node_ports(source_node, direction="output", catalog=self.catalog, subflows=self.subflows)
+                            if source_node.get("kind") == "execution_gate"
+                            else source_item.get("output_ports") or {"output": {"artifact_type": source_item.get("output")}})
             if edge["source_port"] not in source_ports:
                 raise FlowValidationError(f"节点 {edge['source']} 不存在输出端口 {edge['source_port']}")
             if target_node.get("kind") == "knowledge_sink":
@@ -476,6 +480,8 @@ class FlowCompiler:
             elif target_node.get("kind") == "operator":
                 target_item = resolve_operator(self.catalog, target_node) or {}
                 target_ports = target_item.get("input_ports") or {"input": {"artifact_type": target_item.get("input"), "cardinality": "one"}}
+            elif target_node.get("kind") == "execution_gate":
+                target_ports = _node_ports(target_node, direction="input", catalog=self.catalog, subflows=self.subflows)
             else:
                 raise FlowValidationError(f"展开后仍存在不支持的节点类型：{target_node.get('kind')}")
             if edge["target_port"] not in target_ports:
@@ -527,6 +533,18 @@ class FlowCompiler:
                 sink_types[node_id] = output_key; outputs[node_id] = f"knowledge_item:{output_key}"
                 dependencies.append({"kind": "knowledge_type", "code": knowledge_type, "revision": self.type_revisions[knowledge_type]})
                 continue
+            if kind == "execution_gate":
+                if node.get("gate_type") != "flow_chunk_review" or len(incoming[node_id]) != 1:
+                    raise FlowValidationError(f"Execution Gate {node_id} 必须是单输入 FlowChunk Review Gate")
+                source_types = [outputs[source] for source in incoming[node_id]]
+                if source_types != ["candidate_flow_chunk_set"]:
+                    raise FlowValidationError(f"Execution Gate {node_id} 需要 candidate_flow_chunk_set")
+                node["node_role"] = "execution_gate"
+                node["resolved_input_type"] = "candidate_flow_chunk_set"
+                node["resolved_output_type"] = "flow_chunk_review_snapshot"
+                outputs[node_id] = "flow_chunk_review_snapshot"
+                dependencies.append({"kind": "execution_gate", "code": "flow_chunk_review"})
+                continue
             if kind != "operator":
                 raise FlowValidationError(f"不支持的节点类型：{kind}")
             code = str(node.get("ref", "")); item = resolve_operator(self.catalog, node)
@@ -557,11 +575,6 @@ class FlowCompiler:
             if not isinstance(params, dict):
                 raise FlowValidationError(f"节点 {node_id} 参数必须是对象")
             from .operator_parameters import validate_parameters, FlowParameterError
-            parser_keys = set(params) - {"knowledge_type", "graph_mode"}
-            if code == "document-parser" and parser_keys:
-                raise FlowParameterError("PARAMETER_SCHEMA_INVALID",
-                    f"节点 {node_id} 的 Document Parser 当前不接受参数 {sorted(parser_keys)[0]}；"
-                    "PDF 固定使用 MinerU backend=pipeline、parse_method=auto", node_id=node_id, field=sorted(parser_keys)[0])
             contexts = _reachable_sink_contexts(node_id, by_id, outgoing)
             system = {}
             if len(contexts) == 1:
@@ -604,7 +617,7 @@ class FlowCompiler:
                 if not isinstance(instructions, str):
                     raise FlowValidationError("QA 提取要求必须是字符串")
                 params["extraction_instructions"] = instructions.strip() or DEFAULT_QA_EXTRACTION_INSTRUCTIONS
-            if code == "semantic-chunker":
+            if code == "document-chunker":
                 try:
                     params = normalize_chunker_params(params)
                 except ValueError as exc:
@@ -671,17 +684,8 @@ class FlowCompiler:
         if purpose == "knowledge":
             if not sink_types:
                 raise FlowValidationError("Flow 至少需要一个 Knowledge Sink")
-            if root_refs != {"reviewed-source-chunk-input"}:
-                raise FlowValidationError("知识流程必须且只能从 Reviewed SourceChunk Input 开始")
-            if {"document-parser", "source-chunk-builder"} & node_refs:
-                raise FlowValidationError("知识流程不得重新解析或构建 SourceChunk")
-        else:
-            if sink_types:
-                raise FlowValidationError("Source Preparation 不允许 Knowledge Sink")
-            if root_refs != {"document-parser"}:
-                raise FlowValidationError("Source Preparation 必须从 Document Parser 开始")
-            if len(non_sink_terminals) != 1 or outputs.get(non_sink_terminals[0]) != "source_chunk_set":
-                raise FlowValidationError("Source Preparation 必须且只能以 SourceChunk 结束")
+            if root_refs != {"document-input"}:
+                raise FlowValidationError("知识流程必须且只能从 Document Input 开始")
         compiled = {"schema_version": 3, "purpose": purpose, "nodes": [by_id[node_id] for node_id in ordered], "edges": edges, "sink_types": sink_types}
         compiled["subflow_revisions"] = [value for value in dependencies if value["kind"] == "subflow_revision"]
         if definition.get("graph_config") is not None:

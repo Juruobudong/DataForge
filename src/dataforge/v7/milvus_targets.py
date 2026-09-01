@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from sqlalchemy import select
 
-from .models import DataForgeInstance, DeploymentTarget, MilvusTarget, MilvusTargetRevision, ProjectDeployment, utc_now
+from .models import DataForgeInstance, InstanceReleaseTarget, MilvusTarget, MilvusTargetRevision, ProjectDeployment, utc_now
 from .secret_codec import ConfigCipher
 from .store import V7Store
 from .vector import V7Milvus
@@ -116,18 +116,18 @@ class MilvusConnectionResolver:
         if release_stage not in {"test", "production"}:
             raise ValueError("release_stage 只允许 test 或 production")
         with self.store.sessions() as session:
-            binding = session.get(ProjectDeployment, boundary_id)
-            deployment_id = binding.deployment_id if binding else boundary_id
+            instance = session.scalar(select(DataForgeInstance).where(
+                DataForgeInstance.instance_mode == "central",
+            ))
             revision = session.scalar(select(MilvusTargetRevision).join(
-                DeploymentTarget,
-                DeploymentTarget.milvus_target_revision_id == MilvusTargetRevision.id,
+                InstanceReleaseTarget,
+                InstanceReleaseTarget.milvus_target_revision_id == MilvusTargetRevision.id,
             ).where(
-                DeploymentTarget.deployment_id == deployment_id,
-                DeploymentTarget.release_stage == release_stage,
-                DeploymentTarget.target_kind == "milvus",
+                InstanceReleaseTarget.dataforge_instance_id == (instance.id if instance else ""),
+                InstanceReleaseTarget.release_stage == release_stage,
             ))
             if not revision:
-                raise ValueError(f"Deployment 尚未配置 verified {release_stage} Milvus Target")
+                raise ValueError(f"中心实例尚未配置 verified {release_stage} Milvus Target")
             return self._resolved(revision)
 
     def snapshot(self, snapshot: dict[str, Any]) -> ResolvedMilvusConnection:

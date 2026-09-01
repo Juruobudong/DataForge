@@ -115,11 +115,11 @@ it.each([false, true])('honors semantic preflight valid=%s and displays node-lev
 it('waits for all business input selections before automatically preflighting again', async () => {
   await prepareRun({ options: {
     revision: { id: 'rev', status: 'draft' },
-    review_inputs: [{ source_review_snapshot_id: 'review', document_library_id: 'docs', filename: '审核文档' }],
+    review_inputs: [{ flow_chunk_review_snapshot_id: 'review', document_library_id: 'docs', filename: '审核文档' }],
     sink_requirements: [{ output_key: 'text' }],
     sink_options: { text: [{ id: 'library', name: '文本知识库' }] },
   } })
-  await wrapper.get('input[value="source_review_snapshot"]').setValue(); await flushPromises()
+  await wrapper.get('input[value="flow_chunk_review_snapshot"]').setValue(); await flushPromises()
   expect(wrapper.find('.drawer .success').exists()).toBe(false)
   expect(api.debugRunPreflight).toHaveBeenCalledTimes(1)
   await wrapper.get('.review-option input').setValue(true); await flushPromises()
@@ -127,7 +127,7 @@ it('waits for all business input selections before automatically preflighting ag
   await wrapper.findAll('.drawer select')[1].setValue('library'); await flushPromises()
   expect(api.debugRunPreflight).toHaveBeenCalledTimes(2)
   expect(api.debugRunPreflight).toHaveBeenLastCalledWith(expect.objectContaining({
-    input_source: 'source_review_snapshot', source_review_snapshot_ids: ['review'], sink_library_bindings: { text: 'library' },
+    input_source: 'flow_chunk_review_snapshot', flow_chunk_review_snapshot_ids: ['review'], sink_library_bindings: { text: 'library' },
   }))
   await wrapper.get('.review-option input').setValue(false); await flushPromises()
   expect(wrapper.find('.drawer .success').exists()).toBe(false)
@@ -149,7 +149,7 @@ it.each(['success', 'error'])('ignores a stale preflight %s after changing sampl
   expect(wrapper.get('.drawer [role="status"]').text()).toBe('正在运行预检…')
   expect(wrapper.text()).not.toContain('过期')
   resolveNew({ valid: true, issues: [], input_count: 2, output_keys: ['text'] }); await flushPromises()
-  expect(wrapper.get('.drawer .success').text()).toContain('2 个文档块')
+  expect(wrapper.get('.drawer .success').text()).toContain('2 个 FlowChunk')
   expect(api.debugRunPreflight).toHaveBeenLastCalledWith(expect.objectContaining({ sample_code: 'two' }))
 })
 
@@ -175,7 +175,7 @@ it.each(['options', 'preflight'])('ignores late %s after closing and reopening p
   await clickButton('准备运行')
   resolveOld(phase === 'options' ? { revision: { id: 'stale-rev' } } : { valid: true, issues: [], input_count: 99, output_keys: ['stale'] })
   await flushPromises()
-  expect(wrapper.get('.drawer .success').text()).toContain('1 个文档块')
+  expect(wrapper.get('.drawer .success').text()).toContain('1 个 FlowChunk')
   expect(wrapper.text()).not.toContain('stale')
   expect(api.debugRunPreflight).toHaveBeenCalledTimes(phase === 'options' ? 1 : 2)
   expect(api.createDebugRun).not.toHaveBeenCalled()

@@ -123,8 +123,8 @@ describe('reusable subflow production and consumption', () => {
     expect(definition.nodes.at(-1)).toMatchObject({ kind: 'knowledge_sink', output_key: 'text' })
     expect(definition.edges).toEqual([{ source: 'quality-node', source_port: 'output', target: expect.stringMatching(/^sink-text-/), target_port: 'input' }])
   })
-  it('searches subflows, selects old published versions and excludes preparation from insertion', async () => {
-    wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset, { ...asset, id: 'prepare', name: '文档预处理', usage: 'source_preparation' }] } })
+  it('searches subflows and selects old published versions', async () => {
+    wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset] } })
     expect(wrapper.findAll('.subflow-item')).toHaveLength(1)
     await wrapper.get('input').setValue('quality-flow')
     await wrapper.findAll('.subflow-item select')[0].setValue('r1')

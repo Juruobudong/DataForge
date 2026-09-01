@@ -4,10 +4,33 @@ import PromptRevisionSelector from './PromptRevisionSelector.vue'
 import QualityProfileSelector from './QualityProfileSelector.vue'
 import EntityTypeEditor from '../../graph/EntityTypeEditor.vue'
 import FilterRulesEditor from './FilterRulesEditor.vue'
+import { computed, watch } from 'vue'
 
 const props = defineProps({ schema: { type: Object, default: () => ({}) }, modelValue: { type: Object, default: () => ({}) }, entityTypes: { type: Array, default: () => [] }, evaluationNodes: { type: Array, default: () => [] }, deduplicationNodes: { type: Array, default: () => [] }, disabled: Boolean })
 const emit = defineEmits(['update:modelValue'])
 const widget = spec => spec?.['x-dataforge-ui']?.widget || ''
+const ui = spec => spec?.['x-dataforge-ui'] || {}
+function matches(condition) {
+  return Object.entries(condition || {}).every(([name, expected]) => {
+    const allowed = Array.isArray(expected) ? expected : [expected]
+    return allowed.includes(props.modelValue[name])
+  })
+}
+function runtimeSupported(spec) { return ui(spec).supported_by_runtime !== false }
+function visible(spec) { return runtimeSupported(spec) && matches(ui(spec).visible_if) }
+function enabled(spec) { return runtimeSupported(spec) && matches(ui(spec).enabled_if) }
+function enumValues(spec) {
+  const supported = ui(spec).supported_by_runtime
+  return Array.isArray(supported) ? (spec.enum || []).filter(value => supported.includes(value)) : spec.enum || []
+}
+const displayedProperties = computed(() => Object.fromEntries(
+  Object.entries(props.schema.properties || {}).filter(([, spec]) => visible(spec)),
+))
+watch(() => [props.schema, props.modelValue], () => {
+  const allowed = new Set(Object.entries(props.schema.properties || {}).filter(([, spec]) => visible(spec)).map(([name]) => name))
+  const next = Object.fromEntries(Object.entries(props.modelValue).filter(([name]) => allowed.has(name)))
+  if (JSON.stringify(next) !== JSON.stringify(props.modelValue)) emit('update:modelValue', next)
+}, { deep: true, immediate: true })
 function patch(name, value) { emit('update:modelValue', { ...props.modelValue, [name]: value }) }
 function scalar(name, spec, event) {
   const raw = event.target.type === 'checkbox' ? event.target.checked : event.target.value
@@ -28,7 +51,7 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
 
 <template>
   <div class="parameter-form">
-    <template v-for="(spec,name) in schema.properties || {}" :key="name">
+    <template v-for="(spec,name) in displayedProperties" :key="name">
       <template v-if="widget(spec)==='hidden'"></template>
       <section v-else-if="widget(spec)==='extraction-instructions'" class="extraction-instructions">
         <label>{{ spec.title }}<textarea :aria-label="spec.title" rows="6" :value="modelValue[name] ?? ''" :disabled="disabled" placeholder="例如：只抽取原文明示的内容，不推断原文未提到的信息。" @input="patch(name,$event.target.value)"></textarea></label>
@@ -49,11 +72,11 @@ function allEntities() { return (props.modelValue.entity_type_scope || (props.mo
       <QualityProfileSelector v-else-if="widget(spec)==='quality-profile-selector'" :model-value="modelValue[name] ?? spec.default ?? ''" :knowledge-type="modelValue.knowledge_type || ''" :disabled="disabled" @update:model-value="patch(name,$event)" />
       <section v-else-if="widget(spec)==='relation-constraints'" class="constraints"><b>{{ spec.title || name }}</b><article v-for="(item,index) in constraints(name)" :key="index"><input :value="item.relation_type" placeholder="关系类型" :disabled="disabled" @input="updateConstraint(name,index,'relation_type',$event.target.value)"><input :value="(item.source_types || []).join(', ')" placeholder="来源实体类型，逗号分隔" :disabled="disabled" @input="updateConstraint(name,index,'source_types',$event.target.value)"><input :value="(item.target_types || []).join(', ')" placeholder="目标实体类型，逗号分隔" :disabled="disabled" @input="updateConstraint(name,index,'target_types',$event.target.value)"><button v-if="!disabled" type="button" @click="removeConstraint(name,index)">删除</button></article><button v-if="!disabled" type="button" @click="addConstraint(name)">＋ 添加关系约束</button></section>
       <label v-else>{{ spec.title || name }}
-        <select v-if="spec.enum" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @change="patch(name,$event.target.value)"><option v-for="choice in spec.enum" :key="choice" :value="choice">{{ choice }}</option></select>
-        <input v-else-if="spec.type==='boolean'" type="checkbox" :checked="Boolean(modelValue[name] ?? spec.default)" :disabled="disabled" @change="scalar(name,spec,$event)">
-        <input v-else-if="spec.type==='array'" :value="(modelValue[name] || []).join(', ')" placeholder="逗号分隔" :disabled="disabled" @input="tags(name,$event)">
-        <textarea v-else-if="widget(spec)==='textarea'" :aria-label="spec.title || name" rows="5" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @input="scalar(name,spec,$event)"></textarea>
-        <input v-else :type="spec.type==='number' || spec.type==='integer' ? 'number' : 'text'" :min="spec.minimum" :max="spec.maximum" :step="spec.type==='number' ? '0.01' : '1'" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled" @input="scalar(name,spec,$event)">
+        <select v-if="spec.enum" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled || !enabled(spec)" @change="patch(name,$event.target.value)"><option v-for="choice in enumValues(spec)" :key="choice" :value="choice">{{ choice }}</option></select>
+        <input v-else-if="spec.type==='boolean'" type="checkbox" :checked="Boolean(modelValue[name] ?? spec.default)" :disabled="disabled || !enabled(spec)" @change="scalar(name,spec,$event)">
+        <input v-else-if="spec.type==='array'" :value="(modelValue[name] || []).join(', ')" placeholder="逗号分隔" :disabled="disabled || !enabled(spec)" @input="tags(name,$event)">
+        <textarea v-else-if="widget(spec)==='textarea'" :aria-label="spec.title || name" rows="5" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled || !enabled(spec)" @input="scalar(name,spec,$event)"></textarea>
+        <input v-else :type="spec.type==='number' || spec.type==='integer' ? 'number' : 'text'" :min="spec.minimum" :max="spec.maximum" :step="spec.type==='number' ? '0.01' : '1'" :value="modelValue[name] ?? spec.default ?? ''" :disabled="disabled || !enabled(spec)" @input="scalar(name,spec,$event)">
         <small v-if="spec.description">{{ spec.description }}</small>
       </label>
     </template>

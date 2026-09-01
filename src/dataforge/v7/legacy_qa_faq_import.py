@@ -323,12 +323,19 @@ def ensure_faq_template(store: V7Store) -> dict[str, Any]:
     expected = faq_template_definition()
     with store.sessions() as session:
         template = session.scalar(select(KnowledgeFlowTemplate).where(KnowledgeFlowTemplate.code == FAQ_TEMPLATE_CODE))
+        normalized_expected = store._compile_template_definition(
+            session,
+            expected,
+            [FAQ_TYPE_CODE],
+            purpose="knowledge",
+            authoring_mode="advanced",
+        )["definition"] if template else expected
     if not template:
         created = store.create_flow_template(FAQ_TEMPLATE_CODE, "qa_agent FAQ 结构化文件", [FAQ_TYPE_CODE], expected)
         template_id = created["id"]
         return store.publish_flow_template(template_id)
     current = next(item for item in store.list_flow_templates() if item["id"] == template.id)
-    if current["definition"] != expected:
+    if current["definition"] != normalized_expected:
         raise ValueError("qa-agent-faq-structured 模板已存在但定义不一致")
     if current["status"] != "active" or current["revision_status"] != "published":
         return store.publish_flow_template(template.id)

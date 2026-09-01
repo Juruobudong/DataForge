@@ -8,6 +8,11 @@ cd "$PROJECT_ROOT"
 COMPOSE_FILE="${COMPOSE_FILE:-compose.yaml}"
 ENV_FILE="${ENV_FILE:-.env.docker}"
 EXECUTE=0
+
+# compose.yaml 含内网地址、不入库；全新 clone 回退到脱敏模板。
+if [[ ! -f "$COMPOSE_FILE" && -f compose.example.yaml ]]; then
+  COMPOSE_FILE="compose.example.yaml"
+fi
 CONFIRM=""
 
 usage() {

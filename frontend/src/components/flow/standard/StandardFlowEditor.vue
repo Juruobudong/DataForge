@@ -47,7 +47,14 @@ function updateStage(stageCode, value) { stageConfig.value.stages[stageCode] = {
     <template v-for="(stage, index) in stages" :key="stage.code">
       <span v-if="index" class="arrow">↓</span>
       <article class="business-stage" :data-stage="stage.code"><span class="number">{{ index + 1 }}</span><div class="stage-content">
-        <template v-if="stage.code === 'input'"><h3>输入</h3><b>已审核文档块</b><p>正式运行由 SourceReviewSnapshot 自动注入；开发预览默认使用 DataForge 内置示例审核数据。</p><span class="badge blue">运行时绑定</span></template>
+        <template v-if="stage.code === 'input'"><h3>输入</h3><b>已解析文档</b><p>正式运行注入不可变 ParsedDocument；文档切分和输入审核由后续流程阶段完成。</p><span class="badge blue">运行时绑定</span></template>
+        <template v-else-if="stage.code === 'chunking'">
+          <h3>文档切分</h3>
+          <p>按当前流程版本的切分参数，将 ParsedDocument 生成可审核的 FlowChunkSet。</p>
+          <p v-for="operator in stage.operators || []" :key="operator.node_id" class="stage-operator"><b>{{ operatorPrimaryName(operator) }}</b><small>{{ operatorSubtitle(operator) }}</small></p>
+          <div v-if="stage.configurable && stage.config_schema" class="config-sections"><section><h4>{{ stage.name || '切分参数' }}</h4><OperatorParameterForm :key="`${managedCode}:${template?.id || 'new'}:chunking`" :schema="stage.config_schema" :model-value="configOf(stage.code)" @update:model-value="updateStage(stage.code,$event)" /></section></div>
+        </template>
+        <template v-else-if="stage.code === 'input_review'"><h3>自动冻结输入</h3><b>Flow 输入快照门禁</b><p>系统复验已批准 ParsedDocument，将当前分块冻结为不可变 Snapshot 后自动继续。</p><span class="badge blue">系统执行</span></template>
         <template v-else-if="stage.code === 'mapping'"><h3>文本知识映射</h3><p>审核正文直接映射为文本知识，保留原文和来源，不调用模型。</p></template>
         <template v-else-if="stage.code === 'generation'">
           <h3>知识生成</h3>
@@ -58,6 +65,7 @@ function updateStage(stageCode, value) { stageConfig.value.stages[stageCode] = {
         </template>
         <template v-else-if="stage.code === 'quality'"><h3>图谱校验</h3><div class="checks"><span>✓ Graph Schema</span><span>✓ Graph Quality</span></div><p>仅校验图谱分支的实体、关系和 Evidence；硬失败阻止该分支提交。</p></template>
         <template v-else-if="stage.code === 'submit'"><h3>输出知识</h3><div class="outputs"><section v-for="item in managedTemplate?.output_types || []" :key="item"><b>{{ runtimeArtifactLabel(`candidate:${item}`) }}</b><span>Knowledge Sink · 正式知识提交</span></section></div><p>Sink 统一保证 Schema、审核血缘、来源绑定、Diff 和事务提交。输出类型由固定模板维护，不绑定具体 KnowledgeLibrary。</p></template>
+        <template v-else><h3>{{ stage.name || stage.code }}</h3><p>该业务阶段由固定模板维护，请在“技术流程”中查看实际算子。</p></template>
       </div></article>
     </template>
     </template>

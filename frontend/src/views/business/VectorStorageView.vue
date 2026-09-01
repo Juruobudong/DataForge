@@ -1,13 +1,17 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
+import StorageProfileGovernance from '../../components/governance/StorageProfileGovernance.vue'
 import {
   defaultVectorStorageFilters, formatInventoryCount, knowledgeTypeLabel, sortCollections, sortPartitions,
   vectorStatusClass, vectorStatusLabel,
 } from './vectorStorageModel'
 
 const router = useRouter()
+const route = useRoute()
+const activeTab = computed(() => route.query.tab === 'profiles' ? 'profiles' : 'assets')
+const initialKnowledgeType = computed(() => String(route.query.knowledge_type || ''))
 const overview = ref(null), collections = ref([]), collectionDetails = reactive({})
 const expanded = ref(new Set()), loading = ref(false), error = ref(''), notice = ref('')
 const filters = reactive(defaultVectorStorageFilters())
@@ -83,6 +87,11 @@ async function submitGc() {
     await refresh()
   } catch (err) { error.value = err.message }
 }
+function switchTab(tab) {
+  if (tab === activeTab.value) return
+  router.push({ path: '/business/vector-storage', query: tab === 'profiles' ? { tab: 'profiles' } : {} })
+  if (tab === 'assets' && !overview.value) refresh()
+}
 function onDrawerKeydown(event) {
   if (event.key === 'Escape') { event.preventDefault(); closeDrawer(); return }
   if (event.key !== 'Tab') return
@@ -92,14 +101,17 @@ function onDrawerKeydown(event) {
   if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
 }
-onMounted(refresh)
+onMounted(() => { if (activeTab.value === 'assets') refresh() })
 </script>
 
 <template>
   <section class="vector-storage-page">
-    <div class="page-head"><div><h2>向量存储</h2><p>查看逻辑知识资产与 Milvus Collection / Partition 的实时关系，并执行受控运维。</p></div><div class="page-actions"><button @click="openGc">清理历史资产</button><button class="primary" :disabled="loading" @click="refresh">{{ loading ? '刷新中…' : '刷新' }}</button></div></div>
+    <div class="page-head"><div><h2>向量存储</h2><p>{{ activeTab === 'assets' ? '查看逻辑知识资产与 Milvus Collection / Partition 的实时关系，并执行受控运维。' : '维护 Index Profile、Storage Contract、Managed Collection 与 Embedding 绑定。' }}</p></div><div v-if="activeTab==='assets'" class="page-actions"><button @click="openGc">清理历史资产</button><button class="primary" :disabled="loading" @click="refresh">{{ loading ? '刷新中…' : '刷新' }}</button></div></div>
+    <nav class="page-tabs" aria-label="向量存储页面"><button :class="{active:activeTab==='assets'}" @click="switchTab('assets')">向量资产</button><button :class="{active:activeTab==='profiles'}" @click="switchTab('profiles')">Storage Profile（高级治理）</button></nav>
+    <StorageProfileGovernance v-if="activeTab === 'profiles'" :initial-knowledge-type="initialKnowledgeType" />
+    <template v-else>
 
-    <section v-if="overview" class="vector-overview panel">
+      <section v-if="overview" class="vector-overview panel">
       <div><small>Milvus Target</small><b><code>{{ overview.target || '未配置' }}</code></b></div>
       <div><small>连接状态</small><b><span :class="['badge', overview.healthy ? 'green' : 'red']">{{ overview.healthy ? '● 正常' : '● 不可用' }}</span></b></div>
       <div><small>Managed Collection</small><b>{{ overview.managed_collection_count }}</b></div>
@@ -146,10 +158,11 @@ onMounted(refresh)
       </aside>
     </div>
 
-    <div v-if="gcOpen" class="menu-dialog-backdrop" @click.self="gcOpen=false"><section class="gc-dialog panel" role="dialog" aria-modal="true"><h3>清理可回收历史 Asset</h3><p>当前清单包含 {{ gcPlan?.eligible?.length || 0 }} 个 AssetVersion。任务提交后由现有 GC Worker 再次复验并删除对应版本化 Partition。</p><div class="gc-list"><code v-for="item in gcPlan?.eligible" :key="item.asset_version_id">{{ item.collection_name }}/{{ item.partition_name }}</code></div><label><input v-model="gcConfirmed" type="checkbox"> 我已核对当前全部 eligible 清单</label><div class="actions"><button @click="gcOpen=false">取消</button><button class="danger" :disabled="!gcConfirmed || !gcPlan?.eligible?.length" @click="submitGc">提交 GC 任务</button></div></section></div>
+      <div v-if="gcOpen" class="menu-dialog-backdrop" @click.self="gcOpen=false"><section class="gc-dialog panel" role="dialog" aria-modal="true"><h3>清理可回收历史 Asset</h3><p>当前清单包含 {{ gcPlan?.eligible?.length || 0 }} 个 AssetVersion。任务提交后由现有 GC Worker 再次复验并删除对应版本化 Partition。</p><div class="gc-list"><code v-for="item in gcPlan?.eligible" :key="item.asset_version_id">{{ item.collection_name }}/{{ item.partition_name }}</code></div><label><input v-model="gcConfirmed" type="checkbox"> 我已核对当前全部 eligible 清单</label><div class="actions"><button @click="gcOpen=false">取消</button><button class="danger" :disabled="!gcConfirmed || !gcPlan?.eligible?.length" @click="submitGc">提交 GC 任务</button></div></section></div>
+    </template>
   </section>
 </template>
 
 <style scoped>
-.vector-storage-page{display:grid;gap:18px}.vector-overview{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px}.vector-overview>div{display:grid;gap:7px;padding:12px;border-radius:10px;background:var(--panel-muted)}.vector-overview small{color:var(--muted)}.vector-overview b{font-size:18px}.vector-overview code{font-size:12px}.vector-filters{display:grid;grid-template-columns:minmax(260px,2fr) repeat(2,minmax(150px,1fr)) repeat(4,auto);align-items:end;gap:10px}.vector-filters label{display:grid;gap:6px;color:var(--muted);font-size:12px}.vector-filters .check{display:flex;align-items:center;align-self:center;gap:6px;color:var(--text)}.vector-collection-table{min-width:1080px}.expand-button{width:30px;min-height:30px;padding:0}.partition-container>td{padding:12px;background:#f8faff}.partition-table{min-width:960px}.text-link{padding:0;border:0;background:transparent;color:var(--blue);font-weight:750}.drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.vector-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(590px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.vector-drawer>header{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}.vector-drawer h3{margin:4px 0 0}.route-reference{display:grid;gap:4px;padding:10px 0;border-top:1px solid var(--border)}.route-reference:first-of-type{border-top:0}.route-reference span,.route-reference small{color:var(--muted)}.gc-dialog{width:min(680px,calc(100vw - 40px));max-height:80vh;overflow:auto}.gc-list{display:grid;gap:5px;max-height:280px;overflow:auto;margin:14px 0;padding:12px;background:var(--panel-muted)}@media(max-width:1500px){.vector-overview{grid-template-columns:repeat(4,minmax(0,1fr))}.vector-filters{grid-template-columns:2fr 1fr 1fr}}
+.vector-storage-page{display:grid;gap:18px}.page-tabs{display:flex;gap:4px;border-bottom:1px solid var(--border)}.page-tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.page-tabs button.active{border-bottom-color:var(--blue);color:var(--blue)}.vector-overview{display:grid;grid-template-columns:repeat(8,minmax(120px,1fr));gap:10px}.vector-overview>div{display:grid;gap:7px;padding:12px;border-radius:10px;background:var(--panel-muted)}.vector-overview small{color:var(--muted)}.vector-overview b{font-size:18px}.vector-overview code{font-size:12px}.vector-filters{display:grid;grid-template-columns:minmax(260px,2fr) repeat(2,minmax(150px,1fr)) repeat(4,auto);align-items:end;gap:10px}.vector-filters label{display:grid;gap:6px;color:var(--muted);font-size:12px}.vector-filters .check{display:flex;align-items:center;align-self:center;gap:6px;color:var(--text)}.vector-collection-table{min-width:1080px}.expand-button{width:30px;min-height:30px;padding:0}.partition-container>td{padding:12px;background:#f8faff}.partition-table{min-width:960px}.text-link{padding:0;border:0;background:transparent;color:var(--blue);font-weight:750}.drawer-backdrop{position:fixed;z-index:70;inset:0;background:rgba(15,23,42,.38)}.vector-drawer{position:absolute;top:0;right:0;bottom:0;display:grid;width:min(590px,100%);grid-template-rows:auto minmax(0,1fr);background:var(--panel);box-shadow:-18px 0 48px rgba(15,23,42,.18)}.vector-drawer>header{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}.vector-drawer h3{margin:4px 0 0}.route-reference{display:grid;gap:4px;padding:10px 0;border-top:1px solid var(--border)}.route-reference:first-of-type{border-top:0}.route-reference span,.route-reference small{color:var(--muted)}.gc-dialog{width:min(680px,calc(100vw - 40px));max-height:80vh;overflow:auto}.gc-list{display:grid;gap:5px;max-height:280px;overflow:auto;margin:14px 0;padding:12px;background:var(--panel-muted)}@media(max-width:1500px){.vector-overview{grid-template-columns:repeat(4,minmax(0,1fr))}.vector-filters{grid-template-columns:2fr 1fr 1fr}}
 </style>

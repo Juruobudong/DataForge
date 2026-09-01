@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import threading
+import uuid
 import time
 import unicodedata
 from copy import deepcopy
@@ -39,6 +40,9 @@ from .graph_schema import GraphExtractionConfig, normalize_graph_config
 from .llm_serving import DEFAULT_LLM_SERVING_ID, configure_llm_serving_registry, get_llm_serving_registry
 from .models import KnowledgeJob, Source, SourceVersion
 from .parser_runtime import content_list_blocks, parse_with_mineru
+from .parsed_document import (
+    html_to_markdown, markdown_from_blocks, persist_content, read_anchors, read_content, table_v1,
+)
 from .source_anchor import finalize_source_blocks, sort_positions
 from .storage import LocalObjectStore, MinioObjectStore
 from .store import V7Store
@@ -50,7 +54,7 @@ logger = logging.getLogger("dataforge.v7.runner")
 
 class RunRequest(BaseModel):
     job_id: str | None = None
-    source_preparation_job_id: str | None = None
+    parse_job_id: str | None = None
     flow_run_id: str | None = None
     lease_owner: str | None = None
 
@@ -105,6 +109,10 @@ def _native_source_blocks(filename: str, payload: bytes) -> tuple[str, list[dict
     if suffix in {".txt", ".md"}:
         text, blocks = _text_blocks(_decode_utf8(payload, filename), suffix.removeprefix("."))
         return text, blocks, suffix.removeprefix(".")
+    if suffix in {".html", ".htm"}:
+        text = html_to_markdown(payload)
+        text, blocks = _text_blocks(text, "html")
+        return text, blocks, "html"
     if suffix == ".csv":
         reader = csv.reader(io.StringIO(_decode_utf8(payload, filename), newline=""))
         raw, previous_line = [], 0
@@ -248,8 +256,10 @@ def _boundary_units(text: str, delimiters: list[str]) -> list[dict[str, Any]]:
 def split_document_text(text: str, raw_params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     params = normalize_chunker_params(raw_params)
     target = params["chunk_size"]
-    minimum = params["min_chunk_size"]
-    units = _boundary_units(text, params["delimiters"])
+    minimum = max(1, min(target, int(params.get("min_chunk_size") or target // 4)))
+    delimiters = params.get("delimiters") or (["\n\n", "。", "！", "？", ". ", "! ", "? "]
+                                              if params["split_method"] == "sentence" else ["\n\n", "\n", "。", ". "])
+    units = _boundary_units(text, delimiters)
     expanded: list[dict[str, Any]] = []
     for unit in units:
         value = unit["text"]
@@ -264,7 +274,7 @@ def split_document_text(text: str, raw_params: dict[str, Any] | None = None) -> 
     chunks: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
     current_size = 0
-    overlap_target = round(target * params["overlap_percent"] / 100)
+    overlap_target = int(params["chunk_overlap"])
 
     def flush() -> None:
         nonlocal current, current_size
@@ -279,7 +289,7 @@ def split_document_text(text: str, raw_params: dict[str, Any] | None = None) -> 
                 "char_start": current[0]["start"],
                 "char_end": current[-1]["end"],
                 "hard_cut": any(item.get("hard_cut") for item in current),
-                "heading_context": heading if params["include_heading"] else "",
+                "heading_context": heading if params.get("include_heading", True) else "",
                 "overlap_chars": max(0, sum(len(item["text"]) for item in current if item.get("overlap"))),
             })
         overlap: list[dict[str, Any]] = []
@@ -338,7 +348,7 @@ def split_document_blocks(document: dict[str, Any], raw_params: dict[str, Any] |
     if not blocks:
         return split_document_text(str(document.get("text") or ""), params)
     groups: list[list[dict[str, Any]]] = []
-    if params["preserve_page_boundary"] and document.get("source_type") == "pdf":
+    if params.get("preserve_page_boundary", False) and document.get("source_type") == "pdf":
         for block in blocks:
             if not groups or groups[-1][0].get("page_index") != block.get("page_index"):
                 groups.append([])
@@ -455,9 +465,9 @@ SAMPLE_DOCUMENTS = {
 
 def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], index: int) -> dict[str, Any]:
     content = str(value.get("content") or value.get("text") or value.get("canonical_content") or "示例知识")
-    source_chunk_id = str(value.get("source_chunk_id") or f"preview-chunk-{index + 1}")
+    flow_chunk_id = str(value.get("flow_chunk_id") or f"preview-chunk-{index + 1}")
     common = {
-        "source_knowledge_id": f"preview-{ref}-{index + 1}", "source_chunk_id": source_chunk_id,
+        "source_knowledge_id": f"preview-{ref}-{index + 1}", "flow_chunk_id": flow_chunk_id,
         "source_version_ids": [str(value.get("source_version_id") or "preview-version")],
         "source_anchor": f"{value.get('filename', '样例文档')}#chunk-{value.get('chunk_index', index)}",
         "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
@@ -480,7 +490,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
 
 def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], root_documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Execute a deterministic, side-effect-free operator approximation for developer preview."""
-    if ref in {"document-parser", "reviewed-source-chunk-input"}:
+    if ref == "document-input":
         return [dict(value) for value in root_documents]
     if ref in {"document-ir-normalizer", "null-filter", "language-filter", "text-cleaner", "whitespace-cleaner", "text-normalizer", "pii-compliance"}:
         result = []
@@ -501,21 +511,21 @@ def _preview_operator(ref: str, params: dict[str, Any], values: list[dict[str, A
                 ]
             result.append(value)
         return result
-    if ref == "semantic-chunker":
+    if ref == "document-chunker":
         params = normalize_chunker_params(params)
         result = []
         for document in values:
-            chunks = split_document_blocks(document, params) if document.get("source_blocks") else split_document_text(str(document.get("text", "")), params)
+            chunks = split_document_text(str(document.get("markdown") or document.get("text", "")), params)
             for index, chunk in enumerate(chunks):
                 anchor = dict(chunk.get("anchor") or {key: value for key, value in chunk.items() if key != "content"})
                 result.append({"source_id": document.get("source_id", "preview-source"),
                                "source_version_id": document.get("source_version_id", "preview-version"),
+                               "parsed_document_id": document.get("parsed_document_id", "preview-parsed-document"),
+                               "flow_chunk_id": hashlib.sha256(f"preview:{document.get('parsed_document_id')}:{index}".encode()).hexdigest(),
                                "filename": document.get("filename", "样例文档"), "content": chunk["content"],
                                "chunk_index": index, "runtime_mode": "preview",
                                "anchor": {**dict(document.get("anchor") or {}), **anchor, "chunk_index": index}})
         return result
-    if ref == "source-chunk-builder":
-        return [{**value, "source_chunk_id": hashlib.sha256(f"preview:{value.get('source_version_id')}:{value.get('chunk_index')}".encode()).hexdigest()} for value in values]
     if ref == "text-knowledge-mapper":
         return [candidate for value in values if (candidate := _text_knowledge_candidate(value)) is not None]
     if ref == "entity-relation-extractor":
@@ -601,8 +611,9 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
         raise ValueError("不支持的内置样例")
     filename, text = SAMPLE_DOCUMENTS[sample_id]
     compiled = compiled_definition or definition
-    root_documents = [{"source_id": "preview-source", "source_version_id": "preview-version", "filename": filename,
-                       "text": text, "content": text, "source_chunk_id": "preview-reviewed-chunk", "chunk_index": 0,
+    root_documents = [{"source_id": "preview-source", "source_version_id": "preview-version",
+                       "parsed_document_id": "preview-parsed-document", "filename": filename,
+                       "kind": "textual", "markdown": text, "text": text, "content": text, "chunk_index": 0,
                        "parser_strategy": "preview", "runtime_profile": "controlled_in_memory",
                        "parser_adapter": "preview", "anchor": {"file": filename, "page": None, "section": None}}]
     nodes = list(compiled.get("nodes") or [])
@@ -613,7 +624,7 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
     for node in nodes:
         node_id = str(node["id"]); source_nodes = incoming.get(node_id, [])
         values = [value for source_id in source_nodes for value in outputs.get(source_id, [])]
-        if node.get("kind") == "operator" and str(node.get("ref")) in {"document-parser", "reviewed-source-chunk-input"} and not source_nodes:
+        if node.get("kind") == "operator" and str(node.get("ref")) == "document-input" and not source_nodes:
             values = [dict(value) for value in root_documents]
         failed_upstream = [source_id for source_id in source_nodes if source_id in failures]
         if failed_upstream:
@@ -624,6 +635,11 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
         if node.get("kind") == "knowledge_sink":
             outputs[node_id] = []
             expanded_runs[node_id] = {"status": "success", "inputs": _port_payload(values), "outputs": {}, "error": None}
+            continue
+        if node.get("kind") == "execution_gate":
+            outputs[node_id] = [dict(value) for value in values]
+            expanded_runs[node_id] = {"status": "success", "inputs": _port_payload(values),
+                                      "outputs": {"output": _preview_port(values)}, "error": None}
             continue
         try:
             result = _preview_operator(str(node.get("ref")), dict(node.get("params") or {}), values, root_documents)
@@ -654,9 +670,10 @@ def preview_template_definition(definition: dict, sample_id: str, *, compiled_de
         top_level_runs[node_id] = {"status": status, "inputs": _merge_preview_ports([expanded_runs.get(item, {}).get("inputs", {}) for item in entries]),
                                    "outputs": {"output": _preview_port(output_values)},
                                    "error": "；".join(errors) or None, "internal_trace": internal_trace}
-    reviewed_root_ids = {str(node["id"]) for node in nodes if node.get("ref") == "reviewed-source-chunk-input"}
+    reviewed_root_ids = {str(node["id"]) for node in nodes if node.get("kind") == "execution_gate"}
     chunk_values = [value for node_id, values in outputs.items()
-                    if node_id.endswith("::chunk") or node_id in reviewed_root_ids for value in values]
+                    if any(str(node["id"]) == node_id and node.get("ref") == "document-chunker" for node in nodes)
+                    or node_id in reviewed_root_ids for value in values]
     sink_totals = {str(node.get("output_key") or node.get("knowledge_type")): expanded_runs.get(str(node["id"]), {}).get("inputs", {}).get("input", {}).get("total", 0)
                    for node in nodes if node.get("kind") == "knowledge_sink"}
     return {"sample_id": sample_id, "filename": filename, "preview_mode": "controlled_in_memory",
@@ -783,12 +800,12 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
         errors = _item_errors(items, contract["schema"])
     if errors:
         raise ValueError("LLM 一次修复后仍未通过 Schema 校验：" + "；".join(errors))
-    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "flow_chunk_id": str(chunk["flow_chunk_id"])}
     result: list[dict] = []
     for data in items:
         if output_type == "graph:semantic":
             data = dict(data)
-            data["evidence"] = [{"source_version_id": version.id, "source_chunk_id": str(chunk["source_chunk_id"])}]
+            data["evidence"] = [{"source_version_id": version.id, "flow_chunk_id": str(chunk["flow_chunk_id"])}]
         def nested(path: str) -> Any:
             current: Any = data
             for part in path.split("."):
@@ -803,7 +820,7 @@ def _structured_candidates(source: Source, version: SourceVersion, output_type: 
             "canonical_content": canonical,
             "data_json": data,
             "source_version_ids": [version.id],
-            "source_chunk_id": chunk["source_chunk_id"],
+            "flow_chunk_id": chunk["flow_chunk_id"],
             "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}",
             "anchor_json": anchor,
             "evidence_text": chunk["content"],
@@ -826,14 +843,14 @@ def _text_knowledge_candidate(chunk: dict[str, Any]) -> dict[str, Any] | None:
         if key in chunk:
             data[key] = deepcopy(chunk[key])
     anchor = deepcopy(chunk.get("anchor") or {})
-    anchor.update(file=chunk["filename"], chunk_index=chunk["chunk_index"], source_chunk_id=chunk["source_chunk_id"])
+    anchor.update(file=chunk["filename"], chunk_index=chunk["chunk_index"], flow_chunk_id=chunk["flow_chunk_id"])
     return {
         "source_knowledge_id": _source_key(chunk["source_id"], "text", str(chunk["chunk_index"])),
         "canonical_content": content, "data_json": data,
-        "source_version_ids": [chunk["source_version_id"]], "source_chunk_id": chunk["source_chunk_id"],
+        "source_version_ids": [chunk["source_version_id"]], "flow_chunk_id": chunk["flow_chunk_id"],
         "source_anchor": f"{chunk['filename']}#chunk-{chunk['chunk_index']}",
         "anchor_json": anchor, "evidence_text": content, "is_primary": True,
-        **{key: chunk[key] for key in ("source_chunk_revision_id", "source_review_snapshot_id") if key in chunk},
+        **{key: chunk[key] for key in ("flow_chunk_revision_id", "flow_chunk_review_snapshot_id") if key in chunk},
     }
 
 
@@ -857,8 +874,8 @@ def _generated_text_candidates(source: Source, version: SourceVersion, chunk: di
         "identity_fields": [],
     }
     candidates = _structured_candidates(source, version, "text", chunk, effective_contract, llm_serving=llm_serving)
-    reserved = {"source_knowledge_id", "source_id", "source_version_id", "source_version_ids", "source_chunk_id",
-                "source_chunk_revision_id", "source_review_snapshot_id", "source_anchor", "anchor", "anchor_json",
+    reserved = {"source_knowledge_id", "source_id", "source_version_id", "source_version_ids", "flow_chunk_id",
+                "flow_chunk_revision_id", "flow_chunk_review_snapshot_id", "source_anchor", "anchor", "anchor_json",
                 "evidence_text", "evidence", "is_primary"}
     return [{**deepcopy(mapped), "source_knowledge_id": candidate["source_knowledge_id"],
              "canonical_content": candidate["canonical_content"],
@@ -868,9 +885,9 @@ def _generated_text_candidates(source: Source, version: SourceVersion, chunk: di
 
 
 def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
-    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "flow_chunk_id": str(chunk["flow_chunk_id"])}
     if output_type == "text":
-        return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": version.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "source_chunk_id": chunk["source_chunk_id"], "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
+        return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": version.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "flow_chunk_id": chunk["flow_chunk_id"], "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
     if not contract:
         raise ValueError(f"不支持的知识类型或缺少已发布契约：{output_type}")
     return _structured_candidates(source, version, output_type, chunk, contract, llm_serving=llm_serving)
@@ -891,7 +908,7 @@ def select_parser_adapter(filename: str, profile: str, environ: dict[str, str] |
         return "dataforge-word-parser"
     if suffix in {".csv", ".xlsx", ".json", ".jsonl"}:
         return "dataforge-structured-table-parser"
-    if suffix in {".md", ".txt"}:
+    if suffix in {".md", ".txt", ".html", ".htm"}:
         return "dataforge-text-parser"
     if suffix == ".pdf":
         return "mineru-pipeline-gpu"
@@ -1185,12 +1202,12 @@ def _normalize_entities(record: dict[str, Any], library_id: str, config: GraphEx
 
 
 def _candidate_meta(source: Source, version: SourceVersion, chunk: dict[str, Any], canonical: str, data_json: dict[str, Any]) -> dict[str, Any]:
-    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "source_chunk_id": str(chunk["source_chunk_id"])}
+    anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "flow_chunk_id": str(chunk["flow_chunk_id"])}
     return {
         "canonical_content": canonical,
         "data_json": data_json,
         "source_version_ids": [version.id],
-        "source_chunk_id": chunk["source_chunk_id"],
+        "flow_chunk_id": chunk["flow_chunk_id"],
         "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}",
         "anchor_json": anchor,
         "evidence_text": chunk["content"],
@@ -1291,7 +1308,7 @@ def _bind_evidence(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
         candidate = dict(candidate)
         data = dict(candidate.get("data_json") or {})
         data["evidence"] = [{"source_version_id": (candidate.get("source_version_ids") or [None])[0],
-                             "source_chunk_id": str(candidate.get("source_chunk_id") or "")}]
+                             "flow_chunk_id": str(candidate.get("flow_chunk_id") or "")}]
         candidate["data_json"] = data
         result.append(candidate)
     return result
@@ -1378,15 +1395,11 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         else:
             raise ValueError(f"未登记的三元组分块算子：{ref}")
         return graph_chunk_stage.run(values, process, store=store, job_id=job_id)
-    if ref == "document-parser":
-        return root_documents
-    if ref == "reviewed-source-chunk-input":
-        return [dict(value) for value in root_documents]
     if ref == "text-knowledge-mapper":
         outcome = (generation if generation is not None else {}).setdefault("text", {"successful": [], "failed": [], "targeted": []})
         result = []
         for chunk in values:
-            scope_key = ("text", str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            scope_key = ("text", str(chunk["source_version_id"]), str(chunk["flow_chunk_id"]))
             if retry_scope is not None and scope_key not in retry_scope:
                 continue
             outcome["targeted"].append(chunk)
@@ -1396,7 +1409,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                     result.append(candidate)
                 outcome["successful"].append(chunk)
                 if store and job_id:
-                    store.record_chunk_generation(job_id, "text", chunk, status="completed", candidate_count=int(candidate is not None))
+                    count = int(candidate is not None)
+                    store.record_chunk_generation(job_id, "text", chunk, status="success" if count else "success_empty", candidate_count=count)
             except Exception as exc:
                 outcome["failed"].append({**chunk, "error": str(exc)})
                 if store and job_id:
@@ -1427,45 +1441,6 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 value["runtime_mode"] = mode
             result.append(value)
         return result
-    if ref == "semantic-chunker":
-        params = normalize_chunker_params(params)
-        result = []; mode = select_runtime_mode(len(values))
-        for document in values:
-            if document.get("source_blocks"):
-                for index, chunk in enumerate(split_document_blocks(document, params)):
-                    result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
-                                   "filename": document["filename"], "content": chunk["content"], "chunk_index": index,
-                                   "runtime_mode": mode, "anchor": {**dict(chunk["anchor"]), "chunk_index": index}})
-                continue
-            segments = document.get("page_segments") or [{"text": str(document.get("text", "")), "page": None, "page_index": None}]
-            if not params["preserve_page_boundary"]:
-                segments = [{
-                    "text": "\n\n".join(str(item.get("text", "")) for item in segments),
-                    "page": segments[0].get("page") if len(segments) == 1 else None,
-                    "page_index": segments[0].get("page_index") if len(segments) == 1 else None,
-                    "page_start": segments[0].get("page") if segments else None,
-                    "page_end": segments[-1].get("page") if segments else None,
-                }]
-            index = 0
-            for segment in segments:
-                for chunk in split_document_text(str(segment.get("text", "")), params):
-                    result.append({"source_id": document["source_id"], "source_version_id": document["source_version_id"],
-                                   "filename": document["filename"], "content": chunk["content"], "chunk_index": index,
-                                   "runtime_mode": mode, "anchor": {**document.get("anchor", {}), "page": segment.get("page"),
-                                                                       "page_index": segment.get("page_index"),
-                                                                       "page_start": segment.get("page_start"), "page_end": segment.get("page_end"),
-                                                                       **{key: value for key, value in chunk.items() if key != "content"},
-                                                                       "chunk_index": index}})
-                    index += 1
-        return result
-    if ref == "source-chunk-builder":
-        # This is the formal provenance boundary.  Any further internal LLM
-        # context-window splitting remains an execution artifact only.
-        chunk_set_id = str(params.get("chunk_set_id") or "")
-        if not chunk_set_id:
-            raise ValueError("Source Chunk Builder 缺少 chunk_set_id")
-        return [{**value, "chunk_set_id": chunk_set_id,
-                 "source_chunk_id": hashlib.sha256(f"{chunk_set_id}:{value['chunk_index']}".encode("utf-8")).hexdigest()} for value in values]
     if ref == "faq-table-row-builder":
         documents = [{**value, "table_rows": value.get("_faq_table_rows") or []} for value in values]
         rows = normalize_faq_rows(documents)
@@ -1473,6 +1448,9 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         return [{
             "source_id": document["source_id"],
             "source_version_id": document["source_version_id"],
+            "parsed_document_id": document["parsed_document_id"],
+            "input_kind": "document",
+            "input_ref": f"{document['parsed_document_id']}#sheet:{row['sheet']}:row:{row['row_number']}",
             "filename": document["filename"],
             "content": row["full_text"],
             "chunk_index": index,
@@ -1489,7 +1467,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         outcome = (generation if generation is not None else {}).setdefault(kind, {"successful": [], "failed": [], "targeted": []})
         result: list[dict[str, Any]] = []
         for chunk in values:
-            scope_key = (kind, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            scope_key = (kind, str(chunk["source_version_id"]), str(chunk["input_ref"]))
             if retry_scope is not None and scope_key not in retry_scope:
                 continue
             outcome["targeted"].append(chunk)
@@ -1500,7 +1478,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                     "canonical_content": data["full_text"],
                     "data_json": data,
                     "source_version_ids": [chunk["source_version_id"]],
-                    "source_chunk_id": chunk["source_chunk_id"],
+                    "parsed_document_id": chunk["parsed_document_id"],
+                    "input_kind": "document", "input_ref": chunk["input_ref"],
                     "source_anchor": f"{chunk['filename']}#row-{(chunk.get('anchor') or {}).get('row')}",
                     "anchor_json": dict(chunk.get("anchor") or {}),
                     "evidence_text": chunk["content"],
@@ -1508,7 +1487,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 }
                 result.append(candidate); outcome["successful"].append(chunk)
                 if store and job_id:
-                    store.record_chunk_generation(job_id, kind, chunk, status="completed", candidate_count=1)
+                    store.record_chunk_generation(job_id, kind, chunk, status="success", candidate_count=1)
             except Exception as exc:
                 outcome["failed"].append({**chunk, "error": str(exc)})
                 if store and job_id:
@@ -1529,7 +1508,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         outcome = (generation if generation is not None else {}).setdefault(output_key, {"successful": [], "failed": [], "targeted": []})
         result: list[dict[str, Any]] = []
         for chunk in values:
-            scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["flow_chunk_id"]))
             if retry_scope is not None and scope_key not in retry_scope:
                 continue
             outcome["targeted"].append(chunk)
@@ -1549,7 +1528,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 outcome["successful"].append(chunk)
                 result.extend(candidates)
                 if store and job_id:
-                    store.record_chunk_generation(job_id, output_key, chunk, status="completed", candidate_count=len(candidates))
+                    store.record_chunk_generation(job_id, output_key, chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
             except Exception as exc:
                 outcome["failed"].append({**chunk, "error": str(exc)})
                 if store and job_id:
@@ -1565,7 +1544,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         node_config = _graph_config_for_node(cfg, params, governed_prompt=uses_graph_guidance(ref, operator_version))
         result: list[dict[str, Any]] = []
         for chunk in values:
-            scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["source_chunk_id"]))
+            scope_key = (output_key, str(chunk["source_version_id"]), str(chunk["flow_chunk_id"]))
             if retry_scope is not None and scope_key not in retry_scope:
                 continue
             outcome["targeted"].append(chunk)
@@ -1574,7 +1553,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 result.append({**chunk, "entities": entities})
                 outcome["successful"].append(chunk)
                 if store and job_id:
-                    store.record_chunk_generation(job_id, output_key, chunk, status="completed", candidate_count=len(entities))
+                    store.record_chunk_generation(job_id, output_key, chunk, status="success" if entities else "success_empty", candidate_count=len(entities))
             except Exception as exc:
                 outcome["failed"].append({**chunk, "error": str(exc)})
                 if store and job_id:
@@ -1593,7 +1572,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 result.append({**record, "relations": relations})
             except Exception as exc:
                 if outcome is not None:
-                    outcome["successful"] = [item for item in outcome.get("successful", []) if str(item.get("source_chunk_id")) != str(record.get("source_chunk_id"))]
+                    outcome["successful"] = [item for item in outcome.get("successful", []) if str(item.get("flow_chunk_id")) != str(record.get("flow_chunk_id"))]
                     outcome["failed"].append({**record, "error": str(exc)})
                 if store and job_id:
                     store.record_chunk_generation(job_id, output_key, record, status="failed", error=str(exc))
@@ -1655,63 +1634,166 @@ def _builtin_dispatch(ref: str, params: dict[str, Any], inputs: list[dict[str, A
     )
 
 
-def execute_source_preparation(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
-    context = store.source_preparation_context(job_id)
+def execute_parse_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
+    context = store.parse_job_context(job_id)
     job, version, source = context["job"], context["version"], context["source"]
-    chunk_set = context["chunk_set"]
-    chunk_params = _operator_params(context.get("definition"), "semantic-chunker")
     if job.status not in {"queued", "running"}:
         return {"id": job.id, "status": job.status, "idempotent": True}
-    run = store.start_source_preparation_flow_run(job_id)
-    created_parser_keys: list[str] = []
-    persisted_parser_keys: set[str] = set()
+    created_keys: list[str] = []
     try:
-        versions = {version.id: version}; sources = {source.id: source}
-        documents = _documents_for_versions(objects, [version], sources, run["id"], created_parser_keys)
-        store.record_document_irs(run["id"], documents)
-        parser_ids = store.record_flow_node(
-            run["id"], "parse::parser", [], [{**item, "_artifact_type": "document_ir"} for item in documents],
-            operator_code="document-parser",
-        )
-        persisted_parser_keys.update(created_parser_keys)
-        documents = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in documents]
-        cleaned = documents
-        last_ids = parser_ids
-        for node_id, ref in (
-            ("clean::null", "null-filter"), ("clean::language", "language-filter"),
-            ("clean::clean", "text-cleaner"), ("clean::space", "whitespace-cleaner"),
-            ("clean::normalize", "text-normalizer"),
-        ):
-            cleaned = _run_operator(ref, {}, cleaned, root_documents=documents, sources=sources, versions=versions,
-                                    type_contracts={})
-            last_ids = store.record_flow_node(run["id"], node_id, last_ids, cleaned, operator_code=ref)
-        if any(item.get("_faq_table_rows") for item in documents):
-            chunk_values = _run_operator("faq-table-row-builder", {}, cleaned, root_documents=documents,
-                                         sources=sources, versions=versions, type_contracts={})
-            chunk_values = [{**item, "anchor": {**dict(item.get("anchor") or {}), "faq": dict(item.get("faq") or {})}}
-                            for item in chunk_values]
-            chunk_ids = store.record_flow_node(run["id"], "chunk::faq-rows", last_ids, chunk_values,
-                                               operator_code="faq-table-row-builder")
+        payload = objects.get_blob(version.blob_uri)
+        document = _documents_for_versions(objects, [version], {source.id: source}, job.id, created_keys)[0]
+        suffix = Path(version.original_filename).suffix.lower()
+        parsed_id = f"parsed_{uuid.uuid4().hex}"
+        if suffix in {".csv", ".xlsx"}:
+            content, anchors = table_v1(version.original_filename, payload)
+            kind = "tabular"
         else:
-            chunk_values = _run_operator("semantic-chunker", chunk_params, cleaned, root_documents=documents,
-                                         sources=sources, versions=versions, type_contracts={})
-            chunk_ids = store.record_flow_node(run["id"], "chunk::chunk", last_ids, chunk_values,
-                                               operator_code="semantic-chunker")
-        formal = _run_operator("source-chunk-builder", {"chunk_set_id": chunk_set.id}, chunk_values, root_documents=documents,
-                               sources=sources, versions=versions, type_contracts={})
-        store.record_source_chunks(run["id"], formal)
-        store.record_flow_node(run["id"], "chunk::source-chunks", chunk_ids, formal,
-                               operator_code="source-chunk-builder")
-        store.finish_flow_run(run["id"], status="completed")
-        return {**store.finish_source_preparation(job_id), "flow_run_id": run["id"]}
+            content = (document["text"] if suffix in {".pdf", ".md", ".txt", ".html", ".htm"}
+                       else markdown_from_blocks(document.get("source_blocks") or [], document.get("text", "")))
+            anchors = dict(document.get("anchor") or {})
+            kind = "textual"
+        persisted = persist_content(objects, parsed_id, kind=kind, content=content, anchors=anchors)
+        created_keys.extend(persisted.pop("object_keys"))
+        return store.finish_parse_job(job_id, {
+            "id": parsed_id, **persisted,
+            "metadata_json": {"filename": version.original_filename, "source_type": document.get("source_type"),
+                              "parser_artifacts": list(document.get("_parser_artifacts") or [])},
+        })
     except Exception as exc:
-        store.finish_flow_run(run["id"], str(exc), status="failed")
-        result = store.finish_source_preparation(job_id, str(exc))
-        for object_key in created_parser_keys:
-            if object_key not in persisted_parser_keys:
-                try: objects.delete_key(object_key)
-                except Exception: logger.exception("清理 Source Preparation Parser Artifact 失败")
-        return {**result, "flow_run_id": run["id"]}
+        result = store.finish_parse_job(job_id, error=str(exc))
+        for key in created_keys:
+            try: objects.delete_key(key)
+            except Exception: logger.exception("清理 ParseJob 对象失败：%s", key)
+        return result
+
+
+def _prepare_job_flow_inputs(store: V7Store, objects, job_id: str,
+                             pending: list[dict[str, Any]]) -> dict[str, Any]:
+    definition = store.template_definition_for_job(job_id)
+    chunker = next((node for node in definition.get("nodes", []) if node.get("ref") == "document-chunker"), None)
+    if not chunker:
+        raise ValueError("待准备知识任务缺少 document-chunker")
+    flow_run = store.start_flow_run(job_id)
+    registry = build_runtime_registry(_builtin_dispatch, definition)
+    incoming = _incoming(definition)
+    runtime = {"cancelled": lambda: store.is_job_cancelled(job_id), "root_documents": [], "sources": {},
+               "versions": {}, "type_contracts": {}, "generation": {}, "sink_libraries": {}}
+    auto_freeze = store.job_auto_freezes_input(job_id)
+    try:
+        for item in pending:
+            parsed = store.parsed_document(item["parsed_document_id"])
+            content = read_content(objects, parsed)
+            if parsed.kind == "tabular":
+                raise ValueError("TABULAR_CHUNKING_UNSUPPORTED: 当前 Runtime 尚未实现表格切分")
+            document = {"parsed_document_id": parsed.id, "source_version_id": parsed.source_version_id,
+                        "kind": parsed.kind, "markdown": content,
+                        "source_anchors": list((read_anchors(objects, parsed) or {}).get("blocks") or [])}
+            node_outputs: dict[str, list[dict[str, Any]]] = {}
+            node_artifacts: dict[str, list[str]] = {}
+            for node in definition.get("nodes", []):
+                node_id, ref = str(node["id"]), str(node.get("ref") or "")
+                source_nodes = incoming.get(node_id, [])
+                input_values = [value for source_id in source_nodes for value in node_outputs.get(source_id, [])]
+                input_ids = [artifact_id for source_id in source_nodes for artifact_id in node_artifacts.get(source_id, [])]
+                if ref == "document-input":
+                    node_outputs[node_id] = [document]
+                    node_artifacts[node_id] = store.record_flow_node(
+                        flow_run["id"], node_id, [], [{**document, "_artifact_type": "parsed_document"}],
+                        operator_code=ref, operator_version=int(node.get("operator_version") or 1),
+                    )
+                    continue
+                if node.get("kind") == "execution_gate":
+                    store.record_flow_node(
+                        flow_run["id"], node_id, input_ids, [],
+                        status="completed" if auto_freeze else "waiting_for_input_review",
+                    )
+                    break
+                if node.get("kind") == "knowledge_sink": continue
+                executor = registry.resolve(ref, int(node["operator_version"]))
+                result = executor.execute(
+                    inputs=input_values, params=dict(node.get("params") or {}),
+                    context=OperatorExecutionContext(flow_run_id=flow_run["id"], node_id=node_id, runtime=runtime),
+                )
+                node_outputs[node_id] = list(result.outputs)
+                artifact_type = "candidate_flow_chunk_set" if ref == "document-chunker" else None
+                node_artifacts[node_id] = store.record_flow_node(
+                    flow_run["id"], node_id, input_ids,
+                    [{**value, **({"_artifact_type": artifact_type} if artifact_type else {})} for value in result.outputs],
+                    operator_code=ref, operator_version=int(node["operator_version"]),
+                    resolved_parameters=dict(node.get("params") or {}), logs=getattr(result, "logs", []),
+                    metrics=getattr(result, "metrics", {}),
+                )
+                if ref == "document-chunker":
+                    store.record_flow_chunks(item["flow_chunk_set_id"], result.outputs)
+                    if auto_freeze:
+                        store.auto_freeze_flow_chunk_set(
+                            item["flow_chunk_set_id"], actor=f"system:parsed-document-review:{item['parsed_document_id']}",
+                        )
+        if auto_freeze:
+            store.finish_flow_run(flow_run["id"], status="completed")
+            return {"id": job_id, "status": "queued", "flow_run_id": flow_run["id"]}
+        store.finish_flow_run(flow_run["id"], status="waiting_for_input_review")
+        job = store.mark_job_waiting_for_input_review(job_id)
+        return {"id": job_id, "status": job["status"], "flow_run_id": flow_run["id"]}
+    except Exception as exc:
+        store.finish_flow_run(flow_run["id"], str(exc), status="failed")
+        store.mark_job_failed(job_id, str(exc))
+        return {"id": job_id, "status": "failed", "flow_run_id": flow_run["id"], "error": str(exc)}
+
+
+def _backend_token_count(value: str, tokenizer_name: str) -> int:
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+        return len(tokenizer.encode(value, add_special_tokens=False))
+    except Exception:
+        # Conservative fail-safe for deployments that have not installed the
+        # selected tokenizer beside the Runner: CJK code points are often one
+        # token and Latin text is normally cheaper than one token per character.
+        return len(value)
+
+
+def _assert_context_budget(node: dict[str, Any], params: dict[str, Any], values: list[dict[str, Any]], registry) -> None:
+    requirements = dict((node.get("operator_spec") or {}).get("runtime_requirements") or {})
+    policy = dict(requirements.get("context_policy") or {})
+    if not policy or policy.get("overflow_strategy") != "reject" or not values:
+        return
+    serving = registry.require(str(params.get("llm_serving") or registry.default_serving))
+    prompt_payload = json.dumps({
+        "system": params.get("system_prompt") or "",
+        "prompt": params.get("_resolved_prompt_template") or params.get("extraction_instructions") or "",
+        "schema": (node.get("operator_spec") or {}).get("output_ports") or {},
+    }, ensure_ascii=False, sort_keys=True)
+    fixed = _backend_token_count(prompt_payload, serving.tokenizer_name)
+    reserved = int(policy.get("reserved_output_tokens") or 0)
+    margin = int(policy.get("safety_margin_tokens") or 0)
+    for value in values:
+        content = str(value.get("content") or value.get("canonical_content") or value.get("text") or "")
+        used = _backend_token_count(content, serving.tokenizer_name) + fixed + reserved + margin
+        if used > serving.context_window_tokens:
+            raise ValueError(
+                f"CONTEXT_BUDGET_EXCEEDED: input={used - fixed - reserved - margin}, "
+                f"fixed={fixed}, reserved={reserved}, safety_margin={margin}, "
+                f"context_window={serving.context_window_tokens}"
+            )
+
+
+def _faq_rows_from_table_v1(table: dict[str, Any]) -> list[dict[str, Any]]:
+    values = []
+    for sheet in table.get("sheets", []):
+        rows = list(sheet.get("rows") or [])
+        if not rows: continue
+        headers = [str(cell.get("value") or "").strip() for cell in rows[0].get("cells", [])]
+        for row in rows[1:]:
+            record = {headers[index]: cell.get("value") for index, cell in enumerate(row.get("cells", []))
+                      if index < len(headers) and headers[index]}
+            values.append({
+                "values": record,
+                "sheet": sheet.get("name"),
+                "row_number": int(row.get("row_index", 0)) + 1,
+            })
+    return values
 
 
 def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None = None) -> dict:
@@ -1728,6 +1810,9 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         versions = {version.id: version for version in versions_list}
         sources = {source.id: source for source in session.scalars(select(Source).where(Source.id.in_([version.source_id for version in versions_list])))}
         sink_libraries = dict(job.sink_library_ids or job.output_library_ids)
+    pending_inputs = store.pending_flow_inputs(job_id)
+    if pending_inputs:
+        return _prepare_job_flow_inputs(store, objects, job_id, pending_inputs)
     retry_scope = store.retry_chunk_scope(job_id)
     flow_run = store.start_flow_run(job_id)
     outputs: dict[str, list[dict[str, Any]]] = {}
@@ -1746,6 +1831,15 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
         graph_config = _graph_config_from_contracts(type_contracts)
         incoming = _incoming(definition)
         root_documents = store.reviewed_chunks_for_job(job_id)
+        for value in root_documents:
+            if value.get("input_kind") != "document": continue
+            parsed = store.parsed_document(value["parsed_document_id"])
+            parsed_content = read_content(objects, parsed)
+            value["kind"] = parsed.kind
+            if parsed.kind == "textual": value["markdown"] = parsed_content; value["content"] = parsed_content
+            else:
+                value["table"] = parsed_content
+                value["_faq_table_rows"] = _faq_rows_from_table_v1(parsed_content)
         current_source_chunks = [dict(value) for value in root_documents]
         registry = build_runtime_registry(_builtin_dispatch, definition)
         runtime = {
@@ -1768,9 +1862,25 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
             if node.get("kind") == "knowledge_sink":
                 sink_nodes.append(node)
                 continue
+            if node.get("kind") == "execution_gate":
+                outputs[node_id] = [dict(value) for value in root_documents]
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run["id"], node_id, input_ids,
+                    [{**value, "_artifact_type": "flow_chunk_review_snapshot"} for value in outputs[node_id]],
+                    status="completed",
+                )
+                continue
             ref = str(node.get("ref"))
             operator_version = int(node["operator_version"])
             resolved_params = dict(node.get("params") or {})
+            if ref in {"document-input", "document-chunker"}:
+                outputs[node_id] = [dict(value) for value in root_documents] if ref == "document-input" else []
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run["id"], node_id, input_ids, outputs[node_id],
+                    status="completed" if ref == "document-input" else "skipped",
+                    operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params,
+                )
+                continue
             failed_upstream = [source_id for source_id in source_nodes if source_id in node_errors]
             if failed_upstream:
                 message = "上游节点失败，已跳过：" + "、".join(failed_upstream)
@@ -1778,6 +1888,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=message, operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
             try:
+                _assert_context_budget(node, resolved_params, input_values, store.llm_serving_registry)
                 executor = registry.resolve(ref, operator_version)
                 result = executor.execute(
                     inputs=input_values, params=resolved_params,
@@ -1788,23 +1899,13 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 node_errors[node_id] = str(exc); outputs[node_id] = []
                 artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, [], error=str(exc), logs=getattr(exc, "operator_logs", []), metrics=getattr(exc, "operator_metrics", {}), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
                 continue
-            if ref == "document-parser":
-                store.record_document_irs(flow_run["id"], values)
-            elif ref == "source-chunk-builder":
-                store.record_source_chunks(flow_run["id"], values)
-                current_source_chunks = [dict(value) for value in values]
             outputs[node_id] = values
             artifact_type = node.get("resolved_output_type") or "execution"
             if values:
                 values = [{**value, "_artifact_type": artifact_type} for value in values]
                 outputs[node_id] = values
             artifact_values = values
-            if ref == "document-parser":
-                artifact_values = [{key: value for key, value in item.items() if key != "_faq_table_rows"} for item in values]
             artifact_ids[node_id] = store.record_flow_node(flow_run["id"], node_id, input_ids, artifact_values, logs=getattr(result, "logs", []), metrics=getattr(result, "metrics", {}), operator_code=ref, operator_version=operator_version, resolved_parameters=resolved_params)
-            if ref == "document-parser":
-                persisted_parser_keys.update(created_parser_keys)
-                outputs[node_id] = [{key: value for key, value in item.items() if key != "_parser_artifacts"} for item in outputs[node_id]]
         # All generation gates finish before any Knowledge Sink writes.  A
         # failed chunk stays out of a Sink's replacement range, so successful
         # neighbouring chunks can publish without erasing it.
@@ -1850,7 +1951,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                 store.assert_work_lease("knowledge", job_id, lease_owner)
             store.mark_job_failed(job_id, detail)
             return {"id": job_id, "status": "failed", "flow_run_id": flow_run["id"], "changes": changes, "sink_errors": sink_errors}
-        warnings = [{"knowledge_type": kind, "source_version_id": item["source_version_id"], "source_chunk_id": item["source_chunk_id"], "chunk_index": item["chunk_index"], "error": item["error"]} for kind, outcome in generation.items() for item in outcome["failed"]]
+        warnings = [{"knowledge_type": kind, "source_version_id": item["source_version_id"], "flow_chunk_id": item["flow_chunk_id"], "chunk_index": item["chunk_index"], "error": item["error"]} for kind, outcome in generation.items() for item in outcome["failed"]]
         warnings.extend({"node_id": node_id, "error": message} for node_id, message in node_errors.items())
         warnings.extend({"output_key": key, "error": message} for key, message in sink_errors.items())
         # Only after every sink has applied its successful chunk range may an
@@ -1895,7 +1996,6 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
                     objects.delete_key(object_key)
                 except Exception:
                     pass
-        store.mark_source_versions_failed([item.id for item in versions_list], str(exc))
         store.finish_flow_run(flow_run["id"], str(exc))
         store.mark_job_failed(job_id, str(exc))
         raise
@@ -1916,10 +2016,10 @@ def _reachable_nodes(definition: dict[str, Any], start_node_id: str, mode: str) 
 def _candidate_chunks(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for value in values:
-        chunk_id = str(value.get("source_chunk_id") or "")
+        chunk_id = str(value.get("flow_chunk_id") or "")
         for version_id in value.get("source_version_ids") or []:
             if chunk_id:
-                result[(str(version_id), chunk_id)] = {"source_version_id": str(version_id), "source_chunk_id": chunk_id,
+                result[(str(version_id), chunk_id)] = {"source_version_id": str(version_id), "flow_chunk_id": chunk_id,
                                                         "chunk_index": int((value.get("anchor_json") or {}).get("chunk_index", 0))}
     return list(result.values())
 
@@ -1938,7 +2038,7 @@ def _sink_successful_inputs(values, generation, output_key):
 
 
 def _graph_chunk_errors(generation):
-    return {f"{key}/{item['source_version_id']}/{item['source_chunk_id']}": item["error"]
+    return {f"{key}/{item['source_version_id']}/{item['flow_chunk_id']}": item["error"]
             for key, outcome in generation.items() if outcome.get("chunk_isolation")
             for item in outcome.get("failed", [])}
 
@@ -1995,6 +2095,14 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
                     flow_run_id, node_id, input_ids, [], error=message, status="skipped",
                 )
                 continue
+            if node.get("kind") == "execution_gate":
+                outputs[node_id] = [dict(value) for value in root_documents]
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids,
+                    [{**value, "_artifact_type": "flow_chunk_review_snapshot"} for value in outputs[node_id]],
+                    status="completed",
+                )
+                continue
             if node.get("kind") == "knowledge_sink":
                 output_key = str(node.get("output_key") or (
                     f"graph:{node.get('graph_mode')}" if node.get("knowledge_type") == "graph" and node.get("graph_mode")
@@ -2029,6 +2137,14 @@ def execute_debug_run(store: V7Store, objects, flow_run_id: str) -> dict[str, An
             params = {**dict(node.get("params") or {}), **dict((context["parameter_overrides"] or {}).get(node_id) or {})}
             params.pop("force_ocr", None)
             operator_version = int(node["operator_version"])
+            if ref in {"document-input", "document-chunker"}:
+                outputs[node_id] = [dict(value) for value in root_documents] if ref == "document-input" else []
+                artifact_ids[node_id] = store.record_flow_node(
+                    flow_run_id, node_id, input_ids, outputs[node_id],
+                    status="completed" if ref == "document-input" else "skipped",
+                    operator_code=ref, operator_version=operator_version, resolved_parameters=params,
+                )
+                continue
             try:
                 result = registry.resolve(ref, operator_version).execute(
                     inputs=input_values, params=params,
@@ -2079,10 +2195,7 @@ def execute_derived_run(store: V7Store, objects, flow_run_id: str) -> dict[str, 
     outputs: dict[str, list[dict[str, Any]]] = {}; artifact_ids: dict[str, list[str]] = {}; failed: set[str] = set()
     generation: dict[str, dict[str, list[dict[str, Any]]]] = {}; previews = []; created_parser_keys: list[str] = []
     try:
-        start_node = by_id[context["start_node_id"]]
-        override = dict((context["parameter_overrides"] or {}).get(context["start_node_id"]) or {})
-        root_documents = _documents_for_versions(objects, versions_list, sources, flow_run_id, created_parser_keys,
-                                                 force_ocr=bool(override.get("force_ocr"))) if start_node.get("ref") == "document-parser" else []
+        root_documents: list[dict[str, Any]] = []
         for node in definition.get("nodes", []):
             node_id = str(node["id"])
             if node_id not in selected: continue
@@ -2183,22 +2296,22 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     @app.post("/internal/jobs", status_code=202)
     def run(payload: RunRequest, authorization: str | None = Header(None)):
         verify(authorization)
-        request_id = payload.job_id or payload.source_preparation_job_id or payload.flow_run_id or "invalid"
+        request_id = payload.job_id or payload.parse_job_id or payload.flow_run_id or "invalid"
         with active_lock:
             active_requests.add(request_id)
         try:
             if payload.flow_run_id: return execute_flow_run(store, objects, payload.flow_run_id)
-            if payload.source_preparation_job_id:
+            if payload.parse_job_id:
                 if not payload.lease_owner:
-                    raise ValueError("Source Preparation 请求缺少 lease_owner")
-                return execute_source_preparation(
-                    store, objects, payload.source_preparation_job_id, lease_owner=payload.lease_owner,
+                    raise ValueError("ParseJob 请求缺少 lease_owner")
+                return execute_parse_job(
+                    store, objects, payload.parse_job_id, lease_owner=payload.lease_owner,
                 )
             if payload.job_id:
                 if not payload.lease_owner:
                     raise ValueError("知识任务请求缺少 lease_owner")
                 return execute_job(store, objects, payload.job_id, lease_owner=payload.lease_owner)
-            raise ValueError("job_id、source_preparation_job_id 或 flow_run_id 至少提供一个")
+            raise ValueError("job_id、parse_job_id 或 flow_run_id 至少提供一个")
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
         finally:
             with active_lock:

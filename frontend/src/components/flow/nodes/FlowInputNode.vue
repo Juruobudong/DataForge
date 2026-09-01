@@ -9,7 +9,7 @@ const interactionClasses = computed(() => edgeNodeClasses(edgeInteraction.value,
 
 <template>
   <article class="input-node" :class="[{ selected }, interactionClasses]">
-    <header><span class="icon">→</span><div><em>INPUT</em><b>已审核文档块</b><small>运行时自动绑定 · SourceReviewSnapshot</small></div></header>
+    <header><span class="icon">→</span><div><em>INPUT</em><b>文档输入</b><small>运行时绑定 · ParsedDocument</small></div></header>
     <section><TypedHandle v-for="(spec, port) in data.meta.outputs" :key="port" :node-id="id" :port="port" :spec="spec" :definition="data.definition" :node-kind="data.meta.kind" direction="output" /></section>
     <footer>流程输入 · 系统节点</footer>
   </article>

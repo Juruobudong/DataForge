@@ -108,7 +108,7 @@ class SubflowService:
         validate_flow_edges({"schema_version": 3, "nodes": expanded, "edges": edges}, catalog=catalog, subflows=registry)
         for node in expanded:
             item = resolve_operator(catalog, node)
-            if node.get("kind") != "operator" or node_role(node) != "operator" or node.get("ref") == "reviewed-source-chunk-input":
+            if node.get("kind") != "operator" or node_role(node) != "operator" or node.get("ref") == "document-input":
                 raise FlowValidationError("子流程不能包含 Flow Input 或 Knowledge Sink")
             if not item or item.get("exposure") in {"disabled", "internal"} or not item.get("enabled", True):
                 raise FlowValidationError("子流程包含未登记或不可用算子")
@@ -116,8 +116,8 @@ class SubflowService:
                 raise FlowValidationError("子流程包含尚未批准的算子")
             if not preparation and item.get("surfaces") and "advanced-canvas" not in item["surfaces"]:
                 raise FlowValidationError("该算子不能用于知识子流程")
-            if not preparation and node.get("ref") in {"document-parser", "source-chunk-builder"}:
-                raise FlowValidationError("知识子流程不得重新解析或构建 SourceChunk")
+            if node.get("ref") == "document-chunker":
+                raise FlowValidationError("可复用子流程不得封装文档切分与输入审核 Gate")
         incoming = {(edge["target"], edge["target_port"]) for edge in edges}
         expanded_entry = next(node["id"] for node in expanded if not any(edge["target"] == node["id"] for edge in edges))
         for node in expanded:
@@ -186,7 +186,7 @@ class SubflowService:
                 "revision_status": revision.status, "description": revision.description, "definition": definition,
                 "input_contract": inputs, "output_contract": outputs,
                 "node_count": len(definition.get("nodes", [])), "edge_count": len(definition.get("edges", [])),
-                "usage": "source_preparation" if asset.code in SUBFLOW_DISPLAY_NAMES_ZH else "knowledge"}
+                "usage": "knowledge"}
 
     def inventory(self):
         with self.store.sessions() as session:
@@ -256,7 +256,6 @@ class SubflowService:
                 definition, description = revision.definition_json, revision.description
                 input_contract, output_contract = revision.input_contract, revision.output_contract
             normalized, inputs, outputs = self.validate(session, definition, input_contract, output_contract,
-                                                       preparation=asset.code in SUBFLOW_DISPLAY_NAMES_ZH,
                                                        previous_definition=revision.definition_json)
             if check:
                 return {"valid": True, "definition": normalized, "input_contract": inputs, "output_contract": outputs}
@@ -287,10 +286,10 @@ class SubflowService:
             if published:
                 current.append(published)
             for version in current:
-                base = {"template_id": flow.id, "template_name": "文档预处理" if flow.purpose == "source_preparation" else flow.name,
+                base = {"template_id": flow.id, "template_name": flow.name,
                         "template_revision": version.revision_no, "revision_status": version.status,
                         "authoring_mode": version.authoring_mode, "purpose": flow.purpose,
-                        "is_builtin": bool(flow.managed_template_code) or flow.purpose == "source_preparation"}
+                        "is_builtin": bool(flow.managed_template_code)}
                 deps = []
                 if version.status == "published":
                     snapshot = snapshots.get(version.execution_snapshot_id)

@@ -30,6 +30,8 @@ class LLMServingConfig:
     timeout_seconds: float
     max_retries: int
     max_tokens: int
+    context_window_tokens: int
+    tokenizer_name: str
     disable_thinking: bool
 
 
@@ -152,6 +154,8 @@ def _parse_registry(path: Path) -> LLMServingRegistry:
             timeout_seconds=_positive_float(raw_config, "timeout_seconds", serving_id),
             max_retries=_non_negative_int(raw_config, "max_retries", serving_id),
             max_tokens=max_tokens,
+            context_window_tokens=int(raw_config.get("context_window_tokens") or 8192),
+            tokenizer_name=str(raw_config.get("tokenizer_name") or model_name),
             disable_thinking=disable_thinking,
         )
     if default_serving not in servings:

@@ -176,11 +176,12 @@ def faq_rows_digest(rows: Iterable[dict[str, Any]]) -> str:
 
 def faq_template_definition() -> dict[str, Any]:
     nodes = [
-        {"id": "reviewed-input", "kind": "operator", "ref": "reviewed-source-chunk-input"},
+        {"id": "document-input", "kind": "operator", "ref": "document-input"},
+        {"id": "faq-rows", "kind": "operator", "ref": "faq-table-row-builder"},
         {"id": "generate", "kind": "operator", "ref": "faq-record-mapper", "params": {"knowledge_type": FAQ_TYPE_CODE}},
         {"id": "sink", "kind": "knowledge_sink", "knowledge_type": FAQ_TYPE_CODE, "output_key": FAQ_TYPE_CODE},
     ]
-    order = ["reviewed-input", "generate", "sink"]
+    order = ["document-input", "faq-rows", "generate", "sink"]
     return {
         "schema_version": 3,
         "purpose": "knowledge",
