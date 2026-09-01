@@ -34,6 +34,8 @@ _QA_CONFIG_SCHEMA = {"type": "object", "additionalProperties": False, "propertie
     "questions_per_chunk": {"type": "integer", "title": "每块最多问题数", "minimum": 1, "maximum": 10, "default": 1},
     "extraction_instructions": deepcopy(QA_EXTRACTION_SCHEMA),
 }}
+_MULTI_QA_CONFIG_SCHEMA = {**_QA_CONFIG_SCHEMA, "properties": {**_QA_CONFIG_SCHEMA["properties"],
+    "qa_output_type": {"type": "string", "title": "QA 输出类型", "enum": ["qa-question", "qa-full"], "default": "qa-question"}}}
 _GRAPH_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -110,7 +112,11 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
         _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _TEXT_MAPPING_STAGE,
         _SUBMIT_STAGE,
     )),
-    ManagedFlowDefinition(code="standard-qa", name="问答知识", output_types=("qa",), stages=(
+    ManagedFlowDefinition(code="standard-qa-question", name="问答·Q检索", output_types=("qa-question",), stages=(
+        _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-extractor",)),
+        _SUBMIT_STAGE,
+    )),
+    ManagedFlowDefinition(code="standard-qa-full", name="问答·QA检索", output_types=("qa-full",), stages=(
         _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _generation("问答生成", config_schema=_QA_CONFIG_SCHEMA, operator_refs=("qa-extractor",)),
         _SUBMIT_STAGE,
     )),
@@ -127,9 +133,9 @@ _STANDARD_FLOWS: tuple[ManagedFlowDefinition, ...] = (
                                    "semantic-relation-builder", "evidence-binder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
-    ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa", "graph:triple"), stages=(
+    ManagedFlowDefinition(code="standard-multi", name="多产出知识", output_types=("text", "qa-question", "graph:triple"), stages=(
         _INPUT_STAGE, _CHUNK_STAGE, _GATE_STAGE, _TEXT_MAPPING_STAGE,
-        _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_QA_CONFIG_SCHEMA["properties"]}},
+        _generation("多产出生成", config_schema={**_GRAPH_CONFIG_SCHEMA, "properties": {**_GRAPH_CONFIG_SCHEMA["properties"], **_MULTI_QA_CONFIG_SCHEMA["properties"]}},
                     operator_refs=("qa-extractor", "entity-relation-extractor", "literal-detector", "triple-builder")),
         _QUALITY_STAGE, _SUBMIT_STAGE,
     )),
@@ -161,8 +167,29 @@ def assert_normalized_output_types_match_managed_template(
     return expected
 
 
+def resolve_managed_output_types(
+    managed_template_code: str, definition: dict[str, Any] | None, output_types: list[str] | None, *, catalog=None,
+) -> list[str]:
+    """Derive Standard outputs from its managed config and validate caller assertions."""
+    managed_catalog = catalog or MANAGED_FLOW_CATALOG
+    normalized = managed_catalog.normalize_config(managed_template_code, definition or {})
+    if managed_template_code == "standard-multi":
+        generation = (normalized.get("stages") or {}).get("generation") or {}
+        config = generation.get("config") or {}
+        qa_output_type = str(config.get("qa_output_type") or "qa-question")
+        if qa_output_type not in {"qa-question", "qa-full"}:
+            raise ManagedTemplateError("MULTI_QA_OUTPUT_INVALID", "多产出流程必须选择 QA 输出类型", "stages.generation.config.qa_output_type")
+        expected = ["text", qa_output_type, "graph:triple"]
+    else:
+        expected = list(managed_catalog.get(managed_template_code).output_types)
+    if output_types is not None and {normalise_output_key(value) for value in output_types} != set(expected):
+        raise ManagedTemplateError("MANAGED_TEMPLATE_OUTPUT_MISMATCH",
+                                   f"标准模板 {managed_template_code} 的输出必须为 {expected}", "output_types")
+    return expected
+
+
 class ManagedFlowCatalog:
-    """Registry of the five built-in standard templates."""
+    """Registry of the built-in standard templates."""
 
     def __init__(self, definitions: tuple[ManagedFlowDefinition, ...] = _STANDARD_FLOWS):
         self._by_code = {definition.code: definition for definition in definitions}
@@ -201,14 +228,16 @@ class ManagedFlowCatalog:
         definition = self.get(code)
         presets = {
             "standard-text": {"split_method": "recursive", "chunk_size": 900, "chunk_overlap": 90},
-            "standard-qa": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 120},
+            "standard-qa-question": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 120},
+            "standard-qa-full": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 120},
             "standard-graph-triple": {"split_method": "sentence", "chunk_size": 1100, "chunk_overlap": 0},
             "standard-graph-semantic": {"split_method": "recursive", "chunk_size": 1100, "chunk_overlap": 0},
             "standard-multi": {"split_method": "sentence", "chunk_size": 1000, "chunk_overlap": 120},
         }
         stages = {"chunking": {"config": {**DEFAULT_CHUNKER_PARAMS, **presets[code]}}}
         if code in {"standard-graph-triple", "standard-graph-semantic", "standard-multi"}:
-            stages["generation"] = {"config": {"entity_types": entity_type_catalog()["base"]}}
+            stages["generation"] = {"config": {"entity_types": entity_type_catalog()["base"],
+                                                  **({"qa_output_type": "qa-question"} if code == "standard-multi" else {})}}
         return {"schema_version": 1, "template_code": definition.code, "stages": stages}
 
     def normalize_config(self, code: str, definition: dict[str, Any]) -> dict[str, Any]:
@@ -273,9 +302,9 @@ class ManagedFlowCompiler:
         if not template_code:
             raise ManagedTemplateError("MANAGED_TEMPLATE_CODE_INVALID", "标准配置缺少 template_code", "definition.template_code")
         flow_definition = self.catalog.get(template_code)
-        output_types = assert_normalized_output_types_match_managed_template(template_code, output_types, catalog=self.catalog)
         normalized = self.catalog.normalize_config(template_code, definition)
         stages_config = normalized.get("stages") or {}
+        output_types = resolve_managed_output_types(template_code, normalized, output_types, catalog=self.catalog)
         baseline = builtin_flow_definition(list(output_types))
         stage_by_code = {stage.code: stage for stage in flow_definition.stages}
         stage_by_ref: dict[str, ManagedStageDefinition] = {}

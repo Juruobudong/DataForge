@@ -58,6 +58,7 @@ from .migration.package import inspect_package
 from .migration.planner import InstitutionReleasePlanner
 from .migration.verifier import ActivationPreflightVerifier
 from .store import (
+    CENTRAL_DEPLOYMENT_CODE,
     CENTRAL_STAGE_TARGETS,
     ReviewGateError,
     V7Store,
@@ -202,6 +203,7 @@ class KnowledgeVectorPublishRequest(BaseModel):
     scope: Literal["all_approved", "all_active"]
     expected_snapshot_digest: str = Field(min_length=64, max_length=64)
     idempotency_key: str = Field(min_length=1, max_length=64)
+    approve_pending: bool = False
 
 
 class KnowledgeJobRequest(BaseModel):
@@ -480,7 +482,6 @@ class DeploymentTaskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     project_task_id: str
     index_profile_id: str
-    qa_embedding_mode: Literal["question", "full"] | None = None
     top_k: int = 10
     final_top_k: int | None = None
     reranker_serving_code: str | None = None
@@ -827,6 +828,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             except Exception as exc:
                 logger.warning(
                     "Default authoring Milvus binding failed: target_id=%s error_type=%s",
+                    test_target_id, type(exc).__name__,
+                )
+            try:
+                store.bind_default_test_release_target_if_unset(app.state.instance.id)
+            except Exception as exc:
+                logger.warning(
+                    "Default test release Milvus binding failed: target_id=%s error_type=%s",
                     test_target_id, type(exc).__name__,
                 )
         return results
@@ -1580,6 +1588,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 library_id, scope=payload.scope,
                 expected_snapshot_digest=payload.expected_snapshot_digest,
                 idempotency_key=payload.idempotency_key,
+                approve_pending=payload.approve_pending,
             )
         except ReviewGateError as exc: raise _review_error(exc) from exc
         except ValueError as exc: raise _error(exc) from exc
@@ -2481,7 +2490,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
     def create_release_task(project_id: str, payload: DeploymentTaskRequest):
         try:
             return store.create_release_task(project_id, payload.project_task_id, payload.index_profile_id,
-                qa_embedding_mode=payload.qa_embedding_mode, top_k=payload.top_k, enabled=payload.enabled,
+                top_k=payload.top_k, enabled=payload.enabled,
                 final_top_k=payload.final_top_k, reranker_serving_code=payload.reranker_serving_code)
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
@@ -2492,6 +2501,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             return store.patch_release_task(project_id, task_id, payload.model_dump(exclude_unset=True))
         except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc: raise _error(exc) from exc
+
+    @app.delete("/api/projects/{project_id}/release-tasks/{task_id}", status_code=204)
+    def delete_release_task(project_id: str, task_id: str):
+        try:
+            store.delete_release_task(project_id, task_id)
+            return Response(status_code=204)
+        except LookupError as exc: raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/projects/{project_id}/retrieval-debug/options")
     def retrieval_debug_options(project_id: str, release_stage: Literal["test", "production"],
@@ -2509,13 +2525,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
                 project_id, payload.release_stage, payload.route_mode, payload.version_no,
             )
             if not snapshot.get("milvus_target"):
-                connection = milvus_resolver.stage(project_id, payload.release_stage)
-                snapshot["milvus_target"] = {
-                    "id": connection.target_id, "name": "当前环境 Milvus",
-                    "milvus_url": connection.uri, "revision_id": connection.revision_id,
-                    "connection_fingerprint": connection.fingerprint,
-                    "token_configured": bool(connection.token),
-                }
+                snapshot = _execution_snapshot(
+                    project_id, snapshot, payload.release_stage,
+                    _stage_connection(project_id, payload.release_stage),
+                )
             return app.state.retrieval_debug.run_resolved(
                 snapshot, identity, payload, instance_mode=app.state.instance.mode,
             )
@@ -2529,15 +2542,19 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             snapshot, _identity = app.state.retrieval_debug.snapshot(
                 project_id, payload.release_stage, "published",
             )
+            deployment_code = (
+                CENTRAL_DEPLOYMENT_CODE if app.state.instance.mode == "central"
+                else snapshot["deployment"]["code"]
+            )
             public_request = PublicRetrievalRequest(org_code=payload.org_code, query=payload.query)
             content, trace, failure = app.state.public_retrieval.query_with_trace(
-                snapshot["project"]["code"], snapshot["deployment"]["code"],
+                snapshot["project"]["code"], deployment_code,
                 payload.release_stage, payload.task_code, public_request,
                 request_id=request.state.request_id, instance_mode=app.state.instance.mode,
             )
             public_path = (
                 f"/api/runtime/retrieval/v1/{snapshot['project']['code']}/"
-                f"{snapshot['deployment']['code']}/{payload.release_stage}/"
+                f"{deployment_code}/{payload.release_stage}/"
                 f"{payload.task_code}/query"
             )
             response_body = content if content is not None else {
@@ -2610,7 +2627,13 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
         try: return milvus_resolver.stage(project_id, release_stage)
         except ValueError as exc: raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    def _publication_snapshot(project_id: str, core: dict, release_stage: str, connection) -> dict:
+    def _execution_snapshot(project_id: str, core: dict, release_stage: str, connection) -> dict:
+        """Attach transient execution identity to a Project-level route snapshot.
+
+        ProjectRouteVersion intentionally contains no central Deployment or physical
+        target.  This helper is the single boundary that resolves those values for
+        a debug run or a publication; it never writes them back to the core route.
+        """
         snapshot = dict(core)
         snapshot["release_stage"] = release_stage
         if app.state.instance.mode == "local" and app.state.instance.bound_deployment_id:
@@ -2631,13 +2654,10 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             revision_id = f"local:{connection.revision_id}"
         else:
             snapshot["deployment"] = {
-                "id": "central-runtime", "code": "dataforge-central",
+                "id": "central-runtime", "code": CENTRAL_DEPLOYMENT_CODE,
                 "name": "DataForge 中心", "scope": "central",
             }
-            snapshot["project_deployment"] = {
-                "id": f"central:{project_id}", "project_id": project_id,
-                "deployment_id": "central-runtime", "status": "active",
-            }
+            snapshot.pop("project_deployment", None)
             revision_id = connection.revision_id
         snapshot["milvus_target"] = {
             "id": connection.target_id, "name": "当前环境 Milvus",
@@ -2654,7 +2674,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             target_validation_mode="live",
         )
         if result.get("snapshot"):
-            result["snapshot"] = _publication_snapshot(
+            result["snapshot"] = _execution_snapshot(
                 project_id, result["snapshot"], release_stage, connection,
             )
         return result
@@ -2714,7 +2734,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             if not version:
                 raise ValueError("请先冻结项目版本")
             detail = store.route_version_detail(project_id, version["version_no"], stage)
-            candidate = _publication_snapshot(project_id, detail["snapshot"], stage, connection)
+            candidate = _execution_snapshot(project_id, detail["snapshot"], stage, connection)
             if app.state.instance.mode == "central":
                 RoutingDeliveryService(
                     store, resolved.routing_dir / "production-backups", resolver=milvus_resolver,
@@ -2755,7 +2775,7 @@ def create_app(settings: Settings | None = None, *, check_schema: bool = True) -
             store.restore_authorizations(project_id, previous.snapshot_json)
             check = _validate_target_routing(project_id, stage)
             if not check["valid"]: raise ValueError("回滚后的授权校验失败：" + "；".join(check["problems"]))
-            snapshot = _publication_snapshot(project_id, previous.snapshot_json, stage, connection)
+            snapshot = _execution_snapshot(project_id, previous.snapshot_json, stage, connection)
             if app.state.instance.mode == "central":
                 RoutingDeliveryService(
                     store, resolved.routing_dir / "production-backups", resolver=milvus_resolver,

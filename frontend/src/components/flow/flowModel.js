@@ -338,9 +338,18 @@ export function validateFlow(nodes, edges, outputTypes = []) {
   }
   if (createsCycle(nodes, edges)) issues.push({ code: 'CYCLE', message: '流程必须是有向无环图' })
   const sinks = nodes.filter(node => node.data.meta.kind === 'knowledge_sink')
-  if (!sinks.length) issues.push({ code: 'MISSING_SINK', message: '流程至少需要一个 Knowledge Sink' })
-  for (const output of outputTypes) {
-    if (!sinks.some(node => node.data.definition.output_key === output)) issues.push({ code: 'MISSING_OUTPUT_SINK', message: `模板输出缺少对应 Sink：${output}` })
+  if (!outputTypes.length) {
+    issues.push({ code: 'OUTPUT_TYPES_REQUIRED', message: '请先在流程设置选择至少一种正式输出类型' })
+  } else {
+    if (!sinks.length) issues.push({
+      code: 'MISSING_SINK', message: '流程至少需要一个 Knowledge Sink', action: 'focus_sink',
+      outputKey: outputTypes.length === 1 ? outputTypes[0] : null,
+    })
+    for (const output of outputTypes) {
+      if (!sinks.some(node => node.data.definition.output_key === output)) issues.push({
+        code: 'MISSING_OUTPUT_SINK', message: `模板输出缺少对应 Sink：${output}`, action: 'focus_sink', outputKey: output,
+      })
+    }
   }
   for (const sink of sinks) {
     const key = sink.data.definition.output_key

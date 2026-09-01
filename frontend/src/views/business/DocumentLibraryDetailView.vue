@@ -26,10 +26,12 @@ const someTemplatesSelected = computed(() => templateIds.value.length > 0 && !al
 const allPageSourcesSelected = computed(() => files.value.length > 0 && files.value.every(source => selectedSources.value.includes(source.id)))
 const somePageSourcesSelected = computed(() => selectedSources.value.length > 0 && !allPageSourcesSelected.value)
 const selectedSourceRows = computed(() => files.value.filter(source => selectedSources.value.includes(source.id)))
-const reviewableSelected = computed(() => selectedSourceRows.value.filter(source => {
+function isReviewable(source) {
   const parsed = source.version?.parsed_document
   return source.version?.parse_status === 'completed' && parsed?.review_status === 'pending'
-}))
+}
+const reviewableSelected = computed(() => selectedSourceRows.value.filter(isReviewable))
+const reviewablePage = computed(() => files.value.filter(isReviewable))
 const flatTree = computed(() => {
   const output = []
   const visit = (node, depth = 0) => (node.children || []).forEach(child => { output.push({ ...child, depth }); visit(child, depth + 1) })
@@ -184,13 +186,13 @@ async function hardDelete() {
   if (mutationBusy.value || !selectedSources.value.length) return
   try { const body = { source_ids: selectedSources.value }; const check = await api.documentDeletionPreflight(body); if (!check.deletable) throw new Error('存在运行任务，整批不能彻底删除。'); if (!confirm(`将彻底删除 ${check.source_count} 个文件，并影响 ${check.impact.knowledge_item_count} 个知识项、${check.impact.vector_record_count} 条向量。\n此操作不可撤销，确定继续吗？`)) return; await api.requestDocumentDeletion(body); selectedSources.value = []; await load() } catch (e) { error.value = e.message }
 }
-async function approveSelectedPage() {
-  if (mutationBusy.value || !selectedSources.value.length) return
-  const reviewable = reviewableSelected.value
-  const approved = selectedSourceRows.value.filter(item => item.version?.parsed_document?.review_status === 'approved').length
-  const unavailable = selectedSourceRows.value.length - reviewable.length - approved
+async function approvePageRows(rows, confirmSelection) {
+  if (mutationBusy.value || !rows.length) return
+  const reviewable = rows.filter(isReviewable)
+  const approved = rows.filter(item => item.version?.parsed_document?.review_status === 'approved').length
+  const unavailable = rows.length - reviewable.length - approved
   const estimatedJobs = reviewable.length * bindings.value.filter(item => item.status === 'active').length
-  if (!confirm(`将审阅通过当前页所选文件。\n\n所选：${selectedSourceRows.value.length}\n可批准：${reviewable.length}\n已通过：${approved}\n解析未完成或不可用：${unavailable}\n预计触发模板任务：${estimatedJobs}\n\n需要修正 OCR 或表格内容的文件请先进入单文件页面校订。`)) return
+  if (confirmSelection && !confirm(`将审阅通过当前页所选文件。\n\n所选：${rows.length}\n可批准：${reviewable.length}\n已通过：${approved}\n解析未完成或不可用：${unavailable}\n预计触发模板任务：${estimatedJobs}\n\n需要修正 OCR 或表格内容的文件请先进入单文件页面校订。`)) return
   mutationBusy.value = true; error.value = ''; notice.value = ''
   try {
     const items = reviewable.map(source => ({
@@ -208,6 +210,11 @@ async function approveSelectedPage() {
     await load(true)
   } catch (e) { error.value = e.message } finally { mutationBusy.value = false }
 }
+async function approveSelectedPage() {
+  if (!selectedSources.value.length) return
+  await approvePageRows(selectedSourceRows.value, true)
+}
+async function approveAllPage() { await approvePageRows(files.value, false) }
 function toggleAllPageSources(event) { if (!mutationBusy.value && !loading.value) selectedSources.value = event.target.checked ? files.value.map(source => source.id) : [] }
 function toggleAllTemplates(event) { templateIds.value = event.target.checked ? availableTemplates.value.map(item => item.id) : [] }
 async function bindTemplates() {
@@ -244,6 +251,7 @@ onBeforeUnmount(() => { active = false; ++viewEpoch; ++loadRequest })
           <select v-model="fileType" aria-label="文件格式" @change="page=1; load()"><option value="">全部格式</option><option value="pdf">PDF</option><option value="docx">DOCX</option><option value="xlsx">XLSX</option></select>
           <button @click="load">刷新 / 筛选</button><span class="badge amber">已选当前页 {{ selectedSources.length }} 个</span>
           <button class="primary batch-review-button" :disabled="!selectedSources.length" @click="approveSelectedPage">审阅通过所选文件（{{ reviewableSelected.length }}）</button>
+          <button class="batch-review-all-button" :disabled="!reviewablePage.length" @click="approveAllPage">一键全选审阅通过（{{ reviewablePage.length }}）</button>
           <button class="danger" :disabled="!selectedSources.length" @click="hardDelete">彻底删除</button>
         </div>
         <div v-if="dragging" class="drop-zone">拖拽文件或文件夹到此处</div><div v-else-if="!files.length" class="drop-zone">拖拽文件或文件夹到此处，或使用顶部上传入口</div>

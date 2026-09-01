@@ -35,8 +35,29 @@ const graphWarnings = computed(() => candidateResults.value?.find(item => item.c
 const runtimeUnknown = computed(() => candidateResults.value?.some(item => item.runtime_status?.status === 'unknown'))
 let candidateTimer, candidateSequence = 0
 const issues = ref([]), focusedIssue = ref(null), connectionError = ref(null)
+function presentIssue(issue) {
+  if (issue.code === 'OUTPUT_TYPES_REQUIRED') return {
+    ...issue,
+    displayTitle: '未选择正式输出类型',
+    displayMessage: issue.message,
+    actionLabel: '',
+    actionable: false,
+  }
+  if (issue.action === 'focus_sink') return {
+    ...issue,
+    displayTitle: '缺少正式知识输出',
+    displayMessage: issue.outputKey ? `需要添加 ${issue.outputKey} 类型 Knowledge Sink` : issue.message,
+    actionLabel: issue.outputKey ? '定位并添加 →' : '',
+    actionable: Boolean(issue.outputKey),
+  }
+  return { ...issue, displayTitle: issue.code, displayMessage: issue.message, actionLabel: '定位 →', actionable: true }
+}
+const displayedIssues = computed(() => {
+  const hasOutputSpecificIssue = issues.value.some(issue => issue.code === 'MISSING_OUTPUT_SINK')
+  return issues.value.filter(issue => !(hasOutputSpecificIssue && issue.code === 'MISSING_SINK')).map(presentIssue)
+})
 const nodes = ref([]), edges = ref([])
-const canvas = ref(null), editor = ref(null)
+const canvas = ref(null), palette = ref(null), editor = ref(null)
 const graphConfig = ref({ entity_types: [], relation_types: [], literal_policy: { enabled_datatypes: [] }, unknown_entity_policy: 'reject', unknown_relation_policy: 'reject', prompt: { mode: 'generated', body: null } })
 const graphConfigOpen = ref(false)
 const graphConfigPanel = ref(null), graphSchemaEditor = ref(null), graphConfigButton = ref(null), promptPanel = ref(null)
@@ -93,7 +114,8 @@ function serialize() {
 }
 function validate() {
   issues.value = props.fragment ? validateSubflow(nodes.value, edges.value) : validateFlow(nodes.value, edges.value, props.outputTypes)
-  if (issues.value.length) focusIssue(issues.value[0])
+  const firstActionableIssue = displayedIssues.value.find(issue => issue.actionable)
+  if (firstActionableIssue) focusIssue(firstActionableIssue)
   return issues.value.length === 0
 }
 function loadDefinition(value) {
@@ -284,7 +306,21 @@ function selectNode(node) { selectedNode.value = node; selectedEdge.value = null
 function selectEdge(edge) { selectedEdge.value = edge; selectedNode.value = null; connectionSource.value = null; connectionError.value = null }
 function deleteEdge(edgeId) { canvas.value?.deleteEdge(edgeId) }
 function reportConnectionError(issue) { connectionError.value = issue; if (issue) emit('error', issue.message) }
-function focusIssue(issue) { focusedIssue.value = issue; canvas.value?.focusElement(issue) }
+async function focusIssue(issue) {
+  focusedIssue.value = issue
+  if (issue?.action === 'focus_sink' || ['MISSING_SINK', 'MISSING_OUTPUT_SINK'].includes(issue?.code)) {
+    const outputKey = issue.outputKey || (props.outputTypes.length === 1 ? props.outputTypes[0] : null)
+    clearTimeout(candidateTimer); candidateSequence++
+    selectedNode.value = null; selectedEdge.value = null; connectionSource.value = null
+    candidateResults.value = null; candidateError.value = ''; candidatesLoading.value = false
+    discoveryDirection.value = 'downstream'
+    canvas.value?.focusElement?.({})
+    await nextTick()
+    return outputKey ? Boolean(await palette.value?.focusSink?.(outputKey)) : false
+  }
+  canvas.value?.focusElement(issue)
+  return true
+}
 function focusBackendProblem(problem) {
   if (!problem?.code) return false
   const details = problem.details || {}
@@ -318,7 +354,7 @@ onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown',
       <div><span class="selection-state">{{ nodes.length }} 节点 · {{ edges.length }} 连线</span><button v-if="!fragment" :disabled="!nodes.some(node => node.selected)" @click="extractSelection">另存为可复用子流程</button><button v-if="hasGraphOutput" ref="graphConfigButton" :class="{ active: graphConfigOpen }" :aria-expanded="graphConfigOpen" aria-controls="graph-config-panel" @click="openGraphConfig()">图谱抽取配置</button></div>
     </div>
     <div ref="editor" class="flow-workspace">
-      <OperatorPalette :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :selected-node="selectedNode" :direction="discoveryDirection" :candidate-results="candidateResults" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @change-direction="discoveryDirection = $event" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
+      <OperatorPalette ref="palette" :catalog="catalog" :subflows="subflows" :output-types="fragment ? [] : outputTypes" :purpose="purpose" :nodes="nodes" :edges="edges" :source="connectionSource" :selected-node="selectedNode" :direction="discoveryDirection" :candidate-results="candidateResults" :loading="candidatesLoading" :error="candidateError" @retry="refreshCandidates" @clear-source="connectionSource = null" @change-direction="discoveryDirection = $event" @drag-start="dragStart" @add-item="addItem" @add-sink="addSink" />
       <DataForgeFlowCanvas ref="canvas" v-model:nodes="nodes" v-model:edges="edges" height="var(--flow-canvas-height)" :issue="focusedIssue" :flow-context="{ schemaVersion: 3, outputTypes }" :show-technical-code="!fragment" @before-change="beforeChange" @change="markDirty" @select-node="selectNode" @select-edge="selectEdge" @connection-source="connectionSource = $event" @connection-error="reportConnectionError" @add-definition="addDefinition" @open-subflow="openSubflow" />
       <EdgeInspector v-if="selectedEdge" :edge="selectedEdge" :nodes="nodes" :issue="selectedIssue" @delete="deleteEdge" />
       <NodeInspector v-else :node="selectedNode" :catalog="catalog" :subflows="subflows" :purpose="purpose" :output-types="outputTypes" :entity-types="graphConfig.entity_types" :evaluation-nodes="evaluationNodes" :deduplication-nodes="deduplicationNodes" :issue="selectedIssue" :sample-result="sampleResult" @replace-operator="replaceOperator" @apply-parameters="applyParameters" @open-graph-config="openGraphConfig" @open-subflow="openSubflow(selectedNode)" @change-subflow-revision="changeSubflowRevision" @change-operator-version="changeOperatorVersion" />
@@ -330,7 +366,7 @@ onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown',
       <GraphSchemaEditor ref="graphSchemaEditor" :model-value="graphConfig" @update:model-value="applyGraphConfig" />
       <div ref="promptPanel" tabindex="-1" class="graph-prompt-panel"><PromptPreview :definition="promptDefinition" v-model:selected-node-id="promptNodeId" /></div>
     </section>
-    <section v-if="issues.length" class="validation-panel"><div><h3>画布校验</h3><span>{{ issues.length }} 个问题</span></div><button v-for="(issue,index) in issues" :key="`${issue.code}-${index}`" @click="focusIssue(issue)"><b>{{ issue.code }}</b><span>{{ issue.message }}</span><small>定位 →</small></button></section>
+    <section v-if="displayedIssues.length" class="validation-panel"><div class="validation-panel-header"><h3>画布校验</h3><span>{{ displayedIssues.length }} 个问题</span></div><template v-for="(issue,index) in displayedIssues" :key="`${issue.code}-${issue.outputKey || issue.nodeId || issue.edgeId || index}`"><button v-if="issue.actionable" class="validation-issue" @click="focusIssue(issue)"><b>{{ issue.displayTitle }}</b><span>{{ issue.displayMessage }}</span><small>{{ issue.actionLabel }}</small></button><div v-else class="validation-issue validation-issue-static" role="status"><b>{{ issue.displayTitle }}</b><span>{{ issue.displayMessage }}</span></div></template></section>
     <SubflowExtractionDialog v-if="extraction" :definition="extraction.definition" :output-types="outputTypes" :selected-node-ids="extraction.ids" @close="extraction=null" @created="emit('subflow-created', $event)" @open="extraction=null; emit('open-subflow', $event)" />
   </div>
 </template>
@@ -347,13 +383,14 @@ onBeforeUnmount(() => { graphNavigation++; window.removeEventListener('keydown',
 .graph-config-panel { display: grid; grid-template-columns: minmax(0,1.4fr) minmax(320px,1fr); gap: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: #f7f9fc; }
 .flow-toolbar button.active { border-color: #2f6fed; color: #2f6fed; background: #eff5ff; }
 .validation-panel { display: grid; gap: 6px; padding: 12px; border: 1px solid #efcf91; border-radius: 11px; background: #fff7e7; }
-.validation-panel > div { display: flex; align-items: center; justify-content: space-between; }
+.validation-panel-header { display: flex; align-items: center; justify-content: space-between; }
 .validation-panel h3 { margin: 0; color: #986316; }
-.validation-panel > div span { color: #986316; font-size: 12px; }
-.validation-panel button { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; text-align: left; }
-.validation-panel button b { color: #986316; }
-.validation-panel button span { color: #6b5a3a; }
-.validation-panel button small { color: #a8842e; }
+.validation-panel-header span { color: #986316; font-size: 12px; }
+.validation-issue { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; text-align: left; }
+.validation-issue b { color: #986316; }
+.validation-issue span { color: #6b5a3a; }
+.validation-issue small { color: #a8842e; }
+.validation-issue-static { padding: 9px 11px; border: 1px solid #ead8ad; border-radius: 8px; background: #fffaf0; }
 </style>
 <style scoped>
 .graph-config-panel,.graph-prompt-panel,.flow-toolbar button,.graph-config-panel :deep(.schema-block){scroll-margin-top:88px}.graph-config-heading{grid-column:1/-1;display:flex;justify-content:space-between;gap:16px;align-items:start}.graph-config-heading h3{margin:0;font-size:18px}.graph-config-heading p{margin:8px 0 0;color:var(--muted);font-size:13px}.graph-config-heading>div:last-child{display:flex;gap:8px;flex-shrink:0}.graph-prompt-panel{min-width:0}

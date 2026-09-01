@@ -128,7 +128,7 @@ onMounted(() => { if (activeTab.value === 'assets') refresh() })
     <template v-else-if="overview?.healthy">
       <section class="panel vector-filters">
         <label>搜索<input v-model="filters.q" placeholder="Collection / Partition / 知识库" @keyup.enter="loadCollections"></label>
-        <label>知识类型<select v-model="filters.knowledge_type" @change="loadCollections"><option value="">全部</option><option value="text">文本</option><option value="qa">问答</option><option value="graph:triple">三元组图谱</option><option value="graph:semantic">语义图谱</option></select></label>
+        <label>知识类型<select v-model="filters.knowledge_type" @change="loadCollections"><option value="">全部</option><option value="text">文本</option><option value="qa-question">问答·Q检索</option><option value="qa-full">问答·QA检索</option><option value="graph:triple">三元组图谱</option><option value="graph:semantic">语义图谱</option></select></label>
         <label>状态<select v-model="filters.status" @change="loadCollections"><option value="">全部</option><option v-for="value in ['USING','PENDING','HISTORY','GC_ELIGIBLE','INCONSISTENT','UNMANAGED']" :key="value" :value="value">{{ vectorStatusLabel(value) }}</option></select></label>
         <label class="check"><input v-model="filters.only_managed" type="checkbox" @change="loadCollections">只看已托管</label>
         <label class="check"><input v-model="filters.only_anomaly" type="checkbox" @change="loadCollections">只看异常</label>

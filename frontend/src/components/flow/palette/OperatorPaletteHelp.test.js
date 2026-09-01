@@ -6,7 +6,7 @@ import { makeCanvasNode } from '../flowModel.js'
 import { checkEdgeCompatibility } from '../edge/edgeCompatibility.js'
 
 let wrapper
-afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.useRealTimers() })
+afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); vi.useRealTimers() })
 const item = (code = 'HtmlEntityFilter', source = 'dataflow') => ({ code, name: code, display_name_zh: 'HTML 实体过滤器', summary: '删除含HTML实体的整条文本，不是局部清理。', description: '删除含HTML实体的整条文本，不是局部清理。', source, catalog_group: source === 'custom' ? 'custom' : source === 'dataflow' ? 'dataflow_featured' : 'dataforge', category: source === 'custom' ? 'content-filtering' : source === 'dataflow' ? 'content-filtering' : 'content-processing', version: 1, exposure: 'canvas', status: 'published', enabled: true, approved: true, surfaces: ['advanced-canvas'], knowledge_types: ['text'], dependency_status: { status: 'ready' }, runtime_requirements: { driver: source === 'custom' ? 'custom' : source === 'dataflow' ? 'dataflow' : 'builtin', executor: source === 'dataforge' ? 'dataforge-native' : 'dataflow-storage', uses_llm: false, resources: 'CPU', data_behavior: '过滤整条文本', limitations: '不进行HTML实体替换' }, input_ports: { input: { artifact_type: 'candidate:text' } }, output_ports: { output: { artifact_type: 'candidate:text' } } })
 function palette(catalog = [item()]) { wrapper = mount(OperatorPalette, { props: { catalog, outputTypes: ['text'] }, attachTo: document.body }); return wrapper }
 const info = () => wrapper.get('.operator-info')
@@ -199,4 +199,39 @@ it('shows compatible, runtime-unready and incompatible operators without hiding 
   expect(wrapper.emitted('add-item')).toHaveLength(1)
   await wrapper.get('[role="tab"][aria-selected="false"]').trigger('click')
   expect(wrapper.emitted('change-direction')[0]).toEqual(['upstream'])
+})
+
+it('focuses a Sink with scroll, keyboard focus, a resettable hint and no add event', async () => {
+  vi.useFakeTimers()
+  vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })))
+  palette()
+  const target = wrapper.get('.sink-item').element
+  target.scrollIntoView = vi.fn()
+
+  await expect(wrapper.vm.focusSink('text')).resolves.toBe(true)
+  expect(target.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' })
+  expect(document.activeElement).toBe(target)
+  expect(wrapper.get('.sink-item').classes()).toContain('sink-targeted')
+  expect(wrapper.get('.sink-add-hint').text()).toBe('双击此处添加到画布')
+  expect(wrapper.emitted('add-sink')).toBeUndefined()
+
+  await vi.advanceTimersByTimeAsync(3000)
+  await expect(wrapper.vm.focusSink('text')).resolves.toBe(true)
+  await vi.advanceTimersByTimeAsync(3999)
+  expect(wrapper.find('.sink-add-hint').exists()).toBe(true)
+  await vi.advanceTimersByTimeAsync(1)
+  expect(wrapper.find('.sink-add-hint').exists()).toBe(false)
+})
+
+it('uses instant reduced-motion navigation and returns false for an unknown Sink', async () => {
+  vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true })))
+  wrapper = mount(OperatorPalette, { props: { outputTypes: ['text', 'qa'] }, attachTo: document.body })
+  const targets = wrapper.findAll('.sink-item')
+  targets.forEach(target => { target.element.scrollIntoView = vi.fn() })
+
+  await expect(wrapper.vm.focusSink('qa')).resolves.toBe(true)
+  expect(targets[1].element.scrollIntoView).toHaveBeenCalledWith({ behavior: 'auto', block: 'center' })
+  expect(document.activeElement).toBe(targets[1].element)
+  await expect(wrapper.vm.focusSink('graph:triple')).resolves.toBe(false)
+  expect(wrapper.emitted('add-sink')).toBeUndefined()
 })

@@ -48,16 +48,16 @@ describe('Standard business stages follow the managed contract', () => {
     expect(wrapper.find('[data-stage="quality"]').exists()).toBe(false)
   })
 
-  it.each(['standard-qa', 'standard-graph-triple', 'standard-graph-semantic', 'standard-multi'])('%s keeps generation controls separate from quality', async code => {
+  it.each(['standard-qa-question', 'standard-qa-full', 'standard-graph-triple', 'standard-graph-semantic', 'standard-multi'])('%s keeps generation controls separate from quality', async code => {
     await render(code)
-    const count = code === 'standard-qa' ? 5 : code === 'standard-multi' ? 7 : 6
+    const count = code.startsWith('standard-qa-') ? 5 : code === 'standard-multi' ? 7 : 6
     expect(wrapper.findAll('.number').map(item => item.text())).toEqual(Array.from({ length: count }, (_, i) => String(i + 1)))
     const generation = wrapper.get('[data-stage="generation"]')
     expect(generation.text()).toContain('模型服务')
     expect(generation.text()).not.toContain('质量规则')
     expect(wrapper.text()).not.toContain('质量规则')
-    expect(wrapper.find('[data-stage="quality"]').exists()).toBe(code !== 'standard-qa')
-    if (code !== 'standard-qa') {
+    expect(wrapper.find('[data-stage="quality"]').exists()).toBe(!code.startsWith('standard-qa-'))
+    if (!code.startsWith('standard-qa-')) {
       expect(generation.text()).toContain('实体类型')
       expect(generation.text()).toContain('关系类型')
     }
@@ -66,20 +66,20 @@ describe('Standard business stages follow the managed contract', () => {
   })
 
   it('uses stages rather than output type and supports an unsaved draft', async () => {
-    await render('standard-qa', { template: null, managedTemplateCode: 'standard-qa', outputTypes: ['text'],
-      definition: { template_code: 'standard-qa', stages: {} } })
+    await render('standard-qa-question', { template: null, managedTemplateCode: 'standard-qa-question', outputTypes: ['text'],
+      definition: { template_code: 'standard-qa-question', stages: {} } })
     expect(wrapper.findAll('.business-stage')).toHaveLength(5)
     await wrapper.get('.serving-selector select').setValue('model')
-    expect(wrapper.emitted('update:definition').at(-1)[0].template_code).toBe('standard-qa')
+    expect(wrapper.emitted('update:definition').at(-1)[0].template_code).toBe('standard-qa-question')
     await wrapper.setProps({ managedTemplateCode: 'standard-text', definition: { template_code: 'standard-text', stages: {} } })
     expect(wrapper.findAll('.business-stage')).toHaveLength(5)
   })
 
   it('resolves the current Standard config into a readonly technical chain', async () => {
-    await render('standard-qa')
+    await render('standard-qa-question')
     await wrapper.findAll('.standard-views button')[1].trigger('click')
     await flushPromises()
-    expect(api.resolveStandardFlow).toHaveBeenCalledWith(expect.objectContaining({ managed_template_code: 'standard-qa', authoring_mode: 'standard' }))
+    expect(api.resolveStandardFlow).toHaveBeenCalledWith(expect.objectContaining({ managed_template_code: 'standard-qa-question', authoring_mode: 'standard' }))
     expect(wrapper.get('[aria-label="只读技术流程"]').text()).toMatch(/文档输入|文档切分|自动冻结输入|问答生成器|Knowledge Sink/)
     expect(api.resolveStandardFlow.mock.calls.at(-1)[0]).not.toHaveProperty('output_types')
     expect(wrapper.findAll('.operator-step')).toHaveLength(5)
@@ -88,7 +88,7 @@ describe('Standard business stages follow the managed contract', () => {
     expect(wrapper.text()).not.toMatch(/删除算子|替换算子|添加分支/)
   })
 
-  it.each(['standard-qa', 'standard-multi'])('%s saves and reloads multiline extraction instructions', async code => {
+  it.each(['standard-qa-question', 'standard-multi'])('%s saves and reloads multiline extraction instructions', async code => {
     await render(code)
     expect(wrapper.get('[data-stage="generation"] .stage-operator').text()).toContain('问答提取器')
     expect(wrapper.get('[data-stage="generation"] .stage-operator').text()).toContain('QA Extractor')
@@ -101,5 +101,18 @@ describe('Standard business stages follow the managed contract', () => {
     await wrapper.findAll('.standard-views button')[1].trigger('click')
     await flushPromises()
     expect(api.resolveStandardFlow.mock.calls.at(-1)[0].definition.stages.generation.config.extraction_instructions).toBe(requirements)
+  })
+
+  it('defaults Multi to qa-question and updates the visible sink when changed to qa-full', async () => {
+    await render('standard-multi')
+    const generation = wrapper.get('[data-stage="generation"]')
+    const select = generation.findAll('select').find(item => item.element.value === 'qa-question')
+    expect(select).toBeTruthy()
+    expect(wrapper.get('[data-stage="submit"]').text()).toContain('qa-question')
+    await select.setValue('qa-full')
+    expect(wrapper.emitted('update:definition').at(-1)[0].stages.generation.config.qa_output_type).toBe('qa-full')
+    expect(wrapper.get('[data-stage="submit"]').text()).toContain('qa-full')
+    await wrapper.setProps({ definition: wrapper.emitted('update:definition').at(-1)[0], outputTypes: ['text', 'qa-full', 'graph:triple'] })
+    expect(generation.findAll('select').find(item => item.element.value === 'qa-full')).toBeTruthy()
   })
 })

@@ -28,6 +28,7 @@ let publishNoticeTimer
 let saveTimer, savePromise, editGeneration = 0, editorSession = 0
 const router = useRouter()
 const route = useRoute()
+const ADVANCED_AUTOSAVE_DELAY_MS = 10_000
 const activePage = computed(() => route.query.tab === 'output-types' ? 'output-types' : 'flows')
 const advancedConversionHelp = '基于当前标准配置展开完整执行 DAG，先在当前页面预览和编辑。首次保存或运行前保存时才创建独立的自定义高级流程，直接退出不会创建草稿。原标准流程不会被修改。'
 
@@ -44,7 +45,7 @@ function resetSaveState() { cancelAutosave(); clearPublishNotice(); editorSessio
 function markDirty() {
   dirty.value = true; saveFailed.value = false; editGeneration++; cancelAutosave()
   if (authoringMode.value === 'advanced' && !pendingConversion.value && code.value.trim() && name.value.trim()) {
-    saveTimer = setTimeout(() => { if (dirty.value) save() }, 500)
+    saveTimer = setTimeout(() => { if (dirty.value) save() }, ADVANCED_AUTOSAVE_DELAY_MS)
   }
 }
 function currentViewport() { return { left: window.scrollX, top: window.scrollY } }
@@ -62,6 +63,14 @@ onBeforeUnmount(resetSaveState)
 
 function outputFamily(value) { return value.startsWith('graph:') ? 'graph' : value }
 function outputSummary(item) { return templateOutputSummary(item, types.value) }
+function standardOutputTypes(definition = stageDefinition.value) {
+  const managedCode = definition?.template_code || selected.value?.managed_template_code
+  if (managedCode === 'standard-multi') {
+    const qaOutputType = definition?.stages?.generation?.config?.qa_output_type || 'qa-question'
+    return ['text', qaOutputType, 'graph:triple']
+  }
+  return outputTypes.value
+}
 
 function defaultDraftIdentity(managedCode = '') {
   const managed = managedTemplates.value.find(item => item.code === managedCode)
@@ -188,7 +197,7 @@ function buildBody() {
   }
   return { name: name.value, output_types: outputTypes.value, authoring_mode: 'advanced', managed_template_code: null, definition: advancedEditor.value?.serialize() || { schema_version: 3, nodes: [], edges: [] } }
 }
-function onStageDefinition(value) { stageDefinition.value = value; markDirty() }
+function onStageDefinition(value) { stageDefinition.value = value; outputTypes.value = standardOutputTypes(value); markDirty() }
 async function convertToAdvanced() {
   if (!selected.value || authoringMode.value !== 'standard' || converting.value) return
   if (dirty.value) { error.value = '请先保存当前标准配置，再转换为高级编排'; return }
@@ -292,7 +301,7 @@ async function saveOnce() {
       revision_status: response.revision_status || (response.status === 'published' ? 'published' : 'draft'), status: response.status }
     const index = templates.value.findIndex(item => item.id === refreshed.id)
     if (index >= 0) templates.value.splice(index, 1, refreshed); else templates.value.push(refreshed)
-    selected.value = refreshed; saveFailed.value = false
+    selected.value = refreshed; outputTypes.value = [...refreshed.output_types]; saveFailed.value = false
     if (conversion) {
       pendingConversion.value = null
       router.replace(`/developer/flow-templates?template_id=${refreshed.id}&edit=1`)
@@ -376,9 +385,9 @@ onMounted(async () => {
     <UnsavedNavigationDialog v-if="pendingSubflow" :pending="navigationSaving" :error="error" @cancel="pendingSubflow=null" @discard="navigateSubflow(pendingSubflow)" @save="saveThenNavigate" />
     <header class="template-page-head">
       <div><div class="title-row"><h2>知识流程</h2></div><p>{{ activePage === 'flows' ? '通过标准业务配置或高级编排定义知识生产规则；正式输出库由业务运行时绑定。' : '定义 Text、QA、Graph 与扩展类型的正式输出语义。' }}</p><p v-if="editing && activePage === 'flows'" class="template-revisions">{{ templateRevisionSummary(selected) }}</p></div>
-      <div class="header-actions"><template v-if="editing && activePage === 'flows'"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected" @click="action('validate')">编译校验</button><button @click="runDebug()">运行当前流程</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
+      <div class="header-actions"><template v-if="editing && activePage === 'flows'"><span class="save-state" :class="{ dirty }" role="status"><i></i>{{ statusLabel }}</span><button :disabled="saving" @click="settingsOpen=!settingsOpen">流程设置</button><button :disabled="!selected || saving" @click="action('validate')">编译校验</button><button :disabled="saving" @click="runDebug()">运行当前流程</button><button class="primary" :disabled="!selected || saving" @click="action('publish')">发布</button></template></div>
     </header>
-    <nav class="page-tabs" aria-label="知识流程页面"><button :class="{active:activePage==='flows'}" @click="switchPage('flows')">知识流程</button><button :class="{active:activePage==='output-types'}" @click="switchPage('output-types')">输出类型配置</button></nav>
+    <nav class="page-tabs" aria-label="知识流程页面"><button :disabled="saving" :class="{active:activePage==='flows'}" @click="switchPage('flows')">知识流程</button><button :disabled="saving" :class="{active:activePage==='output-types'}" @click="switchPage('output-types')">输出类型配置</button></nav>
     <OutputTypeConfiguration v-if="activePage === 'output-types'" />
     <template v-else>
       <p v-if="pendingConversion" class="conversion-notice">当前为转换预览，尚未创建草稿。首次保存或运行前保存后才创建独立流程，直接退出不会保留。</p>
@@ -413,7 +422,7 @@ onMounted(async () => {
           </div>
         </section>
       </template>
-      <template v-else>
+      <template v-else><div class="editor-save-surface" :inert="saving ? '' : null" :aria-busy="saving ? 'true' : undefined">
         <form v-if="settingsOpen" class="template-settings" novalidate @submit.prevent="save">
           <label>模板编码
             <input id="template-code" ref="codeInput" v-model="code" :disabled="!!selected" required placeholder="template-code" :aria-invalid="!code.trim() ? 'true' : undefined" :aria-describedby="!code.trim() ? 'template-code-error' : undefined" @input="markDirty">
@@ -423,17 +432,17 @@ onMounted(async () => {
             <input id="template-name" ref="nameInput" v-model="name" required placeholder="模板名称" :aria-invalid="!name.trim() ? 'true' : undefined" :aria-describedby="!name.trim() ? 'template-name-error' : undefined" @input="markDirty">
             <small v-if="!name.trim()" id="template-name-error" class="field-error">模板名称不能为空</small>
           </label>
-          <fieldset><legend>正式输出</legend><p v-if="authoringMode === 'standard'" data-testid="managed-outputs">固定模板维护：{{ outputSummary({ output_types: managedTemplates.find(item => item.code === (stageDefinition?.template_code || selected?.managed_template_code))?.output_types || [] }) }}</p><template v-else><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="markDirty">{{ item.name }}</label></template></fieldset>
+          <fieldset><legend>正式输出</legend><p v-if="authoringMode === 'standard'" data-testid="managed-outputs">固定模板维护：{{ outputSummary({ output_types: standardOutputTypes() }) }}</p><template v-else><label v-for="item in typeOptions" :key="item.code"><input v-model="outputTypes" type="checkbox" :value="item.code" @change="markDirty">{{ item.name }}</label></template></fieldset>
           <label>样例<select v-model="sampleId"><option value="guideline-md">指南 Markdown</option><option value="faq-csv">FAQ CSV</option><option value="case-txt">病例摘要</option></select></label>
-          <div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary">保存草稿</button></div>
+          <div class="settings-actions"><button v-if="selected" type="button" @click="action('default')">设为默认</button><button v-if="selected" type="button" class="danger" @click="action('archive')">归档</button><button class="primary" :disabled="saving">{{ saving ? '保存中…' : '保存草稿' }}</button></div>
         </form>
         <div class="flow-toolbar">
           <div class="authoring-mode-actions"><span class="selection-state">{{ authoringMode === 'standard' ? '标准配置 · 业务阶段' : '高级编排 · Authoring DAG' }}</span><template v-if="authoringMode==='standard' && selected"><button @click="convertToAdvanced">转换为高级编排</button><FieldHelp label="高级编排转换说明" :text="advancedConversionHelp" /></template><button class="exit toolbar-exit" @click="exitEditing">‹ 退出编辑</button></div>
-          <div><button class="primary" @click="save">保存草稿</button></div>
+          <div><button class="primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存草稿' }}</button></div>
         </div>
         <StandardFlowEditor v-if="authoringMode === 'standard'" :template="selected" :managed-template-code="stageDefinition?.template_code || selected?.managed_template_code || ''" :definition="stageDefinition" :managed-templates="managedTemplates" :output-types="outputTypes" @update:definition="onStageDefinition" />
         <AdvancedFlowEditor v-else ref="advancedEditor" :catalog="catalog" :subflows="subflows" :output-types="outputTypes" :sample-result="sampleResult" @dirty="onEditorDirty" @error="onEditorError" @open-subflow="requestSubflow" @subflow-created="refreshSubflows" />
-      </template>
+      </div></template>
       <div v-if="wizardOpen" class="wizard-backdrop" @click.self="wizardOpen=false"><section class="wizard"><header><div><h3>选择知识生产目标</h3><p>普通路径只选择业务目标，不需要理解 Node、Edge 或 Port。</p></div><button @click="wizardOpen=false">关闭</button></header><div class="goal-grid"><button v-for="item in managedTemplates" :key="item.code" @click="startNew(item.code)"><b>{{ item.name }}</b><small>{{ (item.output_types || []).join(' + ') }}</small></button></div><div class="advanced-choice"><span>高级</span><button @click="startNew('')"><b>空白高级流程</b><small>从 Authoring DAG 开始</small></button></div></section></div>
       <section v-if="error || result" ref="actionConsole" class="action-console" aria-label="Console">
         <header><b>Console</b></header>

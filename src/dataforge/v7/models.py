@@ -517,6 +517,15 @@ class KnowledgeLibraryWorkLease(Timestamped, Base):
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
 
 
+class GraphExecutionLease(Timestamped, Base):
+    """One cross-library lease serializes graph model-processing jobs."""
+    __tablename__ = "graph_execution_leases"
+    scope: Mapped[str] = mapped_column(String(64), primary_key=True)
+    work_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    lease_owner: Mapped[str] = mapped_column(String(255), nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
 class ComponentHeartbeat(Timestamped, Base):
     """Latest liveness signal for one Worker or Runner process."""
     __tablename__ = "component_heartbeats"
@@ -1175,6 +1184,7 @@ class VectorSyncJob(Timestamped, Base):
         ForeignKey("knowledge_asset_versions.id"), nullable=True, index=True
     )
     publish_idempotency_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    requested_snapshot_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class KnowledgeAssetVersion(Timestamped, Base):
@@ -1413,7 +1423,6 @@ class ProjectReleaseTask(Timestamped, Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
     project_task_id: Mapped[str] = mapped_column(ForeignKey("project_tasks.id"), nullable=False, index=True)
     index_profile_id: Mapped[str | None] = mapped_column(ForeignKey("knowledge_index_profiles.id"), nullable=True, index=True)
-    qa_embedding_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
     top_k: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
     final_top_k: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     reranker_serving_code: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

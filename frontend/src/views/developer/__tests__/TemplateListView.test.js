@@ -146,11 +146,11 @@ describe('new knowledge flow identity', () => {
   it('uses one shared suffix when either preferred value already exists', async () => {
     api.flowTemplates.mockResolvedValue([
       standardTemplate(), advanced,
-      { ...advanced, id: 'custom-qa', code: 'custom-standard-qa', name: '问答知识流程（自定义）' },
+      { ...advanced, id: 'custom-qa', code: 'custom-standard-qa-question', name: '问答知识·仅问题检索流程（自定义）' },
     ])
     await render(); await startNew(1)
-    expect(wrapper.get('#template-code').element.value).toBe('custom-standard-qa-2')
-    expect(wrapper.get('#template-name').element.value).toBe('问答知识流程（自定义）（2）')
+    expect(wrapper.get('#template-code').element.value).toBe('custom-standard-qa-question-2')
+    expect(wrapper.get('#template-name').element.value).toBe('问答知识·仅问题检索流程（自定义）（2）')
   })
 
   it('shows and clears field-level required errors immediately', async () => {
@@ -275,7 +275,7 @@ describe('temporary Advanced conversion', () => {
     expect(wrapper.get('.template-page-head .template-revisions').text()).toBe('最新草稿：r1 · 已发布版本：未发布')
     if (action === '运行当前流程') expect(router.push).toHaveBeenCalledWith(expect.stringContaining('template_id=converted'))
     wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
-    await vi.advanceTimersByTimeAsync(500); await flushPromises()
+    await vi.advanceTimersByTimeAsync(10_000); await flushPromises()
     expect(api.updateFlowTemplate).toHaveBeenCalledWith('converted', expect.any(Object))
     expect(api.createFlowTemplate).toHaveBeenCalledTimes(1)
   })
@@ -343,13 +343,13 @@ describe('knowledge flow editing toolbar', () => {
     api.updateFlowTemplate.mockImplementationOnce(() => new Promise((resolve, reject) => { fail = reject }))
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
     const editor = wrapper.findComponent('.advanced-editor-test')
-    editor.vm.$emit('dirty'); await vi.advanceTimersByTimeAsync(500)
+    editor.vm.$emit('dirty'); await vi.advanceTimersByTimeAsync(10_000)
     editor.vm.definition = { nodes: [{ id: 'newest' }], edges: [] }
     editor.vm.$emit('dirty')
     fail(new Error('old request failed')); await flushPromises()
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
     expect(api.updateFlowTemplate.mock.calls[1][1].definition.nodes).toEqual([{ id: 'newest' }])
-    await vi.advanceTimersByTimeAsync(2000)
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
   })
   it('does not retry a failed unchanged generation and never announces a 409 publish as success', async () => {
@@ -357,7 +357,7 @@ describe('knowledge flow editing toolbar', () => {
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
     api.updateFlowTemplate.mockRejectedValueOnce(new Error('network failed'))
     wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
-    await vi.advanceTimersByTimeAsync(2500); await flushPromises()
+    await vi.advanceTimersByTimeAsync(10_000); await flushPromises()
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
     api.publishFlowTemplate.mockRejectedValueOnce(Object.assign(new Error('STALE_FLOW_DRAFT'), { status: 409 }))
     await button('发布').trigger('click'); await flushPromises()
@@ -383,22 +383,62 @@ describe('knowledge flow editing toolbar', () => {
     const editor = wrapper.findComponent('.advanced-editor-test')
     editor.vm.definition = { schema_version: 3, nodes: [{ id: 'latest' }], edges: [] }
     editor.vm.$emit('dirty')
-    await vi.advanceTimersByTimeAsync(499)
+    await vi.advanceTimersByTimeAsync(9_999)
     expect(api.updateFlowTemplate).not.toHaveBeenCalled()
     await button('运行当前流程').trigger('click'); await flushPromises()
     expect(api.updateFlowTemplate.mock.calls[0][1].definition.nodes).toEqual([{ id: 'latest' }])
     expect(router.push).toHaveBeenCalledWith(expect.stringContaining('revision_kind=draft'))
-    await vi.advanceTimersByTimeAsync(501)
+    await vi.advanceTimersByTimeAsync(1)
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
   })
-  it('serializes slow saves, preserves subsequent edits and only then opens a run', async () => {
+  it('waits ten seconds after the latest Advanced edit before autosaving', async () => {
+    vi.useFakeTimers()
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+    const editor = wrapper.findComponent('.advanced-editor-test')
+    editor.vm.$emit('dirty')
+    await vi.advanceTimersByTimeAsync(5_000)
+    editor.vm.definition = { schema_version: 3, nodes: [{ id: 'latest-edit' }], edges: [] }
+    editor.vm.$emit('dirty')
+    await vi.advanceTimersByTimeAsync(9_999)
+    expect(api.updateFlowTemplate).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1); await flushPromises()
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
+    expect(api.updateFlowTemplate.mock.calls[0][1].definition.nodes).toEqual([{ id: 'latest-edit' }])
+  })
+  it('locks every editor control while a manual save is pending, then restores it', async () => {
+    vi.useFakeTimers()
+    let finish
+    api.updateFlowTemplate.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
+    await button('流程设置').trigger('click')
+    const saveButtons = () => wrapper.findAll('button').filter(item => ['保存草稿', '保存中…'].includes(item.text().trim()))
+    await saveButtons().at(-1).trigger('click'); await flushPromises()
+
+    expect(saveButtons()).toHaveLength(2)
+    expect(saveButtons().every(item => item.element.disabled)).toBe(true)
+    expect(wrapper.get('.editor-save-surface').attributes('inert')).toBeDefined()
+    for (const label of ['流程设置', '编译校验', '运行当前流程', '发布']) {
+      expect(button(label).element.disabled).toBe(true)
+    }
+    await saveButtons()[0].trigger('click')
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
+
+    finish({ revision: 2, revision_id: 'r2', source_definition_checksum: 'checksum2', status: 'draft' })
+    await flushPromises()
+    expect(saveButtons().every(item => !item.element.disabled)).toBe(true)
+    expect(wrapper.get('.editor-save-surface').attributes('inert')).toBeUndefined()
+    expect(button('流程设置').element.disabled).toBe(false)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(api.updateFlowTemplate).toHaveBeenCalledTimes(1)
+  })
+  it('serializes slow saves, preserves subsequent edits, and keeps run locked', async () => {
     vi.useFakeTimers()
     let finish
     api.updateFlowTemplate.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
     const editor = wrapper.findComponent('.advanced-editor-test')
     editor.vm.$emit('dirty')
-    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(10_000)
     editor.vm.definition = { schema_version: 3, nodes: [{ id: 'new-node' }], edges: [] }
     editor.vm.$emit('dirty')
     await button('运行当前流程').trigger('click')
@@ -408,8 +448,8 @@ describe('knowledge flow editing toolbar', () => {
     expect(editor.vm.definition.nodes).toEqual([{ id: 'new-node' }])
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
     expect(api.updateFlowTemplate.mock.calls[1][1].definition.nodes).toEqual([{ id: 'new-node' }])
-    expect(router.push).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(500)
+    expect(router.push).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(api.updateFlowTemplate).toHaveBeenCalledTimes(2)
   })
   it('does not run an old draft after a save fails', async () => {
@@ -428,7 +468,7 @@ describe('knowledge flow editing toolbar', () => {
     api.updateFlowTemplate.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
     await render(); await wrapper.findAll('.template-list button')[1].trigger('click')
     wrapper.findComponent('.advanced-editor-test').vm.$emit('dirty')
-    await vi.advanceTimersByTimeAsync(500)
+    await vi.advanceTimersByTimeAsync(10_000)
     vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
     await button('‹ 退出编辑').trigger('click')
     finish({ revision: 2, status: 'draft' }); await flushPromises()

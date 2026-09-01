@@ -155,10 +155,16 @@ def _run_knowledge_job(store: V7Store, resolved: Settings, job_id: str, owner: s
             store.mark_job_failed(job_id, "DATAFORGE_RUNNER_URL 未配置")
             return 0
         headers = {"Authorization": f"Bearer {resolved.runner_service_token}"} if resolved.runner_service_token else {}
+        timeout_seconds = store.graph_job_runner_timeout_seconds(
+            job_id,
+            default_timeout_seconds=resolved.runner_timeout_seconds,
+            graph_llm_timeout_seconds=resolved.graph_llm_timeout_seconds,
+            graph_timeout_buffer_seconds=resolved.graph_runner_timeout_buffer_seconds,
+        )
         response = httpx.post(
             f"{resolved.runner_url.rstrip('/')}/internal/jobs",
             json={"job_id": job_id, "lease_owner": owner}, headers=headers,
-            timeout=resolved.runner_timeout_seconds,
+            timeout=timeout_seconds,
         )
         response.raise_for_status()
         return 1
@@ -269,6 +275,7 @@ def _run_exclusive_once(store: V7Store, resolved: Settings) -> int | None:
 
 def run_once(settings: Settings | None = None, *, check_schema: bool = True) -> int:
     resolved = settings or Settings.load()
+    resolved.ensure_directories()
     store = V7Store(resolved.platform_database_url)
     if check_schema:
         store.assert_schema_current()
@@ -298,6 +305,7 @@ def run_once(settings: Settings | None = None, *, check_schema: bool = True) -> 
 def run_forever(settings: Settings | None = None, *, poll_seconds: float = 2.0, stop_event=None) -> None:
     """Run dedicated knowledge/vector pools with an exclusive maintenance barrier."""
     resolved = settings or Settings.load()
+    resolved.ensure_directories()
     store = V7Store(resolved.platform_database_url)
     store.assert_schema_current()
     heartbeat_instance = f"worker:{socket.gethostname()}:{os.getpid()}"

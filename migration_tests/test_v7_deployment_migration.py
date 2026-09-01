@@ -24,7 +24,7 @@ from dataforge.v7.migration.manifest import validate_manifest
 from dataforge.v7.migration.planner import InstitutionReleasePlanner, MigrationPlanner
 from dataforge.v7.migration.verifier import ActivationPreflightVerifier
 from dataforge.v7.migrations import upgrade
-from dataforge.v7.models import DataForgeInstance, Deployment, FlowExecutionSnapshot, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeFlowTemplateRevision, KnowledgeItem, KnowledgeEvidence, ParsedDocument, FlowChunkReviewSnapshot, SourceVersion
+from dataforge.v7.models import DataForgeInstance, Deployment, FlowExecutionSnapshot, ImportedRouteCandidate, KnowledgeAssetVersion, KnowledgeAssetItem, KnowledgeFlowTemplateRevision, KnowledgeIndexProfile, KnowledgeIndexProfileRevision, KnowledgeItem, KnowledgeEvidence, ParsedDocument, FlowChunkReviewSnapshot, SourceVersion
 from dataforge.v7.storage import LocalObjectStore
 from dataforge.v7.store import V7Store
 from dataforge.v7.vector import V7Milvus
@@ -345,11 +345,11 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
         sha256="f" * 64, size_bytes=10, media_type="text/plain",
     )
     record_and_approve_source(store, objects, source, "冻结 FAQ 来源")
-    library = store.create_knowledge_library("冻结 FAQ", "qa")
+    library = store.create_knowledge_library("冻结 FAQ", "qa-question")
     job = store.create_knowledge_job(
-        [source["version"]["id"]], {"qa": library["id"]}, "flow_standard-qa",
+        [source["version"]["id"]], {"qa-question": library["id"]}, "flow_standard-qa-question",
     )
-    store.apply_knowledge_output(job["id"], "qa", [{
+    store.apply_knowledge_output(job["id"], "qa-question", [{
         "source_knowledge_id": "freeze-faq", "canonical_content": "冻结答案",
         "data_json": {"question": "冻结？", "answer": "是"},
         "source_version_ids": [source["version"]["id"]],
@@ -391,7 +391,13 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     monkeypatch.setenv("DATAFORGE_INSTANCE_CODE", "dataforge-central")
     monkeypatch.setattr(
         v7_web, "V7Milvus",
-        lambda uri, token=None: SimpleNamespace(uri=uri, token=token, list_collections=lambda: []),
+        lambda uri, token=None: SimpleNamespace(
+            uri=uri, token=token, list_collections=lambda: ["dataforge_qa_question"],
+            validate_collection=lambda _collection, fields, dimension: {
+                "fields": sorted(fields.values()), "dimension": dimension,
+            },
+            partition_exists=lambda *_: True,
+        ),
     )
     client = TestClient(create_app(Settings(
         project_root=tmp_path, state_dir=tmp_path / "state", database_url=url,
@@ -400,13 +406,13 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     validation = client.post(
         f"/api/projects/{project['id']}/routing/validate?release_stage=test",
     ).json()
-    assert validation["valid"] is True, validation
+    assert validation["valid"] is True, json.dumps(validation, ensure_ascii=False, indent=2)
     assert validation["target_validation"] == {
         "mode": "live", "attempted": True, "reachable": True, "reason": None,
     }
     second_project = store.create_project("共享资产项目")
     second_task = store.create_project_task(
-        second_project["id"], "knowledge_qa_shared", "共享问答", "qa",
+        second_project["id"], "knowledge_qa_shared", "共享问答", "qa-question",
     )
     second_binding = store.bind_project_deployment(deployment["deployment_id"], second_project["id"])
     profile = next(item for item in store.list_index_profiles() if item["code"] == "qa-question")
@@ -445,12 +451,31 @@ def test_institution_freeze_locks_institution_code_and_does_not_create_package(t
     assert {item["project_name"] for item in required_option["required_by_projects"]} == {
         project["name"], second_project["name"],
     }
+    assert required_option["index_profile_code"] == "qa-question"
 
-    other_asset_id = next(item["id"] for item in store.vector_status(library["id"])["asset_versions"]
-                          if item["id"] != required_asset_id and item["status"] == "ready")
     with store.sessions.begin() as session:
         required_asset = session.get(KnowledgeAssetVersion, required_asset_id)
-        session.get(KnowledgeAssetVersion, other_asset_id).collection_name = required_asset.collection_name
+        qa_full = session.scalar(select(KnowledgeIndexProfile).where(
+            KnowledgeIndexProfile.code == "qa-full",
+        ))
+        qa_full_revision = session.get(KnowledgeIndexProfileRevision, qa_full.current_revision_id) if qa_full else None
+        assert required_asset and qa_full and qa_full_revision
+        other_asset_id = "kav_release_conflict_qa_full"
+        session.add(KnowledgeAssetVersion(
+            id=other_asset_id, knowledge_library_id=library["id"],
+            version_no=required_asset.version_no + 1,
+            index_profile_id=qa_full.id, index_profile_revision_id=qa_full_revision.id,
+            storage_contract_revision_id=qa_full_revision.storage_contract_revision_id,
+            embedding_serving_id=qa_full_revision.embedding_serving_id,
+            embedding_model=required_asset.embedding_model,
+            embedding_dimension=required_asset.embedding_dimension,
+            collection_name=required_asset.collection_name,
+            partition_name=f"{library['partition_name']}__v{required_asset.version_no + 1}",
+            status="ready", item_count=required_asset.item_count,
+            content_digest=required_asset.content_digest,
+            review_snapshot_digest=required_asset.review_snapshot_digest,
+            review_gate_status="approved",
+        ))
     conflict_draft = store.create_institution_release_draft(
         deployment["deployment_id"], "institution_release", release_stage="test",
         target_institution_code=deployment["institution_code"],

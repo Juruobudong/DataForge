@@ -55,8 +55,8 @@ def validate_manifest(raw):
     if any(key.startswith("_") or key in {"knowledge_type", "graph_mode", "knowledge_library_id", "flow_chunk_review_snapshot_id"}
            for key in schema.get("properties", {})):
         raise ValueError("参数 Schema 不能开放系统运行参数")
-    kinds = value.get("knowledge_types", ["text", "qa", "graph"])
-    if not isinstance(kinds, list) or not kinds or any(kind not in {"text", "qa", "graph"} for kind in kinds):
+    kinds = value.get("knowledge_types", ["text", "qa-question", "qa-full", "graph"])
+    if not isinstance(kinds, list) or not kinds or any(kind not in {"text", "qa-question", "qa-full", "graph"} for kind in kinds):
         raise ValueError("自定义算子必须声明支持的知识类型")
     if not isinstance(value.get("graph_modes", []), list) or any(mode not in {"triple", "semantic"} for mode in value.get("graph_modes", [])):
         raise ValueError("未知图谱模式")
@@ -110,7 +110,7 @@ class OperatorPluginService:
                     display_name_zh=value["display_name_zh"], summary=value.get("description", value["name"]),
                     description=value.get("description", value["name"]), source="custom", catalog_group="custom",
                     category=value["category"], subcategory="",
-                    scenarios=["已审核来源知识处理"], knowledge_types=value.get("knowledge_types", ["text", "qa", "graph"]),
+                    scenarios=["已审核来源知识处理"], knowledge_types=value.get("knowledge_types", ["text", "qa-question", "qa-full", "graph"]),
                     surfaces=["advanced-canvas"], exposure="controlled", risk_level="advanced", enabled=True, lifecycle_status="draft")
                 session.add(definition); session.flush()
             previous = session.scalars(select(OperatorVersion).where(OperatorVersion.operator_definition_id == definition.id)).all()

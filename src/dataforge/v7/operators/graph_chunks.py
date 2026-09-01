@@ -97,9 +97,10 @@ def chunk_identity(value):
 
 
 class GraphChunkStage:
-    def __init__(self, node_id, params, generation):
+    def __init__(self, node_id, params, generation, *, isolate_llm_timeout=False):
         self.node_id, self.generation = node_id, generation
         self.output_key = "graph:triple"
+        self.isolate_llm_timeout = isolate_llm_timeout
         self.diagnostics = OperatorDiagnostics()
         self.diagnostics.add_secrets(params)
         self.attempted, self.successful, self.failed = set(), set(), set()
@@ -165,8 +166,15 @@ class GraphChunkStage:
             targeted[key] = chunk
             try:
                 outputs = process(records)
-            except GraphChunkError as exc:
-                message = self.diagnostics.error(f"{exc} [node={self.node_id}, source_version_id={key[0]}, flow_chunk_id={key[1]}]")
+            except (GraphChunkError, TimeoutError) as exc:
+                # Explicitly opted-in Triple LLM extraction treats a timeout as an attributable
+                # chunk failure: successful neighbouring chunks must still be
+                # eligible for the formal Sink.  Builders, validators, Semantic graphs and every
+                # other infrastructure exception retain node-failure semantics.
+                if isinstance(exc, TimeoutError) and not self.isolate_llm_timeout:
+                    raise
+                detail = f"GRAPH_CHUNK_TIMEOUT: {exc}" if isinstance(exc, TimeoutError) else str(exc)
+                message = self.diagnostics.error(f"{detail} [node={self.node_id}, source_version_id={key[0]}, flow_chunk_id={key[1]}]")
                 successful.pop(key, None)
                 failed[key] = {**chunk, "error": message}
                 self.failed.add(key)

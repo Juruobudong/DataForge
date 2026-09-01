@@ -1,18 +1,19 @@
 """Reviewed DataFlow identities with explicit, frozen DataForge artifact adaptations."""
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from copy import deepcopy
-import json
+
 from openai import APITimeoutError
 
+from ..llm_serving import get_llm_serving_registry
+from ..operator_runtime_contract import validate_runtime_requirements
 from .base import OperatorResult
-from .runtime import OperatorRuntime
 from .diagnostics import capture_operator_diagnostics
 from .outcomes import capture_generation_metrics
 from .qa import QAChunkSession, generate_qa_chunks, serving_snapshot
-from ..llm_serving import get_llm_serving_registry
-from ..operator_runtime_contract import validate_runtime_requirements
+from .runtime import OperatorRuntime
 
 
 def serving_call(params, runtime):
@@ -107,9 +108,10 @@ class DataFlowOperatorExecutor:
             return execute_governance(self, values, params, context, invoke)
         elif self.adapter == "source-chunk-to-qa-v4":
             from .derived_text import prepare_generation, restore_evidence
-            inputs, originals = prepare_generation(values, "qa", context)
+            qa_kind = params.get("knowledge_type")
+            inputs, originals = prepare_generation(values, qa_kind, context)
             outputs = self._qa(inputs, params, context, invoke, allow_no_match=True) if inputs else []
-            outputs = restore_evidence(outputs, originals, "qa", context)
+            outputs = restore_evidence(outputs, originals, qa_kind, context)
         elif self.adapter in {"candidate-hash-deduplicate-v1", "candidate-minhash-deduplicate-v1"}:
             if "method" in params:
                 raise ValueError("去重算法由算子身份固定，不接受 method 参数")
@@ -140,23 +142,19 @@ class DataFlowOperatorExecutor:
                 raise ValueError("PARSED_DOCUMENT_CONTENT_INVALID: 文本 ParsedDocument 缺少 Markdown")
             rows = invoke([{"text": text}], init=init,
                           run_arguments={"input_key": "text", "output_key": "raw_chunk"})
-            try:
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(str(params.get("tokenizer_name") or "Qwen/Qwen3-32B"),
-                                                           local_files_only=True)
-                count_tokens = lambda value: len(tokenizer.encode(value, add_special_tokens=False))
-            except Exception:
-                count_tokens = len
             for ordinal, row in enumerate(rows):
                 content = row.get("raw_chunk") or row.get("text")
                 if not isinstance(content, str) or not content.strip():
                     raise ValueError("DATAFLOW_CHUNK_OUTPUT_INVALID: KBCChunkGenerator 返回空正文")
+                token_count = row.get("_dataforge_token_count")
+                if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count <= 0:
+                    raise ValueError("DATAFLOW_CHUNK_TOKEN_COUNT_INVALID: KBCChunkGenerator 未返回有效 Token 数")
                 start = text.find(content)
                 outputs.append({
                     "parsed_document_id": document.get("parsed_document_id"),
                     "source_version_id": document.get("source_version_id"),
                     "content": content, "ordinal": ordinal,
-                    "token_count": count_tokens(content),
+                    "token_count": token_count,
                     "content_digest": __import__("hashlib").sha256(content.encode("utf-8")).hexdigest(),
                     "anchor": {"markdown_start": start if start >= 0 else None,
                                "markdown_end": start + len(content) if start >= 0 else None,
@@ -167,7 +165,7 @@ class DataFlowOperatorExecutor:
     def _filter_candidates(self, values, params, invoke):
         from ..operator_parameters import business_parameters
         business = business_parameters(self.parameter_schema, params)
-        if params.get("knowledge_type") not in {"text", "qa"}:
+        if params.get("knowledge_type") not in {"text", "qa-question", "qa-full"}:
             raise ValueError("精选过滤器仅支持文本与问答候选")
         init = {key: value for key, value in business.items() if key not in {"llm_serving", "prompt_template_revision_id"}}
         if self.adapter == "candidate-prompted-filter-v1":
@@ -217,7 +215,7 @@ class DataFlowOperatorExecutor:
             if not value.get("source_knowledge_id"):
                 raise ValueError("候选缺少 source_knowledge_id")
             if method == "minhash":
-                if params.get("knowledge_type") not in {"text", "qa"} or not value.get("flow_chunk_id"):
+                if params.get("knowledge_type") not in {"text", "qa-question", "qa-full"} or not value.get("flow_chunk_id"):
                     raise ValueError("MinHash 仅支持带来源 Chunk 的文本与问答")
                 group = (tuple(value.get("source_version_ids", [])), value["flow_chunk_id"])
                 text = value.get("canonical_content")
@@ -248,7 +246,7 @@ class DataFlowOperatorExecutor:
     def _refine(values, params, invoke):
         prompt = (params.get("_resolved_prompt_template") or {}).get("body")
         kind = params.get("knowledge_type")
-        if not prompt or kind not in {"text", "qa"}:
+        if not prompt or kind not in {"text", "qa-question", "qa-full"}:
             raise ValueError("修订必须使用已冻结 Prompt，且仅支持文本与问答")
         records, originals = [], {}
         for index, value in enumerate(values):
@@ -267,7 +265,7 @@ class DataFlowOperatorExecutor:
             if not isinstance(payload, dict) or set(payload) != expected or any(not isinstance(v, str) or not v.strip() for v in payload.values()):
                 raise ValueError("REFINER_OUTPUT_INVALID: 修订输出不满足知识契约")
             value = deepcopy(originals[row["_df_row"]])
-            if kind == "qa":
+            if kind in {"qa-question", "qa-full"}:
                 value["data_json"] = {**value["data_json"], **payload}
                 value["canonical_content"] = f"{payload['question']} {payload['answer']}"
             else:

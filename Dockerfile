@@ -107,8 +107,29 @@ RUN --network=none /opt/dataforge-operators/dataflow-1.0.10-semantic-v1/bin/pyth
     --dependency-lock runtime/dataflow/requirements-semantic-v1.lock \
     --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
 
+# KBC document-chunker使用独立轻量环境，不借用缺少chonkie/transformers的旧环境，
+# 也不借用包含完整语义模型与Torch的semantic-v1环境。
+FROM operator-semantic-resources AS operator-chunker-deps
+COPY runtime/dataflow/requirements-chunker-v1.lock ./runtime/dataflow/
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv venv --python /usr/local/bin/python /opt/dataforge-operators/dataflow-1.0.10-chunker-v1 \
+    && uv pip sync --python /opt/dataforge-operators/dataflow-1.0.10-chunker-v1/bin/python \
+        --require-hashes --only-binary=:all: runtime/dataflow/requirements-chunker-v1.lock \
+    && uv pip install --no-deps --python /opt/dataforge-operators/dataflow-1.0.10-chunker-v1/bin/python \
+        /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
+FROM operator-chunker-deps AS operator-chunker-resources
+COPY scripts/prepare-chunker-resources.py ./scripts/
+COPY runtime/dataflow/chunker-tokenizer-v1.lock.json ./runtime/dataflow/
+RUN --network=none /opt/dataforge-operators/dataflow-1.0.10-chunker-v1/bin/python scripts/prepare-chunker-resources.py \
+    --download-only --offline-tokenizer-directory /tmp/operator-resource-bundle/qwen3-tokenizer-v1 \
+    --resources /opt/dataforge-operators/resources-chunker-v1 \
+    --manifest /opt/dataforge-operators/operator-runtime.json \
+    --dependency-lock runtime/dataflow/requirements-chunker-v1.lock \
+    --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
+
 # 旧环境注册只读取已安装环境与审核wheel，禁止网络和再次安装。
-FROM operator-semantic-resources AS operator-runtime
+FROM operator-chunker-resources AS operator-runtime
 
 COPY scripts/register-operator-runtime.py ./scripts/
 
@@ -130,6 +151,11 @@ RUN --network=none \
         --register-only --resources /opt/dataforge-operators/resources-semantic-v1 \
         --manifest /opt/dataforge-operators/operator-runtime.json \
         --dependency-lock runtime/dataflow/requirements-semantic-v1.lock \
+        --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl \
+    && /opt/dataforge-operators/dataflow-1.0.10-chunker-v1/bin/python scripts/prepare-chunker-resources.py \
+        --register-only --resources /opt/dataforge-operators/resources-chunker-v1 \
+        --manifest /opt/dataforge-operators/operator-runtime.json \
+        --dependency-lock runtime/dataflow/requirements-chunker-v1.lock \
         --wheel /tmp/operator-wheels/open_dataflow-1.0.10-py3-none-any.whl
 
 # -----------------------------------------------------------------------------
@@ -151,7 +177,7 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 
 RUN groupadd --system --gid 10001 dataforge \
     && useradd --system --uid 10001 --gid dataforge --home /app dataforge \
-    && mkdir -p /var/lib/dataforge \
+    && mkdir -p /var/lib/dataforge/routing /var/lib/dataforge/migrations \
     && chown -R dataforge:dataforge /app /var/lib/dataforge
 
 ENV DATAFORGE_ROOT=/app \

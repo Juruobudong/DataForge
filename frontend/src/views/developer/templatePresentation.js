@@ -1,6 +1,7 @@
 export const BUILTIN_TEMPLATE_ORDER = [
   'standard-text',
-  'standard-qa',
+  'standard-qa-question',
+  'standard-qa-full',
   'standard-graph-triple',
   'standard-graph-semantic',
   'standard-multi',

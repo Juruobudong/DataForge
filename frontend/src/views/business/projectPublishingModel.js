@@ -1,19 +1,38 @@
-export function qaEmbeddingMode(profile) {
-  if (profile?.code === 'qa-question') return 'question'
-  if (profile?.code === 'qa-full') return 'full'
-  return null
-}
-
 export function normalizeDefaultReleaseStage(value) {
   return value === 'production' ? 'production' : 'test'
 }
 
-export function compatibleProfilesForTask(task, knowledgeTypes, qaAgent = false) {
+const BUILTIN_KNOWLEDGE_TYPE_ORDER = { 'qa-question': 0, 'qa-full': 1, text: 2, graph: 3 }
+const EXTENSION_RANK = 4, UNKNOWN_RANK = 5
+
+function knowledgeTypeRank(item) {
+  const builtin = BUILTIN_KNOWLEDGE_TYPE_ORDER[item?.code]
+  return builtin ?? (item?.kind === 'extension' ? EXTENSION_RANK : UNKNOWN_RANK)
+}
+
+export function sortKnowledgeTypes(types = []) {
+  return [...types].sort((left, right) => knowledgeTypeRank(left) - knowledgeTypeRank(right)
+    || String(left?.code || '').localeCompare(String(right?.code || '')))
+}
+
+export function defaultKnowledgeType(types = []) {
+  const sorted = sortKnowledgeTypes(types)
+  return sorted.find(item => item?.code === 'qa-question')?.code || sorted[0]?.code || ''
+}
+
+function projectCode(value) {
+  return String(value?.code || value?.name || '').trim().toLowerCase().replaceAll('_', '-')
+}
+
+export function sortProjectChoices(projects = []) {
+  return [...projects].sort((left, right) => Number(projectCode(right) === 'qa-agent') - Number(projectCode(left) === 'qa-agent'))
+}
+
+export function compatibleProfilesForTask(task, knowledgeTypes) {
   if (!task?.knowledge_type) return []
   const type = knowledgeTypes.find(item => item.status === 'active' && item.code === task.knowledge_type)
   const unique = new Map()
   for (const profile of type?.index_profiles || []) {
-    if (qaAgent && profile.code !== 'qa-question') continue
     unique.set(profile.id, profile)
   }
   return [...unique.values()]
@@ -37,6 +56,14 @@ export function movePriority(ids, id, offset) {
   if (index < 0 || target < 0 || target >= ids.length) return [...ids]
   const next = [...ids]
   ;[next[index], next[target]] = [next[target], next[index]]
+  return next
+}
+
+export function reorderPriority(ids, id, targetId, after = false) {
+  if (id === targetId || !ids.includes(id) || !ids.includes(targetId)) return [...ids]
+  const next = ids.filter(value => value !== id)
+  const targetIndex = next.indexOf(targetId)
+  next.splice(targetIndex + (after ? 1 : 0), 0, id)
   return next
 }
 

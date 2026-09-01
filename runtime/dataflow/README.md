@@ -2,6 +2,23 @@
 
 API/Worker 不加载 DataFlow。Runner 在独立 **Python 3.12 CPU** 环境中调用 `open-dataflow==1.0.10`，当前 Catalog 登记26个精选算子，不扫描全Registry。新质量信号的适配行为在 Catalog 明确声明；MinHash的同Chunk/短文本保护不变。注册数量不等于所有模型环境均已Ready。
 
+## chunker-v1 独立文档切分环境（2026-09-01）
+
+`document-chunker v2` 固定使用 `requirements-chunker-v1.in/lock`，锁摘要为 `11f3a0a8f31ed0d02b68d3d6fd4725abaa75c8df91ef60bc075783da86b39259`。环境包含 `chonkie==1.0.8`、`transformers==4.51.3`、NumPy 1.26.4 及其完整传递依赖，不安装 Torch；不得回退到缺少依赖的基础环境，也不得借用包含完整语义模型的 semantic-v1 环境。
+
+固定 tokenizer 为 `Qwen/Qwen3-32B` revision `9216db5781bf21249d130ec9da846c4624c16137`。`chunker-tokenizer-v1.lock.json` 审核5个必需文件，合计15,881,800 bytes；本机资源树摘要为 `b8bb2d9e63092615fc27afafac3f53aa8587823386d0f31a4b684a2ade7a7c3f`。扁平离线目录 `runtime/dataflow/vendor-resources/qwen3-tokenizer-v1/` 不入 Git，必须和代码分开同步到构建服务器。
+
+先激活 `sun`，创建全新的本地环境并离线登记资源：
+
+```powershell
+python scripts/install-operator-runtime.py --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl --environment .dataforge/operator-env-chunker-v1 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-chunker-v1.lock
+.dataforge/operator-env-chunker-v1/Scripts/python.exe scripts/prepare-chunker-resources.py --offline-tokenizer-directory runtime/dataflow/vendor-resources/qwen3-tokenizer-v1 --resources .dataforge/operator-resources-chunker-v1 --manifest .dataforge/operator-runtime.json --dependency-lock runtime/dataflow/requirements-chunker-v1.lock --wheel .dataforge/operator-downloads/open_dataflow-1.0.10-py3-none-any.whl
+```
+
+隔离 Worker 将 ParsedDocument 正文写入一次性临时 Markdown，以满足上游 `KBCChunkGenerator` 的文件输入协议；`sentence`/`recursive` 均强制复用审核后的 Qwen tokenizer，并由同一进程返回真实 token 数。中文句号、问号和叹号属于 sentence 边界。缺包、资源、哈希或 Profile 时 fail closed，不回退字符数或联网下载。
+
+本机全新环境、5项资源哈希、离线 tokenizer 加载、两种切分方法及五个 Standard 准备主链已验证；Docker 和 `.34` 尚未执行，不能将本地结果标为远程验收。
+
 ## semantic-v1 独立多语言模型（2026-08-31）
 
 新增 `requirements-semantic-v1.in/lock`，锁摘要 `59032efef5ff7783d5023f371a578bffc48e204991bde9e38bd767181fa8c447`。Windows全新环境已实际安装47个依赖加open-dataflow；不包含PII/Presidio/spaCy，原环境和Manifest条目不覆盖。
@@ -102,10 +119,12 @@ python-base
 ├─ app-common → app / runner
 └─ operator-deps → operator-expanded-deps → operator-governance-deps
    → operator-governance-resources → operator-semantic-deps
-   → operator-semantic-resources → operator-runtime → 复制到 runner
+   → operator-semantic-resources → operator-chunker-deps
+   → operator-chunker-resources → operator-runtime → 复制到 runner
 ```
 
 - `operator-deps` 只复制 `upstream.lock` 和 `requirements.lock`，复用 pip/uv 缓存。当前依赖锁已有 26 个固定版本及 SHA-256，不需要在构建时重新生成；上游依然单独锁定，不能解析它的完整依赖集合。
+- `operator-chunker-deps` 只安装审核后的轻量 Chunker 闭包；`operator-chunker-resources` 在 `--network=none` 下导入5个固定 tokenizer 文件，缺少忽略目录时镜像构建直接失败。
 - `operator-runtime` 才复制注册脚本，在 `RUN --network=none` 下生成 Manifest。Runner 只接收 `/opt/dataforge-operators`，不接收下载 wheel，并保留相同绝对路径。
 - 仅修改应用源码、Adapter、安装脚本、注册脚本或此说明，不会使算子依赖阶段失效；修改锁文件、Python/uv 基础层或相应构建指令会使其重建。修改注册脚本只重做登记和后续镜像组装。
 - 缓存减少重复安装，不能保证首次下载速度；保留缓存也不保证所有包都已缓存。`Resolved` 日志不表示版本未锁定，不以日志是否出现作为验收标准。

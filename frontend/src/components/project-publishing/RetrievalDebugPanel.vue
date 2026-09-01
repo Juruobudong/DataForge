@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api } from '../../api/platform'
 
 const props = defineProps({
-  deploymentId: String, releaseStage: String, institution: Boolean,
+  projectId: String, releaseStage: String, institution: Boolean,
   projectCode: String, deploymentCode: String,
 })
 
@@ -51,7 +51,7 @@ async function loadOptions() {
   const priorVersions = options.value.versions
   options.value = { tasks: [], versions: priorVersions, rerankers: [] }
   taskCode.value = ''; orgCode.value = ''; filters.value = []; experiment.value = false
-  if (!props.deploymentId || viewMode.value !== 'public' && routeMode.value === 'historical' && !version.value) {
+  if (!props.projectId || viewMode.value !== 'public' && routeMode.value === 'historical' && !version.value) {
     loading.value = false; return
   }
   try {
@@ -60,7 +60,7 @@ async function loadOptions() {
       route_mode: viewMode.value === 'public' ? 'published' : routeMode.value,
     }
     if (viewMode.value !== 'public' && routeMode.value === 'historical') params.version_no = version.value
-    const response = await api.retrievalDebugOptions(props.deploymentId, params)
+    const response = await api.retrievalDebugOptions(props.projectId, params)
     if (epoch !== optionsEpoch) return
     options.value = response
     taskCode.value = response.tasks[0]?.task_code || ''
@@ -74,7 +74,7 @@ async function loadOptions() {
   } finally { if (epoch === optionsEpoch) loading.value = false }
 }
 
-watch(() => [props.deploymentId, props.releaseStage, props.projectCode, props.deploymentCode], () => {
+watch(() => [props.projectId, props.releaseStage, props.projectCode, props.deploymentCode], () => {
   routeMode.value = 'draft'; version.value = ''; options.value = { tasks: [], versions: [], rerankers: [] }
   clearResults(); loadOptions()
 }, { immediate: true })
@@ -119,7 +119,7 @@ async function runEffect(openTrace = false) {
   const epoch = ++runEpoch
   error.value = ''; effectResult.value = null; busy.value = true
   try {
-    const response = await api.retrievalDebug(props.deploymentId, debugPayload())
+    const response = await api.retrievalDebug(props.projectId, debugPayload())
     if (epoch !== runEpoch) return
     effectResult.value = response; traceResult.value = response
     if (openTrace) viewMode.value = 'trace'
@@ -130,7 +130,7 @@ async function runPublic() {
   const epoch = ++runEpoch
   error.value = ''; publicEnvelope.value = null; busy.value = true
   try {
-    const envelope = await api.retrievalPublicTest(props.deploymentId, {
+    const envelope = await api.retrievalPublicTest(props.projectId, {
       release_stage: props.releaseStage, task_code: taskCode.value,
       org_code: orgCode.value, query: query.value,
     })
@@ -167,7 +167,7 @@ async function copyValue(value, success) {
       <form class="panel stack" @submit.prevent="runEffect(false)">
         <div class="controls">
           <label>测试对象<select v-model="routeMode"><option value="draft">当前配置</option><option value="published">当前已发布</option><option value="historical">历史版本</option></select></label>
-          <label v-if="routeMode==='historical'">历史版本<select v-model="version" required><option value="">选择版本</option><option v-for="item in options.versions.filter(v=>['published','frozen'].includes(v.status))" :key="item.id" :value="item.version_no">V{{ item.version_no }}</option></select></label>
+          <label v-if="routeMode==='historical'">历史版本<select v-model="version" required><option value="">选择版本</option><option v-for="item in options.versions.filter(v=>v.is_published)" :key="item.id" :value="item.version_no">V{{ item.version_no }}</option></select></label>
           <label>检索任务<select v-model="taskCode" required :disabled="loading"><option value="">选择任务</option><option v-for="item in options.tasks" :key="item.task_code" :value="item.task_code">{{ item.task_name || item.task_code }}</option></select></label>
           <label>组织授权<select v-model="orgCode" required><option value="">选择 org_code</option><option v-for="item in orgs" :key="item.org_code" :value="item.org_code">{{ item.org_name || item.org_code }} · {{ item.org_code }}</option></select></label>
         </div>
@@ -188,10 +188,46 @@ async function copyValue(value, success) {
       <p v-if="error" role="alert" class="error">{{ error }}</p>
       <template v-if="effectResult">
         <article class="panel result-summary"><div><b>{{ effectResult.experimental?'本次实验':'版本配置' }} · {{ statusNames[effectResult.status] }}</b><p>{{ effectResult.route_mode }} · {{ effectResult.version_no==null?'未发布配置':`V${effectResult.version_no}` }}</p></div><span>{{ effectResult.latency_ms }} ms</span></article>
-        <div class="result-grid">
-          <article v-for="key in ['recall','reranker','final']" :key="key" class="panel stack"><h4>{{ stageNames[key] }}</h4><p>{{ statusNames[stage(key)?.status] }} · {{ stage(key)?.latency_ms || 0 }} ms</p><p v-if="stage(key)?.error" class="error">{{ stage(key).error }}</p><p v-if="!candidates(stage(key)).length">{{ stage(key)?.data?.reason || '没有匹配结果。' }}</p><ol v-else><li v-for="item in candidates(stage(key))" :key="`${item.asset_version_id}:${item.source_knowledge_id}`"><b>{{ item.citation_id || item.source_knowledge_id }}</b><span>{{ item.content }}</span><small>Vector {{ item.vector_score }}<template v-if="item.rerank_score!=null"> · Rerank {{ item.rerank_score }}</template></small></li></ol></article>
+        <div class="effect-result-layout">
+          <article class="panel final-results">
+            <header class="result-section-head">
+              <div><small>检索答案</small><h4>最终结果</h4><p>优先查看实际返回内容；召回与重排过程收在右侧。</p></div>
+              <span class="result-count">{{ candidates(stage('final')).length }} 条 · {{ stage('final')?.latency_ms || 0 }} ms</span>
+            </header>
+            <p v-if="stage('final')?.error" class="error">{{ stage('final').error }}</p>
+            <div v-if="!candidates(stage('final')).length" class="result-empty">
+              <b>没有最终结果</b><p>{{ stage('final')?.data?.reason || '当前查询没有匹配到可返回的内容。' }}</p>
+            </div>
+            <ol v-else class="final-list">
+              <li v-for="(item,index) in candidates(stage('final'))" :key="`${item.asset_version_id}:${item.source_knowledge_id}:${index}`" class="result-card">
+                <span class="result-rank">{{ index + 1 }}</span>
+                <div class="result-card-body">
+                  <header><b>{{ item.citation_id ? `[${item.citation_id}]` : `结果 ${index + 1}` }}</b><span class="score-group"><small v-if="item.vector_score!=null">Vector {{ item.vector_score }}</small><small v-if="item.rerank_score!=null">Rerank {{ item.rerank_score }}</small></span></header>
+                  <p>{{ item.content }}</p>
+                  <details v-if="item.source_knowledge_id" class="result-source"><summary>来源标识</summary><code>{{ item.source_knowledge_id }}</code></details>
+                </div>
+              </li>
+            </ol>
+          </article>
+          <aside class="panel result-process">
+            <header class="result-section-head"><div><small>过程诊断</small><h4>检索过程</h4><p>需要排查效果时再展开候选明细。</p></div></header>
+            <details v-for="key in ['recall','reranker']" :key="key" class="result-stage" :open="stage(key)?.status==='failed'">
+              <summary><span><b>{{ stageNames[key] }}</b><small>{{ candidates(stage(key)).length }} 条</small></span><span :class="['stage-state',stage(key)?.status]">{{ statusNames[stage(key)?.status] }} · {{ stage(key)?.latency_ms || 0 }} ms</span></summary>
+              <div class="stage-body">
+                <p v-if="stage(key)?.error" class="error">{{ stage(key).error }}</p>
+                <p v-if="!candidates(stage(key)).length" class="stage-reason">{{ stage(key)?.data?.reason || '没有匹配结果。' }}</p>
+                <ol v-else class="candidate-list">
+                  <li v-for="(item,index) in candidates(stage(key))" :key="`${item.asset_version_id}:${item.source_knowledge_id}:${index}`">
+                    <header><span>{{ index + 1 }}</span><code :title="item.source_knowledge_id">{{ item.citation_id || item.source_knowledge_id }}</code></header>
+                    <p>{{ item.content }}</p>
+                    <small>Vector {{ item.vector_score }}<template v-if="item.rerank_score!=null"> · Rerank {{ item.rerank_score }}</template></small>
+                  </li>
+                </ol>
+              </div>
+            </details>
+            <button type="button" class="trace-link" @click="openTrace">查看完整执行链路</button>
+          </aside>
         </div>
-        <button type="button" @click="openTrace">查看本次链路</button>
       </template>
     </template>
 
@@ -229,5 +265,5 @@ async function copyValue(value, success) {
 </template>
 
 <style scoped>
-.retrieval-validation{display:grid;gap:16px}.validation-tabs{display:inline-flex;width:max-content;gap:3px;padding:3px;border:1px solid var(--border);border-radius:10px;background:#eef2f7}.validation-tabs button{border:0;background:transparent}.validation-tabs button.active{color:var(--blue);background:#fff}.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:end}.controls label{display:grid;flex:1;min-width:170px;gap:6px}.advanced-box,.raw-contract{padding:14px;border:1px solid var(--border);border-radius:9px;background:#fbfcfe}.experiment{margin-top:12px;padding:12px;background:var(--amber-soft)}.result-summary,.api-summary,.trace-summary{display:flex;justify-content:space-between;gap:16px;align-items:center}.result-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}.result-grid ol{display:grid;gap:10px;margin:0;padding-left:20px}.result-grid li span,.result-grid li small{display:block;margin-top:4px}.public-items{display:grid;gap:12px}.public-items>section{padding:14px;border:1px solid var(--border);border-radius:9px}.public-items header{display:flex;justify-content:space-between;gap:12px}.trace-list{display:grid;gap:10px}.trace-step{padding:0 14px;border:1px solid var(--border);border-radius:10px;background:#fff}.trace-step>summary{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:14px 0;cursor:pointer}.trace-dot{width:10px;height:10px;border-radius:50%;background:#9aa6b6}.trace-dot.completed{background:var(--green)}.trace-dot.failed{background:var(--red)}.trace-dot.blocked{background:var(--amber)}.content,pre{white-space:pre-wrap;overflow-wrap:anywhere}.notice.amber{padding:10px;border-radius:8px;background:var(--amber-soft)}.technical-details{margin:10px 0}.actions{display:flex;gap:8px}@media(max-width:1100px){.result-grid{grid-template-columns:1fr}}
+.retrieval-validation{display:grid;gap:16px}.validation-tabs{display:inline-flex;width:max-content;gap:3px;padding:3px;border:1px solid var(--border);border-radius:10px;background:#eef2f7}.validation-tabs button{border:0;background:transparent}.validation-tabs button.active{color:var(--blue);background:#fff}.controls{display:flex;flex-wrap:wrap;gap:14px;align-items:end}.controls label{display:grid;flex:1;min-width:170px;gap:6px}.advanced-box,.raw-contract{padding:14px;border:1px solid var(--border);border-radius:9px;background:#fbfcfe}.experiment{margin-top:12px;padding:12px;background:var(--amber-soft)}.result-summary,.api-summary,.trace-summary{display:flex;justify-content:space-between;gap:16px;align-items:center}.effect-result-layout{display:grid;grid-template-columns:minmax(0,1.65fr) minmax(300px,.75fr);gap:14px;align-items:start}.final-results,.result-process{min-width:0}.result-section-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.result-section-head small{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.04em}.result-section-head h4{margin:3px 0 0;font-size:19px}.result-section-head p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.55}.result-count{flex:0 0 auto;padding:7px 10px;border-radius:999px;color:var(--blue);background:var(--blue-soft);font-size:12px;font-weight:800}.result-empty{display:grid;justify-items:start;gap:6px;margin-top:16px;padding:24px;border:1px dashed var(--border);border-radius:10px;color:var(--muted);background:var(--panel-muted)}.result-empty b{color:var(--text)}.result-empty p{margin:0}.final-list{display:grid;gap:10px;margin:18px 0 0;padding:0;list-style:none}.result-card{display:grid;grid-template-columns:34px minmax(0,1fr);gap:12px;padding:15px;border:1px solid var(--border);border-radius:11px;background:#fff}.result-rank{display:grid;width:32px;height:32px;place-items:center;border-radius:9px;color:var(--blue);background:var(--blue-soft);font-weight:850}.result-card-body{min-width:0}.result-card-body>header{display:flex;justify-content:space-between;gap:12px;align-items:center}.result-card-body>p{margin:9px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.72}.score-group{display:flex;flex:0 0 auto;flex-wrap:wrap;justify-content:flex-end;gap:5px}.score-group small{padding:4px 7px;border-radius:999px;color:var(--muted);background:var(--panel-muted);font-size:11px}.result-source{margin-top:10px;color:var(--muted);font-size:12px}.result-source summary{width:max-content;cursor:pointer}.result-source code{display:block;margin-top:7px;overflow-wrap:anywhere}.result-process{display:grid;gap:10px;align-content:start}.result-stage{border:1px solid var(--border);border-radius:10px;background:#fff}.result-stage>summary{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px;cursor:pointer;list-style-position:inside}.result-stage>summary>span:first-child{display:grid;min-width:0;gap:3px}.result-stage>summary small{color:var(--muted);font-size:11px}.stage-state{flex:0 0 auto;color:var(--muted);font-size:12px;font-weight:750}.stage-state.completed{color:var(--green)}.stage-state.failed{color:var(--red)}.stage-state.skipped{color:var(--muted)}.stage-body{padding:0 13px 13px;border-top:1px solid var(--border)}.stage-reason{margin-bottom:0;color:var(--muted);font-size:13px}.candidate-list{display:grid;gap:9px;margin:12px 0 0;padding:0;list-style:none}.candidate-list li{min-width:0;padding:11px;border-radius:9px;background:var(--panel-muted)}.candidate-list header{display:grid;grid-template-columns:22px minmax(0,1fr);gap:6px;align-items:center}.candidate-list header>span{display:grid;width:20px;height:20px;place-items:center;border-radius:6px;color:var(--blue);background:#fff;font-size:11px;font-weight:800}.candidate-list code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:11px}.candidate-list p{display:-webkit-box;overflow:hidden;margin:8px 0 5px;-webkit-box-orient:vertical;-webkit-line-clamp:3;line-clamp:3;line-height:1.55}.candidate-list small{color:var(--muted);font-size:11px}.trace-link{width:100%;margin-top:2px}.public-items{display:grid;gap:12px}.public-items>section{padding:14px;border:1px solid var(--border);border-radius:9px}.public-items header{display:flex;justify-content:space-between;gap:12px}.trace-list{display:grid;gap:10px}.trace-step{padding:0 14px;border:1px solid var(--border);border-radius:10px;background:#fff}.trace-step>summary{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:14px 0;cursor:pointer}.trace-dot{width:10px;height:10px;border-radius:50%;background:#9aa6b6}.trace-dot.completed{background:var(--green)}.trace-dot.failed{background:var(--red)}.trace-dot.blocked{background:var(--amber)}.content,pre{white-space:pre-wrap;overflow-wrap:anywhere}.notice.amber{padding:10px;border-radius:8px;background:var(--amber-soft)}.technical-details{margin:10px 0}.actions{display:flex;gap:8px}@media(max-width:1100px){.effect-result-layout{grid-template-columns:1fr}.result-process{grid-row:2}}@media(max-width:680px){.result-section-head,.result-card-body>header{align-items:flex-start;flex-direction:column}.result-count,.score-group{align-self:flex-start}.result-card{grid-template-columns:28px minmax(0,1fr);padding:12px}.result-rank{width:27px;height:27px}}
 </style>

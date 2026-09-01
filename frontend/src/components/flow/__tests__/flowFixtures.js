@@ -21,21 +21,23 @@ const inputReview = { code: 'input_review', name: '自动冻结输入', configur
 const extraction = { type: 'string', title: 'QA 提取要求', default: '仅基于审核通过的原文生成问答。问题应清晰、具体且可独立理解，避免依赖上下文的模糊指代。答案必须能够从原文直接得到或由原文明确归纳，不使用外部知识，不猜测或补充原文未提供的信息。优先提取定义、事实、条件、步骤、规则、结论和数值等具有明确答案的知识。答案保持原文语言，简洁但信息完整；文本不足以形成可靠问答时不生成。', 'x-dataforge-ui': { widget: 'textarea' } }
 export const managedTemplates = [
   ['standard-text', '文本知识', ['text']],
-  ['standard-qa', '问答知识', ['qa']],
+  ['standard-qa-question', '问答知识·仅问题检索', ['qa-question']],
+  ['standard-qa-full', '问答知识·问题与答案检索', ['qa-full']],
   ['standard-graph-triple', '三元组图谱', ['graph:triple']],
   ['standard-graph-semantic', '语义图谱', ['graph:semantic']],
-  ['standard-multi', '多产出知识', ['text', 'qa', 'graph:triple']],
+  ['standard-multi', '多产出知识', ['text', 'qa-question', 'graph:triple']],
 ].map(([code, name, output_types]) => ({
   code, name, output_types,
-  default_definition: { schema_version: 1, template_code: code, stages: code.startsWith('standard-graph-') || code === 'standard-multi' ? { generation: { config: { entity_types: entityTypeCatalog.base } } } : {} },
+  default_definition: { schema_version: 1, template_code: code, stages: code.startsWith('standard-graph-') || code === 'standard-multi' ? { generation: { config: { entity_types: entityTypeCatalog.base, ...(code === 'standard-multi' ? { qa_output_type: 'qa-question' } : {}) } } } : {} },
   stages: [
     { code: 'input', configurable: false },
     chunking,
     inputReview,
     ...(code === 'standard-text' || code === 'standard-multi' ? [{ code: 'mapping', configurable: false }] : []),
-    ...(code === 'standard-text' ? [] : [{ code: 'generation', name: code === 'standard-qa' ? '问答生成' : '实体关系抽取', configurable: true,
-      operators: ['standard-qa', 'standard-multi'].includes(code) ? [nativeQaOperator] : [],
-      config_schema: { type: 'object', properties: { llm_serving: llm, ...(['standard-qa', 'standard-multi'].includes(code) ? { extraction_instructions: extraction } : {}), ...(code === 'standard-qa' ? {} : {
+    ...(code === 'standard-text' ? [] : [{ code: 'generation', name: code.startsWith('standard-qa-') ? '问答生成' : '实体关系抽取', configurable: true,
+      operators: (code.startsWith('standard-qa-') || code === 'standard-multi') ? [nativeQaOperator] : [],
+      config_schema: { type: 'object', properties: { llm_serving: llm, ...((code.startsWith('standard-qa-') || code === 'standard-multi') ? { extraction_instructions: extraction } : {}), ...(code.startsWith('standard-qa-') ? {} : {
+        ...(code === 'standard-multi' ? { qa_output_type: { type: 'string', title: 'QA 输出类型', enum: ['qa-question', 'qa-full'], default: 'qa-question' } } : {}),
         entity_types: { type: 'array', title: '实体类型', 'x-dataforge-ui': { widget: 'entity-type-editor' } }, relation_types: { type: 'array', title: '关系类型' },
       }) } },
     }]),

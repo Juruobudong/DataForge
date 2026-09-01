@@ -1,6 +1,0 @@
-interface:
-  display_name: "Devora Clarify"
-  short_description: "Resolve high-impact ambiguities in the active feature specification."
-  default_prompt: "Use $devora-clarify for this task."
-policy:
-  allow_implicit_invocation: true

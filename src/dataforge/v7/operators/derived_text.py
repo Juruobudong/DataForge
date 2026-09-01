@@ -36,7 +36,7 @@ def derived_record(value):
 
 def prepare_generation(values, kind, context):
     """Return transient model inputs and original evidence, recording normal exclusions."""
-    if kind not in {"text", "qa"}:
+    if kind not in {"text", "qa-question", "qa-full"}:
         if any("source_chunk" in value for value in values):
             raise ValueError("DERIVED_TEXT_UNSUPPORTED: 派生正文仅支持Text/QA")
         return deepcopy(values), {}

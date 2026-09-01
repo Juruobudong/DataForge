@@ -130,7 +130,7 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
         uses_llm = adapter in {"multihop", "evaluate", "evaluate_generic"}
         item.update(code=code, name=code, display_name_zh=name, version=1, subcategory=category,
                     summary=SHORT_SUMMARIES[code], description=description, scenarios=[description], upstream=[code],
-                    adapter_code=f"governance-{adapter}-v1", knowledge_types=["qa"] if uses_llm else ["text", "qa"],
+                    adapter_code=f"governance-{adapter}-v1", knowledge_types=["qa-question", "qa-full"] if uses_llm else ["text", "qa-question", "qa-full"],
                     parameter_schema={"type": "object", "properties": deepcopy(properties), "additionalProperties": False},
                     parameter_docs={key: value.get("description", value["title"]) for key, value in properties.items()})
         if adapter in {"conditions", "evaluate_generic"}:
@@ -177,7 +177,7 @@ def extend_catalog(entries, package, package_version, package_digest, lock_diges
         elif adapter in {"evaluate", "evaluate_generic"}:
             item["input"] = item["output"] = "candidate:qa"
             if adapter == "evaluate_generic":
-                item["knowledge_types"] = ["text", "qa"]
+                item["knowledge_types"] = ["text", "qa-question", "qa-full"]
                 item["input"] = item["output"] = "candidate:*"
                 item["input_ports"]["input"].update(artifact_type="candidate:*", accepted_types=["candidate:text", "candidate:qa"])
                 item["output_ports"]["output"].update(artifact_type="candidate:*", output_by_input={"candidate:text": "candidate:text", "candidate:qa": "candidate:qa"})

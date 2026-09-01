@@ -169,6 +169,25 @@ test('cycle detection, validation locations, and cascading removal work', () => 
   assert.equal(removed.edges.length, 0)
 })
 
+test('missing Sink diagnostics keep raw codes and carry actionable output targets', () => {
+  assert.deepEqual(validateFlow([], [], []), [
+    { code: 'OUTPUT_TYPES_REQUIRED', message: '请先在流程设置选择至少一种正式输出类型' },
+  ])
+
+  const single = validateFlow([], [], ['text']).filter(issue => issue.code.startsWith('MISSING'))
+  assert.deepEqual(single, [
+    { code: 'MISSING_SINK', message: '流程至少需要一个 Knowledge Sink', action: 'focus_sink', outputKey: 'text' },
+    { code: 'MISSING_OUTPUT_SINK', message: '模板输出缺少对应 Sink：text', action: 'focus_sink', outputKey: 'text' },
+  ])
+
+  const multiple = validateFlow([], [], ['text', 'qa']).filter(issue => issue.code.startsWith('MISSING'))
+  assert.deepEqual(multiple, [
+    { code: 'MISSING_SINK', message: '流程至少需要一个 Knowledge Sink', action: 'focus_sink', outputKey: null },
+    { code: 'MISSING_OUTPUT_SINK', message: '模板输出缺少对应 Sink：text', action: 'focus_sink', outputKey: 'text' },
+    { code: 'MISSING_OUTPUT_SINK', message: '模板输出缺少对应 Sink：qa', action: 'focus_sink', outputKey: 'qa' },
+  ])
+})
+
 test('history records graph transactions and supports undo and redo', () => {
   const nodes = ref([node('a', 'source')]), edges = ref([])
   const history = useFlowHistory(nodes, edges)

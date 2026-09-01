@@ -1,6 +1,0 @@
-interface:
-  display_name: "Devora Constitution"
-  short_description: "Create or update the project's durable development principles and governance rules."
-  default_prompt: "Use $devora-constitution for this task."
-policy:
-  allow_implicit_invocation: true

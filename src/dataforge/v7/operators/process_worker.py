@@ -130,7 +130,33 @@ def execute(request):
         init = governance.prepare_init(request, init)
     if serving is not None:
         init["llm_serving"] = serving
-    operator = cls(**init)
+    if request.get("adapter_version") == "parsed-document-to-flow-chunks-v1":
+        from chonkie import RecursiveChunker, SentenceChunker
+
+        original_initialize_chunker = cls._initialize_chunker
+
+        def initialize_reviewed_chunker(self):
+            if self.split_method == "sentence":
+                return SentenceChunker(
+                    tokenizer_or_token_counter=self.tokenizer,
+                    chunk_size=self.chunk_size,
+                    chunk_overlap=self.chunk_overlap,
+                    delim=[". ", "! ", "? ", "\n", "。", "！", "？"],
+                )
+            if self.split_method == "recursive":
+                return RecursiveChunker(
+                    tokenizer_or_token_counter=self.tokenizer,
+                    chunk_size=self.chunk_size,
+                )
+            return original_initialize_chunker(self)
+
+        cls._initialize_chunker = initialize_reviewed_chunker
+        try:
+            operator = cls(**init)
+        finally:
+            cls._initialize_chunker = original_initialize_chunker
+    else:
+        operator = cls(**init)
     if governance:
         governance.configure_operator(request, operator)
     if request["executor"] == "custom-native":
@@ -154,10 +180,29 @@ def execute(request):
             def write(self, data):
                 self.frame = data.copy(deep=True); self.written = True
                 return "dataforge-memory"
-        storage = MemoryStorage(request["records"])
+        records = request["records"]
+        if request.get("adapter_version") == "parsed-document-to-flow-chunks-v1":
+            input_key = str((request.get("run_arguments") or {}).get("input_key") or "text")
+            materialized = []
+            for index, row in enumerate(records):
+                value = row.get(input_key)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError("PARSED_DOCUMENT_CONTENT_INVALID: document-chunker输入正文无效")
+                path = Path.cwd() / f"dataforge-chunker-input-{index}.md"
+                path.write_text(value, encoding="utf-8")
+                materialized.append({**row, input_key: str(path)})
+            records = materialized
+        storage = MemoryStorage(records)
         operator.run(storage=storage, **request.get("run_arguments", {}))
         if not storage.written or calls_failed:
             raise ValueError("OPERATOR_NO_OUTPUT: upstream failed or did not write storage")
+        if request.get("adapter_version") == "parsed-document-to-flow-chunks-v1":
+            output_key = str((request.get("run_arguments") or {}).get("output_key") or "raw_chunk")
+            counts = []
+            for value in storage.frame[output_key].tolist():
+                encoded = operator.tokenizer.encode(value, add_special_tokens=False)
+                counts.append(len(encoded))
+            storage.frame["_dataforge_token_count"] = counts
         outputs = storage.frame.to_dict(orient="records")
     if calls_failed:
         raise ValueError("Upstream Serving failed")
@@ -178,7 +223,7 @@ def main():
         send({"type": "result", "ok": True, "error": None, "logs_streamed": True,
               "operator_logs": diagnostics.snapshot(), **result})
         return 0
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - serialize every worker failure through the bounded protocol
         message = "PII_EXECUTION_FAILED: 英文PII模型执行失败，请检查受控环境与资源" if sensitive else diagnostics.error(f"{type(exc).__name__}: {exc}")
         send({"type": "error", "ok": False, "message": message, "error": message,
               "logs_streamed": True, "operator_logs": diagnostics.snapshot()})

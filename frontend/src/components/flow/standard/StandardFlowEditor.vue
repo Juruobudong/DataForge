@@ -11,6 +11,11 @@ const managedCode = computed(() => props.managedTemplateCode || props.template?.
 const managedTemplate = computed(() => props.managedTemplates.find(item => item.code === managedCode.value) || null)
 const stages = computed(() => managedTemplate.value?.stages || [])
 const stageConfig = ref({ schema_version: 1, template_code: '', stages: {} })
+const effectiveOutputTypes = computed(() => {
+  if (managedCode.value !== 'standard-multi') return props.outputTypes.length ? props.outputTypes : (managedTemplate.value?.output_types || [])
+  const qaOutputType = stageConfig.value.stages?.generation?.config?.qa_output_type || 'qa-question'
+  return ['text', qaOutputType, 'graph:triple']
+})
 const view = ref('business'), technical = ref(null), loading = ref(false), resolveError = ref('')
 let resolveSequence = 0
 async function resolveTechnical() {
@@ -60,11 +65,11 @@ function updateStage(stageCode, value) { stageConfig.value.stages[stageCode] = {
           <h3>知识生成</h3>
           <p v-for="operator in (stage.operators || []).filter(item => item.source === 'dataflow' || ['qa-extractor', 'entity-relation-extractor'].includes(item.code))" :key="operator.node_id" class="stage-operator"><b>{{ operatorPrimaryName(operator) }}</b><small>{{ operatorSubtitle(operator) }}</small></p>
           <div v-if="stage.configurable && stage.config_schema" class="config-sections"><section><h4>{{ stage.name }}</h4><OperatorParameterForm :key="`${managedCode}:${template?.id || 'new'}`" :schema="stage.config_schema" :model-value="configOf(stage.code)" @update:model-value="updateStage(stage.code,$event)" /></section></div>
-          <small v-if="managedCode === 'standard-qa' || managedCode === 'standard-multi'">DataForge 原生问答提取器根据业务要求直接生成完整问答；输出格式和来源由系统维护。没有匹配内容时产出零条，要求随流程版本冻结。高级编排可另选 DataFlow 上游两阶段生成器。</small>
+          <small v-if="['standard-qa-question', 'standard-qa-full', 'standard-multi'].includes(managedCode)">DataForge 原生问答提取器根据业务要求直接生成完整问答；输出格式和来源由系统维护。没有匹配内容时产出零条，要求随流程版本冻结。高级编排可另选 DataFlow 上游两阶段生成器。</small>
           <small v-if="managedCode?.includes('graph') || managedCode === 'standard-multi'">图谱实体和关系每块联合抽取一次；校验失败最多再修复一次完整结果。Prompt、来源和 JSON 格式由系统维护。</small>
         </template>
         <template v-else-if="stage.code === 'quality'"><h3>图谱校验</h3><div class="checks"><span>✓ Graph Schema</span><span>✓ Graph Quality</span></div><p>仅校验图谱分支的实体、关系和 Evidence；硬失败阻止该分支提交。</p></template>
-        <template v-else-if="stage.code === 'submit'"><h3>输出知识</h3><div class="outputs"><section v-for="item in managedTemplate?.output_types || []" :key="item"><b>{{ runtimeArtifactLabel(`candidate:${item}`) }}</b><span>Knowledge Sink · 正式知识提交</span></section></div><p>Sink 统一保证 Schema、审核血缘、来源绑定、Diff 和事务提交。输出类型由固定模板维护，不绑定具体 KnowledgeLibrary。</p></template>
+        <template v-else-if="stage.code === 'submit'"><h3>输出知识</h3><div class="outputs"><section v-for="item in effectiveOutputTypes" :key="item"><b>{{ runtimeArtifactLabel(`candidate:${item}`) }}</b><span>Knowledge Sink · 正式知识提交</span></section></div><p>Sink 统一保证 Schema、审核血缘、来源绑定、Diff 和事务提交。输出类型由固定模板维护，不绑定具体 KnowledgeLibrary。</p></template>
         <template v-else><h3>{{ stage.name || stage.code }}</h3><p>该业务阶段由固定模板维护，请在“技术流程”中查看实际算子。</p></template>
       </div></article>
     </template>

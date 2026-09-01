@@ -53,3 +53,18 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# src 布局：不装 editable 也能 import dataforge，避免依赖具体环境是否 pip install -e .
+pythonpath = ["src"]
+# 测试临时产物统一落在仓库内 .pytest-tmp/，不散落到系统临时目录或 .dataforge/。
+#
+# 注意：basetemp 只能通过命令行传，不是合法的 ini 选项。直接写 `basetemp = "..."`
+# 会被 pytest 报 "Unknown config option: basetemp" 并静默忽略，所以放进 addopts。
+#
+# 指向 _active 子目录而非 .pytest-tmp 本身，原因：pytest 对显式指定的 basetemp 会
+# 先 rm_rf 再重建（实测确认）。若直接指向 .pytest-tmp，每次跑测试都会清空整个目录，
+# 连手工归档的产物一起删掉。用 _active 则只清空这个子目录，同级归档目录不受影响。
+#
+# 需要隔离某次产物时只能显式覆盖为 .pytest-tmp/<任务名>；禁止在仓库根目录
+# 新建 .pytest-tmp-*，也不要把根目录 .pytest-tmp 本身传给 --basetemp。
+# （命令行参数后出，会覆盖 addopts 里的值。）
+addopts = "--basetemp=.pytest-tmp/_active"

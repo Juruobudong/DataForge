@@ -50,7 +50,10 @@ class BuiltinOperatorExecutor:
             return NativeQAExecutor().execute(inputs=inputs, params=params, context=context)
         runtime = {**dict(context.runtime or {}), "operator_version": self.version}
         if uses_triple_chunks(self.code, self.version, params):
-            stage = GraphChunkStage(context.node_id, params, context.runtime.setdefault("generation", {}))
+            stage = GraphChunkStage(
+                context.node_id, params, context.runtime.setdefault("generation", {}),
+                isolate_llm_timeout=self.code == "relation-extractor",
+            )
             runtime["graph_chunk_stage"] = stage
             try:
                 outputs = self._runner(self.code, dict(params or {}), list(inputs), runtime)

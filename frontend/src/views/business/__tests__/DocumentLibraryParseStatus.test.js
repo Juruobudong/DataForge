@@ -23,8 +23,8 @@ beforeEach(() => {
   api.documentLibraries.mockResolvedValue([{ id: 'lib-a', name: '产品资料' }])
   api.documentTree.mockResolvedValue({ children: [] })
   api.librarySources.mockResolvedValue({ items: [
-    source('pending', 'pending'), source('running', 'running'), source('ready', 'completed'), source('failed', 'failed'),
-  ], total: 4 })
+    source('pending', 'pending'), source('running', 'running'), source('ready', 'completed'), source('approved', 'completed', 'approved'), source('failed', 'failed'),
+  ], total: 5 })
   api.documentTemplateBindings.mockResolvedValue([]); api.flowTemplates.mockResolvedValue([])
   api.sourceDownloadUrl.mockReturnValue('/download')
   api.batchReviewParsedDocuments.mockResolvedValue({ approved: [{}], already_approved: [], skipped: [], failed: [], dispatches: [] })
@@ -54,10 +54,34 @@ it('opens the immutable SourceVersion ParsedDocument page', async () => {
   const all = wrapper.get('[aria-label="全选当前页文件"]')
   await all.setValue(true)
     expect(wrapper.findAll('.source-row input[type="checkbox"]').every(input => input.element.checked)).toBe(true)
-    expect(wrapper.text()).toContain('已选当前页 4 个')
+    expect(wrapper.text()).toContain('已选当前页 5 个')
     await wrapper.get('.batch-review-button').trigger('click'); await flushPromises()
+    expect(confirm).toHaveBeenCalledOnce()
     expect(api.batchReviewParsedDocuments).toHaveBeenCalledWith('lib-a', [{
       source_id: 'ready', source_version_id: 'version-ready', parsed_document_id: 'parsed-ready',
       expected_content_digest: 'a'.repeat(64), expected_anchor_map_digest: 'b'.repeat(64),
     }])
   })
+
+it('one-click approves every reviewable file on the current page without confirmation', async () => {
+  wrapper = mount(DocumentLibraryDetailView); await flushPromises()
+
+  expect(wrapper.get('.batch-review-all-button').text()).toBe('一键全选审阅通过（1）')
+  await wrapper.get('.batch-review-all-button').trigger('click'); await flushPromises()
+
+  expect(confirm).not.toHaveBeenCalled()
+  expect(api.batchReviewParsedDocuments).toHaveBeenCalledWith('lib-a', [{
+    source_id: 'ready', source_version_id: 'version-ready', parsed_document_id: 'parsed-ready',
+    expected_content_digest: 'a'.repeat(64), expected_anchor_map_digest: 'b'.repeat(64),
+  }])
+})
+
+it('disables one-click review when the current page has no pending parsed documents', async () => {
+  api.librarySources.mockResolvedValue({ items: [
+    source('pending', 'pending'), source('approved', 'completed', 'approved'), source('failed', 'failed'),
+  ], total: 3 })
+  wrapper = mount(DocumentLibraryDetailView); await flushPromises()
+
+  expect(wrapper.get('.batch-review-all-button').attributes('disabled')).toBeDefined()
+  expect(wrapper.get('.batch-review-all-button').text()).toBe('一键全选审阅通过（0）')
+})

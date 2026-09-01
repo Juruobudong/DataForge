@@ -6,7 +6,7 @@ import ModelServicesView from '../../views/developer/ModelServicesView.vue'
 import { api } from '../../api/platform'
 
 vi.mock('../../api/platform', () => ({ api: Object.fromEntries([
-  'retrievalDebugOptions', 'retrievalDebug', 'retrievalPublicTest', 'patchDeploymentTask', 'rerankerServings',
+  'retrievalDebugOptions', 'retrievalDebug', 'retrievalPublicTest', 'patchReleaseTask', 'rerankerServings',
   'servingCategories', 'modelServings', 'embeddingServings', 'createRerankerServing',
   'patchRerankerServing', 'testRerankerServing',
 ].map(name => [name, vi.fn()])) }))
@@ -18,7 +18,10 @@ const reranker = { id: 'r1', serving_code: 'bge_reranker_large', name: 'BGE Larg
 const options = () => ({ tasks: [{ task_code: 'lookup', task_name: 'Lookup', top_k: 10, final_top_k: 5,
   reranker_serving_code: 'bge_reranker_large', org_routes: [{ org_code: 'general' }],
   filter_fields: { source_knowledge_id: 'VARCHAR' } }],
-versions: [{ id: 'v1', version_no: 1, status: 'published' }], rerankers: [reranker] })
+versions: [
+  { id: 'v2', version_no: 2, status: 'frozen', is_published: false },
+  { id: 'v1', version_no: 1, status: 'frozen', is_published: true },
+], rerankers: [reranker] })
 const report = (status = 'completed') => ({ status, route_mode: 'draft', checksum: 'abc', version_no: null,
   latency_ms: 8, experimental: false, baseline: { top_k: 10 }, effective: { top_k: 10 }, stages: [
     { key: 'routing', status: 'completed', latency_ms: 1, data: { project: { name: 'Project' }, deployment: { name: 'Central' }, task_code: 'lookup', org_code: 'general', libraries: [] } },
@@ -54,7 +57,7 @@ beforeEach(() => {
 afterEach(() => wrapper?.unmount())
 
 async function mountPanel() {
-  wrapper = mount(RetrievalDebugPanel, { props: { deploymentId: 'pd1', releaseStage: 'test', projectCode: 'project-a', deploymentCode: 'central' } })
+  wrapper = mount(RetrievalDebugPanel, { props: { projectId: 'project1', releaseStage: 'test', projectCode: 'project-a', deploymentCode: 'central' } })
   await flushPromises()
 }
 
@@ -62,10 +65,29 @@ describe('three-level retrieval validation', () => {
   it('defaults to draft retrieval effect and shows result layers', async () => {
     await mountPanel(); await wrapper.find('textarea').setValue('question')
     await wrapper.find('form').trigger('submit'); await flushPromises()
-    expect(api.retrievalDebug).toHaveBeenCalledWith('pd1', expect.objectContaining({ route_mode: 'draft', query: 'question' }))
+    expect(api.retrievalDebug).toHaveBeenCalledWith('project1', expect.objectContaining({ route_mode: 'draft', query: 'question' }))
     expect(api.retrievalPublicTest).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('Vector Search 与候选合并')
-    expect(wrapper.text()).toContain('查看本次链路')
+    expect(wrapper.text()).toContain('查看完整执行链路')
+  })
+
+  it('prioritizes readable final results and keeps retrieval candidates folded', async () => {
+    const populated = report()
+    populated.stages.find(item => item.key === 'recall').data.candidates = [
+      { asset_version_id: 'asset1', source_knowledge_id: 'very-long-internal-source-id-123456789', content: '候选正文', vector_score: 0.82 },
+    ]
+    populated.stages.find(item => item.key === 'final').data.results = [
+      { asset_version_id: 'asset1', source_knowledge_id: 'very-long-internal-source-id-123456789', citation_id: 'C1', content: '便于阅读的最终结果', vector_score: 0.82 },
+    ]
+    api.retrievalDebug.mockResolvedValue(populated)
+    await mountPanel(); await wrapper.find('textarea').setValue('question')
+    await wrapper.find('form').trigger('submit'); await flushPromises()
+    const layout = wrapper.find('.effect-result-layout')
+    expect(layout.element.firstElementChild.classList.contains('final-results')).toBe(true)
+    expect(wrapper.find('.final-list .result-card').text()).toContain('便于阅读的最终结果')
+    expect(wrapper.find('.final-list .result-card').text()).toContain('[C1]')
+    expect(wrapper.find('.result-process .result-stage').attributes('open')).toBeUndefined()
+    expect(wrapper.find('.result-source').text()).toContain('来源标识')
   })
 
   it('keeps temporary retrieval overrides out of saved task settings', async () => {
@@ -75,7 +97,7 @@ describe('three-level retrieval validation', () => {
     api.retrievalDebug.mockResolvedValue({ ...report(), experimental: true })
     await wrapper.find('form').trigger('submit'); await flushPromises()
     expect(api.retrievalDebug.mock.lastCall[1].overrides.final_top_k).toBe(3)
-    expect(api.patchDeploymentTask).not.toHaveBeenCalled()
+    expect(api.patchReleaseTask).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain('本次实验')
   })
 
@@ -83,7 +105,7 @@ describe('three-level retrieval validation', () => {
     await mountPanel(); await button('公共接口').trigger('click'); await flushPromises()
     await wrapper.find('textarea').setValue('question'); await wrapper.find('form').trigger('submit'); await flushPromises()
     expect(api.retrievalDebugOptions.mock.lastCall[1]).toEqual(expect.objectContaining({ release_stage: 'test', route_mode: 'published' }))
-    expect(api.retrievalPublicTest).toHaveBeenCalledWith('pd1', { release_stage: 'test', task_code: 'lookup', org_code: 'general', query: 'question' })
+    expect(api.retrievalPublicTest).toHaveBeenCalledWith('project1', { release_stage: 'test', task_code: 'lookup', org_code: 'general', query: 'question' })
     expect(wrapper.text()).toContain('HTTP 200')
     expect(wrapper.text()).toContain('Public content')
     expect(wrapper.text()).toContain('原始 Request / Response / cURL')
@@ -113,6 +135,8 @@ describe('three-level retrieval validation', () => {
   it('selects a historical effect version and invalidates late responses on context change', async () => {
     await mountPanel()
     await wrapper.findAll('select')[0].setValue('historical'); await flushPromises()
+    expect(wrapper.findAll('select')[1].text()).toContain('V1')
+    expect(wrapper.findAll('select')[1].text()).not.toContain('V2')
     await wrapper.findAll('select')[1].setValue(1); await flushPromises()
     await wrapper.find('textarea').setValue('question')
     let finish
@@ -127,10 +151,10 @@ describe('three-level retrieval validation', () => {
 })
 
 it('saves embedded task retrieval settings explicitly', async () => {
-  wrapper = mount(RetrievalTaskSettings, { props: { deploymentId: 'pd1', task: { id: 'dt1', task: { name: 'Lookup' }, top_k: 10, final_top_k: 5, reranker_serving_code: null, enabled: true } } })
+  wrapper = mount(RetrievalTaskSettings, { props: { projectId: 'project1', task: { id: 'dt1', task: { name: 'Lookup' }, top_k: 10, final_top_k: 5, reranker_serving_code: null, enabled: true } } })
   await flushPromises(); await wrapper.find('select').setValue('bge_reranker_large')
   await wrapper.find('form').trigger('submit'); await flushPromises()
-  expect(api.patchDeploymentTask).toHaveBeenCalledWith('pd1', 'dt1', expect.objectContaining({ reranker_serving_code: 'bge_reranker_large', final_top_k: 5 }))
+  expect(api.patchReleaseTask).toHaveBeenCalledWith('project1', 'dt1', expect.objectContaining({ reranker_serving_code: 'bge_reranker_large', final_top_k: 5 }))
   expect(wrapper.text()).toContain('尚未发布')
 })
 

@@ -5,7 +5,7 @@ import { api } from '../../../api/platform'
 
 vi.mock('../../../api/platform', () => ({ api: { sinkPreviewCandidates: vi.fn() } }))
 let wrapper
-function run(id = 'r', keys = ['text', 'qa', 'graph:triple', 'graph:semantic', 'extension']) {
+function run(id = 'r', keys = ['text', 'qa-question', 'graph:triple', 'graph:semantic', 'extension']) {
   return { id, status: 'completed', nodes: [], runtime_dag: { nodes: keys.map(key => ({ id: key, kind: 'knowledge_sink', output_key: key })), edges: [] },
     sink_previews: keys.map(key => ({ id: `${id}-${key}`, output_key: key, candidate_count: 51, diff: { ADD: 1, UNCHANGED: 50 } })) }
 }
@@ -34,7 +34,7 @@ it.each([[0, 1], [5, 1], [50, 1], [51, 2]])('shows total pages for %i results', 
 it('renders full content/evidence and maintains independent pagination per output without poll refetch', async () => {
   api.sinkPreviewCandidates.mockImplementation(async (id, preview, offset) => {
     const result = response(`${preview}-${offset}`, offset)
-    return preview.endsWith('-qa') ? { ...result, total: 5, has_more: false } : result
+    return preview.endsWith('-qa-question') ? { ...result, total: 5, has_more: false } : result
   })
   const detail = run()
   wrapper = mount(FinalResultsPanel, { props: { run: detail } })
@@ -53,9 +53,9 @@ it('renders full content/evidence and maintains independent pagination per outpu
   expect(wrapper.text()).toContain('version-001')
   expect(wrapper.text()).toContain('chunk-revision-001')
   expect(wrapper.text()).toContain('review-001')
-  await button('问答').trigger('click'); await flushPromises()
+  await button('问答·Q检索').trigger('click'); await flushPromises()
   expect(wrapper.text()).toContain('问题')
-  expect(api.sinkPreviewCandidates).toHaveBeenLastCalledWith('r', 'r-qa', 0, 50)
+  expect(api.sinkPreviewCandidates).toHaveBeenLastCalledWith('r', 'r-qa-question', 0, 50)
   expect(wrapper.get('.pagination span').text()).toBe('第 1 页 · 共 1 页 · 共 5 条')
   await button('文本').trigger('click'); await flushPromises()
   expect(api.sinkPreviewCandidates).toHaveBeenLastCalledWith('r', 'r-text', 50, 50)
@@ -71,10 +71,10 @@ it('renders full content/evidence and maintains independent pagination per outpu
 
 it.each([
   ['文本知识流程', ['text']],
-  ['问答知识流程', ['qa']],
+  ['问答知识流程', ['qa-question']],
   ['三元组图谱流程', ['graph:triple']],
   ['语义图谱流程', ['graph:semantic']],
-  ['多产出知识流程', ['text', 'qa', 'graph:triple']],
+  ['多产出知识流程', ['text', 'qa-question', 'graph:triple']],
 ])('%s exposes the common source and review detail', async (name, keys) => {
   wrapper = mount(FinalResultsPanel, { props: { run: run(name, keys) } })
   await flushPromises()
@@ -108,7 +108,7 @@ it('ignores stale output/run responses and retries errors without showing old re
   let finishOld
   api.sinkPreviewCandidates.mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve }))
   wrapper = mount(FinalResultsPanel, { props: { run: run() } }); await flushPromises()
-  await button('问答').trigger('click'); await flushPromises()
+  await button('问答·Q检索').trigger('click'); await flushPromises()
   expect(wrapper.text()).toContain('问题')
   finishOld(response('STALE')); await flushPromises()
   expect(wrapper.text()).not.toContain('STALE')
@@ -141,7 +141,7 @@ it('renders triple and semantic details, extensions and untrusted content as tex
 })
 
 it('keeps absent branches and warns about failures even with an empty final preview', async () => {
-  const detail = run('r', ['text', 'qa'])
+  const detail = run('r', ['text', 'qa-question'])
   detail.sink_previews = [{ id: 'p', output_key: 'text', candidate_count: 0 }]
   detail.runtime_dag.nodes.unshift({ id: 'g', kind: 'operator' })
   detail.runtime_dag.edges = [{ source: 'g', target: 'text' }]
@@ -152,6 +152,6 @@ it('keeps absent branches and warns about failures even with an empty final prev
   expect(wrapper.text()).not.toContain('成功零产出')
   await button('查看节点诊断').trigger('click')
   expect(wrapper.emitted('inspect-node')).toEqual([['g']])
-  await button('问答').trigger('click'); await flushPromises()
+  await button('问答·Q检索').trigger('click'); await flushPromises()
   expect(wrapper.text()).toContain('该输出尚无已暂存的最终结果')
 })

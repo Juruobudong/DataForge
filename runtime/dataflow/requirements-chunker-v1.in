@@ -1,0 +1,4 @@
+# Isolated DataFlow KBC document-chunker runtime. Keep prior environments intact.
+-r requirements.in
+chonkie==1.0.8
+transformers==4.51.3

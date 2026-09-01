@@ -473,7 +473,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
         "anchor_json": dict(value.get("anchor") or {"chunk_index": value.get("chunk_index", index)}),
         "evidence_text": content, "is_primary": True,
     }
-    kind = "qa" if ref in {"qa-extractor", "Text2QAGenerator", "multihop-qa"} else str(params.get("knowledge_type") or "text")
+    kind = str(params.get("knowledge_type") or ("qa-question" if ref in {"qa-extractor", "Text2QAGenerator", "multihop-qa"} else "text"))
     mode = str(params.get("graph_mode") or "")
     if ref == "triple-builder" or kind == "graph" and mode != "semantic":
         data = {"subject": "高血压", "predicate": "需要", "object": "规范随访"}
@@ -482,7 +482,7 @@ def _preview_candidate(ref: str, params: dict[str, Any], value: dict[str, Any], 
         data = {"source_entity": {"name": "高血压"}, "target_entity": {"name": "规范随访"},
                 "relation": {"description": "患者需要"}, "evidence": [content]}
         return {**common, "canonical_content": "高血压 患者需要 规范随访", "data_json": data}
-    if kind == "qa":
+    if kind in {"qa-question", "qa-full"}:
         data = {"question": "高血压患者需要什么？", "answer": "需要规范随访。"}
         return {**common, "canonical_content": f"{data['question']} {data['answer']}", "data_json": data}
     return {**common, "canonical_content": content, "data_json": {"content": content}}
@@ -691,7 +691,7 @@ def _initialize_llm_servings():
     return get_llm_serving_registry()
 
 
-def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system: str = "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。", temperature: float | None = None) -> dict[str, Any]:
+def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system: str = "你是严谨的知识抽取器。只返回符合请求的 JSON 对象，不要输出 Markdown 或解释。", temperature: float | None = None, timeout_seconds: float | None = None) -> dict[str, Any]:
     """Call one configured Model Serving and parse its structured response."""
     registry = _initialize_llm_servings()
     serving, client = registry.client(llm_serving)
@@ -712,7 +712,8 @@ def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system:
         )
         if temperature is not None:
             request["temperature"] = temperature
-        response = client.chat.completions.create(**request)
+        request_client = client.with_options(timeout=timeout_seconds, max_retries=0) if timeout_seconds else client
+        response = request_client.chat.completions.create(**request)
     except APITimeoutError as exc:
         elapsed = time.monotonic() - started
         logger.error(
@@ -720,7 +721,7 @@ def _llm_json(prompt: str, *, llm_serving: str = DEFAULT_LLM_SERVING_ID, system:
             serving.id, len(prompt), elapsed, type(exc).__name__,
         )
         raise TimeoutError(
-            f"上游 LLM Serving {serving.id} 请求超时（{serving.timeout_seconds:g} 秒，未自动重试）"
+            f"上游 LLM Serving {serving.id} 请求超时（{(timeout_seconds or serving.timeout_seconds):g} 秒，未自动重试）"
         ) from exc
     except Exception as exc:
         elapsed = time.monotonic() - started
@@ -760,7 +761,8 @@ def _json_errors(data: dict[str, Any], schema: dict[str, Any]) -> list[str]:
 def _chunk_prompt(output_type: str, contract: dict[str, Any], content: str) -> str:
     schema = contract["schema"]
     instructions = {
-        "qa": "从当前来源分块生成全部有事实依据且可独立回答的问答对。每项必须包含 question 和 answer。",
+        "qa-question": "从当前来源分块生成全部有事实依据且可独立回答的问答对。每项必须包含 question 和 answer。",
+        "qa-full": "从当前来源分块生成全部有事实依据且可独立回答的问答对。每项必须包含 question 和 answer。",
         "graph": "从当前来源分块抽取全部明确陈述的关系三元组。每项必须包含 subject、predicate、object。",
         "graph:triple": "从当前来源分块抽取明确关系。每项包含 subject、predicate、object。",
         "graph:semantic": "抽取语义实体关系。每项包含 source_entity、target_entity、relation 和可核验 evidence。",
@@ -788,14 +790,14 @@ def _item_errors(items: Any, schema: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _structured_candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], contract: dict[str, Any], *, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
+def _structured_candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], contract: dict[str, Any], *, llm_serving: str = DEFAULT_LLM_SERVING_ID, timeout_seconds: float | None = None) -> list[dict]:
     prompt = _chunk_prompt(output_type, contract, str(chunk["content"]))
-    response = _llm_json(prompt, llm_serving=llm_serving)
+    response = _llm_json(prompt, llm_serving=llm_serving, timeout_seconds=timeout_seconds)
     items = response.get("items") if isinstance(response, dict) else None
     errors = _item_errors(items, contract["schema"])
     if errors:
         repair = prompt + "\n\n上次输出校验失败，请只返回修复后的 JSON。错误：" + "；".join(errors)
-        response = _llm_json(repair, llm_serving=llm_serving)
+        response = _llm_json(repair, llm_serving=llm_serving, timeout_seconds=timeout_seconds)
         items = response.get("items") if isinstance(response, dict) else None
         errors = _item_errors(items, contract["schema"])
     if errors:
@@ -884,13 +886,14 @@ def _generated_text_candidates(source: Source, version: SourceVersion, chunk: di
             for candidate in candidates]
 
 
-def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID) -> list[dict]:
+def _candidates(source: Source, version: SourceVersion, output_type: str, chunk: dict[str, Any], *, contract: dict[str, Any] | None = None, llm_serving: str = DEFAULT_LLM_SERVING_ID, timeout_seconds: float | None = None) -> list[dict]:
     anchor = {"file": version.original_filename, "chunk_index": int(chunk["chunk_index"]), "flow_chunk_id": str(chunk["flow_chunk_id"])}
     if output_type == "text":
         return [{"source_knowledge_id": _source_key(source.id, "text", str(chunk["chunk_index"])), "canonical_content": chunk["content"], "data_json": {"filename": version.original_filename, "chunk_index": chunk["chunk_index"]}, "source_version_ids": [version.id], "flow_chunk_id": chunk["flow_chunk_id"], "source_anchor": f"{version.original_filename}#chunk-{chunk['chunk_index']}", "anchor_json": anchor, "evidence_text": chunk["content"], "is_primary": True}]
     if not contract:
         raise ValueError(f"不支持的知识类型或缺少已发布契约：{output_type}")
-    return _structured_candidates(source, version, output_type, chunk, contract, llm_serving=llm_serving)
+    return _structured_candidates(source, version, output_type, chunk, contract, llm_serving=llm_serving,
+                                  timeout_seconds=timeout_seconds)
 
 
 def _incoming(definition: dict[str, Any]) -> dict[str, list[str]]:
@@ -1033,12 +1036,13 @@ def _literal_entity(name: str) -> dict[str, Any] | None:
 
 
 def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_serving: str,
-                      params: dict[str, Any] | None = None, *, operator_version: int | None = None) -> list[dict[str, Any]]:
+                      params: dict[str, Any] | None = None, *, operator_version: int | None = None,
+                      timeout_seconds: float | None = None) -> list[dict[str, Any]]:
     """One LLM call extracting typed entities from a single source chunk."""
     if (params or {}).get("entity_type_scope") == "subset" and not params.get("entity_types"):
         return []
     system, prompt = graph_node_prompt(config, params or {}, "entity-extractor", operator_version, str(chunk.get("content", "")))
-    response = _llm_json(prompt, llm_serving=llm_serving, system=system)
+    response = _llm_json(prompt, llm_serving=llm_serving, system=system, timeout_seconds=timeout_seconds)
     raw_entities = response.get("entities") if isinstance(response, dict) else None
     if not isinstance(raw_entities, list):
         raise ValueError("LLM 实体抽取未返回 entities 数组")
@@ -1077,14 +1081,15 @@ def _extract_entities(chunk: dict[str, Any], config: GraphExtractionConfig, llm_
     return entities
 
 
-def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str, *, strict_endpoints: bool = False, params: dict[str, Any] | None = None, operator_version: int | None = None, graph_chunk_stage=None) -> list[dict[str, Any]]:
+def _extract_relations(chunk: dict[str, Any], entities: list[dict[str, Any]], config: GraphExtractionConfig, llm_serving: str, *, strict_endpoints: bool = False, params: dict[str, Any] | None = None, operator_version: int | None = None, graph_chunk_stage=None, timeout_seconds: float | None = None) -> list[dict[str, Any]]:
     """Extract relations; v8 Triple can repair an unknown endpoint once per chunk."""
     entity_names = [item["name"] for item in entities if item.get("object_kind") != "literal"]
     system, prompt = graph_node_prompt(config, params or {}, "relation-extractor", operator_version, str(chunk.get("content", "")), entity_names)
     def extract(request):
         try:
             response = _llm_json(request, llm_serving=llm_serving, system=system,
-                                 temperature=0 if operator_version == RELATION_REPAIR_VERSION and strict_endpoints else None)
+                                 temperature=0 if operator_version == RELATION_REPAIR_VERSION and strict_endpoints else None,
+                                 timeout_seconds=timeout_seconds)
         except ValueError as exc:
             if strict_endpoints:
                 raise GraphChunkError("GRAPH_RELATION_INVALID: 关系抽取响应格式不合法") from exc
@@ -1350,7 +1355,7 @@ def _validate_graph_item(data: dict[str, Any], config: GraphExtractionConfig, gr
                 raise ValueError(f"三元组 object_type 非法：{data.get('object_type')}")
 
 
-def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None, operator_version: int | None = None, graph_chunk_stage=None) -> list[dict[str, Any]]:
+def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]], *, root_documents: list[dict[str, Any]], sources: dict[str, Source], versions: dict[str, SourceVersion], type_contracts: dict[str, dict[str, Any]], job_id: str | None = None, store: V7Store | None = None, retry_scope: set[tuple[str, str, str]] | None = None, generation: dict[str, dict[str, list[dict[str, Any]]]] | None = None, graph_config: GraphExtractionConfig | None = None, sink_libraries: dict[str, str] | None = None, operator_version: int | None = None, graph_chunk_stage=None, graph_llm_timeout_seconds: float | None = None) -> list[dict[str, Any]]:
     """Execute only DataForge adapters; DataFlow class names never enter a Flow."""
     cfg = graph_config or _graph_config_from_contracts(type_contracts)
     library_id = str((sink_libraries or {}).get(_graph_output_key(params)) or "")
@@ -1362,8 +1367,9 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
             graph_chunk_stage.relation_repair_enabled = operator_version == RELATION_REPAIR_VERSION
             def process(records):
                 return [{**record, "relations": _extract_relations(record, record.get("entities") or [], node_config,
-                                                                   llm_serving, strict_endpoints=True, params=params, operator_version=operator_version,
-                                                                   graph_chunk_stage=graph_chunk_stage)} for record in records]
+                                                                    llm_serving, strict_endpoints=True, params=params, operator_version=operator_version,
+                                                                    graph_chunk_stage=graph_chunk_stage,
+                                                                    timeout_seconds=graph_llm_timeout_seconds)} for record in records]
         elif ref == "triple-builder":
             def process(records):
                 return [candidate for record in records for candidate in _build_triples(
@@ -1524,6 +1530,7 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                     candidates = _candidates(
                         sources[chunk["source_id"]], versions[chunk["source_version_id"]], output_key, chunk,
                         contract=contract, llm_serving=llm_serving,
+                        timeout_seconds=graph_llm_timeout_seconds if output_key.startswith("graph:") else None,
                     )
                 outcome["successful"].append(chunk)
                 result.extend(candidates)
@@ -1549,7 +1556,8 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
                 continue
             outcome["targeted"].append(chunk)
             try:
-                entities = _extract_entities(chunk, node_config, llm_serving, params, operator_version=operator_version)
+                entities = _extract_entities(chunk, node_config, llm_serving, params, operator_version=operator_version,
+                                             timeout_seconds=graph_llm_timeout_seconds)
                 result.append({**chunk, "entities": entities})
                 outcome["successful"].append(chunk)
                 if store and job_id:
@@ -1568,7 +1576,9 @@ def _run_operator(ref: str, params: dict[str, Any], values: list[dict[str, Any]]
         result = []
         for record in values:
             try:
-                relations = _extract_relations(record, record.get("entities") or [], node_config, llm_serving, params=params, operator_version=operator_version)
+                relations = _extract_relations(record, record.get("entities") or [], node_config, llm_serving,
+                                               params=params, operator_version=operator_version,
+                                               timeout_seconds=graph_llm_timeout_seconds)
                 result.append({**record, "relations": relations})
             except Exception as exc:
                 if outcome is not None:
@@ -1631,6 +1641,7 @@ def _builtin_dispatch(ref: str, params: dict[str, Any], inputs: list[dict[str, A
         sink_libraries=runtime.get("sink_libraries"),
         operator_version=runtime.get("operator_version"),
         graph_chunk_stage=runtime.get("graph_chunk_stage"),
+        graph_llm_timeout_seconds=runtime.get("graph_llm_timeout_seconds"),
     )
 
 
@@ -1847,6 +1858,7 @@ def execute_job(store: V7Store, objects, job_id: str, *, lease_owner: str | None
             "type_contracts": type_contracts, "job_id": job_id, "store": store,
             "retry_scope": retry_scope, "generation": generation,
             "graph_config": graph_config, "sink_libraries": sink_libraries,
+            "graph_llm_timeout_seconds": int(os.getenv("DATAFORGE_GRAPH_LLM_TIMEOUT_SECONDS", "400")),
             "cancelled": lambda: store.is_job_cancelled(job_id),
             "llm_serving_registry": store.llm_serving_registry,
         }

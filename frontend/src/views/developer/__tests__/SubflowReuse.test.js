@@ -8,11 +8,12 @@ import { dataflowOperators } from '../../../components/flow/__tests__/flowFixtur
 
 const router = vi.hoisted(() => ({ push: vi.fn() }))
 const route = vi.hoisted(() => ({ params: { subflowId: 'parent', revision: '1' }, query: { return_template_id: 'consumer' } }))
+const canvasFocus = vi.hoisted(() => vi.fn())
 vi.mock('vue-router', () => ({ useRouter: () => router, useRoute: () => route }))
 vi.mock('../../../api/platform', () => ({ api: Object.fromEntries(['createFlowSubgraph', 'flowSubgraphRevision', 'flowSubgraphs', 'operatorCatalog', 'flowSubgraphReferences', 'operatorCandidates'].map(name => [name, vi.fn()])) }))
 vi.mock('../../../components/flow/DataForgeFlowCanvas.vue', () => ({ default: {
   name: 'CanvasStub', props: ['nodes', 'edges'], template: '<div class="canvas-stub"></div>',
-  methods: { fit() {}, screenToFlowCoordinate(value) { return value } },
+  methods: { fit() {}, focusElement(value) { canvasFocus(value) }, screenToFlowCoordinate(value) { return value } },
 } }))
 
 const catalog = [{ code: 'quality', name: 'Quality', display_name_zh: '质量评估', category: 'quality-processing', source: 'dataforge', catalog_group: 'dataforge', version: 1,
@@ -24,12 +25,13 @@ const version = revision => ({ id: 'quality', code: 'quality-flow', name: '质�
 const asset = { ...version(2), revisions: [version(2), version(1)] }
 let wrapper
 beforeEach(() => {
+  canvasFocus.mockReset()
   api.operatorCandidates.mockResolvedValue(catalog)
   api.operatorCatalog.mockResolvedValue(catalog)
   api.flowSubgraphs.mockResolvedValue([asset])
   api.flowSubgraphReferences.mockResolvedValue({ reference_count: 0, references: [], unlocked_references: [] })
 })
-afterEach(() => { wrapper?.unmount(); document.body.innerHTML = '' })
+afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); vi.useRealTimers() })
 const button = label => wrapper.findAll('button').find(item => item.text() === label)
 
 describe('reusable subflow production and consumption', () => {
@@ -122,6 +124,84 @@ describe('reusable subflow production and consumption', () => {
     const definition = wrapper.vm.serialize()
     expect(definition.nodes.at(-1)).toMatchObject({ kind: 'knowledge_sink', output_key: 'text' })
     expect(definition.edges).toEqual([{ source: 'quality-node', source_port: 'output', target: expect.stringMatching(/^sink-text-/), target_port: 'input' }])
+  })
+  it('turns a missing Sink issue into navigation without changing the DAG', async () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false })))
+    const incompatible = { ...catalog[0], output_ports: { output: { artifact_type: 'candidate:qa' } } }
+    api.operatorCandidates.mockResolvedValue([{ ...incompatible, compatibility: { compatible: false, direction: 'downstream', reason: '端口数据类型不兼容' }, runtime_status: { status: 'ready' } }])
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog: [incompatible], subflows: [], outputTypes: ['text'] }, attachTo: document.body })
+    wrapper.vm.loadDefinition({ nodes: [{ id: 'quality-node', kind: 'operator', ref: 'quality', operator_version: 1 }], edges: [] })
+    await flushPromises()
+    const canvas = wrapper.findComponent({ name: 'CanvasStub' })
+    canvas.vm.$emit('select-node', wrapper.vm.nodes[0])
+    await vi.waitFor(() => expect(wrapper.find('.sink-item').attributes('disabled')).toBeDefined())
+    const before = wrapper.vm.serialize(), dirtyBefore = wrapper.emitted('dirty')?.length || 0
+    const sinkTarget = wrapper.get('.sink-item').element
+    sinkTarget.scrollIntoView = vi.fn()
+
+    expect(wrapper.vm.validate()).toBe(false)
+    await flushPromises()
+    expect(canvasFocus).toHaveBeenCalledWith(expect.objectContaining({ nodeId: 'quality-node' }))
+    const sinkIssues = wrapper.findAll('.validation-panel button').filter(item => item.text().includes('缺少正式知识输出'))
+    expect(sinkIssues).toHaveLength(1)
+    expect(sinkIssues[0].text()).toContain('需要添加 text 类型 Knowledge Sink')
+    expect(wrapper.text()).not.toContain('MISSING_OUTPUT_SINK')
+    expect(wrapper.text()).not.toContain('MISSING_SINK')
+
+    await sinkIssues[0].trigger('click'); await flushPromises()
+    const palette = wrapper.findComponent(OperatorPalette)
+    expect(palette.props('selectedNode')).toBeNull()
+    expect(palette.props('candidateResults')).toBeNull()
+    expect(palette.props('direction')).toBe('downstream')
+    expect(wrapper.get('.sink-item').attributes('disabled')).toBeUndefined()
+    expect(sinkTarget.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' })
+    expect(document.activeElement).toBe(sinkTarget)
+    expect(wrapper.vm.serialize()).toEqual(before)
+    expect(wrapper.emitted('dirty')?.length || 0).toBe(dirtyBefore)
+
+    await wrapper.get('.sink-item').trigger('dblclick')
+    expect(wrapper.vm.serialize().nodes.at(-1)).toMatchObject({ kind: 'knowledge_sink', output_key: 'text' })
+    expect(wrapper.vm.serialize().edges).toEqual([])
+    expect(wrapper.emitted('dirty').length).toBe(dirtyBefore + 1)
+  })
+  it('shows one actionable row for each missing output type', async () => {
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true })))
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog: [], subflows: [], outputTypes: ['text', 'qa'] }, attachTo: document.body })
+    wrapper.findAll('.sink-item').forEach(item => { item.element.scrollIntoView = vi.fn() })
+    expect(wrapper.vm.validate()).toBe(false)
+    await flushPromises()
+
+    const panel = wrapper.findAll('.validation-panel').at(-1)
+    expect(panel.text()).toContain('2 个问题')
+    expect(panel.findAll('button')).toHaveLength(2)
+    expect(panel.findAll('button').map(item => item.text())).toEqual([
+      expect.stringContaining('需要添加 text 类型 Knowledge Sink'),
+      expect.stringContaining('需要添加 qa 类型 Knowledge Sink'),
+    ])
+    expect(panel.text()).not.toContain('MISSING_SINK')
+  })
+  it('shows a static output-type requirement without clearing the current selection', async () => {
+    const source = { ...catalog[0], code: 'source', input_ports: {}, output_ports: { output: { artifact_type: 'candidate:text' } } }
+    wrapper = mount(AdvancedFlowEditor, { props: { catalog: [source], subflows: [], outputTypes: [] }, attachTo: document.body })
+    wrapper.vm.loadDefinition({ nodes: [{ id: 'source-node', kind: 'operator', ref: 'source', operator_version: 1 }], edges: [] })
+    await flushPromises()
+    const canvas = wrapper.findComponent({ name: 'CanvasStub' })
+    canvas.vm.$emit('select-node', wrapper.vm.nodes[0])
+    await flushPromises()
+    const before = wrapper.vm.serialize(), dirtyBefore = wrapper.emitted('dirty')?.length || 0
+
+    expect(wrapper.vm.validate()).toBe(false)
+    await flushPromises()
+
+    const panel = wrapper.findAll('.validation-panel').at(-1)
+    expect(panel.text()).toContain('未选择正式输出类型')
+    expect(panel.text()).toContain('请先在流程设置选择至少一种正式输出类型')
+    expect(panel.findAll('button')).toHaveLength(0)
+    expect(panel.get('.validation-issue-static').attributes('role')).toBe('status')
+    expect(wrapper.findComponent(OperatorPalette).props('selectedNode')?.id).toBe('source-node')
+    expect(canvasFocus).not.toHaveBeenCalled()
+    expect(wrapper.vm.serialize()).toEqual(before)
+    expect(wrapper.emitted('dirty')?.length || 0).toBe(dirtyBefore)
   })
   it('searches subflows and selects old published versions', async () => {
     wrapper = mount(OperatorPalette, { props: { catalog, subflows: [asset] } })

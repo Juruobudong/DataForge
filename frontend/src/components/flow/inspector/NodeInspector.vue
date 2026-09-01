@@ -27,7 +27,14 @@ const parameterSchema = computed(() => props.node?.data.meta.parameterSchema || 
 const editableKeys = computed(() => new Set(Object.keys(parameterSchema.value.properties || {})))
 const systemParameters = computed(() => Object.fromEntries(Object.entries(params.value).filter(([key]) => !editableKeys.value.has(key))))
 const format = value => JSON.stringify(value, null, 2)
-function updateParameters(value) { params.value = value; emit('apply-parameters', { ...value }) }
+function updateParameters(value) {
+  // The inspector edits only schema-backed fields.  Keep runtime-owned fields
+  // (for example knowledge_type and graph_mode) in the node definition; the
+  // server materializer restores them and dropping them would re-dirty the
+  // canvas immediately after every autosave.
+  params.value = { ...systemParameters.value, ...value }
+  emit('apply-parameters', { ...params.value })
+}
 </script>
 <template>
   <aside class="node-inspector">

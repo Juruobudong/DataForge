@@ -2,3 +2,4 @@
 .resource-export-*/
 *.part
 semantic-multilingual-v1/
+qwen3-tokenizer-v1/

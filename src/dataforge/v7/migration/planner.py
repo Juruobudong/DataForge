@@ -227,6 +227,11 @@ class InstitutionReleasePlanner:
                 KnowledgeAssetVersion.id.in_(asset_ids),
             ))) if asset_ids else []
             assets_by_id = {item.id: item for item in assets}
+            index_profile_codes = {
+                item.id: item.code for item in session.scalars(select(KnowledgeIndexProfile).where(
+                    KnowledgeIndexProfile.id.in_({asset.index_profile_id for asset in assets}),
+                ))
+            } if assets else {}
             checks: list[dict[str, Any]] = []
 
             def block(code: str, subject: dict[str, Any], expected: Any, observed: Any,
@@ -377,6 +382,7 @@ class InstitutionReleasePlanner:
                     "knowledge_library_name": library.name if library else asset.knowledge_library_id,
                     "asset_version_id": asset.id, "asset_version_no": asset.version_no,
                     "index_profile_id": asset.index_profile_id,
+                    "index_profile_code": index_profile_codes.get(asset.index_profile_id, asset.index_profile_id),
                     "index_profile_revision_id": asset.index_profile_revision_id,
                     "storage_contract_revision_id": asset.storage_contract_revision_id,
                     "collection_name": asset.collection_name, "partition_name": asset.partition_name,
@@ -487,6 +493,9 @@ class InstitutionReleasePlanner:
             if not draft:
                 raise ValueError("机构发布草稿不存在")
             if draft.package_kind != "knowledge_update":
+                index_profile_codes = {
+                    item.id: item.code for item in session.scalars(select(KnowledgeIndexProfile))
+                }
                 latest: dict[tuple[str, str], tuple[KnowledgeAssetVersion, KnowledgeLibrary]] = {}
                 rows = session.execute(select(KnowledgeAssetVersion, KnowledgeLibrary).join(
                     KnowledgeLibrary, KnowledgeLibrary.id == KnowledgeAssetVersion.knowledge_library_id,
@@ -499,11 +508,19 @@ class InstitutionReleasePlanner:
                         "asset_version_id": asset.id, "asset_version_no": asset.version_no,
                         "knowledge_library_id": asset.knowledge_library_id,
                         "knowledge_library_name": library.name,
+                        "index_profile_id": asset.index_profile_id,
+                        "index_profile_code": index_profile_codes.get(asset.index_profile_id, asset.index_profile_id),
                         "collection_name": asset.collection_name, "partition_name": asset.partition_name,
                         "item_count": asset.item_count, "content_digest": asset.content_digest,
                         "status": asset.status, "required_by_projects": [],
                         "selected_manually": False, "locked": False,
                     })
+            else:
+                index_profile_codes = {}
+            for row in selected_rows.values():
+                profile_id = row.get("index_profile_id")
+                if profile_id and not row.get("index_profile_code"):
+                    row["index_profile_code"] = index_profile_codes.get(profile_id, profile_id)
         collections: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for item in selected_rows.values():
             row = dict(item)

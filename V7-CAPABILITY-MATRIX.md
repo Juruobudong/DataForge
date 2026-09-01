@@ -6,9 +6,11 @@ ParsedDocument 校订审阅与模板自动执行（2026-09-01）：`LOCAL`。Par
 
 DataFlow 质量信号扩充（2026-08-31）：Catalog 登记26个唯一精选，新增通用评分、语义重复标记、句子/符号过滤和安全重复标点清理；GeneralFilter v2 显式消费上游信号。代码与受控本地链路已实施，Standard DAG 不变。固定多语言模型11个文件已按锁定revision下载、校验、离线导入并登记本地资源Profile，真实模型门禁1 passed；约485MB资源目录不入Git，仍须额外同步到`.34`后复验Runner镜像构建，不能把本地通过描述为远程验收。详见[026实施状态](specs/026-dataflow-quality-signals/summary.md)和[来源基线](wiki/sources/dataflow-quality-signals-2026-08-31.md)。
 
-问答 Provider 分离（2026-08-28）：默认原生 `qa-extractor v1`，Advanced 另选上游 `Text2QAGenerator v8`；提示词、业务参数与 Provider 分离，共用结构约束、有限恢复和诊断。本地完整 Debug 调用 `.34` 真实 Qwen3-32B：原生三轮共15块、DataFlow一轮5块均成功；未部署新版容器。见[实施记录](wiki/sources/qa-provider-separation-2026-08-28.md)。
+QA 类型拆分（2026-09-01）：泛化 `qa` 已替换为 `qa-question`（仅问题 Embedding）和 `qa-full`（问题与答案 Embedding）。两者分别建库、审核、发布、授权和绑定同名 Profile；Multi 默认 `qa-question`，可在内置模板改为 `qa-full`，并将实际选择冻结到保存、发布、Debug 与 Advanced 转换链路；qa-agent Seed 固定消费 qa-question。当前本地契约/空库 Seed 回归通过；真实 `.34` Embedding、Milvus 与浏览器验收待执行。
 
 图谱业务抽取要求与规则编辑（2026-08-28）：实体/关系抽取器 v7 接入真实模型请求通道，版本化指令、统一只读提示词预览、实体名称/描述编辑和配置区定位已实现；本地验证统计见[实施记录](wiki/sources/graph-guidance-2026-08-28.md)。真实模型效果及远程验收仍为 CONNECT。
+
+图谱运行超时与全局串行（2026-09-01）：`LOCAL`。Triple、Semantic 与 Multi 图谱输出的单次模型调用固定 400 秒、无 SDK 自动重试；Runner 预算由冻结分块数和每块最多一次协议修复推导。数据库全局租约只串行真实图谱处理，输入准备和 Text/QA 并发不受影响。空库 Baseline 已覆盖新表；Docker、`.34`、真实 Qwen/Milvus/浏览器验收待执行。来源：[实施记录](wiki/sources/graph-runtime-serial-timeout-2026-09-01.md)。
 
 实体关系联合抽取器（2026-08-31）：`LOCAL`。DataForge 原生 `entity-relation-extractor v1` 在一次模型响应中返回实体和 ID 引用关系，内置 Triple/Semantic/Multi Triple 已切换；每块正常一次调用，协议错误最多完整修复一次，保留严格校验、分块隔离、Evidence 和 Sink。受控模型、真实 Runner/Sink 与前端本地回归通过；`.34` 原任务只读预验收首轮 7/14，修复后原失败 7 块重跑 7/7，尚未完成修正后连续 14/14、远程部署和正式 Sink 验收。来源：[实施基线](wiki/sources/joint-graph-extraction-2026-08-31.md)。
 
@@ -54,15 +56,15 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 | 业务工作区 | 文档管理：目录树、递归上传、ParsedDocument 校订审阅、模板绑定与安全删除 | `LOCAL` | 上传/替换只排队 ParseJob；列表显示解析/审阅双状态并支持当前页批量通过。详情支持 Markdown OCR 校订与 table-v1 Grid cell 校订；批准后自动运行绑定模板。真实 `.34` E2E 为 `CONNECT`。 |
 | 业务工作区 | 处理任务：监控、停止、重试、删除、日志 | `DONE` | 任务只从文档库模板绑定发起；模板和目标知识库名称优先于技术 ID，`completed_with_warnings` 显示失败分块数与日志明细，重试仅执行失败组合；删除不会物理删除已形成的正式知识。 |
 | 业务工作区 | 知识库详情：内容、Knowledge Diff、向量状态、来源追踪 | `DONE` | 总览按类型统计活跃知识；单库详情使用独立路由，历史仅 hash 的 Diff 会明确标注兼容状态。 |
-| 业务工作区 | KnowledgeItem 二次审核与手动全量向量发布 | `LOCAL` | Text/QA 支持编辑、单条/批量 CAS 审核，pending 清零后只冻结 approved；Graph/扩展不逐条审核但手动 all_active 入库。任务不再自动向量化，失败候选不影响旧 Ready/Routing；真实 `.34` Milvus/浏览器验收待执行。 |
+| 业务工作区 | KnowledgeItem 二次审核与手动全量向量发布 | `LOCAL` | Text/QA 支持编辑、单条/批量 CAS 审核，pending 清零后只冻结 approved；总览可对当前筛选的全部非 Ready 库统一确认并逐库提交，Graph/扩展不逐条审核但同样 all_active 入库。任务不再自动向量化，失败候选不影响旧 Ready/Routing；真实 `.34` Milvus/浏览器验收待执行。 |
 | 业务工作区 | 知识库安全删除和失败重试 | `DONE` | Draft/已发布路由引用均阻止删除；仅异步清理目标 V7 Partition。 |
 | 业务工作区 | 向量存储：Collection/Partition 库存、资产映射与受控运维 | `DONE` | 实时聚合 Milvus 与 AssetVersion/Routing/Release/GC；普通刷新只读 stats，显式 verify 持久化最近 count/digest；load/release 仅限严格受管版本 Partition，无任意 drop。`.34` 真实对账仍为 `CONNECT`。 |
 | 业务工作区 | Milvus Connection Contract 与启动健康复核 | `LOCAL` | 中心 Target 使用不可变 URI/加密 Token Revision、CAS `list_collections` 验证和实例级 Authoring 绑定；central 正式数据库 API 启动 30 秒后并行复核内置测试/生产 current，健康失败不撤销 verified Revision 或绑定，页面也可人工复核。Seed 不绑定，机构 Milvus 不进中心，由 local URI/Token Candidate 使用相同 CAS。真实 `.34` 启动检查与双绑定仍为 `CONNECT`。 |
 | 业务工作区 | 菜单排序、显隐与恢复默认 | `DONE` | Menu Registry 与 `dataforge.workspace-menu.v1` 仅保存 order/hidden；支持拖拽和上下按钮，隐藏不影响路由或权限。 |
 | 业务工作区 | 图谱浏览：默认概览、实体搜索、1/2 跳邻居、关系 Evidence | `DONE` | 基于 MySQL 当前态三元组投影，不引入图数据库；默认概览按连接度选择最多 80 节点和 160 边。 |
-| 业务工作区 | 项目发布工作台：配置、验证、发布、版本记录 | `LOCAL` | 固定上下文为 Project/环境/全项目共用 Milvus Target；无中心 Deployment。项目级任务与 org 授权冻结为独立 RouteVersion，再由 ProjectPublication 绑定环境和精确 Target Revision。`DATAFORGE_DEFAULT_RELEASE_STAGE` 仅控制默认环境；真实 `.34` 发布和浏览器视觉验收未完成。 |
-| 业务工作区 | 项目发布三级验证 | `LOCAL` | 检索效果支持 Draft/Published/Historical 与临时实验；公共接口只测 Published Public v1；链路调试展示同次真实七阶段。管理员包装不改变正式 DTO、不持久化 Trace。真实 Bearer/推理/Milvus 验收未完成。见[实施记录](wiki/sources/project-publishing-workbench-2026-08-31.md)。 |
-| 业务工作区 | Public Retrieval v1 与统一检索测试台 | `LOCAL` | Published-only contract/query、独立 Retrieval Token、白名单业务 DTO、管理员公共测试与技术双模式已实现；qa_agent/kg 尚未迁移，`.34` 真实 Bearer/Milvus/浏览器验收为 `CONNECT`。见[实施记录](wiki/sources/public-retrieval-gateway-2026-08-29.md)。 |
+| 业务工作区 | 项目发布工作台：配置、验证、发布、版本记录 | `LOCAL` | 固定上下文为 Project/环境/全项目共用 Milvus Target；无中心 Deployment。项目级任务与 org 授权冻结为独立 RouteVersion，再由 ProjectPublication 绑定环境和精确 Target Revision；当前任务可完整删除，已发布/历史快照保持且下次显式发布生效。`DATAFORGE_DEFAULT_RELEASE_STAGE` 仅控制默认环境；真实 `.34` 发布和浏览器视觉验收未完成。 |
+| 业务工作区 | 项目发布三级验证 | `LOCAL` | 检索效果支持 Draft/Published/Historical 与临时实验；Draft 请求内物化当前执行上下文，Historical 只使用该环境已发布版本的冻结 Target。公共接口只测 Published Public v1；链路调试展示同次真实七阶段。管理员包装不改变正式 DTO、不持久化 Trace。真实 Bearer/推理/Milvus 验收未完成。见[实施记录](wiki/sources/project-publishing-workbench-2026-08-31.md)。 |
+| 业务工作区 | Public Retrieval v1 与统一检索测试台 | `LOCAL` | Published-only contract/query、独立 Retrieval Token、白名单业务 DTO、管理员公共测试与技术双模式已实现；中心 Runtime URL 保留 `dataforge-central` 别名但不依赖中心 Deployment。qa_agent/kg 尚未迁移，`.34` 真实 Bearer/Milvus/浏览器验收为 `CONNECT`。见[实施记录](wiki/sources/public-retrieval-gateway-2026-08-29.md)。 |
 | 业务工作区 | 机构发布部署：多项目 Seed/Release、额外资产、统一 Inventory、Knowledge Update、Prepare/Verify/Activate | `DONE` | 草稿显式校验 Deployment ID 与 `institution_code`，`.dfm` v2 和 local 导入复验机构目标；项目资产锁定、额外 AssetVersion、结构化冲突、模板闭包、waiting、Prepare fingerprint 与逐项目激活已实现，`.34` 仍为 `CONNECT`。 |
 | 业务工作区 | local 初始化、手动组件健康与导入任务详情 | `DONE` | Worker/Runner 15 秒心跳；九类组件支持单项、多选和全选真实检查，结果 15 分钟 stale；向导不动态配置 MySQL/MinIO。真实服务仍归 C-04。 |
 | 流程开发区 | 知识类型 | `DONE` | 初始仅 `text / qa / graph`；扩展 Type 自动生成可改名的受管 Profile，Manual Profile 明确区分 `create / attach`，页面展示 ownership、Contract、Partition、引用和删除任务。 |
@@ -85,8 +87,8 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 | 文档库模板绑定与自动结果库 | `LOCAL` | 一个文档库可绑定多个已发布模板；approved 文档在批准、新绑定、新修订和历史重新启用时按文档/模板幂等调度，每个输出类型固定结果库。 |
 | Source 内容身份 / CAS Blob / 历史重新启用 | `LOCAL` | `(source_id, sha256)` 唯一、全局 `blob://<sha256>` 共享、当前内容幂等、历史内容二次确认、activation-scoped Dispatch/Job/Sink Gate 与引用安全删除已完成本地实现；真实 MySQL/MinIO 验收待 `.34`。 |
 | ParseJob / ParsedDocument | `LOCAL` | 上传只解析；Markdown/table-v1 与 Anchor Map 写对象存储并校验 digest，SourceVersion 只保存解析状态和当前指针。真实 Parser/MinIO 验收待 `.34`。 |
-| FlowChunkSet / execution_gate / Input Snapshot | `LOCAL` | 正式绑定任务从 approved ParsedDocument 生成 Set并由系统批准有效 Chunk、冻结 Snapshot；fingerprint 复用和强制 reprepare 保持。 |
-| Approved Flow 与下游多层 Gate | `LOCAL` | 五模板显式 document-input/document-chunker/execution_gate；Job/Runner/Sink 复验当前 approved 修订与 Snapshot/digest。表格通用分块 fail closed。 |
+| FlowChunkSet / execution_gate / Input Snapshot | `LOCAL` | 正式绑定任务从 approved ParsedDocument 生成 Set并由系统批准有效 Chunk、冻结 Snapshot；fingerprint 复用和强制 reprepare 保持。MySQL 1213/40001 写入死锁使用新事务有限退避重试，其他错误继续 fail closed。 |
+| Approved Flow 与下游多层 Gate | `LOCAL` | 五模板显式 document-input/document-chunker/execution_gate；document-chunker v2 已固定 chunker-v1 锁与 qwen3-tokenizer-v1 Profile，本地真实隔离切分和五模板准备通过。Job/Runner/Sink 复验当前 approved 修订与 Snapshot/digest；表格通用分块 fail closed；`.34` Runner重建待验收。 |
 | `knowledge_item_sources`、Evidence、结构化锚点 | `DONE` | 返回文档、SourceVersion、锚点、Evidence 与 primary 标识。 |
 | Knowledge Diff 和向量状态 | `DONE` | 新变更有可读 before/after；旧记录兼容 hash。 |
 | 受控模板修订 CRUD、默认、校验、发布、样例运行 | `DONE` | 生产任务固定引用已发布修订。 |
@@ -131,7 +133,13 @@ Advanced 上下文兼容算子发现（2026-08-31）：`LOCAL`。支持选中节
 
 ## 执行记录
 
-- 2026-08-31：KnowledgeItem 二次审核与手动全量向量发布完成本地实现；Text/QA 新知识待审、编辑回待审、同内容 Evidence 更新保留审核但标记 stale，Graph/扩展手动发布。空库 schema、后端定向、前端契约/组件与生产构建已验证；真实 `.34` 待验收。来源：[实施基线](wiki/sources/knowledge-review-vector-publish-2026-08-31.md)。
+- 2026-09-01：`.34` 项目发布请求 `1012e4ea-2d7b-4851-984d-c0300b90f563` 暴露 `routing-snapshots` 命名卷仅存在但不可写，中心 API 在创建 `production-backups` 时收到 `PermissionError`。镜像现于非 root 切换前预建 routing/migration 挂载点，API、Worker、Runner 均在启动期探测实际可写性；不修改发布 API、Schema、Milvus Delivery 或旧测试卷兼容。Python 专项、Worker 与发布解耦组合 17 passed，Docker/.34 空卷、真实 Milvus 和浏览器验收仍待用户执行。
+
+- 2026-09-01：kg-for-consultation 空库 Seed 去掉 `clinical_guideline_graph` 默认检索任务，仅保留 `department_text.infectious_disease`；graph-triple Profile 和旧图谱导入工具不删除。已有测试库不做清理兼容，`.34` 需空卷重建后生效。
+
+- 2026-09-01：知识库总览增加当前筛选范围的一键审核并入库；仅编排既有单库摘要、审核和发布事务，最多三路独立提交，Ready 跳过、预检失败和提交失败逐库显示，绝不合并资产或自动切换 Routing。真实 `.34` Milvus/浏览器验收待执行。
+
+- 2026-08-31：KnowledgeItem 二次审核与手动全量向量发布完成本地实现；Text/QA 新知识待审、编辑回待审、同内容 Evidence 更新保留审核但标记 stale，支持一次确认后全库自动通过待审项并发布，Graph/扩展手动发布。空库 schema、后端定向、前端契约/组件与生产构建已验证；真实 `.34` 待验收。来源：[实施基线](wiki/sources/knowledge-review-vector-publish-2026-08-31.md)。
 
 - 本矩阵创建时已完成本期唯一可本地完成的导航收口：开发区第四页为只读「DataFlow 调试台」，向量状态作为其诊断面板的一部分保留。
 - 2026-08-13：MinerU 3.4.4 Pipeline GPU OCR 仓库实现完成；相关 V7 回归 60 passed，覆盖 Adapter、文本/扫描 PDF Runner、Artifact 补偿与删除生命周期、失败保真和 Compose 静态契约。真实 CUDA/模型、文本/扫描 PDF、回环端口和服务恢复仍需 C-01～C-04 部署验收。

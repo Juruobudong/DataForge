@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref } from 'vue'
 import { makeCanvasNode, subflowPrimaryName, subflowSubtitle, operatorPrimaryName, operatorSubtitle, operatorAvailable } from '../flowModel'
 import { checkEdgeCompatibility } from '../edge/edgeCompatibility'
 import OperatorHelpPopover from './OperatorHelpPopover.vue'
@@ -10,6 +10,9 @@ const emit = defineEmits(['drag-start', 'add-item', 'add-sink', 'retry', 'clear-
 const query = ref('')
 const help = ref(null)
 const expanded = ref(new Set(['DataForge 算子', 'DataFlow 精选', '自定义算子']))
+const sinkRefs = new Map()
+const focusedSink = ref('')
+let sinkFocusTimer = null
 
 const catalogGroups = { dataforge: 'DataForge 算子', dataflow_featured: 'DataFlow 精选', custom: '自定义算子' }
 const categoryLabels = {
@@ -50,6 +53,27 @@ function sinkCompatibility(outputKey) {
 }
 function sinkInsertable(outputKey) { return !discoveryActive.value || Boolean(sinkCompatibility(outputKey)?.compatible) }
 function addSink(outputKey) { const value = sinkCompatibility(outputKey); if (!discoveryActive.value || value?.compatible) emit('add-sink', outputKey, value) }
+function setSinkRef(outputKey, element) {
+  if (element) sinkRefs.set(outputKey, element)
+  else sinkRefs.delete(outputKey)
+}
+async function focusSink(outputKey) {
+  if (!outputKey) return false
+  await nextTick()
+  const target = sinkRefs.get(outputKey)
+  if (!target) return false
+  clearTimeout(sinkFocusTimer)
+  if (focusedSink.value === outputKey) {
+    focusedSink.value = ''
+    await nextTick()
+  }
+  focusedSink.value = outputKey
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+  target.scrollIntoView?.({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' })
+  target.focus({ preventScroll: true })
+  sinkFocusTimer = window.setTimeout(() => { focusedSink.value = '' }, 4000)
+  return true
+}
 function connects(raw) {
   if (!props.source?.nodeId) return true
   const sourceNode = props.nodes.find(node => node.id === props.source.nodeId)
@@ -99,6 +123,8 @@ function toggle(key) {
   next.has(key) ? next.delete(key) : next.add(key)
   expanded.value = next
 }
+defineExpose({ focusSink })
+onBeforeUnmount(() => clearTimeout(sinkFocusTimer))
 </script>
 
 <template>
@@ -136,7 +162,7 @@ function toggle(key) {
       </section>
       <section v-if="outputTypes.length && (!discoveryActive || direction === 'downstream')">
         <h4>正式知识输出</h4>
-        <button v-for="item in outputTypes" :key="item" class="sink-item" :class="{ 'sink-incompatible': !sinkInsertable(item) }" :disabled="!sinkInsertable(item)" :title="sinkCompatibility(item)?.reason || '双击添加正式知识输出'" @dblclick="addSink(item)"><span class="item-icon">✓</span><span><b>{{ item }}</b><small>Knowledge Sink</small><small v-if="discoveryActive">{{ sinkCompatibility(item)?.compatible ? `可接下游 · ${sinkCompatibility(item).source_port} → input` : sinkCompatibility(item)?.reason }}</small></span><span class="grab">＋</span></button>
+        <button v-for="item in outputTypes" :key="item" :ref="element => setSinkRef(item, element)" class="sink-item" :class="{ 'sink-incompatible': !sinkInsertable(item), 'sink-targeted': focusedSink === item }" :disabled="!sinkInsertable(item)" :title="sinkCompatibility(item)?.reason || '双击添加正式知识输出'" :aria-current="focusedSink === item ? 'true' : undefined" @dblclick="addSink(item)"><span class="item-icon">✓</span><span><b>{{ item }}</b><small>Knowledge Sink</small><small v-if="discoveryActive">{{ sinkCompatibility(item)?.compatible ? `可接下游 · ${sinkCompatibility(item).source_port} → input` : sinkCompatibility(item)?.reason }}</small><small v-if="focusedSink === item" class="sink-add-hint" role="status">双击此处添加到画布</small></span><span class="grab">＋</span></button>
       </section>
     </div>
     <p class="hint">拖动卡片到画布，松开即可添加</p>
@@ -172,6 +198,10 @@ function toggle(key) {
 .subflow-item .item-icon{background:#e6efff}
 .sink-item .item-icon{color:#1d8c65;background:#eaf7f1}
 .sink-item.sink-incompatible{opacity:.5;cursor:not-allowed}
+.sink-item.sink-targeted{border-color:#2f6fed;background:#eef4ff;box-shadow:0 0 0 3px rgba(47,111,237,.2);animation:sink-target-pulse .8s ease-in-out 3}
+.sink-item .sink-add-hint{color:#2f6fed;font-size:8px;font-weight:800;white-space:normal}
+@keyframes sink-target-pulse{50%{border-color:#7da5f5;background:#f7faff;box-shadow:0 0 0 6px rgba(47,111,237,.08)}}
+@media (prefers-reduced-motion: reduce){.sink-item.sink-targeted{animation:none}}
 .hint{margin:0;padding:9px 10px;border-top:1px solid #edf0f4;color:#8792a4;background:#fafbfd;font-size:7.5px;text-align:center}
 </style>
 <style scoped>

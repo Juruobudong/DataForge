@@ -719,7 +719,6 @@ class MigrationImporter:
                     "project_id": project.id,
                     "project_task_id": task["task_id"],
                     "index_profile_id": profile.get("index_profile_id"),
-                    "qa_embedding_mode": task.get("qa_embedding_mode"),
                     "top_k": int(task.get("top_k", 10)), "enabled": True,
                     "final_top_k": int(task.get("final_top_k", min(5, int(task.get("top_k", 10))))),
                     "reranker_serving_code": task.get("reranker_serving_code"),

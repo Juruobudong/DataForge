@@ -905,7 +905,6 @@ def upgrade():
     sa.Column('project_id', sa.String(length=64), nullable=False),
     sa.Column('project_task_id', sa.String(length=64), nullable=False),
     sa.Column('index_profile_id', sa.String(length=64), nullable=True),
-    sa.Column('qa_embedding_mode', sa.String(length=32), nullable=True),
     sa.Column('top_k', sa.Integer(), nullable=False),
     sa.Column('final_top_k', sa.Integer(), nullable=False),
     sa.Column('reranker_serving_code', sa.String(length=64), nullable=True),
@@ -1210,6 +1209,17 @@ def upgrade():
     op.create_index(op.f('ix_knowledge_library_work_leases_lease_expires_at'), 'knowledge_library_work_leases', ['lease_expires_at'], unique=False)
     op.create_index(op.f('ix_knowledge_library_work_leases_work_id'), 'knowledge_library_work_leases', ['work_id'], unique=False)
     op.create_index(op.f('ix_knowledge_library_work_leases_work_kind'), 'knowledge_library_work_leases', ['work_kind'], unique=False)
+    op.create_table('graph_execution_leases',
+    sa.Column('scope', sa.String(length=64), nullable=False),
+    sa.Column('work_id', sa.String(length=64), nullable=False),
+    sa.Column('lease_owner', sa.String(length=255), nullable=False),
+    sa.Column('lease_expires_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.PrimaryKeyConstraint('scope')
+    )
+    op.create_index(op.f('ix_graph_execution_leases_lease_expires_at'), 'graph_execution_leases', ['lease_expires_at'], unique=False)
+    op.create_index(op.f('ix_graph_execution_leases_work_id'), 'graph_execution_leases', ['work_id'], unique=False)
     op.create_table('knowledge_migration_jobs',
     sa.Column('id', sa.String(length=64), nullable=False),
     sa.Column('direction', sa.String(length=16), nullable=False),
@@ -1562,6 +1572,7 @@ def upgrade():
     sa.Column('error', sa.Text(), nullable=True),
     sa.Column('asset_version_id', sa.String(length=64), nullable=True),
     sa.Column('publish_idempotency_key', sa.String(length=64), nullable=True),
+    sa.Column('requested_snapshot_digest', sa.String(length=64), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['asset_version_id'], ['knowledge_asset_versions.id'], ),
@@ -2121,6 +2132,9 @@ def downgrade():
     op.drop_index(op.f('ix_knowledge_migration_jobs_package_kind'), table_name='knowledge_migration_jobs')
     op.drop_index(op.f('ix_knowledge_migration_jobs_direction'), table_name='knowledge_migration_jobs')
     op.drop_table('knowledge_migration_jobs')
+    op.drop_index(op.f('ix_graph_execution_leases_work_id'), table_name='graph_execution_leases')
+    op.drop_index(op.f('ix_graph_execution_leases_lease_expires_at'), table_name='graph_execution_leases')
+    op.drop_table('graph_execution_leases')
     op.drop_index(op.f('ix_knowledge_library_work_leases_work_kind'), table_name='knowledge_library_work_leases')
     op.drop_index(op.f('ix_knowledge_library_work_leases_work_id'), table_name='knowledge_library_work_leases')
     op.drop_index(op.f('ix_knowledge_library_work_leases_lease_expires_at'), table_name='knowledge_library_work_leases')

@@ -25,11 +25,17 @@ let qaRequestId = 0, lastFocusedElement = null
 
 const libraryId = computed(() => String(route.params.libraryId || ''))
 const isGraph = computed(() => library.value?.knowledge_type === 'graph')
-const isQa = computed(() => library.value?.knowledge_type === 'qa')
+const isQa = computed(() => ['qa-question', 'qa-full'].includes(library.value?.knowledge_type))
 const isText = computed(() => library.value?.knowledge_type === 'text')
 const reviewRequired = computed(() => reviewSummary.value?.review_required === true)
 const reviewCounts = computed(() => reviewSummary.value?.counts || { total: 0, pending: 0, approved: 0, rejected: 0 })
 const publishLabel = computed(() => reviewSummary.value?.has_ready_asset ? '重新全量生效入向量库' : (reviewRequired.value ? '全量生效入向量库' : '入向量库'))
+const canPublish = computed(() => reviewRequired.value
+  ? reviewSummary.value?.can_publish_after_auto_approval === true
+  : reviewSummary.value?.can_publish === true)
+const publishIssues = computed(() => reviewRequired.value
+  ? (reviewSummary.value?.auto_publish_issues || [])
+  : (reviewSummary.value?.issues || []))
 const selectableItems = computed(() => (isQa.value ? qaListing.value.items : items.value).filter(item => item.status === 'active'))
 const allSelected = computed(() => selectableItems.value.length > 0 && selectableItems.value.every(item => selectedIds.value.includes(item.id)))
 const someSelected = computed(() => !allSelected.value && selectableItems.value.some(item => selectedIds.value.includes(item.id)))
@@ -86,7 +92,7 @@ async function load() {
       api.changes(library.value.id), api.vectorStatus(library.value.id), api.deletionJobs(library.value.id),
       api.knowledgeReviewSummary(library.value.id),
     ])
-    if (library.value.knowledge_type === 'qa') {
+    if (['qa-question', 'qa-full'].includes(library.value.knowledge_type)) {
       syncQaFiltersFromRoute()
       await router.replace({ query: qaRouteQuery({ q: qaSearch.value, status: qaStatus.value, page: qaPage.value }) })
       await loadQaItems()
@@ -232,17 +238,20 @@ async function batchReview(action) {
 }
 async function publishVectors() {
   const summary = reviewSummary.value
-  if (!summary?.can_publish || publishBusy.value) return
+  if (!canPublish.value || publishBusy.value) return
   const counts = summary.counts || {}
+  const autoApproveCount = reviewRequired.value ? (summary.auto_approve_pending_count || 0) : 0
   const message = reviewRequired.value
-    ? `即将生成新的完整知识资产版本。\n\n审核通过：${counts.approved || 0} 条\n不通过：${counts.rejected || 0} 条，不进入本版本\n待审核：${counts.pending || 0} 条\n\n确认继续？`
+    ? `${autoApproveCount ? `将自动通过该知识库全部 ${autoApproveCount} 条待审核知识，并` : '即将'}生成新的完整知识资产版本。\n\n审核通过：${(counts.approved || 0) + autoApproveCount} 条\n不通过：${counts.rejected || 0} 条，不进入本版本\n\n确认继续？`
     : `即将把当前 ${summary.selected_count || 0} 条活动知识冻结为新的完整资产版本。\n\n确认继续？`
   if (!window.confirm(message)) return
   publishBusy.value = true; error.value = ''
   try {
     await api.publishKnowledgeVectors(libraryId.value, {
-      scope: summary.scope, expected_snapshot_digest: summary.snapshot_digest,
-      idempotency_key: createClientRequestId(),
+      scope: summary.scope,
+      expected_snapshot_digest: reviewRequired.value
+        ? summary.auto_approval_snapshot_digest : summary.snapshot_digest,
+      idempotency_key: createClientRequestId(), approve_pending: reviewRequired.value,
     })
     await refreshKnowledgeState()
   } catch (err) { error.value = err.message; await refreshKnowledgeState().catch(() => {}) }
@@ -382,9 +391,10 @@ watch(
             <button :disabled="!selectedIds.length || reviewBusy" @click="batchReview('approve')">批量通过</button>
             <button :disabled="!selectedIds.length || reviewBusy" @click="batchReview('reject')">批量不通过</button>
           </template>
-          <button class="primary" :disabled="!reviewSummary?.can_publish || publishBusy" :title="reviewSummary?.issues?.map(item => item.message).join('；')" @click="publishVectors">{{ publishBusy ? '正在提交…' : publishLabel }}</button>
+          <button class="primary" :disabled="!canPublish || publishBusy" :title="publishIssues.map(item => item.message).join('；')" @click="publishVectors">{{ publishBusy ? '正在提交…' : publishLabel }}</button>
         </div>
-        <p v-if="reviewSummary?.issues?.length" class="review-issues" role="status">{{ reviewSummary.issues.map(item => item.message).join('；') }}</p>
+        <p v-if="reviewRequired && reviewSummary?.auto_approve_pending_count" class="review-issues" role="status">全量入库会自动通过该知识库全部 {{ reviewSummary.auto_approve_pending_count }} 条待审核知识。</p>
+        <p v-if="publishIssues.length" class="review-issues" role="status">{{ publishIssues.map(item => item.message).join('；') }}</p>
       </section>
 
       <template v-if="tab === 'content'">

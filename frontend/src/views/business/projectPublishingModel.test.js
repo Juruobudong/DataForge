@@ -5,39 +5,83 @@ import fs from 'node:fs'
 import {
   availableOrgCodePresets,
   compatibleProfilesForTask,
+  defaultKnowledgeType,
   movePriority,
   newOrgScopeDefaults,
   normalizeDefaultReleaseStage,
   orgRoutesForTask,
   preferredDeployment,
-  qaEmbeddingMode,
+  reorderPriority,
   resolveOrgCodePreset,
   routingPublishReadiness,
   routingValidationView,
+  sortKnowledgeTypes,
+  sortProjectChoices,
 } from './projectPublishingModel.js'
 
 test('任务只显示当前知识类型绑定的兼容 Profile', () => {
   const types = [
-    { status: 'active', code: 'qa', index_profiles: [
-      { id: 'question', code: 'qa-question' },
-      { id: 'full', code: 'qa-full' },
-    ] },
+    { status: 'active', code: 'qa-question', index_profiles: [{ id: 'question', code: 'qa-question' }] },
+    { status: 'active', code: 'qa-full', index_profiles: [{ id: 'full', code: 'qa-full' }] },
     { status: 'active', code: 'text', index_profiles: [{ id: 'text', code: 'text-default' }] },
   ]
   assert.deepEqual(
-    compatibleProfilesForTask({ knowledge_type: 'qa' }, types).map(item => item.id),
-    ['question', 'full'],
+    compatibleProfilesForTask({ knowledge_type: 'qa-question' }, types).map(item => item.id),
+    ['question'],
   )
   assert.deepEqual(
-    compatibleProfilesForTask({ knowledge_type: 'qa' }, types, true).map(item => item.id),
-    ['question'],
+    compatibleProfilesForTask({ knowledge_type: 'qa-full' }, types).map(item => item.id),
+    ['full'],
   )
 })
 
-test('QA Profile 自动映射 embedding 模式', () => {
-  assert.equal(qaEmbeddingMode({ code: 'qa-question' }), 'question')
-  assert.equal(qaEmbeddingMode({ code: 'qa-full' }), 'full')
-  assert.equal(qaEmbeddingMode({ code: 'text-default' }), null)
+test('任务知识类型下拉默认 qa-question，扩展与未知类型追加在后', () => {
+  const types = [
+    { code: 'graph', kind: 'builtin' },
+    { code: 'zz-case', kind: 'extension' },
+    { code: 'qa-full', kind: 'builtin' },
+    { code: 'qa-question', kind: 'builtin' },
+    { code: 'aa-case', kind: 'extension' },
+    { code: 'text', kind: 'builtin' },
+    { code: 'legacy', kind: 'builtin' },
+  ]
+  assert.deepEqual(sortKnowledgeTypes(types).map(item => item.code), [
+    'qa-question', 'qa-full', 'text', 'graph', 'aa-case', 'zz-case', 'legacy',
+  ])
+  assert.deepEqual(sortKnowledgeTypes(), [])
+})
+
+test('新增业务任务默认知识类型为问答知识，缺失时回退首项', () => {
+  assert.equal(defaultKnowledgeType([{ code: 'graph' }, { code: 'qa-question' }, { code: 'text' }]), 'qa-question')
+  assert.equal(defaultKnowledgeType([{ code: 'graph' }, { code: 'text' }]), 'text')
+  assert.equal(defaultKnowledgeType([]), '')
+})
+
+test('项目选择器固定将 qa_agent 放在首位，其余项目保持 API 顺序', () => {
+  const projects = [
+    { id: 'kg', code: 'kg-for-consultation', name: 'kg_for_consultation' },
+    { id: 'qa', code: 'qa-agent', name: 'qa_agent' },
+    { id: 'other', code: 'other', name: '其他项目' },
+  ]
+  assert.deepEqual(sortProjectChoices(projects).map(item => item.id), ['qa', 'kg', 'other'])
+  assert.deepEqual(sortProjectChoices([{ id: 'qa', name: 'qa_agent' }, projects[0]]).map(item => item.id), ['qa', 'kg'])
+})
+
+test('项目发布新增任务表单消费知识类型排序与问答默认', () => {
+  const publishing = fs.readFileSync(new URL('./ProjectAuthorizationView.vue', import.meta.url), 'utf8')
+  assert.match(publishing, /const activeKnowledgeTypes = computed\(\(\) => sortKnowledgeTypes\(/)
+  assert.match(publishing, /newTaskKnowledgeType\.value \|\|= defaultKnowledgeType\(activeKnowledgeTypes\.value\)/)
+  assert.match(publishing, /const projectChoices = computed\(\(\) => sortProjectChoices\(projects\.value\)\)/)
+  assert.match(publishing, /projectId\.value \|\|= projectChoices\.value\[0\]\?\.id/)
+  assert.match(publishing, /v-for="project in projectChoices"/)
+})
+
+test('机构 Deployment 的新建与编辑项目选择器复用项目发布排序', () => {
+  const deployment = fs.readFileSync(new URL('./InstitutionDeploymentView.vue', import.meta.url), 'utf8')
+  assert.match(deployment, /import \{ sortProjectChoices \} from '\.\/projectPublishingModel'/)
+  assert.match(deployment, /const projectChoices = computed\(\(\) => sortProjectChoices\(projects\.value\)\)/)
+  assert.equal((deployment.match(/v-for="project in projectChoices"/g) || []).length, 2)
+  assert.doesNotMatch(deployment, /v-for="project in projects"/)
 })
 
 test('默认发布环境只接受生产值，其余安全回退测试环境', () => {
@@ -71,6 +115,13 @@ test('新项目优先选择 DataForge 中心，本地实例选择绑定目标', 
 test('知识范围优先级按上下移动后的显式顺序提交', () => {
   assert.deepEqual(movePriority(['c', 'a', 'b'], 'a', -1), ['a', 'c', 'b'])
   assert.deepEqual(movePriority(['c', 'a', 'b'], 'c', -1), ['c', 'a', 'b'])
+})
+
+test('知识范围拖拽支持目标前后插入且忽略无效重排', () => {
+  assert.deepEqual(reorderPriority(['a', 'b', 'c'], 'c', 'a'), ['c', 'a', 'b'])
+  assert.deepEqual(reorderPriority(['a', 'b', 'c'], 'a', 'b', true), ['b', 'a', 'c'])
+  assert.deepEqual(reorderPriority(['a', 'b', 'c'], 'a', 'a', true), ['a', 'b', 'c'])
+  assert.deepEqual(reorderPriority(['a', 'b', 'c'], 'missing', 'b'), ['a', 'b', 'c'])
 })
 
 test('知识范围按 Task 与 org_code 组合隔离', () => {
@@ -127,9 +178,24 @@ test('项目发布工作台使用固定上下文和四个一级入口', () => {
   assert.doesNotMatch(publishing, /tab==='scope'/)
   assert.match(publishing, /<RetrievalTaskSettings[^>]+:task="task"/)
   assert.match(publishing, /<KnowledgeScopePanel[^>]+:libraries="availableLibraries"/)
+  assert.match(publishing, /@reorder="reorderLibrary"/)
+  assert.match(publishing, /function reorderLibrary\(\{ id, targetId, after \}\)/)
+  assert.match(publishing, /reorderPriority\(chosen\.value, id, targetId, after\)/)
   assert.match(publishing, /@validate="preflight"/)
   assert.match(publishing, /selectedStage\.value = configuredDefaultStage\(\)/)
   assert.match(publishing, /instance\.value\?\.default_release_stage/)
+})
+
+test('项目发布任务删除要求确认、避免重复提交并在成功后刷新草稿', () => {
+  const publishing = fs.readFileSync(new URL('./ProjectAuthorizationView.vue', import.meta.url), 'utf8')
+  const api = fs.readFileSync(new URL('../../api/platform.js', import.meta.url), 'utf8')
+  assert.match(api, /deleteDeploymentTask:.*method: 'DELETE'/)
+  assert.match(publishing, /async function deleteDeploymentTask\(task\)/)
+  assert.match(publishing, /确认删除检索任务/)
+  assert.match(publishing, /已发布和历史版本不受影响；下次发布后正式检索才会生效/)
+  assert.match(publishing, /if \(deletingTaskId\.value\) return/)
+  assert.match(publishing, /:disabled="!!deletingTaskId"/)
+  assert.match(publishing, /await load\(\); await loadDeployment\(\)/)
 })
 
 test('Routing 校验分项保留 blocked、Expected/Observed 与 deferred 语义', () => {

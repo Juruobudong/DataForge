@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -118,6 +119,8 @@ class Settings:
     runner_url: str | None = None
     runner_service_token: str | None = None
     runner_timeout_seconds: float = 1860.0
+    graph_llm_timeout_seconds: int = 400
+    graph_runner_timeout_buffer_seconds: int = 300
     knowledge_job_concurrency: int = 3
     vector_sync_concurrency: int = 2
     parse_concurrency: int = 2
@@ -161,6 +164,10 @@ class Settings:
             runner_url=os.getenv("DATAFORGE_RUNNER_URL"),
             runner_service_token=_read_secret("DATAFORGE_RUNNER_SERVICE_TOKEN"),
             runner_timeout_seconds=float(os.getenv("DATAFORGE_RUNNER_TIMEOUT_SECONDS", "1860")),
+            graph_llm_timeout_seconds=_positive_int_environment("DATAFORGE_GRAPH_LLM_TIMEOUT_SECONDS", 400),
+            graph_runner_timeout_buffer_seconds=_positive_int_environment(
+                "DATAFORGE_GRAPH_RUNNER_TIMEOUT_BUFFER_SECONDS", 300,
+            ),
             knowledge_job_concurrency=_positive_int_environment("DATAFORGE_KNOWLEDGE_JOB_CONCURRENCY", 3),
             vector_sync_concurrency=_positive_int_environment("DATAFORGE_VECTOR_SYNC_CONCURRENCY", 2),
             parse_concurrency=_positive_int_environment("DATAFORGE_PARSE_CONCURRENCY", 2),
@@ -212,5 +219,20 @@ class Settings:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        self.routing_dir.mkdir(parents=True, exist_ok=True)
-        self.migration_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_writable_directory(self.routing_dir, "DATAFORGE_ROUTING_DIR")
+        self._ensure_writable_directory(self.migration_dir, "DATAFORGE_MIGRATION_DIR")
+
+    @staticmethod
+    def _ensure_writable_directory(directory: Path, environment: str) -> None:
+        """Create and remove a unique file so existing mounts are proven writable."""
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            descriptor, probe_name = tempfile.mkstemp(
+                prefix=".dataforge-write-probe-", dir=directory
+            )
+            try:
+                os.close(descriptor)
+            finally:
+                Path(probe_name).unlink(missing_ok=True)
+        except OSError as exc:
+            raise RuntimeError(f"{environment} 目录不可写：{directory}") from exc

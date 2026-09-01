@@ -6,8 +6,8 @@ never leak into a published Flow definition.
 """
 from __future__ import annotations
 
-from typing import Any
 from copy import deepcopy
+from typing import Any
 
 from .llm_serving import DEFAULT_LLM_SERVING_ID
 
@@ -22,6 +22,13 @@ DEFAULT_QA_EXTRACTION_INSTRUCTIONS = (
     "优先提取定义、事实、条件、步骤、规则、结论和数值等具有明确答案的知识。"
     "答案保持原文语言，简洁但信息完整；文本不足以形成可靠问答时不生成。"
 )
+QA_KNOWLEDGE_TYPES = frozenset({"qa-question", "qa-full"})
+
+
+def is_qa_knowledge_type(value: str | None) -> bool:
+    return str(value or "") in QA_KNOWLEDGE_TYPES
+
+
 QA_EXTRACTION_SCHEMA = {
     "type": "string", "title": "QA 提取要求", "default": DEFAULT_QA_EXTRACTION_INSTRUCTIONS,
     "description": "填写提取主题、对象、问法和答案要求；空白使用通用提取规则。无匹配内容时正常产出零条问答。",
@@ -135,9 +142,9 @@ def _knowledge_types(source: str, target: str) -> list[str]:
     if target == "candidate:text": return ["text"]
     contract = f"{source}|{target}"
     if "qa-agent-faq" in contract: return ["qa-agent-faq"]
-    if "qa" in contract: return ["qa"]
+    if "qa" in contract: return sorted(QA_KNOWLEDGE_TYPES)
     if any(value in contract for value in ("graph", "entity", "relation")): return ["graph"]
-    return ["text", "qa", "graph"]
+    return ["text", *sorted(QA_KNOWLEDGE_TYPES), "graph"]
 
 
 def _artifact_example(artifact_type: str) -> dict[str, Any]:
@@ -282,6 +289,8 @@ DATAFLOW_VERSION = "1.0.10"
 DATAFLOW_DIGEST = "75dd8e03fd96875472c11bd9fdf8af30e66d76a6b2d59b6b426d998db25e8790"
 DATAFLOW_LOCK_DIGEST = "d575faf7e20b1bf75725fa15a4d29de17168c957d09f99f5b2cd5053df257a28"
 DATAFLOW_CURATED_LOCK_DIGEST = "dcd3a3c0858ee2af3790255b435885fd50f5ef649fc18a6b26a250d84a0890e8"
+DATAFLOW_CHUNKER_LOCK_DIGEST = "11f3a0a8f31ed0d02b68d3d6fd4725abaa75c8df91ef60bc075783da86b39259"
+CHUNKER_RESOURCE_PROFILE = "qwen3-tokenizer-v1"
 
 
 def operator_surfaces(code: str, input_type: str, exposure: str = "canvas") -> list[str]:
@@ -297,12 +306,15 @@ def operator_surfaces(code: str, input_type: str, exposure: str = "canvas") -> l
 def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
     item = deepcopy(item)
     if item["code"] == "document-chunker":
+        item["version"] = 2
         item["source"] = "dataflow"
         item["catalog_group"] = "dataforge"
         item["runtime_requirements"].update({
             "driver": "dataflow", "executor": "dataflow-storage",
             "package": DATAFLOW_PACKAGE, "package_version": DATAFLOW_VERSION,
             "package_digest": DATAFLOW_DIGEST,
+            "dependency_lock_digest": DATAFLOW_CHUNKER_LOCK_DIGEST,
+            "resource_profile": CHUNKER_RESOURCE_PROFILE,
             "implementation": "dataflow.operators.knowledge_cleaning:KBCChunkGenerator",
             "adapter_version": "parsed-document-to-flow-chunks-v1", "approved": True,
         })
@@ -359,7 +371,7 @@ def _curated_entry(item: dict[str, Any]) -> dict[str, Any]:
         item["runtime_requirements"]["implementations"] = {"identity": implementation}
         item["description"] = item["summary"] = "使用 DataFlow HashDeduplicateFilter 按知识身份精确去重，保留来源与 Evidence"
     else:
-        item["knowledge_types"] = ["text", "qa"]
+        item["knowledge_types"] = ["text", *sorted(QA_KNOWLEDGE_TYPES)]
         props["prompt_template_revision_id"] = {"type": "string", "title": "修订 Prompt", "default": "promptrev_refiner", "x-dataforge-ui": {"widget": "prompt-template-selector"}}
         item["parameter_schema"]["required"] = ["prompt_template_revision_id"]
         docs["prompt_template_revision_id"] = "已发布的修订提示词；只修订候选正文，不能改变来源 Evidence。"
@@ -375,7 +387,7 @@ for _item in CATALOG_SEEDS:
 _hash = next(item for item in CATALOG_SEEDS if item["code"] == "HashDeduplicateFilter")
 _minhash = deepcopy(_hash)
 _minhash.update(code="MinHashDeduplicateFilter", name="MinHashDeduplicateFilter",
-                display_name_zh="MinHash 相似去重过滤器", knowledge_types=["text", "qa"])
+                display_name_zh="MinHash 相似去重过滤器", knowledge_types=["text", *sorted(QA_KNOWLEDGE_TYPES)])
 _minhash["adapter_code"] = _minhash["runtime_requirements"]["adapter_version"] = "candidate-minhash-deduplicate-v1"
 _minhash["runtime_requirements"]["implementation"] = "dataflow.operators.general_text:MinHashDeduplicateFilter"
 _minhash["runtime_requirements"]["implementations"] = {
@@ -419,7 +431,7 @@ def _new_curated_entries():
         description = ("同来源 Chunk 内对文本/问答候选相似去重，保留原候选与完整 Evidence。" if "deduplicate" in spec["adapter"]
                        else "通过真实 DataFlow 过滤文本/问答候选，只决定保留或删除，不改变正文和 Evidence。")
         item.update(code=code, name=code, display_name_zh=spec["name"], subcategory=spec["category"],
-                    summary=description, description=description, version=1, knowledge_types=["text", "qa"],
+                    summary=description, description=description, version=1, knowledge_types=["text", *sorted(QA_KNOWLEDGE_TYPES)],
                     scenarios=[description], upstream=[code], adapter_code=spec["adapter"], surfaces=["advanced-canvas"],
                     parameter_schema={"type": "object", "properties": deepcopy(spec["properties"]), "additionalProperties": False},
                     parameter_docs={key: value.get("description", value["title"]) for key, value in spec["properties"].items()})
@@ -579,13 +591,14 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
          "input_contract": "candidate_flow_chunk_set", "output_contract": "flow_chunk_review_snapshot", "locked": True},
     ]
     edges: list[list[str]] = [["document-input", "document-chunker"], ["document-chunker", "input-review-gate"]]
-    generators = {"text": "text-knowledge-mapper", "qa": "qa-extractor", "graph": "graph-extractor"}
+    generators = {"text": "text-knowledge-mapper", "qa-question": "qa-extractor", "qa-full": "qa-extractor", "graph": "graph-extractor"}
     for raw_kind in output_types:
         kind = "graph:triple" if raw_kind == "graph" else raw_kind
         family, _, mode = kind.partition(":")
+        knowledge_type = kind if is_qa_knowledge_type(kind) else family
         generator = f"generate-{kind}"
         validator = f"validate-{kind}"; quality = f"quality-{kind}"; sink = f"sink-{kind}"
-        generator_params: dict[str, Any] = {"knowledge_type": family}
+        generator_params: dict[str, Any] = {"knowledge_type": knowledge_type}
         if mode:
             generator_params["graph_mode"] = mode
         generator_ref = generators.get(family, "structured-knowledge-generator")
@@ -616,7 +629,7 @@ def builtin_flow_definition(output_types: list[str]) -> dict[str, Any]:
             {"id": generator, "kind": "operator", "ref": generator_ref, "params": generator_params},
             *([{"id": validator, "kind": "operator", "ref": "schema-validator", "params": {"knowledge_type": family, "graph_mode": mode}}] if family == "graph" else []),
             *([{"id": quality, "kind": "operator", "ref": "graph-quality-validator", "params": {"knowledge_type": family, "graph_mode": mode or None}}] if family == "graph" else []),
-            {"id": sink, "kind": "knowledge_sink", "node_role": "knowledge_output", "knowledge_type": family, "graph_mode": mode or None, "output_key": kind},
+            {"id": sink, "kind": "knowledge_sink", "node_role": "knowledge_output", "knowledge_type": knowledge_type, "graph_mode": mode or None, "output_key": kind},
         ))
         edges.extend(graph_edges or [["input-review-gate", generator]])
         edges.extend([[generator, validator], [validator, quality], [quality, sink]]

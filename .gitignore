@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .uv-cache/
+# 本地 Python/uv 与 pytest 临时产物只使用这两个统一根目录。
 .uv-task-cache/
 .DS_Store
 frontend/node_modules/
@@ -41,6 +42,13 @@ llm_servings.yaml
 .pytest-tmp/
 .devora/
 .workbuddy/
+
+# ===== 所有隐藏文件夹（以 . 开头的目录）均不提交 =====
+# 防止本地 Agent 配置 / uv 缓存 / 内网相关目录被推送到公开仓库
+# 注意：本规则只忽略“目录”，隐藏文件（.gitignore/.dockerignore/.python-version）不受影响
+.*/
+# 例外：若未来启用 GitHub Actions CI，取消下一行注释以保留 .github/
+# !/.github/
 specs/
 tests/test_v7_platform.py
 

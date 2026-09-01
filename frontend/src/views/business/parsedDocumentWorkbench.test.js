@@ -15,6 +15,8 @@ test('document library exposes ParseJob plus ParsedDocument review lifecycle', (
   assert.match(listing, /解析失败/)
   assert.match(listing, /openParsedDocument/)
   assert.match(listing, /审阅通过所选文件/)
+  assert.match(listing, /一键全选审阅通过/)
+  assert.match(listing, /approveAllPage/)
   assert.doesNotMatch(listing, /FlowChunk|preparation_status/)
 })
 

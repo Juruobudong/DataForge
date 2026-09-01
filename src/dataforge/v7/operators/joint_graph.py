@@ -104,7 +104,10 @@ class JointGraphExecutor:
         runtime = context.runtime
         config = joint_graph_config(runtime.get("graph_config") or
                                     _graph_config_from_contracts(runtime.get("type_contracts", {})), params)
-        stage = GraphChunkStage(context.node_id, params, runtime.setdefault("generation", {}))
+        stage = GraphChunkStage(
+            context.node_id, params, runtime.setdefault("generation", {}),
+            isolate_llm_timeout=mode == "triple",
+        )
         key = f"graph:{mode}"
         stage.output_key = key
         retry_scope = runtime.get("retry_scope")
@@ -131,7 +134,10 @@ class JointGraphExecutor:
                         calls[identity] += 1
                         try:
                             try:
-                                response = _llm_json(request, llm_serving=serving, system=system, temperature=0)
+                                response = _llm_json(
+                                    request, llm_serving=serving, system=system, temperature=0,
+                                    timeout_seconds=runtime.get("graph_llm_timeout_seconds"),
+                                )
                             except ValueError as exc:
                                 raise GraphChunkError("GRAPH_JOINT_FORMAT_INVALID: 模型没有返回合法 JSON") from exc
                             entities, relations, filtered = parse_joint_graph(response, config, params)

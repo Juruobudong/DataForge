@@ -1,6 +1,0 @@
-interface:
-  display_name: "Devora Resolve"
-  short_description: "Resolve an analysis report by automatically repairing workflow artifacts and asking users only for true product decisions."
-  default_prompt: "Use $devora-resolve for this task."
-policy:
-  allow_implicit_invocation: true

@@ -1,6 +1,0 @@
-interface:
-  display_name: "Devora Review"
-  short_description: "Run an independent pre-PR delivery review and present a focused human approval packet."
-  default_prompt: "Use $devora-review for this task."
-policy:
-  allow_implicit_invocation: true

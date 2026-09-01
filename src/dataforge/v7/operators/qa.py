@@ -222,11 +222,14 @@ def qa_candidate(chunk, row):
 
 
 def generate_qa_chunks(values, params, context, invoke, *, allow_no_match=False):
+    knowledge_type = str(params.get("knowledge_type") or "")
+    if knowledge_type not in {"qa-question", "qa-full"}:
+        raise ValueError("OPERATOR_CONTRACT_MISMATCH: QA 提取器必须选择 qa-question 或 qa-full")
     outputs, runtime = [], context.runtime
-    outcome = runtime.setdefault("generation", {}).setdefault("qa", {"successful": [], "failed": [], "targeted": []})
+    outcome = runtime.setdefault("generation", {}).setdefault(knowledge_type, {"successful": [], "failed": [], "targeted": []})
     store, job, count = runtime.get("store"), runtime.get("job_id"), question_count(params)
     for chunk in values:
-        scope = ("qa", str(chunk.get("source_version_id", "")), str(chunk.get("flow_chunk_id", "")))
+        scope = (knowledge_type, str(chunk.get("source_version_id", "")), str(chunk.get("flow_chunk_id", "")))
         if runtime.get("retry_scope") is not None and scope not in runtime["retry_scope"]:
             continue
         outcome["targeted"].append(chunk)
@@ -250,7 +253,7 @@ def generate_qa_chunks(values, params, context, invoke, *, allow_no_match=False)
             outcome["successful"].append(chunk)
             outputs.extend(candidates)
             if store and job:
-                store.record_chunk_generation(job, "qa", chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
+                store.record_chunk_generation(job, knowledge_type, chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
         except Exception as exc:
             error = runtime["_operator_diagnostics"].error(exc)
             runtime["_operator_diagnostics"].append("stderr", error + "\n")
@@ -258,7 +261,7 @@ def generate_qa_chunks(values, params, context, invoke, *, allow_no_match=False)
                 raise
             outcome["failed"].append({**chunk, "error": error})
             if store and job:
-                store.record_chunk_generation(job, "qa", chunk, status="failed", error=error)
+                store.record_chunk_generation(job, knowledge_type, chunk, status="failed", error=error)
     if outcome["failed"] and not outcome["successful"]:
         error = ValueError(outcome["failed"][0]["error"])
         if "_qa_recovery" in runtime:
@@ -279,7 +282,10 @@ class NativeQAExecutor:
         if not isinstance(instructions, str):
             raise ValueError("QA 提取要求必须是字符串")
         instructions = instructions.strip() or DEFAULT_QA_EXTRACTION_INSTRUCTIONS
-        values, originals = prepare_generation(inputs, "qa", context)
+        knowledge_type = str(params.get("knowledge_type") or "")
+        if knowledge_type not in {"qa-question", "qa-full"}:
+            raise ValueError("OPERATOR_CONTRACT_MISMATCH: QA 提取器必须选择 qa-question 或 qa-full")
+        values, originals = prepare_generation(inputs, knowledge_type, context)
         schema = {"type": "object", "additionalProperties": False, "required": ["items"], "properties": {
             "items": {"type": "array", "minItems": 0, "maxItems": count, "items": {
                 "type": "object", "additionalProperties": False, "required": ["question", "answer"],
@@ -295,11 +301,11 @@ class NativeQAExecutor:
             row = records[0]
             session = QAChunkSession(params, context, row["_df_row"], "dataforge")
             items = session.complete(json.dumps({"source_text": row["text"]}, ensure_ascii=False), system,
-                                     schema, lambda s: parse_items(s, count), "qa")
+                                     schema, lambda s: parse_items(s, count), knowledge_type)
             session.succeeded()
             return ([{**item, "_df_row": row["_df_row"]} for item in items]
                     if items else OperatorEarlyResult(outputs=[]))
         outputs = generate_qa_chunks(values, params, context, invoke, allow_no_match=True)
-        outputs = restore_evidence(outputs, originals, "qa", context)
+        outputs = restore_evidence(outputs, originals, knowledge_type, context)
         return OperatorResult(outputs=outputs, metrics={"input_records": len(inputs), "output_records": len(outputs),
                               "qa_recovery": dict(context.runtime.get("_qa_recovery", {}))})

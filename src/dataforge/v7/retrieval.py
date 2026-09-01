@@ -117,10 +117,13 @@ class RetrievalDebugService:
             if version_no is None:
                 raise RetrievalError("历史模式必须选择 version_no")
             version = self.store.route_version_detail(project_id, version_no, release_stage)
-            if version["status"] not in {"frozen", "published"}:
-                raise RetrievalError("只允许选择冻结或发布的历史版本")
-            snapshot, number = version["snapshot"], version["version_no"]
-            checksum = version["checksum"]
+            if version["status"] != "frozen":
+                raise RetrievalError("只允许选择已冻结的历史版本")
+            publication = self.store.current_project_publication(
+                project_id, release_stage, version_no=version_no,
+            )
+            snapshot, number = publication["snapshot"], publication["version_no"]
+            checksum = publication["checksum"]
         elif route_mode == "published":
             if version_no is not None:
                 raise RetrievalError("当前发布模式不能指定历史版本号")
@@ -198,10 +201,14 @@ class RetrievalDebugService:
             libraries = org.get("libraries", [])
             if not libraries or not profile:
                 raise RetrievalError("Routing 缺少授权知识库或索引配置")
-            complete("routing", {"project": snapshot["project"], "deployment": snapshot["deployment"],
+            deployment = snapshot.get("deployment")
+            milvus_target = snapshot.get("milvus_target")
+            if not deployment or not milvus_target:
+                raise RetrievalError("检索执行快照缺少 Deployment 或 Milvus Target")
+            complete("routing", {"project": snapshot["project"], "deployment": deployment,
                                  "task_code": request.task_code, "org_code": request.org_code,
-                                 "libraries": libraries, "milvus_target": snapshot["milvus_target"]})
-            if instance_mode == "central" and snapshot["deployment"].get("scope") == "institution":
+                                 "libraries": libraries, "milvus_target": milvus_target})
+            if instance_mode == "central" and deployment.get("scope") == "institution":
                 result["status"] = "blocked"
                 result["notice"] = "中心不连接机构现场 Milvus；请在机构本地执行完整检索调试。"
                 return result

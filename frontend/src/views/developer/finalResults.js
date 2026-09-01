@@ -1,7 +1,7 @@
 import { nodeFailureInfo } from '../../components/flow/runtimeDiagnostics.js'
 
 export const RESULT_PAGE_SIZE = 50
-const labels = { text: '文本', qa: '问答', 'graph:triple': '三元组图谱', 'graph:semantic': '语义图谱' }
+const labels = { text: '文本', 'qa-question': '问答·Q检索', 'qa-full': '问答·QA检索', 'graph:triple': '三元组图谱', 'graph:semantic': '语义图谱' }
 const terminal = new Set(['completed', 'completed_with_warnings', 'failed', 'cancelled'])
 
 export function finalOutputKey(node) {
@@ -58,7 +58,7 @@ export function finalResultOutputs(detail) {
 }
 
 export function finalResultColumns(key) {
-  if (key === 'qa') return ['问题', '答案']
+  if (['qa-question', 'qa-full'].includes(key)) return ['问题', '答案']
   if (key === 'graph:triple') return ['主体', '关系', '客体', '客体类别']
   if (key === 'graph:semantic') return ['来源实体', '关系', '目标实体']
   return [key === 'text' ? '正文' : '正文摘要']
@@ -66,7 +66,7 @@ export function finalResultColumns(key) {
 
 export function finalResultCells(key, item) {
   const data = item.data_json || {}
-  if (key === 'qa') return [data.question, data.answer]
+  if (['qa-question', 'qa-full'].includes(key)) return [data.question, data.answer]
   if (key === 'graph:triple') return [data.subject, data.predicate || data.predicate_code, data.object,
     data.data?.object_kind === 'literal' ? '字面值' : data.data?.object_kind === 'entity' ? '实体' : '未记录']
   if (key === 'graph:semantic') return [data.source_entity?.name, data.relation?.type_label || data.relation?.type, data.target_entity?.name]

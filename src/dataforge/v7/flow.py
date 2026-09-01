@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-from .catalog import catalog_by_code, normalize_chunker_params, DEFAULT_QA_EXTRACTION_INSTRUCTIONS
+from .catalog import catalog_by_code, normalize_chunker_params, DEFAULT_QA_EXTRACTION_INSTRUCTIONS, is_qa_knowledge_type
 from .operator_catalog import resolve_operator
 from .operator_runtime_contract import validate_runtime_requirements
 from .llm_serving import LLMServingRegistry, get_llm_serving_registry
@@ -256,7 +256,8 @@ def _node_ports(node: dict[str, Any], *, direction: str,
         knowledge_type = str(node.get("knowledge_type") or "")
         graph_mode = str(node.get("graph_mode") or "") or None
         output_key = str(node.get("output_key") or (f"graph:{graph_mode}" if knowledge_type == "graph" and graph_mode else knowledge_type))
-        return {"input": {"artifact_type": f"candidate:{output_key}", "cardinality": "one",
+        candidate_key = "qa" if is_qa_knowledge_type(knowledge_type) else output_key
+        return {"input": {"artifact_type": f"candidate:{candidate_key}", "cardinality": "one",
                           "required": True, "binding": "edge"}}
     if node.get("kind") == "execution_gate":
         artifact_type = "flow_chunk_review_snapshot" if direction == "output" else "candidate_flow_chunk_set"
@@ -522,7 +523,7 @@ class FlowCompiler:
                 expected_key = (f"graph:{node.get('graph_mode')}" if knowledge_type == "graph" else knowledge_type)
                 if output_key != expected_key or knowledge_type == "graph" and node.get("graph_mode") not in {"triple", "semantic"}:
                     raise FlowValidationError(f"Knowledge Sink {node_id} 输出键与知识类型或图谱模式不一致")
-                required = f"candidate:{output_key}"
+                required = "candidate:qa" if is_qa_knowledge_type(knowledge_type) else f"candidate:{output_key}"
                 source_types = [outputs[source] for source in incoming[node_id]]
                 if source_types != [required]:
                     raise FlowValidationError(f"Knowledge Sink {node_id} 需要 {required}")
@@ -649,7 +650,7 @@ class FlowCompiler:
                 output = output_spec["output_by_input"].get(source_types[0] if len(source_types) == 1 else "")
                 if not output:
                     raise FlowValidationError(f"节点 {node_id} 无法解析正文处理的实际输出类型")
-            if "derived_text_set" in source_types and str(params.get("knowledge_type", "text")) not in {"text", "qa"}:
+            if "derived_text_set" in source_types and str(params.get("knowledge_type", "text")) not in {"text", "qa-question", "qa-full"}:
                 raise FlowValidationError("派生正文仅支持Text/QA生成")
             node["resolved_input_type"] = source_types[0] if len(source_types) == 1 else None
             knowledge_type = str(params.get("knowledge_type", ""))

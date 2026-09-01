@@ -116,7 +116,7 @@ def execute_governance(executor, values, params, context, invoke):
     init = {key: value for key, value in business.items() if key != "llm_serving"}
     adapter = executor.adapter
     if adapter == "governance-multihop-v1":
-        return multihop(values, init, context, invoke)
+        return multihop(values, init, str(params.get("knowledge_type") or ""), context, invoke)
     if adapter == "governance-evaluate-v1":
         return evaluate(values, context, invoke)
     if adapter == "governance-evaluate_generic-v1":
@@ -126,7 +126,7 @@ def execute_governance(executor, values, params, context, invoke):
     sources = all(is_source(value) for value in values)
     if not sources and any(is_source(value) for value in values):
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 不能混合来源和候选")
-    if not sources and params.get("knowledge_type") not in {"text", "qa"}:
+    if not sources and params.get("knowledge_type") not in {"text", "qa-question", "qa-full"}:
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 正文治理仅支持Text/QA")
     originals = [derived_record(value) for value in values] if sources else deepcopy(values)
     records, skipped = [], set()
@@ -164,7 +164,7 @@ def execute_governance(executor, values, params, context, invoke):
                 "max_scores": {"mtld": init["max_mtld"], "hdd": init["max_hdd"]}}
     run = {} if adapter == "governance-conditions-v1" else {"input_key": "text"}
     refiner = adapter in {"governance-anonymize-v1", "governance-punctuation-v1"}
-    if refiner and not sources and params.get("knowledge_type") == "qa":
+    if refiner and not sources and params.get("knowledge_type") in {"qa-question", "qa-full"}:
         records = []
         for index, value in enumerate(originals):
             for offset, field in enumerate(("question", "answer")):
@@ -179,7 +179,7 @@ def execute_governance(executor, values, params, context, invoke):
     for index, value in enumerate(originals):
         before_digest = content_digest(value)
         retained = index in rows or index in skipped
-        if refiner and not sources and params.get("knowledge_type") == "qa":
+        if refiner and not sources and params.get("knowledge_type") in {"qa-question", "qa-full"}:
             retained = True
             question, answer = rows[index * 2]["text"], rows[index * 2 + 1]["text"]
             if any(not isinstance(text, str) or not text.strip() for text in (question, answer)):
@@ -214,7 +214,7 @@ def execute_governance(executor, values, params, context, invoke):
 
 
 def evaluate_generic(executor, values, business, params, context, invoke):
-    if params.get("knowledge_type") not in {"text", "qa"}:
+    if params.get("knowledge_type") not in {"text", "qa-question", "qa-full"}:
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 通用评估仅支持Text/QA Candidate")
     prompt = params.get("_resolved_prompt_template") or {}
     prompt_body = prompt.get("body")
@@ -228,7 +228,7 @@ def evaluate_generic(executor, values, business, params, context, invoke):
         text = value.get("canonical_content")
         if not isinstance(text, str) or not text.strip():
             raise ValueError("OPERATOR_INPUT_INVALID: 评估正文必须为非空字符串")
-        if params.get("knowledge_type") == "qa":
+        if params.get("knowledge_type") in {"qa-question", "qa-full"}:
             qa = value.get("data_json") or {}
             if any(not isinstance(qa.get(key), str) or not qa[key].strip() for key in ("question", "answer")):
                 raise ValueError("QA_OUTPUT_INVALID: 通用评估需要非空问题和答案")
@@ -253,7 +253,7 @@ def semantic_deduplicate(executor, values, business, params, context, invoke):
     sources = all(is_source(value) for value in values)
     if not sources and any(is_source(value) for value in values):
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 不能混合来源和候选")
-    if not sources and params.get("knowledge_type") not in {"text", "qa"}:
+    if not sources and params.get("knowledge_type") not in {"text", "qa-question", "qa-full"}:
         raise ValueError("OPERATOR_CONTRACT_MISMATCH: 语义去重仅支持Text/QA")
     originals = [derived_record(value) for value in values] if sources else deepcopy(values)
     records, skipped, group_counts, identities = [], [], {}, set()
@@ -349,10 +349,12 @@ def evaluate(values, context, invoke):
     return OperatorResult(outputs=result, metrics={"input_records": len(values), "output_records": len(result)})
 
 
-def multihop(values, init, context, invoke):
-    inputs, originals = prepare_generation(values, "qa", context)
+def multihop(values, init, knowledge_type, context, invoke):
+    if knowledge_type not in {"qa-question", "qa-full"}:
+        raise ValueError("OPERATOR_CONTRACT_MISMATCH: 多跳问答仅支持两种 QA 知识类型")
+    inputs, originals = prepare_generation(values, knowledge_type, context)
     runtime = context.runtime
-    outcome = runtime["generation"]["qa"]
+    outcome = runtime["generation"][knowledge_type]
     result = []
     for chunk in inputs:
         outcome["targeted"].append(chunk)
@@ -374,15 +376,15 @@ def multihop(values, init, context, invoke):
                     "source_anchor": f"{chunk.get('filename', '')}#chunk-{chunk.get('chunk_index', 0)}", "is_primary": True})
             outcome["successful"].append(chunk); result.extend(candidates)
             if runtime.get("store") and runtime.get("job_id"):
-                runtime["store"].record_chunk_generation(runtime["job_id"], "qa", chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
+                runtime["store"].record_chunk_generation(runtime["job_id"], knowledge_type, chunk, status="success" if candidates else "success_empty", candidate_count=len(candidates))
         except Exception as exc:
             if "OPERATOR_CANCELLED" in str(exc):
                 raise
             error = runtime["_operator_diagnostics"].error(exc)
             outcome["failed"].append({**chunk, "error": error})
             if runtime.get("store") and runtime.get("job_id"):
-                runtime["store"].record_chunk_generation(runtime["job_id"], "qa", chunk, status="failed", error=error)
-    result = restore_evidence(result, originals, "qa", context)
+                runtime["store"].record_chunk_generation(runtime["job_id"], knowledge_type, chunk, status="failed", error=error)
+    result = restore_evidence(result, originals, knowledge_type, context)
     if outcome["failed"] and not outcome["successful"]:
         raise ValueError(outcome["failed"][0]["error"])
     return OperatorResult(outputs=result, metrics={"input_records": len(values), "output_records": len(result)})

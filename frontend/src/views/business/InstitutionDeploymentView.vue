@@ -2,7 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../../api/platform'
-import { frozenRoutesForStage, groupedAssetOptions, institutionReleaseTarget, releaseCanFreeze, releaseSelectionSummary } from './institutionReleaseModel'
+import { frozenRoutesForStage, groupedAssetOptions, institutionReleaseTarget, releaseAssetVersionConflicts, releaseCanFreeze, releasePreflightExpectedText, releaseSelectionSummary } from './institutionReleaseModel'
+import { sortProjectChoices } from './projectPublishingModel'
 
 const route = useRoute(), router = useRouter()
 const instance = ref(null), deployments = ref([]), projects = ref([]), libraries = ref([])
@@ -17,12 +18,14 @@ const inspected = ref(null), resolutions = ref({}), error = ref(''), busy = ref(
 const local = computed(() => instance.value?.instance_mode === 'local')
 let saveTimer = null
 const institutionDeployments = computed(() => deployments.value.filter(item => item.scope === 'institution'))
+const projectChoices = computed(() => sortProjectChoices(projects.value))
 const selectedDeployment = computed(() => institutionDeployments.value.find(item => item.id === deploymentId.value))
 const targetInstitutionCode = computed(() => selectedDeployment.value?.institution_code || '')
 const updateOnly = computed(() => packageKind.value === 'knowledge_update')
 const assetGroups = computed(() => groupedAssetOptions(assetOptions.value))
 const selectionSummary = computed(() => releaseSelectionSummary(plan.value))
 const canFreeze = computed(() => releaseCanFreeze(plan.value))
+const assetVersionConflicts = computed(() => releaseAssetVersionConflicts(plan.value))
 
 function kindLabel(kind) {
   return ({ deployment_seed: '首次部署 Seed', institution_release: '机构多项目发布', knowledge_update: '知识资产更新' })[kind] || kind
@@ -31,6 +34,13 @@ function statusClass(status) {
   if (['ready', 'completed', 'frozen'].includes(status)) return 'green'
   if (['failed', 'conflict'].includes(status)) return 'red'
   return 'amber'
+}
+function conflictsForCheck(check) {
+  return assetVersionConflicts.value.find(item => item.check === check)?.assets || []
+}
+function assetSource(asset) {
+  return asset.locked ? `项目必选：${(asset.required_by_projects || []).map(item => item.project_name || item).join('、')}`
+    : asset.selected_manually ? '额外选择' : '可额外选择'
 }
 async function loadFrozenRoutes() {
   frozenRoutes.value = []
@@ -181,12 +191,12 @@ onMounted(load)
         <form class="grid2" @submit.prevent="createInstitutionDeployment">
           <label>机构名称<input v-model="newInstitutionName" required></label>
           <label>机构代码<input v-model="newInstitutionCode" required></label>
-          <label>绑定项目<select v-model="newInstitutionProjectIds" multiple required><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
+          <label>绑定项目<select v-model="newInstitutionProjectIds" multiple required><option v-for="project in projectChoices" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
           <button class="primary" :disabled="busy||!newInstitutionProjectIds.length">创建机构 Deployment</button>
         </form>
         <form v-if="selectedDeployment" class="grid2" @submit.prevent="saveInstitutionProjects">
           <label>当前机构<input :value="`${selectedDeployment.institution_name} · ${selectedDeployment.institution_code}`" readonly></label>
-          <label>已绑定项目<select v-model="boundProjectIds" multiple><option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
+          <label>已绑定项目<select v-model="boundProjectIds" multiple><option v-for="project in projectChoices" :key="project.id" :value="project.id">{{ project.name }} · {{ project.code }}</option></select></label>
           <button :disabled="busy">保存项目绑定</button>
         </form>
       </section>
@@ -216,13 +226,14 @@ onMounted(load)
             <label v-for="asset in group.assets" :key="asset.asset_version_id" class="stat-card">
               <span>
                 <input v-if="asset.locked" type="checkbox" checked disabled>
-                <input v-else-if="!updateOnly" v-model="extraAssetVersionIds" type="checkbox" :value="asset.asset_version_id">
+                <input v-else-if="!updateOnly" v-model="extraAssetVersionIds" type="checkbox" :value="asset.asset_version_id" :disabled="asset.selectionBlocked">
                 <span v-else>•</span>
                 {{ asset.knowledge_library_name }} · v{{ asset.asset_version_no }}
               </span>
               <code>{{ asset.partition_name }}</code>
-              <small v-if="asset.locked">项目必选：{{ asset.projectNames.join('、') }}</small>
-              <small v-else>{{ asset.item_count }} 条 · {{ asset.status }}</small>
+              <small v-if="asset.locked">项目必选：{{ asset.projectNames.join('、') }} · {{ asset.index_profile_code }} · {{ asset.item_count }} 条</small>
+              <small v-else-if="asset.conflictWith">与项目必选 v{{ asset.conflictWith.asset_version_no }}（{{ asset.conflictWith.index_profile_code }}）冲突{{ asset.selected_manually ? '，请取消额外选择' : '，不可额外选择' }}</small>
+              <small v-else>{{ asset.index_profile_code }} · {{ asset.item_count }} 条 · {{ asset.status }}</small>
             </label>
           </div>
         </details>
@@ -233,7 +244,7 @@ onMounted(load)
       <section v-else-if="step===3" class="panel">
         <div class="panel-head"><div><h3>判重与就绪</h3><p>后端对项目闭包、资产状态、逻辑版本、Collection Contract 与 Partition 内容执行最终门禁。</p></div><span class="badge" :class="plan?.preflight?.blocked?'red':'green'">{{ plan?.preflight?.blocked||0 }} Blocked</span></div>
         <div class="metrics"><div><b>{{ selectionSummary.projectRequiredRefs }}</b><span>项目资产引用</span></div><div><b>{{ selectionSummary.manualRefs }}</b><span>额外选择</span></div><div><b>{{ selectionSummary.rawRefs }}</b><span>原始引用</span></div><div><b>-{{ selectionSummary.duplicatesRemoved }}</b><span>自动去重</span></div><div><b>{{ selectionSummary.resolvedAssets }}</b><span>最终资产</span></div></div>
-        <table><thead><tr><th>检查</th><th>状态</th><th>Expected</th><th>Observed</th><th>说明</th></tr></thead><tbody><tr v-for="check in plan?.preflight?.checks||[]" :key="`${check.code}-${JSON.stringify(check.subject)}`"><td><code>{{ check.code }}</code></td><td><span class="badge" :class="check.status==='passed'?'green':'red'">{{ check.status }}</span></td><td><code>{{ JSON.stringify(check.expected) }}</code></td><td><code>{{ JSON.stringify(check.observed) }}</code></td><td>{{ check.message }}</td></tr></tbody></table>
+        <table><thead><tr><th>检查</th><th>状态</th><th>Expected</th><th>Observed</th><th>说明</th></tr></thead><tbody><tr v-for="check in plan?.preflight?.checks||[]" :key="`${check.code}-${JSON.stringify(check.subject)}`"><td><code>{{ check.code }}</code></td><td><span class="badge" :class="check.status==='passed'?'green':'red'">{{ check.status }}</span></td><td>{{ releasePreflightExpectedText(check) }}</td><td><template v-if="conflictsForCheck(check).length"><div v-for="asset in conflictsForCheck(check)" :key="asset.asset_version_id"><b>{{ asset.knowledge_library_name }} · v{{ asset.asset_version_no }}</b><br><small>{{ asset.index_profile_code }} · {{ asset.collection_name }} · {{ assetSource(asset) }}</small><br><code>{{ asset.partition_name }}</code></div></template><code v-else>{{ JSON.stringify(check.observed) }}</code></td><td>{{ check.message }}</td></tr></tbody></table>
         <h3>项目就绪矩阵</h3>
         <table><thead><tr><th>项目</th><th>RouteVersion</th><th>知识库</th><th>AssetVersion</th></tr></thead><tbody><tr v-for="project in plan?.projects||[]" :key="project.project_deployment_id"><td>{{ project.project.name }}</td><td>v{{ project.route_version }}</td><td>{{ project.route_snapshot?.routes?.reduce((sum,row)=>sum+(row.libraries?.length||0),0) }}</td><td>{{ project.route_snapshot?.routes?.flatMap(row=>row.libraries||[]).map(item=>`v${item.asset_version_no}`).join('、') }}</td></tr></tbody></table>
         <div class="actions"><button @click="step=2">返回知识资产</button><button class="primary" :disabled="!plan" @click="step=4">查看资产差异</button></div>
